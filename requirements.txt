@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────
+#  Artifex Assistant V5 — Base dependencies (GPU-agnostic)
+# ─────────────────────────────────────────────────────────────────────
+#
+#  This file works on any NVIDIA GPU. Install PyTorch with CUDA first:
+#
+#    RTX 30xx / 40xx:
+#      pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#
+#    RTX 50xx (Blackwell):
+#      pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+#
+#  Then:
+#    pip install -r requirements.txt
+#
+#  For GPU-specific pinned versions, see:
+#    requirements-3060.txt       — RTX 3060 12 GB
+#    requirements-rtx4090.txt    — RTX 4090 24 GB
+#    requirements-rtx5060ti.txt  — RTX 5060 Ti 8 GB
+# ─────────────────────────────────────────────────────────────────────
+
+# ── Core AI ───────────────────────────────────────────────────────────
+transformers>=5.2.0
+bitsandbytes>=0.49.0
+accelerate>=1.6.0
+
+# ── Model hub ─────────────────────────────────────────────────────────
+huggingface-hub>=0.20.0
+
+# ── Image / 3D generation (optional — install for non-text pipelines) ─
+diffusers>=0.30.0
+safetensors>=0.4.0
+Pillow>=10.0.0
+
+# ── Application ───────────────────────────────────────────────────────
+colorama>=0.4.6
+FreeSimpleGUI>=5.0.0
+pyperclip>=1.8.0
+psutil>=5.9.0
+duckduckgo-search>=7.0.0
+pypdf>=4.0.0
+lxml>=5.0.0

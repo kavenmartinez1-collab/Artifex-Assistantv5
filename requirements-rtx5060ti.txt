@@ -1,0 +1,32 @@
+# ─────────────────────────────────────────────────────────────────────
+#  Artifex Assistant V5 — Dependencies for RTX 5060 Ti (8 GB VRAM)
+# ─────────────────────────────────────────────────────────────────────
+#
+#  GPU:   NVIDIA RTX 5060 Ti 8 GB (Blackwell, sm_120)
+#  CUDA:  12.8+ (bundled with PyTorch — no separate CUDA toolkit needed)
+#  Python: 3.11+
+#
+#  IMPORTANT: Install torch from the CUDA 12.8 index FIRST:
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+#  Then install the rest:
+#    pip install -r requirements-rtx5060ti.txt
+#
+#  Note: 8 GB VRAM requires aggressive quantization and VRAM-aware layer control.
+# ─────────────────────────────────────────────────────────────────────
+
+torch>=2.10.0
+torchvision>=0.25.0
+torchaudio>=2.10.0
+transformers>=5.2.0
+bitsandbytes>=0.49.0
+accelerate>=1.6.0,<1.7.0
+tiktoken>=0.12.0
+protobuf>=7.0.0
+colorama>=0.4.6
+FreeSimpleGUI>=5.0.0
+huggingface-hub>=0.20.0
+duckduckgo-search>=7.0.0
+pypdf>=4.0.0
+lxml>=5.0.0
+pyperclip>=1.8.0
+psutil>=7.0.0
