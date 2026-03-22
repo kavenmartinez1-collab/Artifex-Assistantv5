@@ -32,7 +32,7 @@ Universal local AI hosting platform. Run any AI model locally — text generatio
 ### 1. Clone and set up
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/Artifex-Assistantv5.git
+git clone https://github.com/kavenmartinez1-collab/Artifex-Assistantv5.git
 cd Artifex-Assistantv5
 python -m venv venv
 venv\Scripts\activate   # Windows
