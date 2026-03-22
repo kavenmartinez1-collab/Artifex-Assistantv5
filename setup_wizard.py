@@ -3,9 +3,9 @@ Artifex Assistant V5 — Setup Wizard.
 Detects GPU, installs correct requirements, and sets up starter models.
 
 Usage:
-    python setup.py               # Full interactive setup
-    python setup.py --detect      # Just detect GPU and recommend config
-    python setup.py --install     # Install requirements for detected GPU
+    python setup_wizard.py               # Full interactive setup
+    python setup_wizard.py --detect      # Just detect GPU and recommend config
+    python setup_wizard.py --install     # Install requirements for detected GPU
 """
 
 import argparse
@@ -37,18 +37,23 @@ def detect_gpu():
         props = torch.cuda.get_device_properties(0)
         info["name"] = props.name
         info["vram_gb"] = round(props.total_memory / (1024 ** 3), 1)
-        info["compute_cap"] = props.major
+        info["compute_cap"] = f"{props.major}.{props.minor}"
 
-        # Determine architecture
+        # Determine architecture using major.minor compute capability
+        # Ada Lovelace = 8.9, Ampere = 8.0-8.6, Hopper = 9.0, Blackwell = 10.x
+        cc = (props.major, props.minor)
         if props.major >= 10:
             info["arch"] = "Blackwell"
             info["cuda_index"] = "cu128"
-        elif props.major >= 9:
+        elif cc >= (8, 9):
             info["arch"] = "Ada Lovelace"
             info["cuda_index"] = "cu124"
         elif props.major >= 8:
             info["arch"] = "Ampere"
             info["cuda_index"] = "cu124"
+        elif props.major >= 7:
+            info["arch"] = "Turing"
+            info["cuda_index"] = "cu121"
         else:
             info["arch"] = "Older"
             info["cuda_index"] = "cu121"
@@ -61,16 +66,20 @@ def detect_gpu():
         else:
             info["tier"] = "ABUNDANT"
 
-        # Recommend requirements file
+        # Recommend requirements file based on GPU name
+        # Falls back to base requirements.txt for unrecognized GPUs
         name_lower = info["name"].lower()
-        if "5060" in name_lower or "5070" in name_lower or "5080" in name_lower or "5090" in name_lower:
+        if any(x in name_lower for x in ("5060", "5070", "5080", "5090")):
             info["requirements_file"] = "requirements-rtx5060ti.txt"
-        elif "4090" in name_lower or "4080" in name_lower:
+        elif any(x in name_lower for x in ("4090", "4080")):
             info["requirements_file"] = "requirements-rtx4090.txt"
         elif "3060" in name_lower:
             info["requirements_file"] = "requirements-3060.txt"
         else:
             info["requirements_file"] = "requirements.txt"
+            if info["name"] != "Unknown":
+                print(f"  NOTE: No GPU-specific requirements for '{info['name']}'.")
+                print(f"  Using base requirements.txt (works on any NVIDIA GPU).")
 
     except ImportError:
         print("  PyTorch not installed yet. Install it first:")

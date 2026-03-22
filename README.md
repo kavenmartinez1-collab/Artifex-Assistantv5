@@ -42,7 +42,7 @@ venv\Scripts\activate   # Windows
 ### 2. Run the setup wizard
 
 ```bash
-python setup.py
+python setup_wizard.py
 ```
 
 This will detect your GPU, install the correct PyTorch + CUDA version, and recommend models.
@@ -72,7 +72,7 @@ Or double-click `launch.bat` on Windows.
 Artifex-Assistantv5/
 ├── main.py                 # CLI entry point
 ├── main_gui.py             # GUI entry point
-├── setup.py                # Setup wizard
+├── setup_wizard.py         # Setup wizard
 ├── setup_ollama.py         # Ollama backend setup
 ├── download_model.py       # Model downloader
 ├── launch.bat              # Windows launcher
