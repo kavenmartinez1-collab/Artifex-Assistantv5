@@ -1,0 +1,17 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.tool_cache/
+models/
+sessions/
+output/
+logs/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+*.md
+.claude/

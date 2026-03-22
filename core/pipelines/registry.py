@@ -48,6 +48,32 @@ def _ensure_registered():
     except ImportError:
         pass
 
+    # --- V5 new pipelines ---
+
+    try:
+        from core.pipelines.embedding import EmbeddingPipeline
+        _register_pipeline("feature-extraction", EmbeddingPipeline)
+    except ImportError:
+        pass
+
+    try:
+        from core.pipelines.image_edit import ImageEditPipeline
+        _register_pipeline("image-to-image", ImageEditPipeline)
+    except ImportError:
+        pass  # diffusers not installed
+
+    try:
+        from core.pipelines.music import MusicPipeline
+        _register_pipeline("text-to-music", MusicPipeline)
+    except ImportError:
+        pass
+
+    try:
+        from core.pipelines.video_gen import VideoGenerationPipeline
+        _register_pipeline("text-to-video", VideoGenerationPipeline)
+    except ImportError:
+        pass  # diffusers not installed
+
 
 def create_pipeline(pipeline_type: str) -> BasePipeline:
     """Create a pipeline instance for the given type.

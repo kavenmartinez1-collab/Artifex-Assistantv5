@@ -194,6 +194,68 @@ class ImageGenerationPipeline(BasePipeline):
                 error=str(e),
             )
 
+    def load_lora(self, lora_path, weight=1.0, status_callback=None):
+        """Load a LoRA adapter on top of the current model.
+
+        Args:
+            lora_path: Local path or HF repo ID for the LoRA weights
+            weight: LoRA scale factor (0.0-2.0, default 1.0)
+            status_callback: Progress callback
+        """
+        if not self.is_loaded():
+            raise RuntimeError("Load a base model before adding LoRA")
+
+        if status_callback:
+            status_callback(f"Loading LoRA: {os.path.basename(lora_path)}...")
+
+        self.pipe.load_lora_weights(lora_path)
+        if weight != 1.0:
+            self.pipe.fuse_lora(lora_scale=weight)
+
+        if status_callback:
+            status_callback(f"LoRA loaded: {os.path.basename(lora_path)} (weight={weight})")
+
+    def unload_lora(self, status_callback=None):
+        """Remove LoRA weights from the model."""
+        if self.is_loaded():
+            try:
+                self.pipe.unfuse_lora()
+                self.pipe.unload_lora_weights()
+                if status_callback:
+                    status_callback("LoRA unloaded")
+            except Exception:
+                pass  # May not have LoRA loaded
+
+    def load_controlnet(self, controlnet_path, status_callback=None):
+        """Add ControlNet to the pipeline.
+
+        Args:
+            controlnet_path: Path or HF repo ID for ControlNet model
+            status_callback: Progress callback
+
+        Note: Reconstructs the pipeline with ControlNet support.
+        """
+        if not self.is_loaded():
+            raise RuntimeError("Load a base model before adding ControlNet")
+
+        if status_callback:
+            status_callback(f"Loading ControlNet: {os.path.basename(controlnet_path)}...")
+
+        from diffusers import ControlNetModel, StableDiffusionControlNetPipeline
+
+        controlnet = ControlNetModel.from_pretrained(
+            controlnet_path,
+            torch_dtype=torch.float16,
+        )
+
+        self.pipe = StableDiffusionControlNetPipeline.from_pipe(
+            self.pipe,
+            controlnet=controlnet,
+        )
+
+        if status_callback:
+            status_callback(f"ControlNet loaded: {os.path.basename(controlnet_path)}")
+
     def get_vram_estimate(self, model_path: str) -> float:
         """Estimate VRAM for a diffusion model in fp16."""
         from core.model_registry import _estimate_model_size
@@ -205,5 +267,7 @@ class ImageGenerationPipeline(BasePipeline):
         caps["supports_negative_prompt"] = True
         caps["supports_resolution"] = True
         caps["supports_seed"] = True
+        caps["supports_lora"] = True
+        caps["supports_controlnet"] = True
         caps["default_resolution"] = "512x512"
         return caps

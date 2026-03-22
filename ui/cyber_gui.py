@@ -1,18 +1,23 @@
 """
 Artifex Assistant V5 — Cyberpunk GUI application.
 Universal AI hosting with persistent knowledge base.
+Organized layout with grouped controls, image preview, resource monitor, and themes.
 """
 
 import gc
+import io
 import threading
 import traceback
 import os
+import time
 
 import pyperclip
+import psutil
 import FreeSimpleGUI as sg
 
 from core.config import (
-    MODES, get_context_profile, set_context_profile, get_context_profile_name,
+    MODES, GPU_TIER,
+    get_context_profile, set_context_profile, get_context_profile_name,
     get_model_names, get_active_model_name, set_active_model,
     get_active_backend, set_active_backend,
 )
@@ -29,25 +34,73 @@ from tools.agent_tools import (
 )
 from tools.tool_cache import maybe_cache_output, clear_cache, SessionMap, update_session_map
 from ui.gui_theme import (
-    apply_theme, BG_COLOR, OUTPUT_BG,
+    apply_theme, get_theme_names, get_active_theme,
+    BG_COLOR, OUTPUT_BG,
     FONT_MAIN, FONT_TITLE, FONT_MONO, FONT_MONO_SM,
     FONT_SMALL,
+    VRAM_COLOR_OK, VRAM_COLOR_WARN, VRAM_COLOR_CRIT,
 )
 
+# ─── Pipeline Configuration ──────────────────────────────────────────────────
 
-_PIPELINE_MODES = ["Chat", "Image Gen", "Vision", "3D (ShapE)", "Audio TTS", "Audio STT"]
+_PIPELINE_MODES = [
+    "Chat", "Code", "Image Gen", "Image Edit", "Vision",
+    "3D (ShapE)", "Audio TTS", "Audio STT", "Music Gen", "Video Gen",
+]
 _PIPELINE_MAP = {
     "Chat": "text-generation",
+    "Code": "text-generation",
     "Image Gen": "text-to-image",
+    "Image Edit": "image-to-image",
     "Vision": "image-text-to-text",
     "3D (ShapE)": "shap-e",
     "Audio TTS": "text-to-audio",
     "Audio STT": "automatic-speech-recognition",
+    "Music Gen": "text-to-music",
+    "Video Gen": "text-to-video",
 }
-# Modes that need a file input
-_FILE_INPUT_MODES = {"Vision", "Audio STT"}
-# Modes that need a prompt
-_PROMPT_MODES = {"Chat", "Image Gen", "Vision", "3D (ShapE)", "Audio TTS"}
+_FILE_INPUT_MODES = {"Vision", "Audio STT", "Image Edit"}
+_PROMPT_MODES = {
+    "Chat", "Code", "Image Gen", "Image Edit", "Vision",
+    "3D (ShapE)", "Audio TTS", "Music Gen", "Video Gen",
+}
+
+# Categorize pipeline modes for the dropdown display
+_MODE_CATEGORIES = {
+    "Text": ["Chat", "Code"],
+    "Image": ["Image Gen", "Image Edit", "Vision"],
+    "Audio": ["Audio TTS", "Audio STT", "Music Gen"],
+    "3D/Video": ["3D (ShapE)", "Video Gen"],
+}
+
+
+def _vram_color(fraction):
+    """Return color based on VRAM usage fraction."""
+    if fraction < 0.6:
+        return VRAM_COLOR_OK
+    elif fraction < 0.85:
+        return VRAM_COLOR_WARN
+    return VRAM_COLOR_CRIT
+
+
+def _get_resource_text():
+    """Get formatted resource usage string."""
+    parts = []
+    try:
+        import torch
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+            total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            frac = alloc / total if total > 0 else 0
+            parts.append(f"VRAM: {alloc:.1f}/{total:.1f}GB")
+    except Exception:
+        pass
+    ram = psutil.virtual_memory()
+    ram_used = ram.used / (1024 ** 3)
+    ram_total = ram.total / (1024 ** 3)
+    parts.append(f"RAM: {ram_used:.1f}/{ram_total:.0f}GB")
+    parts.append(f"CPU: {psutil.cpu_percent():.0f}%")
+    return " | ".join(parts)
 
 
 class ArtifexGUI:
@@ -55,7 +108,7 @@ class ArtifexGUI:
         apply_theme()
 
         self.engine = None
-        self._pipeline = None  # active non-chat pipeline
+        self._pipeline = None
         self.busy = False
 
         # Knowledge manager
@@ -68,170 +121,289 @@ class ArtifexGUI:
 
         self._pending_agent_actions = []
         self._pending_commands = []
+        self._last_image_path = None
 
         # Ensure output dir exists
         self._output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
         os.makedirs(self._output_dir, exist_ok=True)
 
         self.window = self._build_layout()
+        self._setup_resource_timer()
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # LAYOUT
+    # ═════════════════════════════════════════════════════════════════════════
 
     def _build_layout(self):
-        title_row = [
+        accent = "#00f0ff"
+        dim = "#666688"
+        panel_bg = "#0d0f1a"
+
+        # ─── Title Bar ────────────────────────────────────────────────────
+        title_bar = [
+            sg.Text("ARTIFEX", font=("Segoe UI", 16, "bold"), text_color=accent),
+            sg.Text("ASSISTANT V5", font=("Segoe UI", 16), text_color="#8090cc"),
             sg.Push(),
-            sg.Text("ARTIFEX ASSISTANT V5", font=FONT_TITLE, text_color="#00f0ff", key="-TITLE-"),
-            sg.Push(),
+            sg.Text("Theme:", font=FONT_SMALL, text_color=dim),
+            sg.Combo(get_theme_names(), default_value=get_active_theme(),
+                     key="-THEME-", size=(14, 1), font=FONT_SMALL, readonly=True,
+                     background_color="#161a2b", text_color=accent, enable_events=True),
+            sg.Button("Health", key="-HEALTH-", button_color=(panel_bg, "#44ff88"),
+                      font=FONT_SMALL, size=(7, 1)),
         ]
 
-        ws_bar = [
-            sg.Text("CWD:", text_color="#00f0ff", font=FONT_SMALL),
-            sg.Input(os.getcwd(), size=(40, 1), key="-WS-PATH-", font=FONT_MONO_SM,
-                     background_color="#161a2b", text_color="#00f0ff"),
-            sg.Button("Set", key="-WS-SET-",
-                      button_color=("#0f111a", "#00f0ff"), size=(4, 1)),
-            sg.Button("Scan", key="-WS-SCAN-",
-                      button_color=("#0f111a", "#00f0ff"), size=(5, 1)),
+        # ─── Left Sidebar: Model & Workspace ─────────────────────────────
+        model_frame = sg.Frame("Model & Backend", [
+            [
+                sg.Text("Backend:", font=FONT_SMALL, text_color=dim, size=(7, 1)),
+                sg.Combo(["transformers", "ollama"], default_value=get_active_backend(),
+                         key="-BACKEND-SELECT-", size=(13, 1), font=FONT_SMALL,
+                         readonly=True, background_color="#161a2b", text_color=accent,
+                         enable_events=True),
+            ],
+            [
+                sg.Text("Model:", font=FONT_SMALL, text_color=dim, size=(7, 1)),
+                sg.Combo(get_model_names() or [get_active_model_name()],
+                         default_value=get_active_model_name(),
+                         key="-MODEL-SELECT-", size=(13, 1), font=FONT_SMALL,
+                         readonly=True, background_color="#161a2b", text_color=accent,
+                         enable_events=True),
+            ],
+            [
+                sg.Text(f"GPU: {GPU_TIER}", font=FONT_SMALL, text_color="#f9f871"),
+                sg.Push(),
+                sg.Button(f"CTX: {get_context_profile_name()}", key="-CONTEXT-TOGGLE-",
+                          button_color=(panel_bg, "#f9f871"), font=FONT_SMALL, size=(12, 1)),
+            ],
+        ], font=FONT_SMALL, title_color=accent, border_width=1,
+           background_color=panel_bg, expand_x=True)
+
+        workspace_frame = sg.Frame("Workspace", [
+            [
+                sg.Input(os.getcwd(), size=(18, 1), key="-WS-PATH-", font=FONT_MONO_SM,
+                         background_color="#161a2b", text_color=accent),
+            ],
+            [
+                sg.Button("Set", key="-WS-SET-", button_color=(panel_bg, accent), size=(5, 1)),
+                sg.Button("Scan", key="-WS-SCAN-", button_color=(panel_bg, accent), size=(5, 1)),
+            ],
+        ], font=FONT_SMALL, title_color=accent, border_width=1,
+           background_color=panel_bg, expand_x=True)
+
+        session_frame = sg.Frame("Session", [
+            [
+                sg.Button("Save", key="-SAVE-", button_color=(panel_bg, "#44ff88"), size=(5, 1)),
+                sg.Button("Load", key="-LOAD-", button_color=(panel_bg, accent), size=(5, 1)),
+                sg.Button("Export", key="-EXPORT-", button_color=(panel_bg, dim), size=(6, 1)),
+            ],
+        ], font=FONT_SMALL, title_color=accent, border_width=1,
+           background_color=panel_bg, expand_x=True)
+
+        sidebar = sg.Column([
+            [model_frame],
+            [workspace_frame],
+            [session_frame],
+        ], background_color=BG_COLOR, vertical_alignment="top", expand_y=True)
+
+        # ─── Pipeline Mode Bar ────────────────────────────────────────────
+        pipeline_bar = [
+            sg.Text("Pipeline:", font=FONT_SMALL, text_color="#f9f871"),
+            sg.Combo(_PIPELINE_MODES, default_value="Chat",
+                     key="-PIPELINE-MODE-", size=(14, 1), font=FONT_SMALL,
+                     readonly=True, background_color="#161a2b", text_color=accent,
+                     enable_events=True),
+            sg.VSeparator(),
+            sg.Text("Input:", font=FONT_SMALL, text_color=dim, key="-FILE-LABEL-", visible=False),
+            sg.Input("", size=(30, 1), key="-FILE-PATH-", font=FONT_MONO_SM,
+                     background_color="#161a2b", text_color=accent, visible=False),
+            sg.FileBrowse("Browse", key="-FILE-BROWSE-", button_color=(panel_bg, accent),
+                          size=(7, 1), target="-FILE-PATH-", visible=False,
+                          file_types=(("All Files", "*.*"),
+                                      ("Images", "*.png *.jpg *.jpeg *.webp *.bmp"),
+                                      ("Audio", "*.wav *.mp3 *.flac"))),
+            sg.Push(),
+            sg.Text("Output:", font=FONT_SMALL, text_color=dim, key="-OUTPUT-DIR-LABEL-", visible=False),
+            sg.FolderBrowse("Set Dir", key="-OUTPUT-BROWSE-", button_color=(panel_bg, dim),
+                            size=(7, 1), target="-OUTPUT-DIR-PATH-", visible=False),
+            sg.Input(key="-OUTPUT-DIR-PATH-", visible=False, enable_events=True),
         ]
 
+        # ─── Input Area ──────────────────────────────────────────────────
+        input_section = [
+            [
+                sg.Multiline(size=(50, 3), key="-PROMPT-", font=FONT_MONO,
+                             background_color="#161a2b", text_color="#9efeff",
+                             focus=True, expand_x=True),
+            ],
+            [
+                sg.Text("Tokens:", text_color="#f9f871", font=FONT_SMALL),
+                sg.Input(str(MODES["ASSISTANT"].max_tokens), size=(5, 1), key="-TOKENS-",
+                         font=FONT_SMALL),
+                sg.Text("Temp:", text_color="#f9f871", font=FONT_SMALL),
+                sg.Slider((0.1, 1.5), 0.7, 0.1, orientation="h", size=(8, 12),
+                          key="-TEMP-", font=FONT_SMALL),
+                sg.Push(),
+                sg.Button("EXECUTE", key="-RUN-", button_color=("#ffffff", "#ff2a6d"),
+                          font=("Segoe UI", 11, "bold"), size=(10, 1), bind_return_key=True),
+                sg.Button("Refresh", key="-REFRESH-", button_color=(panel_bg, accent), size=(7, 1)),
+                sg.Button("Clear", key="-RESET-", button_color=(panel_bg, "#666666"), size=(5, 1)),
+                sg.Button("VRAM", key="-VRAM-RELIEF-", button_color=(panel_bg, "#ff6b6b"),
+                          size=(5, 1), tooltip="Free VRAM by unloading model"),
+            ],
+        ]
+
+        # ─── Output Panel (tabbed: Chat / Preview) ───────────────────────
+        chat_tab = sg.Tab("Chat Output", [
+            [sg.Multiline(size=(55, 18), key="-OUTPUT-", font=FONT_MONO,
+                          background_color=OUTPUT_BG, text_color="#c7d0ff",
+                          expand_x=True, expand_y=True, disabled=True, autoscroll=True)],
+        ], background_color=BG_COLOR)
+
+        preview_tab = sg.Tab("Preview", [
+            [sg.Image(key="-IMAGE-PREVIEW-", size=(512, 384), background_color="#0a0a14")],
+            [
+                sg.Text("No preview", key="-PREVIEW-LABEL-", font=FONT_SMALL,
+                         text_color=dim, expand_x=True),
+                sg.Button("Open File", key="-OPEN-PREVIEW-", button_color=(panel_bg, accent),
+                          size=(9, 1), visible=False),
+            ],
+        ], background_color=BG_COLOR)
+
+        output_tabs = sg.TabGroup(
+            [[chat_tab, preview_tab]],
+            key="-OUTPUT-TABS-",
+            background_color=BG_COLOR,
+            title_color=dim,
+            selected_title_color=accent,
+            selected_background_color="#161a2b",
+            expand_x=True, expand_y=True,
+        )
+
+        # ─── Thinking Panel ──────────────────────────────────────────────
+        thinking_col = sg.Column([
+            [sg.Text("THINKING", font=FONT_SMALL, text_color="#b060ff")],
+            [sg.Multiline(size=(22, 18), key="-THINKING-", font=FONT_MONO_SM,
+                          background_color="#1a1030", text_color="#9070cc",
+                          expand_x=True, expand_y=True, disabled=True, autoscroll=True)],
+        ], expand_x=True, expand_y=True, background_color=BG_COLOR)
+
+        # ─── Action Panel (suggested commands) ────────────────────────────
         cmd_panel = [
             sg.pin(sg.Column([
-                [sg.Text("Suggested actions:", text_color="#00f0ff", font=FONT_SMALL)],
-                [sg.Listbox(
-                    values=[], size=(40, 4), key="-CMD-LIST-",
-                    font=FONT_MONO_SM, background_color="#161a2b", text_color="#9efeff",
-                    select_mode=sg.LISTBOX_SELECT_MODE_MULTIPLE,
-                    expand_x=True,
-                )],
+                [sg.Text("Suggested actions:", text_color=accent, font=FONT_SMALL)],
+                [sg.Listbox(values=[], size=(40, 3), key="-CMD-LIST-",
+                            font=FONT_MONO_SM, background_color="#161a2b", text_color="#9efeff",
+                            select_mode=sg.LISTBOX_SELECT_MODE_MULTIPLE, expand_x=True)],
                 [
-                    sg.Button("Run Selected", key="-CMD-RUN-",
-                              button_color=("#0f111a", "#00f0ff"), size=(12, 1)),
-                    sg.Button("Run All", key="-CMD-ALL-",
-                              button_color=("#0f111a", "#00f0ff"), size=(8, 1)),
-                    sg.Button("Skip", key="-CMD-SKIP-",
-                              button_color=("#0f111a", "#444444"), size=(6, 1)),
+                    sg.Button("Run Selected", key="-CMD-RUN-", button_color=(panel_bg, accent), size=(12, 1)),
+                    sg.Button("Run All", key="-CMD-ALL-", button_color=(panel_bg, accent), size=(8, 1)),
+                    sg.Button("Skip", key="-CMD-SKIP-", button_color=(panel_bg, "#444444"), size=(5, 1)),
                     sg.Push(),
-                    sg.Text("", key="-CMD-STATUS-", text_color="#00f0ff", font=FONT_MONO_SM),
+                    sg.Text("", key="-CMD-STATUS-", text_color=accent, font=FONT_MONO_SM),
                 ],
             ], key="-CMD-PANEL-", visible=False, background_color=BG_COLOR, expand_x=True))
         ]
 
-        # Output + Thinking side by side
-        output_col = sg.Column([
-            [
-                sg.Text("OUTPUT:", font=FONT_MAIN, text_color="#00f0ff", key="-OUTPUT-LABEL-"),
-                sg.Push(),
-                sg.Button("COPY", key="-COPY-"),
-            ],
-            [sg.Multiline(
-                size=(55, 15), key="-OUTPUT-", font=FONT_MONO,
-                background_color=OUTPUT_BG, text_color="#c7d0ff",
-                expand_x=True, expand_y=True, disabled=True, autoscroll=True,
-            )],
-        ], expand_x=True, expand_y=True)
-
-        thinking_col = sg.Column([
-            [sg.Text("THINKING:", font=FONT_SMALL, text_color="#b060ff")],
-            [sg.Multiline(
-                size=(25, 15), key="-THINKING-", font=FONT_MONO_SM,
-                background_color="#1a1030", text_color="#9070cc",
-                expand_x=True, expand_y=True, disabled=True, autoscroll=True,
-            )],
-        ], expand_x=True, expand_y=True)
-
-        # Pipeline mode selector + file browse row
-        pipeline_row = [
-            sg.Text("Mode:", font=FONT_SMALL, text_color="#f9f871"),
-            sg.Combo(
-                _PIPELINE_MODES, default_value="Chat",
-                key="-PIPELINE-MODE-", size=(14, 1), font=FONT_SMALL,
-                readonly=True, background_color="#161a2b", text_color="#00f0ff",
-                enable_events=True,
-            ),
+        # ─── Status Bar with Resource Monitor ─────────────────────────────
+        status_bar = [
+            sg.Text("STANDBY", key="-STATUS-", size=(50, 1),
+                    background_color="#161a2b", text_color="#ff2a6d", font=FONT_SMALL),
+            sg.Push(),
+            sg.Text("", key="-RESOURCES-", font=FONT_SMALL, text_color="#44ff44",
+                    background_color="#161a2b"),
             sg.VSeparator(),
-            sg.Text("Input file:", font=FONT_SMALL, text_color="#888888", key="-FILE-LABEL-",
-                     visible=False),
-            sg.Input("", size=(35, 1), key="-FILE-PATH-", font=FONT_MONO_SM,
-                     background_color="#161a2b", text_color="#00f0ff", visible=False),
-            sg.FileBrowse("Browse", key="-FILE-BROWSE-",
-                          button_color=("#0f111a", "#00f0ff"), size=(8, 1),
-                          target="-FILE-PATH-", visible=False,
-                          file_types=(("All Files", "*.*"), ("Images", "*.png *.jpg *.jpeg *.webp *.bmp"),
-                                      ("Audio", "*.wav *.mp3 *.flac"))),
-            sg.VSeparator(),
-            sg.Text(f"Output: output/", font=FONT_SMALL, text_color="#888888", key="-OUTPUT-DIR-LABEL-",
-                     visible=False),
-            sg.FolderBrowse("Set Output", key="-OUTPUT-BROWSE-",
-                            button_color=("#0f111a", "#444444"), size=(10, 1),
-                            target="-OUTPUT-DIR-PATH-", visible=False),
-            sg.Input(key="-OUTPUT-DIR-PATH-", visible=False, enable_events=True),
+            sg.Button("COPY", key="-COPY-", button_color=(panel_bg, dim), size=(5, 1)),
         ]
 
-        layout = [
-            title_row,
-            ws_bar,
-            pipeline_row,
-            [sg.HSeparator()],
-            [sg.Text("INPUT", font=FONT_MAIN, text_color="#00f0ff", key="-INPUT-LABEL-")],
-            [sg.Multiline(
-                size=(40, 3), key="-PROMPT-", font=FONT_MONO,
-                background_color="#161a2b", text_color="#9efeff",
-                focus=True, expand_x=True,
-            )],
-            [
-                sg.Text("Tokens:", text_color="#f9f871"),
-                sg.Input(str(MODES["ASSISTANT"].max_tokens), size=(6, 1), key="-TOKENS-"),
-                sg.VSeparator(),
-                sg.Text("Temp:", text_color="#f9f871"),
-                sg.Slider((0.1, 1.5), 0.7, 0.1, orientation="h", size=(10, 15), key="-TEMP-"),
-                sg.Push(),
-                sg.Button("EXECUTE", key="-RUN-",
-                          button_color=("#0f111a", "#ff2a6d"), bind_return_key=True),
-                sg.Button("REFRESH", key="-REFRESH-",
-                          button_color=("#0f111a", "#00f0ff"), size=(8, 1)),
-                sg.Button("CLEAR", key="-RESET-", button_color=("#0f111a", "#444444")),
-                sg.Button("VRAM RELIEF", key="-VRAM-RELIEF-",
-                          button_color=("#0f111a", "#ff6b6b"), size=(12, 1),
-                          tooltip="Unload model + compress history to free VRAM. Keeps conversation. Model reloads on next message."),
-                sg.VSeparator(),
-                sg.Button(f"CTX: {get_context_profile_name()}", key="-CONTEXT-TOGGLE-",
-                          button_color=("#0f111a", "#f9f871"), size=(14, 1), font=FONT_SMALL,
-                          tooltip="Toggle STANDARD/HIGH context profile"),
-                sg.VSeparator(),
-                sg.Text("Backend:", font=FONT_SMALL, text_color="#888888"),
-                sg.Combo(
-                    ["transformers", "ollama"],
-                    default_value=get_active_backend(),
-                    key="-BACKEND-SELECT-",
-                    size=(12, 1),
-                    font=FONT_SMALL,
-                    readonly=True,
-                    background_color="#161a2b",
-                    text_color="#00f0ff",
-                    enable_events=True,
-                ),
-                sg.Text("Model:", font=FONT_SMALL, text_color="#888888"),
-                sg.Combo(
-                    get_model_names() if get_model_names() else [get_active_model_name()],
-                    default_value=get_active_model_name(),
-                    key="-MODEL-SELECT-",
-                    size=(22, 1),
-                    font=FONT_SMALL,
-                    readonly=True,
-                    background_color="#161a2b",
-                    text_color="#00f0ff",
-                    enable_events=True,
-                ),
-            ],
-            [sg.HSeparator()],
-            [output_col, sg.VSeparator(), thinking_col],
+        # ─── Main Layout Assembly ─────────────────────────────────────────
+        main_area = sg.Column([
+            pipeline_bar,
+            [sg.HSeparator(color="#222244")],
+            *input_section,
+            [sg.HSeparator(color="#222244")],
+            [output_tabs, sg.VSeparator(color="#222244"), thinking_col],
             cmd_panel,
-            [sg.StatusBar("STANDBY", key="-STATUS-",
-                          background_color="#161a2b", text_color="#ff2a6d")],
+        ], expand_x=True, expand_y=True, background_color=BG_COLOR)
+
+        layout = [
+            title_bar,
+            [sg.HSeparator(color="#222244")],
+            [sidebar, sg.VSeparator(color="#222244"), main_area],
+            [sg.HSeparator(color="#222244")],
+            status_bar,
         ]
 
         return sg.Window(
             "Artifex Assistant V5", layout, resizable=True, finalize=True,
-            size=(1200, 700),
+            size=(1340, 780), background_color=BG_COLOR,
         )
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # RESOURCE MONITORING
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _setup_resource_timer(self):
+        """Start a periodic timer to update resource display."""
+        self._update_resources()
+
+    def _update_resources(self):
+        """Update resource monitor in status bar."""
+        try:
+            text = _get_resource_text()
+            self.window["-RESOURCES-"].update(text)
+
+            # Color-code based on VRAM pressure
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+                    total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                    frac = alloc / total if total > 0 else 0
+                    self.window["-RESOURCES-"].update(text_color=_vram_color(frac))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Schedule next update (3 seconds)
+        try:
+            self.window.TKroot.after(3000, self._update_resources)
+        except Exception:
+            pass
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # IMAGE PREVIEW
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _show_image_preview(self, image_path):
+        """Load and display an image in the Preview tab."""
+        if not image_path or not os.path.isfile(image_path):
+            return
+        try:
+            from PIL import Image
+            img = Image.open(image_path)
+
+            # Resize to fit preview area (max 512x384)
+            max_w, max_h = 512, 384
+            img.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
+
+            # Convert to PNG bytes for sg.Image
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            png_data = buf.getvalue()
+
+            self.window["-IMAGE-PREVIEW-"].update(data=png_data)
+            self.window["-PREVIEW-LABEL-"].update(
+                f"{os.path.basename(image_path)} ({img.size[0]}x{img.size[1]})"
+            )
+            self.window["-OPEN-PREVIEW-"].update(visible=True)
+            self._last_image_path = image_path
+        except Exception as e:
+            self.window["-PREVIEW-LABEL-"].update(f"Preview failed: {e}")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # CORE LOGIC (unchanged from original)
+    # ═════════════════════════════════════════════════════════════════════════
 
     def _get_system_prompt(self):
         profile = get_context_profile()
@@ -252,14 +424,11 @@ class ArtifexGUI:
         self.window["-CMD-PANEL-"].update(visible=False)
 
     def refresh_context(self):
-        """Compress old messages into key-point summaries and free VRAM.
-        Keeps the model loaded — much faster than CLEAR."""
         mode_cfg = MODES["ASSISTANT"]
-        old_count = len(self.messages) - 1  # exclude system prompt
+        old_count = len(self.messages) - 1
         self.messages = compress_history(self.messages, mode_cfg.context_window)
         new_count = len(self.messages) - 1
 
-        # Free VRAM without unloading the model
         gc.collect()
         try:
             import torch
@@ -272,11 +441,10 @@ class ArtifexGUI:
         self._pending_agent_actions = []
         self.window["-CMD-PANEL-"].update(visible=False)
         self.window["-STATUS-"].update(
-            f"REFRESHED — {old_count} messages compressed to {new_count} (VRAM freed)"
+            f"REFRESHED -- {old_count} msgs compressed to {new_count}"
         )
 
     def _run_assistant_actions(self, actions=None):
-        """Execute agent actions."""
         actions = actions or self._pending_agent_actions[:]
         outputs = []
         for action in actions:
@@ -290,20 +458,13 @@ class ArtifexGUI:
                 display_text = output if output else "(no output)"
                 display = display_text[:3000] + "\n[...truncated...]" if len(display_text) > 3000 else display_text
                 self.window["-OUTPUT-"].update(display + "\n", append=True)
-                # Process through knowledge engine
                 if output:
                     kb_ids = self.km.process_tool_result(action.type, action.display, output)
                     if kb_ids:
-                        self.window["-OUTPUT-"].update(
-                            f"[KB] {len(kb_ids)} entries\n", append=True
-                        )
-
-                # Update session map BEFORE caching (needs full output)
+                        self.window["-OUTPUT-"].update(f"[KB] {len(kb_ids)} entries\n", append=True)
                 if output:
                     update_session_map(self.session_map, action.type, action.display, output)
-
-                # Cache large outputs — model gets summary, full output on disk
-                result = output if output else "(no output — command completed successfully)"
+                result = output if output else "(no output)"
                 result = maybe_cache_output(action.type, action.display, result)
                 outputs.append(f"[{action.type} output] `{action.display}`:\n{result}")
             else:
@@ -330,7 +491,6 @@ class ArtifexGUI:
             mode_cfg = MODES["ASSISTANT"]
             self.messages, active_messages = build_active_messages(self.messages, mode_cfg.context_window)
 
-            # Build display history
             history_text = ""
             for m in self.messages[1:-1]:
                 if m["role"] == "assistant":
@@ -342,8 +502,6 @@ class ArtifexGUI:
                 history_text += f"{label}: {m['content']}\n\n"
             history_text += f"USER: {user_prompt}\n\nASSISTANT: "
             self.window["-OUTPUT-"].update(history_text)
-
-            # Clear thinking panel for new generation
             self.window["-THINKING-"].update("")
 
             def on_response(text):
@@ -355,9 +513,7 @@ class ArtifexGUI:
             think_filter = ThinkFilter(on_response=on_response, on_thinking=on_thinking)
 
             response = self.engine.generate_streaming(
-                active_messages,
-                max_tokens=max_tokens,
-                temperature=temp,
+                active_messages, max_tokens=max_tokens, temperature=temp,
                 on_token=think_filter.feed,
             )
             think_filter.flush()
@@ -366,13 +522,11 @@ class ArtifexGUI:
             self.window["-OUTPUT-"].update("\n\n", append=True)
             self.window["-STATUS-"].update("READY")
 
-            # Extract knowledge from AI response (don't let failures block tool detection)
             try:
                 self.km.add_from_ai_response(response)
             except Exception:
                 pass
 
-            # Check for agent actions in response
             actions = extract_agent_actions(response)
             if actions:
                 self._pending_agent_actions = actions
@@ -382,10 +536,8 @@ class ArtifexGUI:
                 self.window["-CMD-PANEL-"].update(visible=True)
 
         except Exception as e:
-            traceback.print_exc()  # full traceback to console
-            self.window["-OUTPUT-"].update(
-                f"\nERROR ({type(e).__name__}): {e}", append=True
-            )
+            traceback.print_exc()
+            self.window["-OUTPUT-"].update(f"\nERROR ({type(e).__name__}): {e}", append=True)
         finally:
             self.busy = False
 
@@ -402,11 +554,9 @@ class ArtifexGUI:
                 if len(tool_output) > _limit:
                     truncated += "\n[...truncated...]"
                 feedback_msg = (
-                    "[TOOL OUTPUT — this is automated command output, not a human message]\n\n"
-                    f"{truncated}\n\n"
+                    "[TOOL OUTPUT]\n\n" + truncated + "\n\n"
                     "Analyze the output above and tell the user what you found."
                 )
-
                 self.messages.append({"role": "user", "content": feedback_msg})
                 self.messages[0] = {"role": "system", "content": self._get_system_prompt()}
 
@@ -418,17 +568,13 @@ class ArtifexGUI:
 
                 def on_response(text):
                     self.window["-OUTPUT-"].update(text, append=True, autoscroll=True)
-
                 def on_thinking(text):
                     self.window["-THINKING-"].update(text, append=True, autoscroll=True)
 
                 think_filter = ThinkFilter(on_response=on_response, on_thinking=on_thinking)
-
                 response = self.engine.generate_streaming(
-                    active_messages,
-                    max_tokens=mode_cfg.max_tokens,
-                    temperature=mode_cfg.temperature,
-                    on_token=think_filter.feed,
+                    active_messages, max_tokens=mode_cfg.max_tokens,
+                    temperature=mode_cfg.temperature, on_token=think_filter.feed,
                 )
                 think_filter.flush()
 
@@ -436,7 +582,6 @@ class ArtifexGUI:
                 self.window["-OUTPUT-"].update("\n\n", append=True)
                 self.window["-STATUS-"].update("READY")
 
-                # Extract knowledge from followup response
                 self.km.add_from_ai_response(response)
 
                 actions = extract_agent_actions(response)
@@ -448,20 +593,16 @@ class ArtifexGUI:
                     self.window["-CMD-PANEL-"].update(visible=True)
 
             except Exception as e:
-                traceback.print_exc()  # full traceback to console
-                self.window["-OUTPUT-"].update(
-                    f"\nERROR ({type(e).__name__}): {e}", append=True
-                )
+                traceback.print_exc()
+                self.window["-OUTPUT-"].update(f"\nERROR ({type(e).__name__}): {e}", append=True)
             finally:
                 self.busy = False
 
         threading.Thread(target=_analysis_thread, daemon=True).start()
 
     def _pipeline_thread(self, mode, prompt, values):
-        """Run a non-chat pipeline (image gen, vision, 3D, audio)."""
         try:
             from core.pipelines.registry import create_pipeline
-            import time
 
             pipeline_type = _PIPELINE_MAP.get(mode, "text-generation")
             self.window["-STATUS-"].update(f"Loading {mode} pipeline...")
@@ -469,96 +610,85 @@ class ArtifexGUI:
 
             pipeline = create_pipeline(pipeline_type)
 
-            # Determine model path — use HF defaults for non-text pipelines
             model_defaults = {
                 "text-to-image": "runwayml/stable-diffusion-v1-5",
+                "image-to-image": "runwayml/stable-diffusion-v1-5",
                 "shap-e": "openai/shap-e",
-                "image-text-to-text": None,  # uses loaded transformers model
+                "image-text-to-text": None,
                 "text-to-audio": "suno/bark-small",
                 "automatic-speech-recognition": "openai/whisper-small",
+                "text-to-music": "",
+                "text-to-video": "",
             }
             model_path = model_defaults.get(pipeline_type, "")
 
-            # For vision, try to use the currently active transformers model
             if pipeline_type == "image-text-to-text":
                 from core.config import get_active_model_path
                 model_path = get_active_model_path()
 
-            self.window["-OUTPUT-"].update(f"Model: {model_path}\n", append=True)
-            self.window["-STATUS-"].update(f"Loading model...")
+            self.window["-OUTPUT-"].update(f"Model: {model_path or '(auto-select)'}\n", append=True)
+            self.window["-STATUS-"].update("Loading model...")
 
             try:
                 pipeline.load(model_path, status_callback=lambda msg: self.window["-STATUS-"].update(msg))
             except Exception as e:
-                self.window["-OUTPUT-"].update(f"\nFailed to load model: {e}\n", append=True)
+                self.window["-OUTPUT-"].update(f"\nFailed to load: {e}\n", append=True)
                 self.window["-OUTPUT-"].update(
-                    f"\nTo use this pipeline, download the model first:\n"
-                    f"  python download_model.py --repo {model_path}\n", append=True
-                )
-                self.window["-STATUS-"].update(f"LOAD FAILED")
+                    f"Download model first:\n  python download_model.py --repo {model_path}\n", append=True)
+                self.window["-STATUS-"].update("LOAD FAILED")
                 return
 
             self.window["-STATUS-"].update(f"Running {mode}...")
 
-            # Build kwargs based on mode
             kwargs = {}
             timestamp = int(time.time())
 
             if mode == "Image Gen":
-                kwargs = {
-                    "prompt": prompt,
-                    "width": 512,
-                    "height": 512,
-                    "num_steps": 30,
-                    "output_path": os.path.join(self._output_dir, f"image_{timestamp}.png"),
-                }
-
+                kwargs = {"prompt": prompt, "width": 512, "height": 512, "num_steps": 30,
+                          "output_path": os.path.join(self._output_dir, f"image_{timestamp}.png")}
+            elif mode == "Image Edit":
+                kwargs = {"image_path": values.get("-FILE-PATH-", ""), "prompt": prompt,
+                          "strength": 0.75, "num_steps": 30,
+                          "output_path": os.path.join(self._output_dir, f"edit_{timestamp}.png")}
             elif mode == "Vision":
-                kwargs = {
-                    "image_path": values.get("-FILE-PATH-", ""),
-                    "prompt": prompt or "Describe this image in detail.",
-                    "max_tokens": 512,
-                }
-
+                kwargs = {"image_path": values.get("-FILE-PATH-", ""),
+                          "prompt": prompt or "Describe this image in detail.", "max_tokens": 512}
             elif mode == "3D (ShapE)":
-                kwargs = {
-                    "prompt": prompt,
-                    "num_steps": 64,
-                    "output_path": os.path.join(self._output_dir, f"mesh_{timestamp}.ply"),
-                }
-
+                kwargs = {"prompt": prompt, "num_steps": 64,
+                          "output_path": os.path.join(self._output_dir, f"mesh_{timestamp}.ply")}
             elif mode == "Audio TTS":
-                kwargs = {
-                    "text": prompt,
-                    "output_path": os.path.join(self._output_dir, f"audio_{timestamp}.wav"),
-                }
-
+                kwargs = {"text": prompt,
+                          "output_path": os.path.join(self._output_dir, f"tts_{timestamp}.wav")}
             elif mode == "Audio STT":
-                kwargs = {
-                    "audio_path": values.get("-FILE-PATH-", ""),
-                }
+                kwargs = {"audio_path": values.get("-FILE-PATH-", "")}
+            elif mode == "Music Gen":
+                kwargs = {"prompt": prompt, "duration_seconds": 10,
+                          "output_path": os.path.join(self._output_dir, f"music_{timestamp}.wav")}
+            elif mode == "Video Gen":
+                kwargs = {"prompt": prompt, "num_frames": 16, "fps": 8,
+                          "output_path": os.path.join(self._output_dir, f"video_{timestamp}.mp4")}
 
-            self.window["-OUTPUT-"].update(f"Processing...\n", append=True)
+            self.window["-OUTPUT-"].update("Processing...\n", append=True)
             result = pipeline.run(**kwargs)
 
             if result.success:
                 self.window["-OUTPUT-"].update(f"\nSUCCESS\n", append=True)
                 if result.output_type == "text":
                     self.window["-OUTPUT-"].update(f"\n{result.content}\n", append=True)
-                elif result.output_type == "image":
-                    saved = result.metadata.get("saved_to", "")
-                    self.window["-OUTPUT-"].update(f"Image saved to: {saved}\n", append=True)
+                elif result.output_type in ("image",):
+                    path = result.content or result.metadata.get("saved_to", "")
+                    self.window["-OUTPUT-"].update(f"Saved: {path}\n", append=True)
+                    self._show_image_preview(path)
                 elif result.output_type == "mesh":
-                    self.window["-OUTPUT-"].update(f"Mesh saved to: {result.content}\n", append=True)
-                elif result.output_type == "audio":
-                    self.window["-OUTPUT-"].update(f"Audio saved to: {result.content}\n", append=True)
+                    self.window["-OUTPUT-"].update(f"Mesh: {result.content}\n", append=True)
+                elif result.output_type in ("audio", "video"):
+                    self.window["-OUTPUT-"].update(f"Saved: {result.content}\n", append=True)
 
                 if result.metadata:
-                    self.window["-OUTPUT-"].update(f"\nDetails: {result.metadata}\n", append=True)
+                    self.window["-OUTPUT-"].update(f"Details: {result.metadata}\n", append=True)
             else:
                 self.window["-OUTPUT-"].update(f"\nERROR: {result.error}\n", append=True)
 
-            # Unload pipeline to free VRAM
             pipeline.unload(status_callback=lambda msg: self.window["-STATUS-"].update(msg))
             self.window["-STATUS-"].update("READY")
 
@@ -569,71 +699,77 @@ class ArtifexGUI:
         finally:
             self.busy = False
 
+    # ═════════════════════════════════════════════════════════════════════════
+    # EVENT LOOP
+    # ═════════════════════════════════════════════════════════════════════════
+
     def run(self):
         while True:
-            event, values = self.window.read()
+            event, values = self.window.read(timeout=100)
+
             if event == sg.WIN_CLOSED:
                 break
 
+            if event == "__TIMEOUT__":
+                continue
+
+            # ── Action panel events ──────────────────────────────────
             if event == "-CMD-RUN-" and self._pending_agent_actions:
                 selected_indices = self.window["-CMD-LIST-"].get_indexes()
                 if selected_indices:
-                    selected_actions = [self._pending_agent_actions[i] for i in selected_indices]
-                    tool_output = self._run_assistant_actions(selected_actions)
+                    selected = [self._pending_agent_actions[i] for i in selected_indices]
+                    tool_output = self._run_assistant_actions(selected)
                     if tool_output:
                         self._feed_tool_output(tool_output)
 
-            if event == "-CMD-ALL-" and self._pending_agent_actions:
+            elif event == "-CMD-ALL-" and self._pending_agent_actions:
                 tool_output = self._run_assistant_actions()
                 if tool_output:
                     self._feed_tool_output(tool_output)
 
-            if event == "-CMD-SKIP-":
+            elif event == "-CMD-SKIP-":
                 self.window["-CMD-PANEL-"].update(visible=False)
                 self._pending_commands = []
                 self._pending_agent_actions = []
 
-            if event == "-PIPELINE-MODE-":
+            # ── Pipeline mode change ─────────────────────────────────
+            elif event == "-PIPELINE-MODE-":
                 mode = values["-PIPELINE-MODE-"]
                 needs_file = mode in _FILE_INPUT_MODES
-                needs_output = mode != "Chat"
-                # Show/hide file browse elements
+                needs_output = mode not in ("Chat", "Code")
                 for key in ("-FILE-LABEL-", "-FILE-PATH-", "-FILE-BROWSE-"):
                     self.window[key].update(visible=needs_file)
                 for key in ("-OUTPUT-DIR-LABEL-", "-OUTPUT-BROWSE-"):
                     self.window[key].update(visible=needs_output)
                 self.window["-STATUS-"].update(f"Mode: {mode}")
 
-            if event == "-OUTPUT-DIR-PATH-":
+            elif event == "-OUTPUT-DIR-PATH-":
                 new_dir = values["-OUTPUT-DIR-PATH-"]
                 if new_dir and os.path.isdir(new_dir):
                     self._output_dir = new_dir
                     self.window["-OUTPUT-DIR-LABEL-"].update(f"Output: {os.path.basename(new_dir)}/")
 
-            if event == "-RUN-":
+            # ── Execute ──────────────────────────────────────────────
+            elif event == "-RUN-":
                 if self.busy:
                     continue
                 prompt = values["-PROMPT-"]
                 mode = values["-PIPELINE-MODE-"]
 
-                # Non-chat pipeline modes
-                if mode != "Chat":
+                if mode not in ("Chat", "Code"):
                     if mode in _PROMPT_MODES and not prompt.strip():
                         self.window["-STATUS-"].update("Prompt is required.")
                         continue
                     if mode in _FILE_INPUT_MODES:
-                        file_path = values["-FILE-PATH-"]
-                        if not file_path or not os.path.isfile(file_path):
+                        fp = values["-FILE-PATH-"]
+                        if not fp or not os.path.isfile(fp):
                             self.window["-STATUS-"].update("Select an input file first.")
                             continue
                     self.busy = True
                     self.window["-STATUS-"].update(f"RUNNING {mode.upper()}...")
                     self.window["-PROMPT-"].update("")
-                    threading.Thread(
-                        target=self._pipeline_thread,
-                        args=(mode, prompt.strip(), values),
-                        daemon=True,
-                    ).start()
+                    threading.Thread(target=self._pipeline_thread,
+                                     args=(mode, prompt.strip(), values), daemon=True).start()
                     continue
 
                 if not prompt.strip():
@@ -644,26 +780,23 @@ class ArtifexGUI:
                 self.window["-PROMPT-"].update("")
                 max_tokens = int(values["-TOKENS-"])
                 temp = values["-TEMP-"]
-                threading.Thread(
-                    target=self._generate_thread,
-                    args=(prompt, max_tokens, temp),
-                    daemon=True,
-                ).start()
+                threading.Thread(target=self._generate_thread,
+                                 args=(prompt, max_tokens, temp), daemon=True).start()
 
+            # ── Toolbar buttons ──────────────────────────────────────
             elif event == "-REFRESH-":
                 if not self.busy:
                     self.refresh_context()
 
             elif event == "-RESET-":
                 if self.engine is not None:
-                    self.engine.unload(
-                        status_callback=lambda msg: self.window["-STATUS-"].update(msg)
-                    )
+                    self.engine.unload(status_callback=lambda msg: self.window["-STATUS-"].update(msg))
                     self.engine = None
                 self.session_map.clear()
                 clear_cache()
                 gc.collect()
                 self.reset_history()
+                self.window["-STATUS-"].update("CLEARED")
 
             elif event == "-CONTEXT-TOGGLE-":
                 current = get_context_profile_name()
@@ -672,82 +805,62 @@ class ArtifexGUI:
                 profile = get_context_profile()
                 self.window["-CONTEXT-TOGGLE-"].update(f"CTX: {new_name}")
                 self.window["-TOKENS-"].update(str(profile.max_output_tokens))
-                self.window["-STATUS-"].update(
-                    f"Context: {new_name} | output={profile.max_output_tokens} "
-                    f"history={profile.max_history_tokens}"
-                )
+                self.window["-STATUS-"].update(f"Context: {new_name}")
 
             elif event == "-VRAM-RELIEF-":
                 mode_cfg = MODES["ASSISTANT"]
                 pressured, frac, alloc, total = check_vram_pressure(threshold=0.0)
-                self.window["-STATUS-"].update(
-                    f"VRAM: {alloc:.1f}/{total:.1f} GB ({frac:.0%}) — unloading model..."
-                )
+                self.window["-STATUS-"].update(f"VRAM: {alloc:.1f}/{total:.1f}GB -- unloading...")
                 self.window.refresh()
                 if self.engine is not None:
                     relieved, msg = vram_pressure_relief(
-                        self.engine, self.messages, mode_cfg.context_window
-                    )
+                        self.engine, self.messages, mode_cfg.context_window)
                     if relieved:
                         self.messages[0] = {"role": "system", "content": self._get_system_prompt()}
-                        self.engine = None  # force re-create on next message
-                        self.window["-STATUS-"].update(f"VRAM RELIEF: {msg}")
+                        self.engine = None
+                        self.window["-STATUS-"].update(f"VRAM freed. Model reloads on next message.")
                     else:
                         if self.engine.is_loaded():
                             self.engine.unload()
                         self.engine = None
                         gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        _, post_frac, post_gb, _ = check_vram_pressure(threshold=1.0)
-                        self.window["-STATUS-"].update(
-                            f"Model unloaded. VRAM: {post_gb:.1f}/{total:.1f} GB ({post_frac:.0%}). "
-                            f"Will reload on next message."
-                        )
+                        try:
+                            import torch
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        self.window["-STATUS-"].update("Model unloaded. Will reload on next message.")
                 else:
                     self.window["-STATUS-"].update("No engine loaded.")
 
+            # ── Backend / Model selection ─────────────────────────────
             elif event == "-BACKEND-SELECT-":
                 new_backend = values["-BACKEND-SELECT-"]
                 if new_backend != get_active_backend():
                     if self.engine is not None:
-                        self.engine.unload(
-                            status_callback=lambda msg: self.window["-STATUS-"].update(msg)
-                        )
+                        self.engine.unload(status_callback=lambda msg: self.window["-STATUS-"].update(msg))
                         self.engine = None
                     set_active_backend(new_backend)
-                    # Refresh model dropdown for new backend
                     models = get_model_names()
                     if models:
-                        self.window["-MODEL-SELECT-"].update(
-                            values=models, value=models[0]
-                        )
+                        self.window["-MODEL-SELECT-"].update(values=models, value=models[0])
                     else:
                         self.window["-MODEL-SELECT-"].update(
-                            values=[get_active_model_name()],
-                            value=get_active_model_name()
-                        )
-                    self.window["-STATUS-"].update(
-                        f"Backend: {new_backend} (will load on next message)"
-                    )
+                            values=[get_active_model_name()], value=get_active_model_name())
+                    self.window["-STATUS-"].update(f"Backend: {new_backend}")
 
             elif event == "-MODEL-SELECT-":
                 new_model = values["-MODEL-SELECT-"]
                 if set_active_model(new_model):
                     if self.engine is not None and self.engine.is_loaded():
-                        self.engine.unload(
-                            status_callback=lambda msg: self.window["-STATUS-"].update(msg)
-                        )
+                        self.engine.unload(status_callback=lambda msg: self.window["-STATUS-"].update(msg))
                         self.engine = None
-                    self.window["-STATUS-"].update(
-                        f"Model: {new_model} (will load on next message)"
-                    )
+                    self.window["-STATUS-"].update(f"Model: {new_model}")
                 else:
                     self.window["-MODEL-SELECT-"].update(value=get_active_model_name())
-                    self.window["-STATUS-"].update(
-                        f"Invalid model: {new_model}. Staying on {get_active_model_name()}"
-                    )
 
+            # ── Workspace ────────────────────────────────────────────
             elif event == "-WS-SET-":
                 ws_path = values["-WS-PATH-"].strip()
                 if ws_path and os.path.isdir(ws_path):
@@ -756,20 +869,92 @@ class ArtifexGUI:
                     self.km.bind_workspace_store(ws_path)
                     self.window["-STATUS-"].update(f"Workspace: {ws_path}")
                     self.window["-OUTPUT-"].update(
-                        f"[CWD changed to {ws_path}]\n" +
-                        self.km.get_workspace_summary() + "\n", append=True
-                    )
+                        f"[Workspace: {ws_path}]\n{self.km.get_workspace_summary()}\n", append=True)
                 else:
                     self.window["-STATUS-"].update(f"Directory not found: {ws_path}")
 
             elif event == "-WS-SCAN-":
                 self.km.rescan_workspace()
                 self.window["-OUTPUT-"].update(
-                    f"[Workspace re-scanned]\n{self.km.get_workspace_summary()}\n",
-                    append=True,
-                )
+                    f"[Re-scanned]\n{self.km.get_workspace_summary()}\n", append=True)
 
+            # ── Session management ───────────────────────────────────
+            elif event == "-SAVE-":
+                from core.session import save_session
+                name = sg.popup_get_text("Session name:", title="Save Session",
+                                          default_text="session", background_color=BG_COLOR)
+                if name:
+                    metadata = {"model": get_active_model_name(), "backend": get_active_backend()}
+                    path = save_session(name, self.messages, metadata=metadata)
+                    self.window["-STATUS-"].update(f"Saved: {os.path.basename(path)}")
+
+            elif event == "-LOAD-":
+                from core.session import list_sessions, load_session
+                sessions = list_sessions()
+                if not sessions:
+                    self.window["-STATUS-"].update("No saved sessions.")
+                    continue
+                names = [f"{s['name']} ({s['message_count']} msgs, {s['timestamp']})" for s in sessions]
+                choice = sg.popup_get_text(
+                    "Enter session # or name:\n\n" + "\n".join(f"  {i+1}. {n}" for i, n in enumerate(names[:10])),
+                    title="Load Session", background_color=BG_COLOR)
+                if choice:
+                    from core.session import find_session
+                    path = find_session(choice)
+                    if path:
+                        state = load_session(path)
+                        if state:
+                            self.messages = [{"role": "system", "content": self._get_system_prompt()}] + state.messages
+                            self.window["-STATUS-"].update(f"Loaded: {len(state.messages)} messages")
+                            history = ""
+                            for m in state.messages:
+                                role = "USER" if m["role"] == "user" else "ASSISTANT"
+                                history += f"{role}: {m['content']}\n\n"
+                            self.window["-OUTPUT-"].update(history)
+
+            elif event == "-EXPORT-":
+                export_path = sg.popup_get_file("Save conversation as:", save_as=True,
+                                                 default_extension=".md",
+                                                 file_types=(("Markdown", "*.md"), ("Text", "*.txt")))
+                if export_path:
+                    lines = []
+                    for m in self.messages:
+                        if m.get("role") == "system":
+                            continue
+                        role = "## User" if m["role"] == "user" else "## Assistant"
+                        lines.append(f"{role}\n\n{m.get('content', '')}\n")
+                    with open(export_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(lines))
+                    self.window["-STATUS-"].update(f"Exported: {export_path}")
+
+            # ── Theme switching ──────────────────────────────────────
+            elif event == "-THEME-":
+                new_theme = values["-THEME-"]
+                if new_theme != get_active_theme():
+                    # Theme change requires window recreation
+                    self.window.close()
+                    apply_theme(new_theme)
+                    self.window = self._build_layout()
+                    self._setup_resource_timer()
+                    self.window["-STATUS-"].update(f"Theme: {new_theme}")
+
+            # ── Health check ─────────────────────────────────────────
+            elif event == "-HEALTH-":
+                from core.health import run_health_check, format_health_report
+                report = run_health_check()
+                formatted = format_health_report(report)
+                sg.popup_scrolled(formatted, title="System Health",
+                                   size=(60, 20), background_color=BG_COLOR,
+                                   text_color="#c7d0ff", font=FONT_MONO_SM)
+
+            # ── Preview ──────────────────────────────────────────────
+            elif event == "-OPEN-PREVIEW-":
+                if self._last_image_path and os.path.isfile(self._last_image_path):
+                    os.startfile(self._last_image_path)
+
+            # ── Copy ─────────────────────────────────────────────────
             elif event == "-COPY-":
                 pyperclip.copy(values["-OUTPUT-"])
+                self.window["-STATUS-"].update("Copied to clipboard")
 
         self.window.close()

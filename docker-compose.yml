@@ -1,0 +1,44 @@
+# Artifex Assistant V5 — Docker Compose
+# Launches the API server with optional Ollama backend
+
+services:
+  artifex:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models
+      - ./sessions:/app/sessions
+      - ./output:/app/output
+      - ./knowledge:/app/knowledge
+    environment:
+      - ARTIFEX_API_KEY=${ARTIFEX_API_KEY:-}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # Optional: Ollama backend
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles:
+      - ollama
+
+volumes:
+  ollama_data:

@@ -19,17 +19,26 @@ PLATFORM_STRING = f"{platform.system()} ({platform.machine()})"
 # ===== PATHS =====
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _LOCAL_MODEL = os.path.join(BASE_DIR, "models", "qwen3.5-9b")
-MODEL_PATH = _LOCAL_MODEL
+_SHARED_MODEL = os.path.join(os.path.dirname(BASE_DIR), "Artifex-lite", "models", "qwen3.5-9b")
+_SHARED_MODEL_V3 = os.path.join(os.path.dirname(BASE_DIR), "artifex-lite-v3", "models", "qwen3.5-9b")
+MODEL_PATH = (
+    _LOCAL_MODEL if os.path.isdir(_LOCAL_MODEL)
+    else _SHARED_MODEL_V3 if os.path.isdir(_SHARED_MODEL_V3)
+    else _SHARED_MODEL
+)
 SESSION_DIR = os.path.join(BASE_DIR, "sessions")
 KNOWLEDGE_DIR = os.path.join(BASE_DIR, "knowledge")
 KNOWLEDGE_REFERENCE_DIR = os.path.join(KNOWLEDGE_DIR, "reference")
 
 # ===== MODEL REGISTRY =====
 # Auto-discovers model directories in models/. Skip quantized cache dirs.
+# Also checks shared model dirs (artifex-lite-v3/models, Artifex-lite/models).
 # Add new models by downloading to models/ — they appear in the GUI automatically.
 MODELS = {}
 _model_dirs = [
     os.path.join(BASE_DIR, "models"),
+    os.path.join(os.path.dirname(BASE_DIR), "artifex-lite-v3", "models"),
+    os.path.join(os.path.dirname(BASE_DIR), "Artifex-lite", "models"),
 ]
 for _models_dir in _model_dirs:
     if os.path.isdir(_models_dir):
@@ -222,6 +231,30 @@ def _detect_gpu_tier() -> str:
 
 GPU_TIER = _detect_gpu_tier()
 
+# ===== MULTI-GPU SUPPORT =====
+_active_device = 0
+
+def get_gpu_count():
+    """Get number of available GPUs."""
+    try:
+        import torch
+        return torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception:
+        return 0
+
+def get_active_device():
+    """Get the currently active CUDA device index."""
+    return _active_device
+
+def set_active_device(idx):
+    """Set the active CUDA device by index."""
+    global _active_device
+    count = get_gpu_count()
+    if 0 <= idx < count:
+        _active_device = idx
+        return True
+    return False
+
 
 # ===== MODE CONFIGS =====
 @dataclass
@@ -249,6 +282,12 @@ MODES = {
     "ASSISTANT": ModeConfig(
         max_tokens=_L["mt"],
         temperature=0.7,
+        context_window=_L["cw"],
+        enable_thinking=True,
+    ),
+    "CODE": ModeConfig(
+        max_tokens=min(_L["mt"] * 2, 8192),
+        temperature=0.2,
         context_window=_L["cw"],
         enable_thinking=True,
     ),

@@ -162,6 +162,8 @@ class OllamaEngine(BaseEngine):
             "num_predict": max_tokens,
             "temperature": temperature,
             "stop": STOP_STRINGS,
+            "repeat_penalty": 1.15,
+            "repeat_last_n": 128,
         }
 
         if self._num_gpu is not None:
@@ -186,6 +188,7 @@ class OllamaEngine(BaseEngine):
         )
 
         full_response = ""
+        thinking_response = ""
         in_thinking = False
 
         try:
@@ -205,6 +208,7 @@ class OllamaEngine(BaseEngine):
                     # Wrap Ollama thinking in <think> tags for ThinkFilter
                     thinking = msg.get("thinking", "")
                     if thinking:
+                        thinking_response += thinking
                         if not in_thinking:
                             if on_token:
                                 on_token("<think>")
@@ -237,6 +241,10 @@ class OllamaEngine(BaseEngine):
             raise ConnectionError(
                 f"Lost connection to Ollama: {e}"
             )
+
+        # If model produced only thinking and no content, use thinking as response
+        if not full_response.strip() and thinking_response.strip():
+            full_response = thinking_response
 
         clean_response = _clean_response(full_response)
 

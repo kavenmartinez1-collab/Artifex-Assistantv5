@@ -269,6 +269,15 @@ class TransformersEngine(BaseEngine):
 
         # ── Resolve model path ─────────────────────────────────────────
         model_path = get_active_model_path()
+        if not os.path.isdir(model_path):
+            raise FileNotFoundError(
+                f"\n\n"
+                f"Model not found: {model_path}\n\n"
+                f"No local model is downloaded. To fix this, either:\n"
+                f"  1. Download a model:  python download_model.py\n"
+                f"  2. Switch to Ollama:  /backend ollama  (in CLI)\n"
+                f"     or select 'ollama' in the GUI backend dropdown\n"
+            )
         quantized_path = model_path + "-nf4-cached"
         model_name = os.path.basename(model_path)
 
@@ -568,6 +577,7 @@ class TransformersEngine(BaseEngine):
             temperature=temperature,
             do_sample=True,
             use_cache=True,
+            repetition_penalty=1.15,
             eos_token_id=list(eos_ids) if eos_ids else tokenizer.eos_token_id,
             pad_token_id=pad_id,
             stopping_criteria=StoppingCriteriaList([stop_criteria]),

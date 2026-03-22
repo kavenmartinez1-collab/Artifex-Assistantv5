@@ -92,14 +92,38 @@ def strip_think_blocks(text):
     return text.strip()
 
 
+def _truncate_repetition(text, min_phrase_len=40):
+    """Detect and truncate repeated phrases/blocks in model output.
+
+    Finds the first phrase of at least `min_phrase_len` chars that repeats
+    and truncates the output to keep only the first occurrence.
+    """
+    if len(text) < min_phrase_len * 2:
+        return text
+
+    # Slide a window looking for repeated blocks
+    for phrase_len in range(min_phrase_len, min(300, len(text) // 2) + 1, 10):
+        for start in range(0, len(text) - phrase_len * 2):
+            phrase = text[start:start + phrase_len]
+            # Look for this exact phrase later in the text
+            second = text.find(phrase, start + phrase_len)
+            if second != -1:
+                # Found repetition — keep up to the start of the second occurrence
+                return text[:second].rstrip()
+
+    return text
+
+
 def _clean_response(text):
-    """Strip thinking blocks and any trailing fake user turns from a response."""
+    """Strip thinking blocks, trailing fake user turns, and repetition loops."""
     clean = strip_think_blocks(text)
 
     for marker in STOP_STRINGS:
         idx = clean.find(marker)
         if idx != -1:
             clean = clean[:idx]
+
+    clean = _truncate_repetition(clean)
 
     return clean.rstrip()
 

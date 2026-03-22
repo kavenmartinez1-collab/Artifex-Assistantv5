@@ -80,12 +80,15 @@ SESSION MAP (files explored — use line numbers to drill in with @read_function
 
 
 def build_assistant_prompt(system_info, cwd, workspace_text="", knowledge_text="",
-                           session_map_text=""):
+                           session_map_text="", rag_context=""):
     """Build the ASSISTANT agent system prompt with environment context."""
-    return ASSISTANT_AGENT_PROMPT_TEMPLATE.format(
+    prompt = ASSISTANT_AGENT_PROMPT_TEMPLATE.format(
         system_info=system_info,
         cwd=cwd,
         workspace=workspace_text or "(same as cwd)",
         knowledge=knowledge_text or "(no entries yet — knowledge accumulates as you use tools)",
         session_map=session_map_text or "(no files explored yet)",
     )
+    if rag_context:
+        prompt += f"\n\n{rag_context}"
+    return prompt

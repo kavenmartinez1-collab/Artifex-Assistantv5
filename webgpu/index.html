@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Artifex WebGPU Engine</title>
+  <style>
+    :root {
+      --bg: #0f111a;
+      --bg2: #161a2b;
+      --text: #c7d0ff;
+      --accent: #00f0ff;
+      --accent2: #b060ff;
+      --dim: #666688;
+      --success: #44ff88;
+      --error: #ff4444;
+      --warn: #ffcc00;
+      --mono: 'Consolas', 'Fira Code', 'JetBrains Mono', monospace;
+      --sans: 'Segoe UI', system-ui, sans-serif;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ──────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      padding: 12px 20px;
+      border-bottom: 1px solid #222244;
+      gap: 16px;
+    }
+    header h1 {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--accent);
+    }
+    header h1 span { color: #8090cc; font-weight: 400; }
+    .gpu-badge {
+      font-size: 11px;
+      font-family: var(--mono);
+      padding: 3px 10px;
+      border-radius: 12px;
+      background: var(--bg2);
+      color: var(--success);
+      border: 1px solid #333;
+    }
+    .gpu-badge.error { color: var(--error); }
+    .spacer { flex: 1; }
+    .status-text {
+      font-size: 12px;
+      font-family: var(--mono);
+      color: var(--dim);
+    }
+
+    /* ── Main Layout ─────────────────────────────────────── */
+    main {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* ── Sidebar ─────────────────────────────────────────── */
+    .sidebar {
+      width: 260px;
+      border-right: 1px solid #222244;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      overflow-y: auto;
+    }
+    .panel {
+      background: var(--bg2);
+      border: 1px solid #2a2a4a;
+      border-radius: 6px;
+      padding: 12px;
+    }
+    .panel-title {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 8px;
+    }
+    .panel label {
+      display: block;
+      font-size: 12px;
+      color: var(--dim);
+      margin-bottom: 4px;
+    }
+    .panel select, .panel input[type="text"], .panel input[type="number"] {
+      width: 100%;
+      padding: 6px 8px;
+      background: var(--bg);
+      color: var(--accent);
+      border: 1px solid #333;
+      border-radius: 4px;
+      font-family: var(--mono);
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+    .panel input[type="range"] {
+      width: 100%;
+      margin-bottom: 8px;
+    }
+    .btn {
+      display: inline-block;
+      padding: 6px 14px;
+      font-size: 12px;
+      font-weight: 600;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: var(--sans);
+      transition: opacity 0.15s;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn-primary { background: var(--accent); color: var(--bg); }
+    .btn-danger { background: var(--error); color: #fff; }
+    .btn-dim { background: #333; color: var(--dim); }
+    .btn-success { background: var(--success); color: var(--bg); }
+
+    /* ── Chat Area ───────────────────────────────────────── */
+    .chat-area {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+    .messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .message {
+      max-width: 85%;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .message.user {
+      align-self: flex-end;
+      background: #1a2040;
+      border: 1px solid #2a3060;
+    }
+    .message.assistant {
+      align-self: flex-start;
+      background: var(--bg2);
+      border: 1px solid #2a2a4a;
+    }
+    .message.system {
+      align-self: center;
+      background: transparent;
+      color: var(--dim);
+      font-size: 12px;
+      font-family: var(--mono);
+      border: 1px dashed #333;
+      max-width: 100%;
+    }
+    .message .meta {
+      font-size: 11px;
+      color: var(--dim);
+      font-family: var(--mono);
+      margin-top: 6px;
+    }
+    .thinking {
+      background: #1a1030;
+      border: 1px solid #2a1a4a;
+      color: #9070cc;
+      font-size: 12px;
+      padding: 8px 12px;
+      border-radius: 6px;
+      margin-bottom: 4px;
+      font-family: var(--mono);
+    }
+    .thinking summary { cursor: pointer; color: var(--accent2); }
+
+    /* ── Input Bar ───────────────────────────────────────── */
+    .input-bar {
+      padding: 12px 20px;
+      border-top: 1px solid #222244;
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+    }
+    .input-bar textarea {
+      flex: 1;
+      background: var(--bg2);
+      color: var(--text);
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-family: var(--sans);
+      font-size: 14px;
+      resize: none;
+      min-height: 44px;
+      max-height: 120px;
+      line-height: 1.4;
+    }
+    .input-bar textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .send-btn {
+      padding: 10px 24px;
+      background: #ff2a6d;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-weight: 700;
+      font-size: 14px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .send-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    /* ── Footer ──────────────────────────────────────────── */
+    footer {
+      padding: 6px 20px;
+      border-top: 1px solid #222244;
+      display: flex;
+      gap: 20px;
+      font-size: 11px;
+      font-family: var(--mono);
+      color: var(--dim);
+    }
+    footer .stat { color: var(--success); }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <h1>ARTIFEX <span>WebGPU Engine</span></h1>
+    <div id="gpu-badge" class="gpu-badge">Detecting GPU...</div>
+    <div class="spacer"></div>
+    <div id="status" class="status-text">Initializing...</div>
+  </header>
+
+  <main>
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="panel">
+        <div class="panel-title">Model</div>
+        <label>HuggingFace Repo</label>
+        <input type="text" id="model-repo" value="Qwen/Qwen3.5-0.6B" placeholder="org/model-name">
+        <button class="btn btn-primary" id="load-btn" style="width:100%">Load Model</button>
+        <div id="load-progress" style="margin-top:8px;font-size:11px;color:var(--dim);font-family:var(--mono)"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Generation</div>
+        <label>Max Tokens</label>
+        <input type="number" id="max-tokens" value="2048" min="1" max="8192">
+        <label>Temperature: <span id="temp-val">0.7</span></label>
+        <input type="range" id="temperature" min="0" max="1.5" step="0.1" value="0.7">
+        <label>Top-P: <span id="topp-val">0.9</span></label>
+        <input type="range" id="top-p" min="0" max="1" step="0.05" value="0.9">
+        <label>Top-K</label>
+        <input type="number" id="top-k" value="50" min="0" max="500">
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">System</div>
+        <label>System Prompt</label>
+        <textarea id="system-prompt" style="width:100%;height:60px;background:var(--bg);color:var(--text);border:1px solid #333;border-radius:4px;padding:6px;font-size:11px;font-family:var(--mono);resize:vertical">You are Artifex, a helpful AI assistant.</textarea>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Actions</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn btn-dim" id="clear-btn">Clear Chat</button>
+          <button class="btn btn-dim" id="export-btn">Export</button>
+          <button class="btn btn-danger" id="unload-btn">Unload</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Kernel Tests</div>
+        <button class="btn btn-success" id="test-kernels" style="width:100%">Run GPU Tests</button>
+        <div id="test-results" style="margin-top:8px;font-size:11px;font-family:var(--mono);color:var(--dim);white-space:pre-wrap"></div>
+      </div>
+    </aside>
+
+    <!-- Chat -->
+    <div class="chat-area">
+      <div class="messages" id="messages">
+        <div class="message system">
+          Artifex WebGPU Engine v0.1 — Browser-based LLM inference on any GPU<br>
+          Load a model from HuggingFace to begin, or run kernel tests to verify GPU compute.
+        </div>
+      </div>
+      <div class="input-bar">
+        <textarea id="prompt" rows="1" placeholder="Type a message..." disabled></textarea>
+        <button class="send-btn" id="send-btn" disabled>Send</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- Footer / Stats -->
+  <footer>
+    <div>GPU: <span id="f-gpu" class="stat">—</span></div>
+    <div>VRAM: <span id="f-vram" class="stat">—</span></div>
+    <div>Prefill: <span id="f-prefill" class="stat">— tok/s</span></div>
+    <div>Decode: <span id="f-decode" class="stat">— tok/s</span></div>
+    <div>Tokens: <span id="f-tokens" class="stat">0</span></div>
+  </footer>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

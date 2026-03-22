@@ -25,6 +25,12 @@ from tools.agent_tools import (
     get_tool_output_limit,
 )
 from tools.tool_cache import maybe_cache_output, clear_cache, SessionMap, update_session_map
+from core.resilience import engine_recovery, generate_with_recovery
+from core.session import save_session, load_session, list_sessions, find_session, auto_save
+from core.health import run_health_check, format_health_report
+from core.logging_config import get_logger
+
+_log = get_logger(__name__)
 
 
 def _truncate(text, limit=None):
@@ -148,12 +154,32 @@ def _stream_response(engine, active_messages, mode_cfg):
         on_thinking=_make_think_indicator(),
     )
 
-    response = engine.generate_streaming(
-        active_messages,
-        max_tokens=mode_cfg.max_tokens,
-        temperature=mode_cfg.temperature,
-        on_token=think_filter.feed,
-    )
+    with engine_recovery(engine) as ctx:
+        response = engine.generate_streaming(
+            active_messages,
+            max_tokens=mode_cfg.max_tokens,
+            temperature=mode_cfg.temperature,
+            on_token=think_filter.feed,
+        )
+        ctx.response = response
+
+    if ctx.should_retry:
+        print(f"\n{Fore.YELLOW}  (recovering from error, retrying...){Style.RESET_ALL}")
+        _log.warning("Retrying generation after: %s", ctx.error)
+        print(f"{Fore.CYAN}  assistant > ", end="")
+        think_filter = ThinkFilter(
+            on_response=on_response,
+            on_thinking=_make_think_indicator(),
+        )
+        response = engine.generate_streaming(
+            active_messages,
+            max_tokens=max(mode_cfg.max_tokens // 2, 256),
+            temperature=mode_cfg.temperature,
+            on_token=think_filter.feed,
+        )
+    else:
+        response = ctx.response
+
     think_filter.flush()
 
     print(f"{Style.RESET_ALL}\n")
@@ -265,6 +291,37 @@ def _handle_kb_command(args, km):
         else:
             print(f"{Fore.YELLOW}  Entry '{eid}' not found.{Style.RESET_ALL}\n")
 
+    elif subcmd == "export":
+        export_path = subargs.strip()
+        if not export_path:
+            os.makedirs("output", exist_ok=True)
+            export_path = os.path.join("output", "knowledge_export.json")
+        fmt = "markdown" if export_path.endswith((".md", ".markdown")) else "json"
+        total = 0
+        for store in [km.session_store, km.reference_store]:
+            if not store:
+                continue
+            if fmt == "markdown":
+                total += store.export_to_markdown(export_path)
+            else:
+                total += store.export_to_json(export_path)
+        print(f"{Fore.CYAN}  Exported {total} entries to {export_path}{Style.RESET_ALL}\n")
+
+    elif subcmd == "import":
+        import_path = subargs.strip()
+        if not import_path or not os.path.isfile(import_path):
+            print(f"{Fore.YELLOW}  Usage: /kb import <path.json>{Style.RESET_ALL}\n")
+            return
+        added = km.reference_store.import_from_json(import_path)
+        print(f"{Fore.CYAN}  Imported {added} entries from {import_path}{Style.RESET_ALL}\n")
+
+    elif subcmd == "prune":
+        total = 0
+        if km.session_store:
+            total += km.session_store.auto_prune()
+        total += km.reference_store.auto_prune()
+        print(f"{Fore.CYAN}  Pruned {total} stale entries.{Style.RESET_ALL}\n")
+
     else:
         print(f"{Fore.YELLOW}  Unknown /kb subcommand: {subcmd}{Style.RESET_ALL}\n")
 
@@ -274,7 +331,8 @@ def run_assistant():
     print(f"{Fore.CYAN}  Artifex Assistant V5 — AI Assistant{Style.RESET_ALL}")
     print(f"{Fore.WHITE}  Type your questions. The AI can run shell commands, Python, and web searches.")
     print(f"  Commands: /workspace <path>, /kb search|add|list|show|remove, /refresh, /clear")
-    print(f"  Backend:  /backend transformers|ollama")
+    print(f"  Session:  /save [name], /load [name|#], /sessions, /export [path]")
+    print(f"  System:   /backend transformers|ollama, /health")
     print(f"  Type 'exit' to quit.{Style.RESET_ALL}\n")
 
     # Knowledge manager + workspace setup
@@ -424,6 +482,107 @@ def run_assistant():
                         print(f"{Fore.YELLOW}  Directory not found: {ws_args}{Style.RESET_ALL}\n")
                 continue
 
+            # /health command
+            if user_input.lower() == "/health":
+                report = run_health_check()
+                print(f"{Fore.CYAN}{format_health_report(report)}{Style.RESET_ALL}\n")
+                continue
+
+            # /save command
+            if user_input.lower().startswith("/save"):
+                name = user_input[5:].strip() or "session"
+                metadata = {
+                    "model": get_active_model_name(),
+                    "backend": get_active_backend(),
+                    "workspace": workspace,
+                }
+                smap_data = session_map.to_dict() if hasattr(session_map, "to_dict") else {}
+                path = save_session(name, history, smap_data, metadata)
+                print(f"{Fore.CYAN}  Session saved: {os.path.basename(path)}{Style.RESET_ALL}\n")
+                continue
+
+            # /load command
+            if user_input.lower().startswith("/load"):
+                query = user_input[5:].strip()
+                if not query:
+                    print(f"{Fore.YELLOW}  Usage: /load <name|#index>{Style.RESET_ALL}\n")
+                    continue
+                path = find_session(query)
+                if not path:
+                    print(f"{Fore.YELLOW}  Session not found: {query}{Style.RESET_ALL}\n")
+                    continue
+                state = load_session(path)
+                if state:
+                    history = [{"role": "system", "content": _build_system_prompt()}] + state.messages
+                    _first_message = False
+                    print(f"{Fore.CYAN}  Session loaded: {os.path.basename(path)} ({len(state.messages)} messages){Style.RESET_ALL}\n")
+                else:
+                    print(f"{Fore.YELLOW}  Failed to load session.{Style.RESET_ALL}\n")
+                continue
+
+            # /sessions command
+            if user_input.lower() == "/sessions":
+                sessions = list_sessions()
+                if not sessions:
+                    print(f"{Fore.YELLOW}  No saved sessions.{Style.RESET_ALL}\n")
+                else:
+                    print(f"{Fore.CYAN}  Saved sessions:")
+                    for i, s in enumerate(sessions[:15], 1):
+                        mc = s["message_count"]
+                        ts = s["timestamp"]
+                        print(f"    {i}. {s['name']} ({mc} msgs, {ts})")
+                    print(f"  Use /load <name|#> to restore.{Style.RESET_ALL}\n")
+                continue
+
+            # /export command
+            if user_input.lower().startswith("/export"):
+                export_path = user_input[7:].strip()
+                if not export_path:
+                    import time as _time
+                    os.makedirs("output", exist_ok=True)
+                    export_path = os.path.join("output", f"conversation_{_time.strftime('%Y%m%d_%H%M%S')}.md")
+                lines = []
+                for m in history:
+                    role = m.get("role", "")
+                    if role == "system":
+                        continue
+                    content = m.get("content", "")
+                    if role == "user":
+                        if content.startswith("[TOOL OUTPUT"):
+                            lines.append(f"### Tool Output\n\n{content}\n")
+                        else:
+                            lines.append(f"## User\n\n{content}\n")
+                    elif role == "assistant":
+                        lines.append(f"## Assistant\n\n{content}\n")
+                os.makedirs(os.path.dirname(export_path) or ".", exist_ok=True)
+                with open(export_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines))
+                print(f"{Fore.CYAN}  Exported to: {export_path}{Style.RESET_ALL}\n")
+                continue
+
+            # /index command (RAG indexing)
+            if user_input.lower().startswith("/index"):
+                index_path = user_input[6:].strip() or workspace
+                try:
+                    from core.pipelines.embedding import EmbeddingPipeline
+                    from core.rag import RAGPipeline
+                    print(f"{Fore.CYAN}  Indexing {index_path}...{Style.RESET_ALL}")
+                    emb = EmbeddingPipeline()
+                    emb.load("", status_callback=lambda m: print(f"{Fore.CYAN}  {m}{Style.RESET_ALL}"))
+                    rag = RAGPipeline(emb)
+                    count = rag.index_directory(
+                        index_path,
+                        status_callback=lambda m: print(f"{Fore.CYAN}  {m}{Style.RESET_ALL}"),
+                    )
+                    rag.save(os.path.join(index_path, ".rag_index"))
+                    emb.unload()
+                    print(f"{Fore.CYAN}  Indexed {count} chunks. Saved to .rag_index{Style.RESET_ALL}\n")
+                except ImportError:
+                    print(f"{Fore.YELLOW}  sentence-transformers not installed. Run: pip install sentence-transformers{Style.RESET_ALL}\n")
+                except Exception as e:
+                    print(f"{Fore.RED}  Indexing failed: {e}{Style.RESET_ALL}\n")
+                continue
+
             # /kb command
             if user_input.lower().startswith("/kb"):
                 _handle_kb_command(user_input[3:].strip(), km)
@@ -485,10 +644,17 @@ def run_assistant():
                 more_actions = extract_agent_actions(response)
                 tool_output = offer_action_execution(more_actions, km, session_map)
 
-            # Compress and cleanup
+            # Compress, cleanup, and auto-save
             history = compress_history(history, mode_cfg.context_window)
             if len(history) % 6 == 0:
                 engine.periodic_cleanup()
+            try:
+                auto_save(history, metadata={
+                    "model": get_active_model_name(),
+                    "backend": get_active_backend(),
+                })
+            except Exception:
+                pass  # auto-save is best-effort
 
         except (KeyboardInterrupt, EOFError):
             kb_count = km.session_store.count if km.session_store else 0

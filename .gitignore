@@ -1,46 +1,84 @@
-# Python
+# ─────────────────────────────────────────────────────────────────────
+#  Artifex Assistant V5 — .gitignore
+# ─────────────────────────────────────────────────────────────────────
+
+# ── Python ───────────────────────────────────────────────────────────
+venv/
+.venv/
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
+*.pyo
+*.pyd
 *.egg-info/
+*.egg
 dist/
 build/
-*.egg
+*.whl
 
-# Virtual environments
-venv/
-env/
-.venv/
+# ── Node.js (WebGPU engine) ─────────────────────────────────────────
+webgpu/node_modules/
+webgpu/dist/
+webgpu/metrics.jsonl
 
-# Models (large files — download via setup_wizard.py)
-models/
+# ── Local data (NEVER commit — user-specific, large, or generated) ──
+models/*
+!models/.gitkeep
+sessions/*
+!sessions/.gitkeep
+output/*
+!output/.gitkeep
+logs/*
+!logs/.gitkeep
+.tool_cache/
 
-# Runtime output
-output/
-sessions/
+# ── Knowledge base workspace data (user-specific, per-machine) ──────
+knowledge/workspaces/
+knowledge/reference/entries/*
+!knowledge/reference/entries/.gitkeep
 
-# Knowledge base (generated at runtime)
-knowledge/
+# ── Secrets and credentials ─────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+*.crt
+credentials.json
+secrets.*
+id_rsa*
 
-# IDE / Editor
+# ── IDE and editor files ────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+.project
+.settings/
+*.sublime-project
+*.sublime-workspace
 
-# OS files
+# ── OS files ────────────────────────────────────────────────────────
+.DS_Store
 Thumbs.db
 Desktop.ini
-.DS_Store
+ehthumbs.db
 
-# Claude Code (local settings)
+# ── Testing and caching ────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# ── Claude Code (session-specific, contains auth tokens) ────────────
 .claude/
-.tool_cache/
 
-# Environment / secrets
-.env
-.env.*
-*.pem
-*.key
+# ── Docker build artifacts ──────────────────────────────────────────
+*.tar
+*.tar.gz
+
+# ── Runtime / temp files ────────────────────────────────────────────
+*.log
+*.pid
+*.sock

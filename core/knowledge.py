@@ -340,6 +340,116 @@ class KnowledgeStore:
     def count(self) -> int:
         return len(self._index)
 
+    # --- Import / Export ---
+
+    def export_to_json(self, path: str):
+        """Export all entries as a single JSON file."""
+        entries = []
+        for eid in self._index:
+            entry = self.get(eid)
+            if entry:
+                entries.append(asdict(entry))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"entries": entries, "count": len(entries)}, f, indent=2, ensure_ascii=False)
+        return len(entries)
+
+    def import_from_json(self, path: str) -> int:
+        """Import entries from a JSON file, merging by action_key to avoid duplicates."""
+        if not os.path.isfile(path):
+            return 0
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        added = 0
+        for entry_data in data.get("entries", []):
+            entry = KnowledgeEntry(**entry_data)
+            # Dedup by action_key
+            if entry.action_key and self.find_by_key(entry.action_key):
+                continue
+            # Generate a new ID to avoid collisions
+            entry.id = uuid.uuid4().hex[:12]
+            self.add(entry)
+            added += 1
+        return added
+
+    def export_to_markdown(self, path: str) -> int:
+        """Export entries as human-readable Markdown grouped by category."""
+        by_cat: Dict[str, list] = {}
+        for eid, meta in self._index.items():
+            cat = meta.get("category", "note")
+            if cat not in by_cat:
+                by_cat[cat] = []
+            by_cat[cat].append((eid, meta))
+
+        lines = ["# Knowledge Base Export\n"]
+        for cat in sorted(by_cat.keys()):
+            lines.append(f"\n## {cat.title()} ({len(by_cat[cat])} entries)\n")
+            for eid, meta in by_cat[cat]:
+                tier1 = meta.get("tier1", "(no summary)")
+                tags = ", ".join(meta.get("tags", []))
+                lines.append(f"- **{tier1}**")
+                if tags:
+                    lines.append(f"  Tags: {tags}")
+                lines.append(f"  ID: {eid} | Updated: {meta.get('updated', '?')}")
+                lines.append("")
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        return sum(len(v) for v in by_cat.values())
+
+    # --- Auto-Pruning ---
+
+    def auto_prune(self, max_age_hours: int = 168, max_entries: int = 500) -> int:
+        """Remove stale volatile entries and cap total entries.
+
+        Args:
+            max_age_hours: Remove volatile entries older than this (default 7 days)
+            max_entries: Hard cap on total entries (remove lowest-scored)
+
+        Returns:
+            Number of entries removed
+        """
+        now_ts = time.time()
+        removed = 0
+
+        # 1. Remove old stale volatile entries
+        to_remove = []
+        for eid, meta in list(self._index.items()):
+            if meta.get("lifecycle") != VOLATILE:
+                continue
+            if not meta.get("stale", False):
+                continue
+            try:
+                updated_dt = datetime.fromisoformat(meta.get("updated", ""))
+                hours_ago = (now_ts - updated_dt.timestamp()) / 3600
+                if hours_ago > max_age_hours:
+                    to_remove.append(eid)
+            except (ValueError, TypeError, OSError):
+                to_remove.append(eid)  # can't parse date, remove
+
+        for eid in to_remove:
+            self.remove(eid)
+            removed += 1
+
+        # 2. Cap total entries
+        if self.count > max_entries:
+            # Score all entries, remove lowest
+            scored = []
+            for eid, meta in self._index.items():
+                cat_weight = CATEGORY_WEIGHTS.get(meta.get("category", "note"), 0.5)
+                lc = meta.get("lifecycle", SNAPSHOT)
+                lc_weight = {DISCOVERY: 3.0, SNAPSHOT: 2.0, VOLATILE: 0.5, REFERENCE: 1.0}.get(lc, 1.0)
+                score = cat_weight * lc_weight
+                if meta.get("stale", False):
+                    score *= 0.1
+                scored.append((score, eid))
+            scored.sort(key=lambda x: x[0])
+            excess = self.count - max_entries
+            for _, eid in scored[:excess]:
+                self.remove(eid)
+                removed += 1
+
+        return removed
+
 
 # ===== EXTRACTION PATTERNS =====
 

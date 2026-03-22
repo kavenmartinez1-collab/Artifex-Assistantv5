@@ -23,6 +23,7 @@
 transformers>=5.2.0
 bitsandbytes>=0.49.0
 accelerate>=1.6.0
+numpy>=1.26.0
 
 # ── Model hub ─────────────────────────────────────────────────────────
 huggingface-hub>=0.20.0
@@ -30,7 +31,7 @@ huggingface-hub>=0.20.0
 # ── Image / 3D generation (optional — install for non-text pipelines) ─
 diffusers>=0.30.0
 safetensors>=0.4.0
-Pillow>=10.0.0
+Pillow>=11.0.0
 
 # ── Application ───────────────────────────────────────────────────────
 colorama>=0.4.6
@@ -39,4 +40,11 @@ pyperclip>=1.8.0
 psutil>=5.9.0
 duckduckgo-search>=7.0.0
 pypdf>=4.0.0
-lxml>=5.0.0
+lxml>=5.2.1
+
+# ── API server (optional — install for REST API mode) ────────────────
+# fastapi>=0.115.0
+# uvicorn>=0.30.0
+
+# ── Testing (optional — install for development) ─────────────────────
+# pytest>=8.0.0

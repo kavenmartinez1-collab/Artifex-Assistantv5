@@ -1,130 +1,772 @@
 # Artifex Assistant V5
 
-Universal local AI hosting platform. Run any AI model locally — text generation, image generation, 3D modeling, vision, and audio — with automatic VRAM management and dual backend support.
+> *"Unless the LORD builds the house, the builders labor in vain."*
+> — Psalm 127:1 (NIV)
+
+All glory to **Jesus Christ**, through whom all things were made and in whom all wisdom dwells.
+
+---
+
+Universal Local AI Hosting Platform. Run any AI model locally — text generation, image generation, 3D, vision, audio, music, video, and more. Supports HuggingFace Transformers and Ollama backends with automatic VRAM management, plus an experimental WebGPU browser-based inference engine.
+
+**Everything runs locally. All servers bind to 127.0.0.1 only. Nothing is exposed to the network.**
 
 ## Features
 
-- **Dual Backend** — Switch between Transformers and Ollama at runtime
-- **Pipeline Architecture** — Text generation, image generation, 3D (ShapE), vision, and audio as equal pipeline modes
-- **Auto GPU Detection** — Detects your GPU tier (Tight/Comfortable/Abundant) and scales token limits, context windows, and quantization automatically
-- **Model Registry** — Auto-discovers models from HuggingFace, estimates VRAM requirements
-- **4-bit Quantization** — NF4 quantization via bitsandbytes, with automatic 8-bit fallback
-- **Knowledge System** — Web search, file reading, and workspace-aware context injection
-- **CLI + GUI** — Terminal interface and a cyberpunk-themed GUI (FreeSimpleGUI)
-- **Setup Wizard** — Interactive setup that detects your GPU and installs the right dependencies
+- **Multi-modal inference** — 10 pipeline types: text, image, image editing, 3D mesh, vision, audio, speech recognition, music, video, embeddings
+- **Two backends** — HuggingFace Transformers (GPU-accelerated) and Ollama (pre-quantized models)
+- **Automatic VRAM management** — GPU tier detection, NF4/INT8 quantization, KV cache budgeting
+- **Three interfaces** — CLI with agent tools, cyberpunk GUI, OpenAI-compatible REST API
+- **Agent tools** — shell execution, Python runner, web search, codebase analysis (grep, glob, architecture), file I/O, edit-in-place
+- **RAG knowledge base** — per-workspace knowledge entries with lifecycle classification, action keys, loop detection
+- **Session persistence** — save/load conversations with full metadata (model, backend, mode)
+- **WebGPU engine** — browser-based GPU compute with 5 WGSL kernels (matmul, rmsnorm, rope, softmax, elementwise)
+- **Docker support** — GPU-enabled container with health checks and optional Ollama sidecar
+- **Multi-GPU** — device selection for multi-GPU systems
+- **Security** — all servers localhost-only, dangerous command blocking, API key auth
 
-## Requirements
+## Verified Test Results (2026-03-22)
 
-- **OS:** Windows 10/11 (Linux should work but is untested)
-- **GPU:** NVIDIA GPU with 8+ GB VRAM (CUDA required)
-- **Python:** 3.10+
+| Component | Status | Details |
+|-----------|--------|---------|
+| Unit tests (pytest) | **110/110 PASS** | config, health, inference, knowledge, model registry, pipelines, resilience, sessions, agent tools, tool cache |
+| Hardware detection | PASS | Auto-detects GPU name, VRAM, compute capability, architecture, tier |
+| Engine factory | PASS | Transformers + Ollama engines create and load correctly |
+| Ollama live chat | PASS | Qwen3.5:9b responds locally (thinking + content) |
+| Knowledge base CRUD | PASS | Add, search, find-by-key, remove, persistence, ContextEngine lifecycle |
+| Session save/load | PASS | Round-trip with metadata, list, find-by-name/index |
+| Pipeline registry | PASS | 10 pipelines implement full contract with capabilities |
+| Agent tools | PASS | 7 extraction types + live grep, glob, read_file, python, shell |
+| API /health | PASS | GPU, VRAM, Ollama, dependencies, disk diagnostics |
+| API /v1/chat/completions | PASS | Routes through Ollama backend on localhost |
+| WebGPU TypeScript | PASS | tsc --noEmit clean, 0 errors |
+| WebGPU Vite build | PASS | 13 modules, 23KB bundle |
+| Localhost binding | PASS | Confirmed NOT accessible on LAN IP |
 
-### Supported GPU Tiers
+## Supported GPU Tiers
 
-| Tier | VRAM | Example GPUs |
-|------|------|-------------|
-| Tight | <= 12 GB | RTX 3060 12GB, RTX 4060 8GB |
-| Comfortable | 13-20 GB | RTX 4070 Ti 16GB |
-| Abundant | > 20 GB | RTX 3090 24GB, RTX 4090, RTX 5090 |
+| Tier | VRAM | Examples | Quantization |
+|------|------|----------|-------------|
+| TIGHT | <= 12 GB | RTX 3060 12GB, RTX 5060 Ti 8GB | NF4 double-quant, aggressive budgets |
+| COMFORTABLE | 13-20 GB | RTX 4070 Ti 16GB | NF4 with relaxed budgets |
+| ABUNDANT | > 20 GB | RTX 4090 24GB, RTX 5090 32GB | FP16/BF16 or light quant |
 
-## Quick Start
+---
 
-### 1. Clone and set up
+## Prerequisites
+
+Before setting up Artifex, make sure you have these installed:
+
+1. **Python 3.11+** — [python.org/downloads](https://www.python.org/downloads/)
+2. **NVIDIA GPU drivers** — [nvidia.com/drivers](https://www.nvidia.com/Download/index.aspx) (Game Ready or Studio)
+3. **Git** — [git-scm.com](https://git-scm.com/) (for cloning the repo)
+4. **Node.js 18+** — [nodejs.org](https://nodejs.org/) (only needed for the WebGPU engine)
+5. **Ollama** *(optional)* — [ollama.com](https://ollama.com/) or `winget install Ollama.Ollama` on Windows
+
+You do **not** need to install CUDA separately — PyTorch bundles the CUDA runtime.
+
+---
+
+## Setup Guide
+
+### Step 1: Clone and Create Virtual Environment
 
 ```bash
-git clone https://github.com/kavenmartinez1-collab/Artifex-Assistantv5.git
-cd Artifex-Assistantv5
+git clone <repo-url>
+cd Artifex-Assistant-V5
+
+# Create a Python virtual environment
 python -m venv venv
-venv\Scripts\activate   # Windows
-# source venv/bin/activate  # Linux
+
+# Activate it
+source venv/bin/activate      # Linux / Mac
+venv\Scripts\activate          # Windows (cmd)
+venv/Scripts/activate          # Windows (Git Bash)
 ```
 
-### 2. Run the setup wizard
+### Step 2: Install Dependencies
+
+**Option A — Automatic (recommended):**
 
 ```bash
-python setup_wizard.py
+python setup.py
 ```
 
-This will detect your GPU, install the correct PyTorch + CUDA version, and recommend models.
+The setup wizard will:
+1. Detect your GPU (name, VRAM, architecture, compute capability)
+2. Classify your GPU tier (TIGHT / COMFORTABLE / ABUNDANT)
+3. Install PyTorch with the correct CUDA version for your GPU
+4. Install the pinned requirements for your specific card
+5. Recommend starter models to download
 
-### 3. Download a model
+**Option B — Manual:**
 
 ```bash
-# From HuggingFace
-python download_model.py --repo Qwen/Qwen3.5-9B
+# 1. Install PyTorch with CUDA (pick your GPU generation)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124   # RTX 30xx / 40xx
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128   # RTX 50xx (Blackwell)
 
-# Or use Ollama
-python setup_ollama.py
+# 2. Install project dependencies (pick your GPU or use the base file)
+pip install -r requirements.txt              # Any NVIDIA GPU
+pip install -r requirements-rtx4090.txt      # RTX 4090 24GB (pinned versions)
+pip install -r requirements-3060.txt         # RTX 3060 12GB (pinned versions)
+pip install -r requirements-rtx5060ti.txt    # RTX 5060 Ti 8GB (pinned versions)
+
+# 3. Optional extras
+pip install fastapi uvicorn    # For the REST API server
+pip install pytest             # For running the test suite
 ```
 
-### 4. Launch
+### Step 3: Download a Model
+
+You need at least one model to use Artifex. There are two paths:
+
+**Path A — HuggingFace models (Transformers backend):**
 
 ```bash
-python main.py          # CLI
-python main_gui.py      # GUI
+# Download the default model (Qwen3.5-9B — best quality for the size)
+python download_model.py
+
+# Or pick a specific model
+python download_model.py --repo Qwen/Qwen3.5-4B                              # Smaller, for 8GB GPUs
+python download_model.py --repo stabilityai/stable-diffusion-xl-base-1.0      # Image generation
+python download_model.py --repo openai/shap-e                                 # 3D mesh generation
+
+# See what you have installed
+python download_model.py --list
 ```
 
-Or double-click `launch.bat` on Windows.
+The downloader auto-detects the model type and estimates VRAM requirements.
+
+**Path B — Ollama models (pre-quantized, easier setup):**
+
+```bash
+# Set up Ollama (installs, starts server, pulls a model)
+python setup_ollama.py                  # Default: qwen3.5:9b
+python setup_ollama.py qwen3.5:4b      # Smaller model for tight VRAM
+python setup_ollama.py --list           # List installed Ollama models
+python setup_ollama.py --status         # Check Ollama server status
+
+# Or use the general downloader
+python download_model.py --ollama qwen3.5:9b
+```
+
+### Step 4: Launch
+
+```bash
+python main.py          # CLI — interactive assistant with agent tools
+python main_gui.py      # GUI — cyberpunk desktop interface
+python main_api.py      # API — OpenAI-compatible REST server on :8000
+launch.bat              # Windows — double-click desktop shortcut
+```
+
+### Step 5: Verify Everything Works
+
+```bash
+# Quick GPU check
+python setup.py --detect
+
+# Full health report (from inside the CLI)
+# Type /health after launching python main.py
+
+# Run the test suite
+python -m pytest tests/ -v
+```
+
+---
+
+## Using the CLI (`python main.py`)
+
+Interactive terminal assistant with streaming responses, thinking blocks, and agent tool execution.
+
+### Slash Commands
+
+| Command | Description |
+|---------|-------------|
+| `/backend transformers` | Switch to HuggingFace Transformers backend |
+| `/backend ollama` | Switch to Ollama backend |
+| `/backend` | Show current backend and model |
+| `/context STANDARD` | Switch to standard context profile (lower VRAM) |
+| `/context HIGH` | Switch to high context profile (more tokens, needs 24GB+) |
+| `/workspace <path>` | Set working directory for knowledge base |
+| `/workspace scan` | Re-scan current workspace |
+| `/health` | Full system diagnostics (GPU, VRAM, models, Ollama, disk) |
+| `/save <name>` | Save current conversation |
+| `/load <name\|#index>` | Load a saved conversation |
+| `/sessions` | List all saved sessions |
+| `/export <path>` | Export conversation to a file |
+| `/kb add <text>` | Add a knowledge entry |
+| `/kb search <query>` | Search knowledge base |
+| `/kb list` | List knowledge entries |
+| `/index` | Show/rebuild the knowledge index |
+| `/refresh` | Compress history and free VRAM |
+| `/clear` | Reset conversation (keeps knowledge) |
+| `/cleanup` | Deep clean — reset conversation + remove stale workspace data |
+| `exit` or `quit` | Exit the assistant |
+
+### How Agent Tools Work
+
+When you ask the model a question, it can respond with tool markers. The assistant automatically extracts and executes them:
+
+1. You ask: *"What Python files are in this project?"*
+2. The model responds with: `@glob("**/*.py")`
+3. The assistant executes the glob and feeds the results back to the model
+4. The model gives you a human-readable answer based on the results
+
+All tool execution requires your confirmation before running.
+
+---
+
+## Using the GUI (`python main_gui.py`)
+
+The cyberpunk GUI provides a visual interface with:
+
+- **Model selector** — dropdown of all auto-discovered models
+- **Backend toggle** — switch between Transformers and Ollama
+- **Parameter controls** — temperature, max tokens sliders
+- **System prompt editor** — customize the model's behavior
+- **Chat window** — conversation with streaming responses
+- **Session management** — save/load conversations
+- **Output display** — renders images, audio, and 3D outputs inline
+
+---
+
+## Using the API Server (`python main_api.py`)
+
+OpenAI-compatible REST API. **Binds to 127.0.0.1 by default — localhost only.**
+
+### Starting the Server
+
+```bash
+python main_api.py                              # Default: 127.0.0.1:8000
+python main_api.py --port 8080                  # Custom port
+python main_api.py --port 8000 --reload         # Auto-reload on code changes
+```
+
+### API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/health` | System diagnostics (GPU, VRAM, models, Ollama, deps, disk) |
+| GET | `/v1/models` | List available models |
+| POST | `/v1/chat/completions` | Chat completion (streaming or non-streaming) |
+| POST | `/v1/images/generations` | Image generation |
+| POST | `/v1/embeddings` | Generate embeddings |
+| GET | `/docs` | Interactive Swagger API documentation |
+
+### Example Requests
+
+```bash
+# Health check
+curl http://localhost:8000/health
+
+# List models
+curl http://localhost:8000/v1/models
+
+# Chat completion
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-9b",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 200,
+    "temperature": 0.7,
+    "stream": false
+  }'
+
+# Streaming chat
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-9b",
+    "messages": [{"role": "user", "content": "Tell me a story"}],
+    "stream": true
+  }'
+```
+
+### Authentication
+
+Set the `ARTIFEX_API_KEY` environment variable to require authentication:
+
+```bash
+# Set the key
+export ARTIFEX_API_KEY=my-secret-key       # Linux/Mac
+set ARTIFEX_API_KEY=my-secret-key          # Windows
+
+# Requests must include the key
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer my-secret-key"
+
+# Or via X-API-Key header
+curl http://localhost:8000/v1/models \
+  -H "X-API-Key: my-secret-key"
+```
+
+If `ARTIFEX_API_KEY` is not set, no authentication is required.
+
+---
+
+## Setting Up Ollama Backend
+
+Ollama provides pre-quantized models that are easy to set up and use less VRAM.
+
+### Install Ollama
+
+```bash
+# Windows
+winget install Ollama.Ollama
+
+# Linux
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Mac
+brew install ollama
+```
+
+### Configure for Artifex
+
+```bash
+# Setup helper: finds Ollama, starts the server, pulls a model
+python setup_ollama.py                  # Default: qwen3.5:9b
+python setup_ollama.py qwen3.5:4b      # Smaller model
+python setup_ollama.py --status         # Check what's installed
+python setup_ollama.py --list           # List all models
+```
+
+### Switch to Ollama in the CLI
+
+```
+/backend ollama
+```
+
+### Pull More Models
+
+```bash
+ollama pull qwen3:8b             # Qwen3 8B
+ollama pull llama3.3:8b          # Llama 3.3 8B
+ollama pull mistral:7b           # Mistral 7B
+ollama pull codellama:7b         # Code Llama 7B
+```
+
+All communication with Ollama stays on `localhost:11434` — nothing leaves your machine.
+
+---
+
+## Docker Deployment
+
+### Build and Run
+
+```bash
+# API server with GPU
+docker compose up artifex
+
+# With Ollama sidecar
+docker compose --profile ollama up
+
+# Custom environment
+ARTIFEX_API_KEY=your-key CUDA_VISIBLE_DEVICES=0 docker compose up
+```
+
+### What Docker Provides
+
+- **CUDA 12.4 runtime** base image (no manual CUDA install needed)
+- **GPU passthrough** via NVIDIA Container Toolkit
+- **Health checks** every 30 seconds on `/health`
+- **Persistent volumes** for models, sessions, output, and knowledge
+- **Optional Ollama sidecar** — runs alongside the main container
+
+### Prerequisites for Docker
+
+1. Docker Engine with GPU support
+2. NVIDIA Container Toolkit: [docs.nvidia.com/datacenter/cloud-native/container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+
+---
+
+## Multi-Modal Pipelines
+
+All 10 pipeline types are auto-discovered and implement a standard contract (load, run, unload, get_capabilities):
+
+| Pipeline | Type Key | Description | Min VRAM |
+|----------|----------|-------------|----------|
+| Text Generation | `text-generation` | Chat/instruct models (Qwen, Llama, Mistral, etc.) | 6 GB |
+| Image Generation | `text-to-image` | Stable Diffusion, SDXL, FLUX | 6 GB |
+| Image Editing | `image-to-image` | Inpainting, upscaling, img2img | 6 GB |
+| Vision | `image-text-to-text` | Image understanding (LLaVA, Qwen-VL) | 8 GB |
+| 3D Generation | `shap-e` | Text-to-3D mesh (OpenAI ShapE) | 8 GB |
+| Audio / TTS | `text-to-audio` | Text-to-speech (Bark) | 4 GB |
+| Speech Recognition | `automatic-speech-recognition` | Speech-to-text (Whisper) | 4 GB |
+| Music | `text-to-music` | Music generation (MusicGen) | 8 GB |
+| Video | `text-to-video` | Video generation | 12 GB |
+| Embeddings | `feature-extraction` | Embedding models for RAG (runs on CPU) | 2 GB |
+
+### Adding Models
+
+Models are auto-discovered from the `models/` directory. To add a new model:
+
+1. Download it: `python download_model.py --repo <huggingface-repo-id>`
+2. It saves to `models/<model-name>/`
+3. It appears in the GUI dropdown and CLI automatically on next launch
+
+You can also manually place any HuggingFace model folder in `models/` — the registry detects its type from `config.json`.
+
+---
+
+## Agent Tools
+
+The CLI assistant can execute these tool types, extracted from model responses:
+
+| Tool | Syntax | Description |
+|------|--------|-------------|
+| Shell | `` ```bash ... ``` `` | Execute shell commands (with safety checks) |
+| Python | `` ```python ... ``` `` | Run Python snippets in a sandboxed subprocess |
+| Read File | `@read_file("path")` | Read file contents (chunked for large files) |
+| Edit File | `` ```edit ... ``` `` | Find-and-replace edits with syntax validation |
+| Grep | `@grep("pattern", "path")` | Regex search across files |
+| Glob | `@glob("pattern")` | Find files by pattern |
+| Architecture | `@architecture()` | Map project structure and symbols |
+| Web Search | `@search("query")` | Search the web (DuckDuckGo) |
+| Web Read | `@web_read("url")` | Fetch and parse a webpage |
+| Download | `@download("url", "path")` | Download a file |
+| Find Symbol | `@find_symbol("name")` | Locate function/class definitions |
+| Read Function | `@read_function("name")` | Read a specific function's source code |
+
+Dangerous commands (rm -rf /, format c:, etc.) are blocked by configurable safety patterns.
+
+---
+
+## WebGPU Engine
+
+Experimental browser-based GPU inference using WebGPU compute shaders. Runs directly on your GPU through Chrome/Edge without Python or CUDA. **All servers bind to 127.0.0.1 only.**
+
+### Prerequisites
+
+- **Node.js 18+** — [nodejs.org](https://nodejs.org/)
+- **Chrome 113+** or **Edge 113+** with WebGPU enabled
+  - Navigate to `chrome://flags/#enable-unsafe-webgpu` and enable it
+  - Or use Chrome Canary / Edge Canary where it's on by default
+
+### Setup
+
+```bash
+cd webgpu
+npm install
+```
+
+### Run
+
+```bash
+npm run dev       # Vite dev server (:5173) + metrics server (:3001)
+npm run build     # Production build (13 modules, 23KB bundle)
+npm run preview   # Preview production build
+npm run server    # Metrics server only
+```
+
+### Testing the Kernels
+
+1. Run `npm run dev` from the `webgpu/` directory
+2. Open `http://localhost:5173` in Chrome/Edge
+3. The page auto-detects your GPU (vendor, architecture, limits)
+4. Click **"Run GPU Tests"** in the sidebar
+5. All 5 WGSL kernels run against CPU reference values
+6. Results appear in the browser and log to the metrics server at `:3001`
+
+### Architecture
+
+- **GPU initialization** — WebGPU device/adapter detection, buffer negotiation up to 2GB
+- **5 WGSL compute kernels**:
+  - `matmul.wgsl` — tiled 16x16 matrix multiplication with shared memory
+  - `rmsnorm.wgsl` — RMS layer normalization
+  - `rope.wgsl` — rotary positional embeddings
+  - `softmax.wgsl` — attention softmax
+  - `elementwise.wgsl` — add, multiply, scale operations
+- **Buffer management** — typed GPU buffer creation, read/write operations
+- **Kernel test suite** — correctness validation against CPU reference values
+- **Metrics collection** — browser-to-server event reporting with JSON logging
+- **Dev server** — Express metrics endpoint with color-coded console output
+
+### Status
+
+Phase 0-1 complete (infrastructure, kernels, testing, metrics). Phase 2 (transformer forward pass, weight loading, token generation) is next.
+
+---
 
 ## Project Structure
 
 ```
-Artifex-Assistantv5/
-├── main.py                 # CLI entry point
-├── main_gui.py             # GUI entry point
-├── setup_wizard.py         # Setup wizard
-├── setup_ollama.py         # Ollama backend setup
-├── download_model.py       # Model downloader
-├── launch.bat              # Windows launcher
-├── core/
-│   ├── config.py           # Centralized configuration, GPU tier detection
-│   ├── engine_base.py      # Abstract base engine
-│   ├── engine_factory.py   # Engine factory (create_engine)
-│   ├── engine_transformers.py  # Transformers backend
-│   ├── engine_ollama.py    # Ollama backend
-│   ├── hardware.py         # Hardware detection utilities
-│   ├── inference.py        # Inference orchestration
-│   ├── model_loader.py     # Model loading with quantization
-│   ├── model_registry.py   # Model auto-discovery and type detection
-│   ├── knowledge.py        # Knowledge/RAG system
-│   ├── prompts.py          # System prompt templates
-│   └── pipelines/
-│       ├── base.py         # BasePipeline ABC
-│       ├── registry.py     # Pipeline factory
-│       ├── text_gen.py     # Text generation pipeline
-│       ├── image_gen.py    # Image generation pipeline
-│       ├── shape_3d.py     # 3D generation (ShapE)
-│       ├── vision.py       # Vision pipeline
-│       └── audio.py        # Audio pipeline
-├── tools/
-│   ├── agent_tools.py      # Tool implementations
-│   ├── codebase_tools.py   # Code analysis tools
-│   └── tool_cache.py       # Tool output caching
-├── ui/
-│   ├── cli_assistant.py    # CLI interface
-│   ├── cyber_gui.py        # GUI interface
-│   ├── gui_theme.py        # GUI theming
-│   └── terminal.py         # Terminal utilities
-└── requirements*.txt       # GPU-specific dependency files
+Artifex-Assistant-V5/
+  main.py                  # CLI entry point
+  main_gui.py              # GUI entry point
+  main_api.py              # API server entry point
+  setup.py                 # GPU detection and setup wizard
+  setup_ollama.py          # Ollama setup helper (install, start, pull)
+  download_model.py        # Model downloader (HuggingFace + Ollama)
+  launch.bat               # Windows desktop launcher
+  Dockerfile               # CUDA Docker image
+  docker-compose.yml       # Docker Compose with GPU support
+  pyproject.toml           # Pytest configuration
+  requirements.txt         # Base dependencies (GPU-agnostic)
+  requirements-rtx4090.txt # RTX 4090 24GB (pinned versions)
+  requirements-3060.txt    # RTX 3060 12GB (pinned versions)
+  requirements-rtx5060ti.txt # RTX 5060 Ti 8GB (pinned versions)
+  core/
+    config.py              # GPU tier detection, model registry, modes, safety
+    engine_base.py         # Abstract engine interface
+    engine_factory.py      # Backend factory (Transformers / Ollama)
+    engine_transformers.py # HuggingFace Transformers backend
+    engine_ollama.py       # Ollama backend (localhost only)
+    hardware.py            # GPU detection and VRAM management
+    model_loader.py        # Model weight loading with quantization
+    model_registry.py      # Model type detection and VRAM estimation
+    inference.py           # Token counting, thinking blocks, response cleaning
+    knowledge.py           # RAG knowledge base with ContextEngine
+    rag.py                 # Retrieval-augmented generation pipeline
+    health.py              # System health checks and diagnostics
+    resilience.py          # OOM recovery and crash resilience
+    session.py             # Session save/load with metadata
+    prompts.py             # System prompt builders
+    code_mode.py           # Code execution mode
+    progress.py            # Progress tracking
+    tool_protocol.py       # Agent tool execution protocol
+    logging_config.py      # Structured logging
+    pipelines/             # Multi-modal model pipelines (10 types)
+      base.py              # Abstract pipeline interface
+      registry.py          # Pipeline discovery and factory
+      text_gen.py          # Text generation / LLM chat
+      image_gen.py         # Text-to-image (SD, SDXL, FLUX)
+      image_edit.py        # Image editing (inpaint, upscale)
+      vision.py            # Vision models (LLaVA, Qwen-VL)
+      shape_3d.py          # 3D generation (ShapE)
+      embedding.py         # Embedding models for RAG
+      audio.py             # Audio (TTS + STT)
+      music.py             # Music generation (MusicGen)
+      video_gen.py         # Video generation
+  ui/
+    cli_assistant.py       # CLI assistant loop with tool execution
+    cyber_gui.py           # FreeSimpleGUI cyberpunk GUI
+    gui_theme.py           # GUI theming
+    terminal.py            # Terminal utilities
+  api/
+    server.py              # FastAPI OpenAI-compatible REST API
+  tools/
+    agent_tools.py         # Shell, Python, web search, file ops, edit
+    codebase_tools.py      # Code analysis, symbol search, architecture mapping
+    tool_cache.py          # LRU cache for tool outputs + SessionMap
+  webgpu/
+    src/
+      main.ts              # WebGPU initialization and UI
+      engine/              # GPU device, buffers, compute pipelines
+      shaders/             # WGSL compute kernels (5 kernels)
+      utils/               # Metrics reporting
+    server/
+      dev-server.ts        # Express metrics collection server
+  tests/                   # Pytest test suite (12 modules, 110 tests)
+  knowledge/               # RAG knowledge bases (reference + workspaces)
+  models/                  # Local model cache (auto-discovered)
+  sessions/                # Saved conversations
+  output/                  # Generated outputs (images, audio, 3D, video)
+  logs/                    # Application logs
 ```
 
-## Backends
+---
 
-### Transformers (default)
-Loads models directly from HuggingFace with automatic 4-bit quantization. Best for maximum control and model variety.
+## Configuration
 
-### Ollama
-Connects to a locally running Ollama server. Pre-quantized models, simpler setup, lower VRAM usage. Switch with `/backend ollama` in the CLI.
+### Environment Variables
 
-## Requirements Files
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ARTIFEX_API_KEY` | *(none)* | API authentication key (optional) |
+| `CUDA_VISIBLE_DEVICES` | `0` | GPU device index (for multi-GPU systems) |
+| `CUDA_MODULE_LOADING` | `LAZY` | Deferred CUDA kernel compilation (saves ~300-400 MB VRAM) |
+| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True,garbage_collection_threshold:0.8` | CUDA memory allocation tuning |
 
-| File | Target |
-|------|--------|
-| `requirements.txt` | Base dependencies (any NVIDIA GPU) |
-| `requirements-3060.txt` | RTX 3060 12GB (pinned versions) |
-| `requirements-rtx4090.txt` | RTX 4090 24GB |
-| `requirements-rtx5060ti.txt` | RTX 5060 Ti (Blackwell) |
+### Context Profiles
+
+| Profile | Max Input | Max Output | History | Knowledge Budget | Use Case |
+|---------|-----------|------------|---------|-----------------|----------|
+| STANDARD | 10,000 tokens | 1,536 tokens | 6,000 tokens | 550 tokens | TIGHT/COMFORTABLE GPUs |
+| HIGH | 14,000 tokens | 2,048 tokens | 10,000 tokens | 750 tokens | ABUNDANT GPUs (24+ GB) |
+
+Switch profiles in the CLI with `/context STANDARD` or `/context HIGH`.
+
+### Modes
+
+| Mode | Temperature | Max Tokens | Thinking | Use Case |
+|------|-------------|------------|----------|----------|
+| ASSISTANT | 0.7 | 2048-4096 (by tier) | Enabled | General conversation and tool use |
+| CODE | 0.2 | 4096-8192 (by tier) | Enabled | Code generation and analysis |
+
+---
+
+## Security
+
+- All servers bind to `127.0.0.1` — not accessible from LAN or internet
+- Dangerous command patterns blocked (rm -rf, format, registry edits, shutdown, etc.)
+- API key authentication via `ARTIFEX_API_KEY` environment variable
+- Ollama communication stays on localhost:11434
+- WebGPU Vite and metrics servers locked to localhost
+- Docker exposes ports only within the container network
+- Edit operations validate syntax before applying changes
+
+---
+
+## Testing
+
+```bash
+# Run the full test suite (110 tests)
+python -m pytest
+
+# Verbose with short tracebacks
+python -m pytest tests/ -v --tb=short
+
+# Run specific modules
+python -m pytest tests/test_config.py -v         # Config, GPU tiers, modes
+python -m pytest tests/test_pipelines.py -v       # Pipeline registry and contracts
+python -m pytest tests/test_knowledge.py -v       # Knowledge base CRUD + ContextEngine
+python -m pytest tests/test_agent_tools.py -v     # Agent tool extraction
+python -m pytest tests/test_inference.py -v       # Think filtering, history compression
+python -m pytest tests/test_session.py -v         # Session save/load
+python -m pytest tests/test_resilience.py -v      # OOM recovery
+python -m pytest tests/test_health.py -v          # Health checks
+python -m pytest tests/test_model_registry.py -v  # Model type detection
+python -m pytest tests/test_tool_cache.py -v      # Cache and SessionMap
+
+# WebGPU type-check
+cd webgpu && npx tsc --noEmit
+
+# WebGPU production build
+cd webgpu && npx vite build
+
+# WebGPU kernel tests — run in browser via "Run GPU Tests" button
+cd webgpu && npm run dev
+```
+
+---
+
+## Troubleshooting
+
+### "No CUDA GPU detected"
+- Make sure NVIDIA drivers are installed: `nvidia-smi` should show your GPU
+- Reinstall PyTorch with the correct CUDA version for your card
+
+### "Out of memory" (OOM)
+- Try `/refresh` in the CLI to compress history and free VRAM
+- Switch to a smaller model or use Ollama with a pre-quantized model
+- Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (done automatically)
+
+### "Ollama not reachable"
+- Run `python setup_ollama.py --status` to check the server
+- Start Ollama manually: `ollama serve`
+- Make sure a model is pulled: `ollama pull qwen3.5:9b`
+
+### Models not showing in GUI/CLI
+- Models must be in the `models/` directory (or shared model paths)
+- Each model needs a `config.json` for type detection
+- Run `python download_model.py --list` to see what's installed
+
+### WebGPU not working in browser
+- Use Chrome 113+ or Edge 113+
+- Enable `chrome://flags/#enable-unsafe-webgpu`
+- Check that your GPU supports WebGPU (most discrete GPUs from 2018+ do)
+
+### Windows Firewall popup
+- All servers default to `127.0.0.1` — you should NOT see a firewall prompt
+- If you do, deny the request — nothing needs network access
+
+---
+
+## Requirements
+
+### Python (core)
+
+- Python 3.11+
+- PyTorch with CUDA (12.4 for RTX 30xx/40xx, 12.8 for RTX 50xx)
+- transformers >= 5.2.0
+- bitsandbytes >= 0.49.0
+- accelerate >= 1.6.0
+- numpy >= 1.24.0
+- diffusers >= 0.30.0 (for image/3D/video pipelines)
+- FreeSimpleGUI >= 5.0.0 (for GUI mode)
+- FastAPI + uvicorn (for API server mode)
+- pytest >= 8.0.0 (for testing)
+
+### Node.js (WebGPU engine)
+
+- Node.js 18+
+- TypeScript 5.7+
+- Vite 6+
+- Chrome/Edge with WebGPU support
+
+### Optional
+
+- Ollama — for pre-quantized model support (qwen3.5:9b, qwen3:8b, etc.)
+- librosa + soundfile — for audio processing
+- scipy — for audio file output (WAV writing)
+- sentence-transformers — for embedding models
+- Docker + NVIDIA Container Toolkit — for container deployment
+
+---
+
+## Acknowledgments
+
+> *"For from him and through him and for him are all things. To him be the glory forever! Amen."*
+> — Romans 11:36 (NIV)
+
+First and foremost, all praise and glory to **God** through **Jesus Christ**. Every good gift comes from above, and this work is no exception.
+
+### Frameworks & Libraries
+
+- **[PyTorch](https://pytorch.org/)** — Meta AI — deep learning framework powering all GPU inference
+- **[HuggingFace Transformers](https://huggingface.co/docs/transformers)** — HuggingFace — model loading, tokenization, and inference
+- **[HuggingFace Diffusers](https://huggingface.co/docs/diffusers)** — HuggingFace — image, video, and 3D generation pipelines
+- **[HuggingFace Accelerate](https://huggingface.co/docs/accelerate)** — HuggingFace — multi-GPU support and memory-efficient loading
+- **[bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes)** — bitsandbytes-foundation — NF4 and INT8 quantization
+- **[safetensors](https://github.com/huggingface/safetensors)** — HuggingFace — safe model weight serialization
+- **[Ollama](https://ollama.com/)** — Ollama — local model serving with pre-quantized GGUF models
+- **[FastAPI](https://fastapi.tiangolo.com/)** — Sebastian Ramirez — REST API framework
+- **[Uvicorn](https://www.uvicorn.org/)** — Encode — ASGI server
+- **[FreeSimpleGUI](https://github.com/spyoungtech/FreeSimpleGUI)** — desktop GUI framework
+- **[Vite](https://vite.dev/)** — Evan You / Vite team — frontend build tool for WebGPU engine
+- **[TypeScript](https://www.typescriptlang.org/)** — Microsoft — typed JavaScript for WebGPU engine
+- **[Express](https://expressjs.com/)** — OpenJS Foundation — metrics dev server
+- **[NumPy](https://numpy.org/)** — NumPy team — numerical computing for embeddings and RAG
+- **[Pillow](https://python-pillow.org/)** — Pillow contributors — image processing
+- **[DuckDuckGo Search](https://github.com/deedy5/duckduckgo_search)** — deedy5 — web search integration
+
+### AI Models & Research
+
+- **[Qwen](https://github.com/QwenLM/Qwen)** — Alibaba Cloud / Qwen Team — Qwen3.5, Qwen3, Qwen2.5-Coder, Qwen-VL models
+- **[Stable Diffusion / SDXL](https://stability.ai/)** — Stability AI — text-to-image generation
+- **[FLUX](https://blackforestlabs.ai/)** — Black Forest Labs — text-to-image generation
+- **[ShapE](https://github.com/openai/shap-e)** — OpenAI — text-to-3D mesh generation
+- **[MusicGen](https://github.com/facebookresearch/audiocraft)** — Meta AI / FAIR — music generation
+- **[Bark](https://github.com/suno-ai/bark)** — Suno AI — text-to-speech
+- **[Whisper](https://github.com/openai/whisper)** — OpenAI — speech recognition
+- **[LLaVA](https://llava-vl.github.io/)** — University of Wisconsin-Madison / Microsoft — vision-language models
+- **[Llama](https://ai.meta.com/llama/)** — Meta AI — large language models
+- **[Mistral](https://mistral.ai/)** — Mistral AI — language models
+- **[Gemma](https://ai.google.dev/gemma)** — Google DeepMind — language models
+- **[Phi](https://huggingface.co/microsoft/phi-3-mini-4k-instruct)** — Microsoft Research — small language models
+- **[DeepSeek](https://www.deepseek.com/)** — DeepSeek AI — language models
+- **[CogVideoX](https://github.com/THUDM/CogVideo)** — Tsinghua University / THUDM — video generation
+- **[BERT](https://github.com/google-research/bert)** — Google Research — embedding models
+- **[Sentence Transformers](https://www.sbert.net/)** — UKP Lab, TU Darmstadt — embedding models for RAG
+
+### Standards & Specifications
+
+- **[WebGPU](https://www.w3.org/TR/webgpu/)** — W3C GPU for the Web Working Group — browser GPU compute API
+- **[WGSL](https://www.w3.org/TR/WGSL/)** — W3C — WebGPU Shading Language
+- **[@webgpu/types](https://github.com/gpuweb/types)** — W3C GPU for the Web CG — TypeScript type definitions
+
+### Tools & Infrastructure
+
+- **[NVIDIA CUDA](https://developer.nvidia.com/cuda-toolkit)** — NVIDIA — GPU computing platform
+- **[Docker](https://www.docker.com/)** — Docker Inc. — containerization
+- **[NVIDIA Container Toolkit](https://github.com/NVIDIA/nvidia-container-toolkit)** — NVIDIA — GPU support in Docker
+- **[pytest](https://docs.pytest.org/)** — Holger Krekel and pytest contributors — testing framework
+
+---
 
 ## License
 
-[MIT](LICENSE)
+Artifex Assistant V5 — Universal Local AI Hosting Platform.

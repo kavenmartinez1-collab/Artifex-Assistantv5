@@ -14,11 +14,14 @@ from typing import Optional
 PIPELINE_TYPES = {
     "text-generation": "Text Generation (Chat / Completion)",
     "text-to-image": "Image Generation (Stable Diffusion, SDXL, FLUX)",
+    "image-to-image": "Image Editing (img2img / Inpaint / Upscale)",
     "shap-e": "3D Generation (ShapE)",
     "image-text-to-text": "Vision (Image Understanding)",
     "text-to-audio": "Audio Generation (TTS)",
+    "text-to-music": "Music Generation (MusicGen)",
     "automatic-speech-recognition": "Speech Recognition (STT)",
-    "feature-extraction": "Embedding",
+    "text-to-video": "Video Generation",
+    "feature-extraction": "Embedding / RAG",
 }
 
 # Map HuggingFace model_type to our pipeline type
@@ -73,16 +76,27 @@ _MODEL_TYPE_MAP = {
     "bert": "feature-extraction",
     "roberta": "feature-extraction",
     "sentence-transformers": "feature-extraction",
+
+    # Music generation
+    "musicgen": "text-to-music",
+    "musicgen_melody": "text-to-music",
+
+    # Video generation
+    "text-to-video": "text-to-video",
+    "cogvideox": "text-to-video",
 }
 
 # Backend mapping: which backend handles each pipeline type
 PIPELINE_BACKEND_MAP = {
     "text-generation": "transformers",  # or "ollama"
     "text-to-image": "diffusers",
+    "image-to-image": "diffusers",
     "shap-e": "diffusers",
     "image-text-to-text": "transformers",
     "text-to-audio": "transformers",
+    "text-to-music": "transformers",
     "automatic-speech-recognition": "transformers",
+    "text-to-video": "diffusers",
     "feature-extraction": "transformers",
 }
 
