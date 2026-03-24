@@ -30,6 +30,12 @@ SESSION_DIR = os.path.join(BASE_DIR, "sessions")
 KNOWLEDGE_DIR = os.path.join(BASE_DIR, "knowledge")
 KNOWLEDGE_REFERENCE_DIR = os.path.join(KNOWLEDGE_DIR, "reference")
 
+# ===== WEB GATEWAY =====
+# URL of the web gateway proxy (set automatically in Docker, empty for local dev).
+# When set, web search/fetch/download are routed through the gateway for
+# content sanitization, prompt injection detection, and quarantine storage.
+WEB_GATEWAY_URL = os.getenv("WEB_GATEWAY_URL", "")
+
 # ===== MODEL REGISTRY =====
 # Auto-discovers model directories in models/. Skip quantized cache dirs.
 # Also checks shared model dirs (artifex-lite-v3/models, Artifex-lite/models).

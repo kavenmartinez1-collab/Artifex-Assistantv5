@@ -1,0 +1,78 @@
+# SearXNG settings — API-only mode for Artifex Web Gateway
+# Docs: https://docs.searxng.org/admin/settings/
+
+use_default_settings: true
+
+general:
+  instance_name: "Artifex Search"
+  privacypolicy_url: false
+  donation_url: false
+  contact_url: false
+  enable_metrics: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+server:
+  # Bind to all interfaces inside container (isolated by Docker network)
+  bind_address: "0.0.0.0"
+  port: 8080
+  secret_key: "artifex-searxng-internal-only"
+  limiter: true
+  image_proxy: false
+  # Disable public access features
+  public_instance: false
+
+ui:
+  # Minimal UI (API is primary interface)
+  default_theme: simple
+  static_use_hash: true
+
+# Enable search engines
+engines:
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: false
+
+  - name: bing
+    engine: bing
+    shortcut: b
+    disabled: false
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: false
+
+  - name: wikidata
+    engine: wikidata
+    shortcut: wd
+    disabled: false
+
+  - name: github
+    engine: github
+    shortcut: gh
+    disabled: false
+
+  - name: arxiv
+    engine: arxiv
+    shortcut: ax
+    disabled: false
+
+outgoing:
+  # Connection pooling
+  request_timeout: 6.0
+  max_request_timeout: 15.0
+  pool_connections: 100
+  pool_maxsize: 20

@@ -21,9 +21,10 @@ Universal Local AI Hosting Platform. Run any AI model locally — text generatio
 - **RAG knowledge base** — per-workspace knowledge entries with lifecycle classification, action keys, loop detection
 - **Session persistence** — save/load conversations with full metadata (model, backend, mode)
 - **WebGPU engine** — browser-based GPU compute with 5 WGSL kernels (matmul, rmsnorm, rope, softmax, elementwise)
-- **Docker support** — GPU-enabled container with health checks and optional Ollama sidecar
+- **Secure web search** — SearXNG + Web Gateway with content sanitization, prompt injection detection, tmpfs quarantine, and network isolation
+- **Docker support** — GPU-enabled container with health checks, optional Ollama sidecar, and web gateway proxy
 - **Multi-GPU** — device selection for multi-GPU systems
-- **Security** — all servers localhost-only, dangerous command blocking, API key auth
+- **Security** — all servers localhost-only, dangerous command blocking, API key auth, web content sandboxing
 
 ## Verified Test Results (2026-03-22)
 
@@ -352,33 +353,182 @@ All communication with Ollama stays on `localhost:11434` — nothing leaves your
 
 ---
 
-## Docker Deployment
+## Web Gateway (Secure Web Search)
 
-### Build and Run
+The Web Gateway adds safe, sandboxed web search and content retrieval to Artifex. It uses a three-container Docker architecture that keeps your local AI isolated from the internet while still giving it access to web content through a sanitized proxy.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  docker compose up (default — lightweight, ~500 MB)      │
+│                                                          │
+│  ┌──────────────────┐         ┌──────────────────────┐  │
+│  │     searxng       │◄───────│    web-gateway        │  │
+│  │  (search engine)  │        │  (content proxy)      │  │
+│  │  Google, Bing,    │        │  trafilatura extract   │  │
+│  │  DuckDuckGo, etc. │        │  injection detection  │  │
+│  └──────────────────┘         │  tmpfs quarantine     │  │
+│          │                    │  rate limiting         │  │
+│          ▼                    └──────────┬────────────┘  │
+│       Internet                     port 8080             │
+│                                          │               │
+└──────────────────────────────────────────┼───────────────┘
+                                           │
+                              ┌────────────▼────────────┐
+                              │  Artifex (local venv)    │
+                              │  Your GPU, your models   │
+                              │  WEB_GATEWAY_URL=        │
+                              │   http://localhost:8080   │
+                              └─────────────────────────┘
+```
+
+### Quick Start
 
 ```bash
-# API server with GPU
-docker compose up artifex
+# 1. Start the web gateway + search engine (~500 MB, no GPU needed)
+docker compose up
+
+# 2. Set the gateway URL and run Artifex locally
+set WEB_GATEWAY_URL=http://localhost:8080    # Windows
+export WEB_GATEWAY_URL=http://localhost:8080  # Linux/Mac
+
+python main.py
+```
+
+Now when the model uses `@search("query")` or `@web_read(url)`, requests are routed through the gateway. If Docker isn't running, it falls back to direct DuckDuckGo search automatically.
+
+### Safety Features
+
+| Feature | Description |
+|---------|-------------|
+| **Content sanitization** | trafilatura extracts article text, strips scripts, iframes, ads, and tracking |
+| **Prompt injection detection** | 20+ patterns detected (instruction override, role manipulation, delimiter attacks, tool injection, data exfiltration). Suspicious content wrapped in `[UNTRUSTED]` delimiters |
+| **URL filtering** | Blocked schemes (file://, data://), blocked TLDs (.tk, .ml, etc.), blocked private/metadata IPs (169.254.169.254, 10.x, 172.x, 192.168.x) |
+| **tmpfs quarantine** | Downloads stored in RAM-backed /quarantine/ — never touches disk, auto-deleted on container stop |
+| **Rate limiting** | 20 searches/min, 30 fetches/min, 10 downloads/min per session |
+| **Size limits** | 5 MB per page fetch, 50 MB per download, 500 KB extracted text |
+| **Blocked extensions** | .exe, .bat, .ps1, .dll, .sh, .jar, and other executable formats blocked from download |
+| **Session cleanup** | `/clear` and `/cleanup` commands wipe all quarantined files |
+| **Auto-fallback** | If the gateway is unreachable, search/fetch falls back to direct DuckDuckGo (existing behavior) |
+
+### Web Gateway API Endpoints
+
+The gateway runs on port 8080 inside Docker (exposed to localhost).
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/search` | Search via SearXNG, return sanitized results |
+| POST | `/fetch` | Fetch URL, extract clean text via trafilatura |
+| POST | `/download` | Download file to tmpfs quarantine |
+| GET | `/quarantine/{id}` | Retrieve a quarantined file |
+| GET | `/quarantine` | List all quarantined files |
+| DELETE | `/session` | Wipe all quarantined files (session cleanup) |
+| GET | `/health` | Health check (SearXNG connectivity, quarantine status) |
+
+### SearXNG Search Engines
+
+The self-hosted SearXNG instance aggregates results from multiple engines:
+
+- Google, Bing, DuckDuckGo (general web)
+- Wikipedia, Wikidata (knowledge)
+- GitHub (code and repositories)
+- arXiv (research papers)
+
+### Port Configuration
+
+All ports are configurable. Default values and where to change them:
+
+| Service | Default Port | Config Location | Environment Variable |
+|---------|-------------|-----------------|---------------------|
+| Artifex API | `8000` | `main_api.py --port` | — |
+| Web Gateway | `8080` | `web-gateway/config.py` (`PORT`) | `GATEWAY_PORT` |
+| SearXNG | `8080` (internal) | `web-gateway/searxng/settings.yml` (`server.port`) | — |
+| Ollama | `11434` | Ollama default | `OLLAMA_HOST` |
+
+**Changing the web gateway port:**
+
+1. Update `docker-compose.yml` — change the `ports` mapping under `web-gateway` (e.g., `"9090:8080"` to expose on host port 9090)
+2. Set `WEB_GATEWAY_URL` to match (e.g., `http://localhost:9090`)
+
+**Changing the Artifex API port:**
+
+```bash
+python main_api.py --port 9000
+```
+
+**Integrating with external applications:**
+
+The web gateway is a standalone HTTP service. Any application can use it by calling the gateway endpoints (`/search`, `/fetch`, `/download`) directly. Set `WEB_GATEWAY_URL` as an environment variable or configure it in your application's settings to point at the gateway.
+
+The Artifex API server includes a CORS allowlist in `api/server.py`. Add your application's origin to the `allow_origins` list if you need cross-origin access.
+
+### Stopping the Gateway
+
+```bash
+docker compose down          # Stop containers
+docker compose down -v       # Stop and remove volumes
+docker system prune          # Clean up unused images
+```
+
+---
+
+## Docker Deployment
+
+### Default: Web Gateway Only (Recommended)
+
+```bash
+# Start just the web gateway + SearXNG (~500 MB total)
+docker compose up
+
+# Run Artifex locally with gateway
+set WEB_GATEWAY_URL=http://localhost:8080
+python main.py
+```
+
+### Full Containerized Deployment
+
+```bash
+# Everything in Docker (requires NVIDIA Container Toolkit + GPU)
+docker compose --profile full up
 
 # With Ollama sidecar
-docker compose --profile ollama up
+docker compose --profile full --profile ollama up
 
 # Custom environment
-ARTIFEX_API_KEY=your-key CUDA_VISIBLE_DEVICES=0 docker compose up
+ARTIFEX_API_KEY=your-key CUDA_VISIBLE_DEVICES=0 docker compose --profile full up
 ```
+
+### Docker Profiles
+
+| Profile | Containers | Disk Usage | Use Case |
+|---------|-----------|------------|----------|
+| *(default)* | web-gateway + searxng | ~500 MB | Local dev with safe web search |
+| `full` | + artifex (GPU) | ~8+ GB | Full isolated deployment |
+| `ollama` | + ollama | ~2+ GB | Ollama backend in Docker |
+
+### Network Isolation (Full Profile)
+
+When using the `full` profile, network isolation is enforced:
+
+- **ai_internal** network (`internal: true`): Artifex and Ollama — **no internet access**
+- **ai_external** network: Web gateway and SearXNG — internet access
+- The web gateway bridges both networks, proxying sanitized content to Artifex
 
 ### What Docker Provides
 
-- **CUDA 12.4 runtime** base image (no manual CUDA install needed)
-- **GPU passthrough** via NVIDIA Container Toolkit
-- **Health checks** every 30 seconds on `/health`
-- **Persistent volumes** for models, sessions, output, and knowledge
-- **Optional Ollama sidecar** — runs alongside the main container
+- **SearXNG** — self-hosted meta-search engine (API-only mode, no tracking)
+- **Web Gateway** — content proxy with sanitization, rate limiting, and quarantine
+- **CUDA 12.4 runtime** base image for full profile (no manual CUDA install needed)
+- **GPU passthrough** via NVIDIA Container Toolkit (full profile)
+- **Health checks** on all containers
+- **tmpfs quarantine** — downloads in RAM, auto-deleted on stop
+- **Persistent volumes** for models, sessions, output, and knowledge (full profile)
 
 ### Prerequisites for Docker
 
-1. Docker Engine with GPU support
-2. NVIDIA Container Toolkit: [docs.nvidia.com/datacenter/cloud-native/container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+1. **Docker Desktop** — [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/) (WSL 2 backend on Windows)
+2. **NVIDIA Container Toolkit** *(only for full profile)* — [docs.nvidia.com/datacenter/cloud-native/container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 
 ---
 
@@ -424,9 +574,9 @@ The CLI assistant can execute these tool types, extracted from model responses:
 | Grep | `@grep("pattern", "path")` | Regex search across files |
 | Glob | `@glob("pattern")` | Find files by pattern |
 | Architecture | `@architecture()` | Map project structure and symbols |
-| Web Search | `@search("query")` | Search the web (DuckDuckGo) |
-| Web Read | `@web_read("url")` | Fetch and parse a webpage |
-| Download | `@download("url", "path")` | Download a file |
+| Web Search | `@search("query")` | Search the web (SearXNG via gateway, DuckDuckGo fallback) |
+| Web Read | `@web_read("url")` | Fetch and parse a webpage (sanitized via gateway with injection detection) |
+| Download | `@download("url", "path")` | Download a file (quarantined in tmpfs via gateway) |
 | Find Symbol | `@find_symbol("name")` | Locate function/class definitions |
 | Read Function | `@read_function("name")` | Read a specific function's source code |
 
@@ -501,8 +651,8 @@ Artifex-Assistant-V5/
   setup_ollama.py          # Ollama setup helper (install, start, pull)
   download_model.py        # Model downloader (HuggingFace + Ollama)
   launch.bat               # Windows desktop launcher
-  Dockerfile               # CUDA Docker image
-  docker-compose.yml       # Docker Compose with GPU support
+  Dockerfile               # CUDA Docker image (full profile)
+  docker-compose.yml       # Docker Compose: web gateway (default) + full profile
   pyproject.toml           # Pytest configuration
   requirements.txt         # Base dependencies (GPU-agnostic)
   requirements-rtx4090.txt # RTX 4090 24GB (pinned versions)
@@ -548,9 +698,18 @@ Artifex-Assistant-V5/
   api/
     server.py              # FastAPI OpenAI-compatible REST API
   tools/
-    agent_tools.py         # Shell, Python, web search, file ops, edit
+    agent_tools.py         # Shell, Python, web search, file ops, edit (gateway-aware)
     codebase_tools.py      # Code analysis, symbol search, architecture mapping
     tool_cache.py          # LRU cache for tool outputs + SessionMap
+  web-gateway/
+    Dockerfile             # Python 3.12-slim container (~150 MB)
+    main.py                # FastAPI proxy: search, fetch, download, quarantine
+    sanitizer.py           # Content extraction + prompt injection detection
+    config.py              # URL filtering, rate limits, size limits
+    requirements.txt       # fastapi, trafilatura, httpx, slowapi
+    searxng/
+      settings.yml         # SearXNG API-only config (8 search engines)
+      limiter.toml         # SearXNG rate limiting
   webgpu/
     src/
       main.ts              # WebGPU initialization and UI
@@ -579,6 +738,7 @@ Artifex-Assistant-V5/
 | `CUDA_VISIBLE_DEVICES` | `0` | GPU device index (for multi-GPU systems) |
 | `CUDA_MODULE_LOADING` | `LAZY` | Deferred CUDA kernel compilation (saves ~300-400 MB VRAM) |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True,garbage_collection_threshold:0.8` | CUDA memory allocation tuning |
+| `WEB_GATEWAY_URL` | *(none)* | Web gateway URL (e.g., `http://localhost:8080`). When set, web search/fetch/download route through the gateway for sanitization. Auto-set in Docker full profile. |
 
 ### Context Profiles
 
@@ -605,8 +765,16 @@ Switch profiles in the CLI with `/context STANDARD` or `/context HIGH`.
 - API key authentication via `ARTIFEX_API_KEY` environment variable
 - Ollama communication stays on localhost:11434
 - WebGPU Vite and metrics servers locked to localhost
-- Docker exposes ports only within the container network
+- Docker network isolation — main AI container has no internet access (full profile)
 - Edit operations validate syntax before applying changes
+- **Web content sandboxing:**
+  - Content sanitized via trafilatura before reaching the model
+  - Prompt injection detection with 20+ patterns (instruction override, role manipulation, delimiter attacks, encoded content, data exfiltration)
+  - Downloads quarantined in tmpfs (RAM-backed, never on disk, auto-deleted)
+  - URL filtering blocks private IPs, metadata endpoints, dangerous schemes, and high-abuse TLDs
+  - Executable file extensions (.exe, .bat, .ps1, .dll, etc.) blocked from download
+  - Rate limiting on all web operations (search, fetch, download)
+  - Session cleanup wipes quarantine on `/clear` and `/cleanup`
 
 ---
 
@@ -668,6 +836,13 @@ cd webgpu && npm run dev
 - Use Chrome 113+ or Edge 113+
 - Enable `chrome://flags/#enable-unsafe-webgpu`
 - Check that your GPU supports WebGPU (most discrete GPUs from 2018+ do)
+
+### Web gateway not working
+- Make sure Docker Desktop is running: the whale icon should be in your system tray
+- Start the gateway: `docker compose up`
+- Check health: `curl http://localhost:8080/health`
+- If SearXNG shows "unreachable", wait 15-20 seconds for it to initialize
+- Without the gateway, Artifex falls back to direct DuckDuckGo search automatically
 
 ### Windows Firewall popup
 - All servers default to `127.0.0.1` — you should NOT see a firewall prompt
@@ -731,7 +906,11 @@ First and foremost, all praise and glory to **God** through **Jesus Christ**. Ev
 - **[Express](https://expressjs.com/)** — OpenJS Foundation — metrics dev server
 - **[NumPy](https://numpy.org/)** — NumPy team — numerical computing for embeddings and RAG
 - **[Pillow](https://python-pillow.org/)** — Pillow contributors — image processing
-- **[DuckDuckGo Search](https://github.com/deedy5/duckduckgo_search)** — deedy5 — web search integration
+- **[DuckDuckGo Search](https://github.com/deedy5/duckduckgo_search)** — deedy5 — web search integration (fallback)
+- **[SearXNG](https://github.com/searxng/searxng)** — SearXNG team — self-hosted meta-search engine (primary search via gateway)
+- **[trafilatura](https://github.com/adbar/trafilatura)** — Adrien Barbaresi — web content extraction and sanitization
+- **[HTTPX](https://github.com/encode/httpx)** — Encode — async HTTP client for the web gateway
+- **[SlowAPI](https://github.com/laurentS/slowapi)** — Laurent Savaete — rate limiting for FastAPI
 
 ### AI Models & Research
 
