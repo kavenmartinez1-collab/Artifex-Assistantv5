@@ -25,6 +25,7 @@ from config import (
     MAX_FETCH_BYTES, MAX_DOWNLOAD_BYTES, MAX_EXTRACTED_TEXT, MAX_SEARCH_RESULTS,
     FETCH_TIMEOUT, DOWNLOAD_TIMEOUT, SEARCH_TIMEOUT,
     RATE_LIMIT_SEARCH, RATE_LIMIT_FETCH, RATE_LIMIT_DOWNLOAD,
+    GATEWAY_AUTH_TOKEN,
 )
 from sanitizer import extract_text, sanitize_url, check_download_extension
 
@@ -45,6 +46,23 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
         status_code=429,
         content={"error": "Rate limit exceeded. Please wait before retrying."},
     )
+
+
+# ── Optional Auth Middleware ────────────────────────────────────────────────
+# Only active when GATEWAY_AUTH_TOKEN is set. Health endpoint always open.
+if GATEWAY_AUTH_TOKEN:
+    import hmac
+
+    @app.middleware("http")
+    async def check_auth_token(request: Request, call_next):
+        if request.url.path == "/health":
+            return await call_next(request)
+        token = request.headers.get("X-Gateway-Token", "")
+        if not hmac.compare_digest(token, GATEWAY_AUTH_TOKEN):
+            return JSONResponse(status_code=401, content={"error": "Invalid or missing gateway token"})
+        return await call_next(request)
+
+    log.info("Gateway auth enabled — requests require X-Gateway-Token header")
 
 
 # Ensure quarantine directory exists

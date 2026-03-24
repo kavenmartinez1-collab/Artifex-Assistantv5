@@ -22,6 +22,7 @@ _log = logging.getLogger("artifex.api.web_tools")
 # Set via: $env:WEB_GATEWAY_URL = "http://localhost:8080" (PowerShell)
 #     or:  export WEB_GATEWAY_URL=http://localhost:8080    (bash)
 WEB_GATEWAY_URL = os.getenv("WEB_GATEWAY_URL", "")
+GATEWAY_AUTH_TOKEN = os.getenv("GATEWAY_AUTH_TOKEN", "")
 
 MAX_TOOL_ROUNDS = 3
 
@@ -69,9 +70,12 @@ def gateway_post(endpoint: str, payload: dict) -> tuple[bool, dict | str]:
     """POST JSON to the web gateway. Returns (success, data) or (False, error)."""
     url = f"{WEB_GATEWAY_URL}{endpoint}"
     body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if GATEWAY_AUTH_TOKEN:
+        headers["X-Gateway-Token"] = GATEWAY_AUTH_TOKEN
     req = urllib.request.Request(
         url, data=body,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:

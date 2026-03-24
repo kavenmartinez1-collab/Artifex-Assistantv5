@@ -35,6 +35,7 @@ KNOWLEDGE_REFERENCE_DIR = os.path.join(KNOWLEDGE_DIR, "reference")
 # When set, web search/fetch/download are routed through the gateway for
 # content sanitization, prompt injection detection, and quarantine storage.
 WEB_GATEWAY_URL = os.getenv("WEB_GATEWAY_URL", "")
+GATEWAY_AUTH_TOKEN = os.getenv("GATEWAY_AUTH_TOKEN", "")
 
 # ===== MODEL REGISTRY =====
 # Auto-discovers model directories in models/. Skip quantized cache dirs.

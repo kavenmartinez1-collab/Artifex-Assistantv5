@@ -131,7 +131,7 @@ venv/Scripts/activate          # Windows (Git Bash)
 **Option A — Automatic (recommended):**
 
 ```bash
-python setup.py
+python setup_wizard.py
 ```
 
 The setup wizard will:
@@ -210,7 +210,7 @@ python main_api.py --backend transformers --model qwen3.5-27b-distilled --gatewa
 
 ```bash
 # Quick GPU check
-python setup.py --detect
+python setup_wizard.py --detect
 
 # Full health report (from inside the CLI)
 # Type /health after launching python main.py
@@ -518,6 +518,7 @@ Now when the model uses `@search("query")` or `@web_read(url)`, requests are rou
 | **Size limits** | 5 MB per page fetch, 50 MB per download, 500 KB extracted text |
 | **Blocked extensions** | .exe, .bat, .ps1, .dll, .sh, .jar, and other executable formats blocked from download |
 | **Session cleanup** | `/clear` and `/cleanup` commands wipe all quarantined files |
+| **Optional auth token** | Set `GATEWAY_AUTH_TOKEN` to require a shared secret on all gateway requests (except `/health`). Disabled by default — enable if exposing port 8080 to the network. |
 | **Auto-fallback** | If the gateway is unreachable, search/fetch falls back to direct DuckDuckGo (existing behavior) |
 
 ### Web Gateway API Endpoints
@@ -780,7 +781,7 @@ Artifex-Assistant-V5/
   main.py                  # CLI entry point
   main_gui.py              # GUI entry point
   main_api.py              # API server entry point
-  setup.py                 # GPU detection and setup wizard
+  setup_wizard.py          # GPU detection and setup wizard
   setup_ollama.py          # Ollama setup helper (install, start, pull)
   download_model.py        # Model downloader (HuggingFace + Ollama)
   launch.bat               # Windows desktop launcher
@@ -839,7 +840,7 @@ Artifex-Assistant-V5/
     Dockerfile             # Python 3.12-slim container (~150 MB)
     main.py                # FastAPI proxy: search, fetch, download, quarantine
     sanitizer.py           # Content extraction + prompt injection detection
-    config.py              # URL filtering, rate limits, size limits
+    config.py              # URL filtering, rate limits, size limits, optional auth
     requirements.txt       # fastapi, trafilatura, httpx, slowapi
     searxng/
       settings.yml         # SearXNG API-only config (8 search engines)
@@ -873,6 +874,7 @@ Artifex-Assistant-V5/
 | `CUDA_MODULE_LOADING` | `LAZY` | Deferred CUDA kernel compilation (saves ~300-400 MB VRAM) |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True,garbage_collection_threshold:0.8` | CUDA memory allocation tuning |
 | `WEB_GATEWAY_URL` | *(none)* | Web gateway URL for CLI/GUI (e.g., `http://localhost:8080`). For the API server, use `--gateway` flag instead. Auto-set in Docker full profile. |
+| `GATEWAY_AUTH_TOKEN` | *(none)* | Optional shared secret for web gateway authentication. When set, all gateway requests must include a matching `X-Gateway-Token` header. The `/health` endpoint is always open (for Docker healthchecks). Leave unset to disable (default). |
 
 > **Note on environment variables in PowerShell:** Use `$env:VAR = "value"` syntax (not `set VAR=value` which is CMD-only). For the API server, the `--gateway` flag avoids env var hassles entirely.
 
@@ -902,6 +904,7 @@ Switch profiles in the CLI with `/context STANDARD` or `/context HIGH`.
 - Ollama communication stays on localhost:11434
 - WebGPU Vite and metrics servers locked to localhost
 - Docker network isolation — main AI container has no internet access (full profile)
+- Optional gateway authentication via `GATEWAY_AUTH_TOKEN` — shared secret between Artifex and the web gateway. Disabled by default; enable if you expose port 8080 to the network.
 - Edit operations validate syntax before applying changes
 - **Web content sandboxing:**
   - Content sanitized via trafilatura before reaching the model
