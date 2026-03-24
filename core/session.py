@@ -8,8 +8,9 @@ import os
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+from urllib.request import Request, urlopen
 
-from core.config import SESSION_DIR
+from core.config import SESSION_DIR, WEB_GATEWAY_URL
 from core.logging_config import get_logger
 
 _log = get_logger(__name__)
@@ -186,3 +187,29 @@ def find_session(name_or_index, session_dir=None):
             return s["path"]
 
     return None
+
+
+def cleanup_web_quarantine():
+    """Wipe quarantined web downloads via the web gateway.
+
+    Called on /clear, /cleanup, and session end.
+    No-op if the gateway is not configured or unreachable.
+
+    Returns:
+        (success, message) tuple
+    """
+    if not WEB_GATEWAY_URL:
+        return True, "No web gateway configured."
+
+    try:
+        req = Request(f"{WEB_GATEWAY_URL}/session", method="DELETE")
+        with urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            removed = data.get("removed", 0)
+            if removed:
+                _log.info("Web quarantine cleanup: removed %d files", removed)
+                return True, f"Quarantine cleared ({removed} files removed)."
+            return True, "Quarantine already empty."
+    except Exception as e:
+        _log.debug("Web quarantine cleanup skipped (gateway unavailable): %s", e)
+        return False, f"Gateway unavailable: {e}"

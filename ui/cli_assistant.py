@@ -26,7 +26,7 @@ from tools.agent_tools import (
 )
 from tools.tool_cache import maybe_cache_output, clear_cache, SessionMap, update_session_map
 from core.resilience import engine_recovery, generate_with_recovery
-from core.session import save_session, load_session, list_sessions, find_session, auto_save
+from core.session import save_session, load_session, list_sessions, find_session, auto_save, cleanup_web_quarantine
 from core.health import run_health_check, format_health_report
 from core.logging_config import get_logger
 
@@ -401,7 +401,11 @@ def run_assistant():
                 session_map.clear()
                 clear_cache()
                 engine.periodic_cleanup()
+                # Clean up web quarantine (downloaded files in tmpfs)
+                q_ok, q_msg = cleanup_web_quarantine()
                 print(f"{Fore.CYAN}  Cleared — conversation, session map, and tool cache reset.")
+                if q_ok and "removed" in q_msg.lower():
+                    print(f"  Web quarantine: {q_msg}")
                 print(f"  Knowledge preserved ({km.session_store.count if km.session_store else 0} entries).{Style.RESET_ALL}\n")
                 continue
 
@@ -413,11 +417,15 @@ def run_assistant():
                 session_map.clear()
                 clear_cache()
                 engine.periodic_cleanup()
+                # Clean up web quarantine
+                q_ok, q_msg = cleanup_web_quarantine()
                 # Plus deep clean: stale workspace knowledge dirs
                 removed = cleanup_stale_workspaces()
                 print(f"{Fore.CYAN}  Deep cleanup complete:")
                 print(f"    Conversation, session map, tool cache: reset")
                 print(f"    VRAM: freed")
+                if q_ok and "removed" in q_msg.lower():
+                    print(f"    Web quarantine: {q_msg}")
                 if removed:
                     print(f"    Stale workspaces removed: {len(removed)}")
                     for r in removed:

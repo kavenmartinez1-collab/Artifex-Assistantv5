@@ -1,7 +1,57 @@
 # Artifex Assistant V5 — Docker Compose
-# Launches the API server with optional Ollama backend
+# Default: just web-gateway + searxng (lightweight, ~500 MB total)
+# Optional: full Artifex container via `docker compose --profile full up`
+#
+# Local dev workflow:
+#   docker compose up              ← starts web-gateway + searxng only
+#   set WEB_GATEWAY_URL=http://localhost:8080
+#   python main.py                 ← run Artifex from your local venv
 
 services:
+  # Web Gateway — content proxy with sanitization and quarantine
+  # ~150 MB image (python:3.12-slim + trafilatura + fastapi)
+  web-gateway:
+    build: ./web-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - SEARXNG_URL=http://searxng:8080
+      - QUARANTINE_DIR=/quarantine
+    tmpfs:
+      - /quarantine:size=256m,mode=1777
+    networks:
+      - ai_external
+    depends_on:
+      searxng:
+        condition: service_healthy
+    healthcheck:
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      test: ["CMD", "python", "-c", "import httpx; r = httpx.get('http://localhost:8080/health', timeout=3); assert r.status_code == 200"]
+    restart: unless-stopped
+
+  # SearXNG — self-hosted meta-search engine (API-only mode)
+  # ~350 MB image (pre-built from Docker Hub)
+  searxng:
+    image: searxng/searxng:latest
+    volumes:
+      - ./web-gateway/searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - ./web-gateway/searxng/limiter.toml:/etc/searxng/limiter.toml:ro
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+    networks:
+      - ai_external
+    healthcheck:
+      interval: 15s
+      timeout: 5s
+      start_period: 15s
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/healthz"]
+    restart: unless-stopped
+
+  # ── Optional: Full containerized deployment (docker compose --profile full up) ──
+
+  # Artifex AI server — only builds if you explicitly use the 'full' profile
   artifex:
     build: .
     ports:
@@ -14,6 +64,13 @@ services:
     environment:
       - ARTIFEX_API_KEY=${ARTIFEX_API_KEY:-}
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - WEB_GATEWAY_URL=http://web-gateway:8080
+    networks:
+      - ai_internal
+      - ai_external
+    depends_on:
+      web-gateway:
+        condition: service_healthy
     deploy:
       resources:
         reservations:
@@ -21,15 +78,19 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    profiles:
+      - full
     restart: unless-stopped
 
-  # Optional: Ollama backend
+  # Ollama backend — only with 'ollama' profile
   ollama:
     image: ollama/ollama:latest
     ports:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+    networks:
+      - ai_internal
     deploy:
       resources:
         reservations:
@@ -39,6 +100,15 @@ services:
               capabilities: [gpu]
     profiles:
       - ollama
+
+networks:
+  # Internal network — no internet (for full containerized deployment)
+  ai_internal:
+    internal: true
+
+  # External network — internet access for web-gateway + searxng
+  ai_external:
+    driver: bridge
 
 volumes:
   ollama_data:

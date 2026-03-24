@@ -36,6 +36,8 @@ RUN mkdir -p models sessions output logs .tool_cache
 # Environment configuration
 ENV CUDA_MODULE_LOADING=LAZY
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
+# Web gateway URL (set in docker-compose, empty for local dev = fallback to direct search)
+ENV WEB_GATEWAY_URL=
 
 # Default: API server mode
 EXPOSE 8000

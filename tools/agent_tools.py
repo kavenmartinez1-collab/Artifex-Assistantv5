@@ -18,7 +18,7 @@ from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from urllib.parse import urlencode
 
-from core.config import IS_WINDOWS, ASSISTANT_DANGEROUS_PATTERNS
+from core.config import IS_WINDOWS, ASSISTANT_DANGEROUS_PATTERNS, WEB_GATEWAY_URL
 from core.hardware import sense_system
 
 # HTML parsing: lxml for quality, stdlib HTMLParser always available as fallback
@@ -28,6 +28,70 @@ try:
     _HAS_LXML = True
 except ImportError:
     _HAS_LXML = False
+
+# JSON support for gateway communication
+import json
+from urllib.parse import urljoin
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Web Gateway helpers (route through Docker proxy when available)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_gateway_available = None  # None = not checked, True/False = cached result
+
+
+def _check_gateway():
+    """Check if the web gateway is reachable. Result is cached."""
+    global _gateway_available
+    if _gateway_available is not None:
+        return _gateway_available
+    if not WEB_GATEWAY_URL:
+        _gateway_available = False
+        return False
+    try:
+        req = Request(f"{WEB_GATEWAY_URL}/health", method="GET")
+        with urlopen(req, timeout=3) as resp:
+            _gateway_available = resp.status == 200
+    except Exception:
+        _gateway_available = False
+    return _gateway_available
+
+
+def _gateway_post(endpoint, payload):
+    """POST JSON to the web gateway. Returns (success, data_dict) or (False, error_str)."""
+    url = f"{WEB_GATEWAY_URL}{endpoint}"
+    body = json.dumps(payload).encode("utf-8")
+    req = Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return True, data
+    except HTTPError as e:
+        try:
+            err_body = json.loads(e.read().decode("utf-8"))
+            return False, err_body.get("detail", f"HTTP {e.code}")
+        except Exception:
+            return False, f"HTTP {e.code}: {e.reason}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _gateway_delete(endpoint):
+    """DELETE request to the web gateway."""
+    url = f"{WEB_GATEWAY_URL}{endpoint}"
+    req = Request(url, method="DELETE")
+    try:
+        with urlopen(req, timeout=10) as resp:
+            return True, json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return False, str(e)
+
+
+def reset_gateway_cache():
+    """Reset the gateway availability cache (e.g., after Docker starts)."""
+    global _gateway_available
+    _gateway_available = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -557,6 +621,7 @@ def run_web_search(query, max_results=8):
     """
     Run a web search with retry and fallback.
 
+    Layer 0: Web Gateway (SearXNG via Docker proxy, sanitized).
     Layer 1: duckduckgo-search library with 3 retries + backoff.
     Layer 2: DuckDuckGo Lite HTML scrape (stdlib only).
     Layer 3: Informative error message.
@@ -566,7 +631,27 @@ def run_web_search(query, max_results=8):
     """
     global _last_search_results
 
-    # --- Layer 1: DDGS library with retry ---
+    # --- Layer 0: Web Gateway (preferred — sanitized, SearXNG-backed) ---
+    if _check_gateway():
+        ok, data = _gateway_post("/search", {"query": query, "max_results": max_results})
+        if ok and data.get("results"):
+            gw_results = data["results"]
+            _last_search_results = [
+                {"title": r.get("title", ""), "url": r.get("url", ""), "body": r.get("snippet", "")}
+                for r in gw_results
+            ]
+            lines = []
+            for i, r in enumerate(gw_results, 1):
+                lines.append(f"[{i}] {r.get('title', 'No title')}")
+                lines.append(f"    {r.get('url', '')}")
+                snippet = r.get("snippet", "")
+                if snippet:
+                    lines.append(f"    {snippet[:400]}")
+                lines.append("")
+            lines.append("Use @web_read(N) to read the full page for result N.")
+            return True, "\n".join(lines)
+
+    # --- Layer 1: DDGS library with retry (fallback for non-Docker use) ---
     results = None
     try:
         from duckduckgo_search import DDGS  # noqa: F401 — import test
@@ -1069,6 +1154,10 @@ def run_web_read(ref):
 
     ref: a URL string, or a number N referencing the Nth result from the last @search().
     Returns (success, output) tuple.
+
+    When the web gateway is available, content is fetched and sanitized through
+    the gateway (trafilatura extraction, prompt injection detection).
+    Falls back to direct fetch for non-Docker use.
     """
     global _last_search_results
 
@@ -1092,6 +1181,32 @@ def run_web_read(ref):
     # Ensure URL has a scheme
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
+
+    # --- Gateway path (preferred — sanitized + prompt injection detection) ---
+    if _check_gateway():
+        ok, data = _gateway_post("/fetch", {"url": url})
+        if ok:
+            text = data.get("text", "")
+            gw_title = data.get("title") or title or url
+            warnings = data.get("warnings", [])
+
+            if not text:
+                return True, "(Page returned no readable text content.)"
+
+            header = f"Source: {gw_title}\nURL: {data.get('url', url)}\n---"
+
+            if warnings:
+                header += f"\n[Security warnings: {'; '.join(warnings)}]"
+
+            if len(text) > _WEB_READ_TRUNCATE:
+                text = text[:_WEB_READ_TRUNCATE] + "\n\n[...page truncated. Key content above.]"
+
+            return True, f"{header}\n{text}"
+        else:
+            # Gateway returned an error — include it
+            return False, f"Web gateway error: {data}"
+
+    # --- Direct fallback (non-Docker use) ---
 
     # Detect if this is a PDF URL
     is_pdf = _is_pdf_url(url)
@@ -1163,10 +1278,14 @@ def run_web_read(ref):
 
 def run_download(content):
     """
-    Download a file from a URL to the current working directory.
+    Download a file from a URL.
 
     content format: "url" or "url|filename"
     Returns (success, output) tuple.
+
+    When the web gateway is available, files are downloaded to a quarantined
+    tmpfs directory (RAM-backed, auto-deleted on session end). Falls back to
+    direct download to ./output/ for non-Docker use.
     """
     parts = content.split("|", 1)
     url = parts[0].strip()
@@ -1175,6 +1294,31 @@ def run_download(content):
     # Ensure URL has a scheme
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
+
+    # --- Gateway path (preferred — quarantined in tmpfs) ---
+    if _check_gateway():
+        payload = {"url": url}
+        if custom_name:
+            payload["filename"] = custom_name
+        ok, data = _gateway_post("/download", payload)
+        if ok:
+            qid = data.get("quarantine_id", "unknown")
+            fname = data.get("filename", "unknown")
+            size = data.get("size_bytes", 0)
+            if size > 1024 * 1024:
+                size_str = f"{size / (1024*1024):.1f} MB"
+            else:
+                size_str = f"{size // 1024} KB"
+            return True, (
+                f"Downloaded: {fname} ({size_str})\n"
+                f"Quarantine ID: {qid}\n"
+                f"Status: Held in secure quarantine (RAM-backed, auto-deleted on session end).\n"
+                f"Content type: {data.get('content_type', 'unknown')}"
+            )
+        else:
+            return False, f"Download blocked by web gateway: {data}"
+
+    # --- Direct fallback (non-Docker use) ---
 
     # Determine filename
     if custom_name:

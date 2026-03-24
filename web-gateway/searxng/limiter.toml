@@ -1,0 +1,6 @@
+# SearXNG rate limiter configuration
+# Since this is an internal-only instance, limits are generous.
+
+[botdetection.ip_limit]
+# Disable link token requirement for API-only use
+link_token = false

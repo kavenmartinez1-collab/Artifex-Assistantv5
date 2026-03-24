@@ -229,8 +229,8 @@ def create_app():
             "http://localhost",
             "http://localhost:5173",    # WebGPU dev server
             "http://localhost:3001",    # Metrics server
-            "http://localhost:5000",    # upstream client suite
-            "http://localhost:8080",    # upstream client suite (alt)
+            "http://localhost:5000",    # Common dev server port
+            "http://localhost:8080",    # Common dev server port
             "http://127.0.0.1",
             "http://127.0.0.1:5173",
             "http://127.0.0.1:3001",
