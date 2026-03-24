@@ -1,6 +1,8 @@
 """
 Artifex Assistant V5 — OpenAI-compatible REST API server.
 Exposes chat completions, image generation, embeddings, and model listing.
+Supports streaming for both Ollama and Transformers backends with optional
+web search tool execution via the Docker web-gateway.
 
 Usage:
     python main_api.py --port 8000
@@ -8,8 +10,10 @@ Usage:
     curl http://localhost:8000/v1/chat/completions -d '{"messages":[...]}'
 """
 
+import asyncio
 import json
 import os
+import queue
 import threading
 import time
 import uuid
@@ -23,9 +27,13 @@ from core.config import (
     MODES, get_active_backend, get_active_model_name, get_model_names,
 )
 from core.engine_factory import create_engine
-from core.inference import strip_think_blocks
+from core.inference import strip_think_blocks, ThinkFilter
 from core.health import run_health_check, format_health_report
 from core.logging_config import get_logger
+from api.web_tools import (
+    extract_web_tools, execute_web_tools, tool_status_labels,
+    gateway_available, MAX_TOOL_ROUNDS,
+)
 
 _log = get_logger(__name__)
 
@@ -80,6 +88,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = Field(0.7, ge=0.0, le=2.0)
     stream: Optional[bool] = False
     options: Optional[dict] = None
+    web_tools: Optional[bool] = False
 
 class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., example="A sunset over mountains")
@@ -90,6 +99,30 @@ class ImageGenerationRequest(BaseModel):
 
 class EmbeddingRequest(BaseModel):
     input: List[str] = Field(..., example=["Hello world"])
+
+
+# ── SSE helpers ──────────────────────────────────────────────────────────
+
+_SENTINEL = object()  # Marks end of generation in queue
+
+
+def _make_sse_chunk(chat_id: str, model: str, delta: dict,
+                    finish_reason=None, extra: dict | None = None) -> str:
+    """Build an SSE-formatted OpenAI chunk with optional extended fields."""
+    event = {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason,
+        }],
+    }
+    if extra:
+        event.update(extra)
+    return f"data: {json.dumps(event)}\n\n"
 
 
 # ── Ollama proxy helpers ───────────────────────────────────────────────
@@ -204,6 +237,245 @@ def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options,
     }
 
 
+# ── Ollama streaming ────────────────────────────────────────────────────
+
+def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
+                       options, timeout, out_queue: queue.Queue):
+    """Stream from Ollama into a queue. Runs in a background thread.
+
+    Pushes (type, data) tuples:
+        ("thinking", text)  — thinking token
+        ("content", text)   — response token
+        ("usage", dict)     — final usage stats
+        _SENTINEL           — marks end of stream
+    """
+    ollama_options = {}
+    if options:
+        ollama_options.update(options)
+    if temperature is not None:
+        ollama_options["temperature"] = temperature
+    if max_tokens is not None:
+        ollama_options["num_predict"] = max_tokens
+
+    payload = {
+        "model": model,
+        "messages": ollama_messages,
+        "stream": True,
+        "think": True,
+        "options": ollama_options,
+    }
+
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        OLLAMA_CHAT_URL, data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except Exception as e:
+        out_queue.put(("error", str(e)))
+        out_queue.put(_SENTINEL)
+        return
+
+    try:
+        for line in resp:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            msg = chunk.get("message", {})
+
+            thinking = msg.get("thinking", "")
+            if thinking:
+                out_queue.put(("thinking", thinking))
+
+            content = msg.get("content", "")
+            if content:
+                out_queue.put(("content", content))
+
+            if chunk.get("done", False):
+                out_queue.put(("usage", {
+                    "prompt_tokens": chunk.get("prompt_eval_count", 0),
+                    "completion_tokens": chunk.get("eval_count", 0),
+                }))
+                break
+    except Exception as e:
+        out_queue.put(("error", str(e)))
+    finally:
+        resp.close()
+        out_queue.put(_SENTINEL)
+
+
+# ── Transformers streaming ──────────────────────────────────────────────
+
+def _stream_transformers_raw(engine, messages, max_tokens, temperature,
+                             out_queue: queue.Queue):
+    """Stream from Transformers engine into a queue. Runs in a background thread.
+
+    Uses ThinkFilter to separate thinking from response content.
+    Pushes same tuple format as _stream_ollama_raw.
+    """
+    tf = ThinkFilter(
+        on_response=lambda t: out_queue.put(("content", t)),
+        on_thinking=lambda t: out_queue.put(("thinking", t)),
+    )
+
+    full_text = ""
+    def on_token(text):
+        nonlocal full_text
+        full_text += text
+        tf.feed(text)
+
+    try:
+        engine.generate_streaming(
+            messages, max_tokens=max_tokens or 4096,
+            temperature=temperature, on_token=on_token,
+        )
+        tf.flush()
+
+        # Approximate token counts
+        out_queue.put(("usage", {
+            "prompt_tokens": sum(len(m.get("content", "")) // 4 for m in messages),
+            "completion_tokens": len(full_text) // 4,
+        }))
+    except Exception as e:
+        out_queue.put(("error", str(e)))
+    finally:
+        out_queue.put(_SENTINEL)
+
+
+# ── Unified streaming with optional tool execution ──────────────────────
+
+async def _stream_with_tools(messages: list, model: str, max_tokens: int,
+                             temperature: float, options: dict,
+                             use_web_tools: bool, backend: str):
+    """Full streaming generator with optional tool execution loop.
+
+    Yields SSE events. Handles both Ollama and Transformers backends.
+    """
+    chat_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    search_cache = []  # Request-scoped cache for @web_read(N)
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+
+    current_messages = list(messages)
+    round_count = 0
+
+    while True:
+        # Start generation in a background thread
+        q = queue.Queue(maxsize=256)
+
+        if backend == "ollama":
+            has_images = _messages_have_images(current_messages)
+            timeout = 600 if has_images else 300
+            ollama_msgs = _convert_messages_for_ollama(current_messages)
+            thread = threading.Thread(
+                target=_stream_ollama_raw,
+                args=(ollama_msgs, model, temperature, max_tokens,
+                      options, timeout, q),
+                daemon=True,
+            )
+        else:
+            engine = _get_engine()
+            thread = threading.Thread(
+                target=_stream_transformers_raw,
+                args=(engine, current_messages, max_tokens, temperature, q),
+                daemon=True,
+            )
+
+        thread.start()
+
+        # Consume queue and yield SSE events, collecting full response
+        full_response = ""
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        loop = asyncio.get_event_loop()
+
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if item is _SENTINEL:
+                break
+
+            kind, data = item
+            if kind == "thinking":
+                yield _make_sse_chunk(chat_id, model, {"x_thinking": data})
+            elif kind == "content":
+                full_response += data
+                yield _make_sse_chunk(chat_id, model, {"content": data})
+            elif kind == "usage":
+                usage = data
+            elif kind == "error":
+                yield f"data: {json.dumps({'error': data})}\n\n"
+
+        thread.join(timeout=10)
+
+        # Accumulate usage across rounds
+        total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+        total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+
+        _log.info("Generation complete: %d chars, web_tools=%s, response='%s'",
+                   len(full_response), use_web_tools, full_response[:120])
+
+        # ── Tool execution check ──────────────────────────────────────
+        if not use_web_tools:
+            _log.info("web_tools disabled, skipping tool check")
+            break
+
+        tools = extract_web_tools(full_response)
+        has_gw = gateway_available() if tools else False
+        _log.info("Tool check: %d tools found, gateway=%s", len(tools), has_gw)
+
+        if not tools or not has_gw:
+            if tools and not has_gw:
+                _log.warning("Model requested tools but web gateway unavailable")
+            break
+
+        round_count += 1
+        if round_count > MAX_TOOL_ROUNDS:
+            _log.warning("Max tool rounds (%d) reached", MAX_TOOL_ROUNDS)
+            break
+
+        _log.info("Tool round %d: %d tools detected", round_count, len(tools))
+
+        # Notify client that tools are executing
+        labels = tool_status_labels(tools)
+        yield f"data: {json.dumps({'x_tool_status': labels})}\n\n"
+
+        # Execute tools (blocking, but SSE connection stays open)
+        try:
+            tool_output = await loop.run_in_executor(
+                None, lambda: execute_web_tools(tools, search_cache)
+            )
+            _log.info("Tool execution complete: %d chars of results", len(tool_output))
+        except Exception as e:
+            _log.error("Tool execution error: %s", e)
+            tool_output = f"Tool execution failed: {e}"
+
+        # Signal client to reset for follow-up response
+        yield f"data: {json.dumps({'x_tool_done': True})}\n\n"
+        _log.info("Starting follow-up generation with tool results")
+
+        # Build follow-up messages with tool results
+        current_messages.append({"role": "assistant", "content": full_response})
+        current_messages.append({
+            "role": "user",
+            "content": (
+                f"[Tool results — use this data to answer the original question]\n\n"
+                f"{tool_output}"
+            ),
+        })
+        # Loop continues with new generation round
+
+    # ── Final events ──────────────────────────────────────────────────
+    yield _make_sse_chunk(chat_id, model, {}, finish_reason="stop",
+                          extra={"x_usage": total_usage})
+    yield "data: [DONE]\n\n"
+
+
 def create_app():
     """Create and configure the FastAPI application."""
     try:
@@ -219,10 +491,10 @@ def create_app():
     app = FastAPI(
         title="Artifex Assistant V5 API",
         version="5.0.0",
-        description="OpenAI-compatible local AI API",
+        description="OpenAI-compatible local AI API with web search tools",
     )
 
-    # CORS: only allow localhost origins since we bind to 127.0.0.1
+    # CORS: allow localhost origins for local development
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -231,11 +503,13 @@ def create_app():
             "http://localhost:3001",    # Metrics server
             "http://localhost:5000",    # Common dev server port
             "http://localhost:8080",    # Common dev server port
+            "http://localhost:8114",    # upstream client suite
             "http://127.0.0.1",
             "http://127.0.0.1:5173",
             "http://127.0.0.1:3001",
             "http://127.0.0.1:5000",
             "http://127.0.0.1:8080",
+            "http://127.0.0.1:8114",
         ],
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "X-API-Key"],
@@ -257,6 +531,9 @@ def create_app():
         if not _check_auth(request):
             raise HTTPException(status_code=401, detail="Invalid API key")
         report = run_health_check()
+        # Include web gateway status and backend info
+        report["web_gateway"] = gateway_available()
+        report["backend"] = get_active_backend()
         return report
 
     # ─── Models ───────────────────────────────────────────────────────────
@@ -289,13 +566,51 @@ def create_app():
         temperature = body.temperature
         stream = body.stream
         model = body.model or get_active_model_name()
+        use_web_tools = body.web_tools or False
+        backend = get_active_backend()
 
         if not messages:
             raise HTTPException(status_code=400, detail="messages is required")
 
-        # ── Ollama proxy path ──────────────────────────────────────────
-        if get_active_backend() == "ollama":
-            # Concurrency gate — reject if GPU is already busy
+        # ── Streaming path (both backends) ────────────────────────────
+        if stream:
+            # Concurrency gate
+            if _inference_busy.is_set():
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "GPU busy — retry later"},
+                    headers={"Retry-After": "30"},
+                )
+
+            _inference_busy.set()
+
+            async def guarded_stream():
+                """Wrap streaming generator with inference lock."""
+                try:
+                    if backend == "ollama":
+                        _get_engine()  # Verify Ollama is reachable
+                    async for chunk in _stream_with_tools(
+                        messages, model, max_tokens or 4096, temperature,
+                        body.options, use_web_tools, backend,
+                    ):
+                        yield chunk
+                except Exception as e:
+                    _log.error("Streaming error: %s", e)
+                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                finally:
+                    _inference_busy.clear()
+
+            return StreamingResponse(
+                guarded_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        # ── Non-streaming path ────────────────────────────────────────
+        if backend == "ollama":
             if _inference_busy.is_set():
                 return JSONResponse(
                     status_code=503,
@@ -305,9 +620,7 @@ def create_app():
 
             _inference_busy.set()
             try:
-                # Ensure Ollama engine is initialized (model verified, num_gpu set)
                 _get_engine()
-
                 has_images = _messages_have_images(messages)
                 timeout = 600 if has_images else 300
                 ollama_msgs = _convert_messages_for_ollama(messages)
@@ -317,7 +630,6 @@ def create_app():
                     model, has_images, len(messages),
                 )
 
-                import asyncio
                 loop = asyncio.get_event_loop()
                 result = await loop.run_in_executor(
                     None,
@@ -333,17 +645,8 @@ def create_app():
             finally:
                 _inference_busy.clear()
 
-        # ── Transformers engine path (existing) ────────────────────────
+        # Transformers non-streaming
         engine = _get_engine()
-
-        if stream:
-            return StreamingResponse(
-                _stream_chat(engine, messages, max_tokens, temperature, model),
-                media_type="text/event-stream",
-            )
-
-        # Non-streaming — run in thread to avoid blocking the event loop
-        import asyncio
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
@@ -373,56 +676,6 @@ def create_app():
                                 + len(response) // 4),
             },
         }
-
-    async def _stream_chat(engine, messages, max_tokens, temperature, model):
-        """Stream SSE events for chat completions."""
-        chat_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-        chunks = []
-
-        def on_token(text):
-            chunks.append(text)
-
-        # Run generation in a thread to not block the event loop
-        import asyncio
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: engine.generate_streaming(
-                messages, max_tokens=max_tokens, temperature=temperature,
-                on_token=on_token,
-            ),
-        )
-
-        # Emit accumulated chunks as SSE
-        for chunk_text in chunks:
-            clean = strip_think_blocks(chunk_text) if "</think>" in chunk_text else chunk_text
-            if not clean:
-                continue
-            event = {
-                "id": chat_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": clean},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-            yield f"data: {json.dumps(event)}\n\n"
-
-        # Final event
-        final = {
-            "id": chat_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        }
-        yield f"data: {json.dumps(final)}\n\n"
-        yield "data: [DONE]\n\n"
 
     # ─── Image Generation ────────────────────────────────────────────────
 

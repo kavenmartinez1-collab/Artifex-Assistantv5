@@ -159,6 +159,10 @@ python main.py          # CLI — interactive assistant with agent tools
 python main_gui.py      # GUI — cyberpunk desktop interface
 python main_api.py      # API — OpenAI-compatible REST server on :8000
 launch.bat              # Windows — double-click desktop shortcut
+
+# API server with full options
+python main_api.py --backend ollama --gateway http://localhost:8080 --port 8000
+python main_api.py --backend transformers --model qwen3.5-27b-distilled --gateway http://localhost:8080
 ```
 
 ### Step 5: Verify Everything Works
@@ -239,18 +243,44 @@ OpenAI-compatible REST API. **Binds to 127.0.0.1 by default — localhost only.*
 ### Starting the Server
 
 ```bash
-python main_api.py                              # Default: 127.0.0.1:8000
+python main_api.py                              # Default: 127.0.0.1:8000, auto-detect backend
 python main_api.py --port 8080                  # Custom port
-python main_api.py --port 8000 --reload         # Auto-reload on code changes
+python main_api.py --backend ollama             # Force Ollama backend
+python main_api.py --backend transformers       # Force Transformers backend
+python main_api.py --model qwen3.5-27b-distilled  # Select specific model (Transformers)
+python main_api.py --model qwen3.5:27b          # Select specific model (Ollama)
+python main_api.py --gateway http://localhost:8080  # Enable web search tools via gateway
+python main_api.py --reload                     # Auto-reload on code changes
 ```
+
+**Full example with all options:**
+
+```bash
+# Ollama backend with web search
+python main_api.py --backend ollama --gateway http://localhost:8080 --port 8000
+
+# Transformers backend with web search and specific model
+python main_api.py --backend transformers --model qwen3.5-27b-distilled --gateway http://localhost:8080 --port 8000
+```
+
+### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host` | `127.0.0.1` | Bind address (use `0.0.0.0` for network access) |
+| `--port` | `8000` | Server port |
+| `--backend` | auto-detect | `ollama` or `transformers` |
+| `--model` | auto-detect | Model name (folder name for transformers, Ollama name for ollama) |
+| `--gateway` | *(none)* | Web gateway URL for `@search`/`@web_read` tool execution |
+| `--reload` | off | Auto-reload on code changes (development) |
 
 ### API Endpoints
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/health` | System diagnostics (GPU, VRAM, models, Ollama, deps, disk) |
+| GET | `/health` | System diagnostics (GPU, VRAM, models, backend, web gateway status) |
 | GET | `/v1/models` | List available models |
-| POST | `/v1/chat/completions` | Chat completion (streaming or non-streaming) |
+| POST | `/v1/chat/completions` | Chat completion (streaming or non-streaming, with optional web tools) |
 | POST | `/v1/images/generations` | Image generation |
 | POST | `/v1/embeddings` | Generate embeddings |
 | GET | `/docs` | Interactive Swagger API documentation |
@@ -258,32 +288,67 @@ python main_api.py --port 8000 --reload         # Auto-reload on code changes
 ### Example Requests
 
 ```bash
-# Health check
+# Health check (includes backend and web gateway status)
 curl http://localhost:8000/health
 
 # List models
 curl http://localhost:8000/v1/models
 
-# Chat completion
+# Chat completion (non-streaming)
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3.5-9b",
+    "model": "qwen3.5:27b",
     "messages": [{"role": "user", "content": "Hello!"}],
     "max_tokens": 200,
     "temperature": 0.7,
     "stream": false
   }'
 
-# Streaming chat
-curl http://localhost:8000/v1/chat/completions \
+# Streaming chat (both Ollama and Transformers backends supported)
+curl -N http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3.5-9b",
+    "model": "qwen3.5:27b",
     "messages": [{"role": "user", "content": "Tell me a story"}],
     "stream": true
   }'
+
+# Streaming with web search tools enabled
+curl -N http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5:27b",
+    "messages": [
+      {"role": "system", "content": "You have @search and @web_read tools. Use them for current info."},
+      {"role": "user", "content": "What are the latest Python release notes?"}
+    ],
+    "stream": true,
+    "web_tools": true
+  }'
 ```
+
+### Web Tools in the API
+
+When `web_tools: true` is set in a streaming request and the `--gateway` is configured, the API:
+
+1. Streams the model's response (including thinking blocks) in real-time
+2. Detects `@search("query")` and `@web_read(N)` markers in the response
+3. Executes them through the web gateway (SearXNG search, content extraction)
+4. Feeds results back to the model for a follow-up response
+5. Streams the final answer with real web data
+
+The SSE stream uses an extended OpenAI format with these additional fields:
+
+| SSE Field | Description |
+|-----------|-------------|
+| `delta.x_thinking` | Model's reasoning/thinking tokens (separate from content) |
+| `delta.content` | Standard response content tokens |
+| `x_tool_status` | Array of tool execution labels (e.g., `["Searching: query"]`) |
+| `x_tool_done` | Signals tool execution complete, follow-up response starting |
+| `x_usage` | Token usage stats on the final chunk |
+
+Standard OpenAI clients will ignore the `x_` fields and receive normal content. Clients that understand the extensions (like upstream client suite) can render thinking blocks, tool indicators, and usage stats.
 
 ### Authentication
 
@@ -389,14 +454,16 @@ The Web Gateway adds safe, sandboxed web search and content retrieval to Artifex
 # 1. Start the web gateway + search engine (~500 MB, no GPU needed)
 docker compose up
 
-# 2. Set the gateway URL and run Artifex locally
-set WEB_GATEWAY_URL=http://localhost:8080    # Windows
-export WEB_GATEWAY_URL=http://localhost:8080  # Linux/Mac
-
+# 2a. Run the CLI with gateway
+$env:WEB_GATEWAY_URL = "http://localhost:8080"    # PowerShell
+export WEB_GATEWAY_URL=http://localhost:8080       # Linux/Mac/bash
 python main.py
+
+# 2b. Or run the API server with --gateway flag (no env var needed)
+python main_api.py --backend ollama --gateway http://localhost:8080
 ```
 
-Now when the model uses `@search("query")` or `@web_read(url)`, requests are routed through the gateway. If Docker isn't running, it falls back to direct DuckDuckGo search automatically.
+Now when the model uses `@search("query")` or `@web_read(url)`, requests are routed through the gateway. If Docker isn't running, the CLI falls back to direct DuckDuckGo search automatically. The API server requires the gateway for web tools (`web_tools: true` in requests).
 
 ### Safety Features
 
@@ -446,6 +513,17 @@ All ports are configurable. Default values and where to change them:
 | SearXNG | `8080` (internal) | `web-gateway/searxng/settings.yml` (`server.port`) | — |
 | Ollama | `11434` | Ollama default | `OLLAMA_HOST` |
 
+**Connecting the API server to the web gateway:**
+
+```bash
+# Via CLI flag (recommended)
+python main_api.py --gateway http://localhost:8080
+
+# Via environment variable (CLI/GUI only)
+$env:WEB_GATEWAY_URL = "http://localhost:8080"    # PowerShell
+export WEB_GATEWAY_URL=http://localhost:8080       # Linux/Mac/bash
+```
+
 **Changing the web gateway port:**
 
 1. Update `docker-compose.yml` — change the `ports` mapping under `web-gateway` (e.g., `"9090:8080"` to expose on host port 9090)
@@ -459,9 +537,19 @@ python main_api.py --port 9000
 
 **Integrating with external applications:**
 
-The web gateway is a standalone HTTP service. Any application can use it by calling the gateway endpoints (`/search`, `/fetch`, `/download`) directly. Set `WEB_GATEWAY_URL` as an environment variable or configure it in your application's settings to point at the gateway.
+The Artifex API server is designed as a standalone backend that any frontend can connect to. To integrate:
 
-The Artifex API server includes a CORS allowlist in `api/server.py`. Add your application's origin to the `allow_origins` list if you need cross-origin access.
+1. Start the API: `python main_api.py --backend ollama --gateway http://localhost:8080`
+2. POST to `/v1/chat/completions` with `stream: true` and `web_tools: true`
+3. Parse the SSE stream — standard OpenAI format with optional `x_thinking`, `x_tool_status`, `x_tool_done`, and `x_usage` extensions
+4. The API handles all backend selection, model management, and tool execution internally
+
+Your application only needs to:
+- Send messages to the Artifex API
+- Parse the SSE response stream
+- Render thinking blocks, tool indicators, and content tokens as desired
+
+The API server includes a CORS allowlist in `api/server.py`. Add your application's origin to the `allow_origins` list if you need cross-origin browser access (not needed for server-to-server proxying).
 
 ### Stopping the Gateway
 
@@ -481,9 +569,13 @@ docker system prune          # Clean up unused images
 # Start just the web gateway + SearXNG (~500 MB total)
 docker compose up
 
-# Run Artifex locally with gateway
-set WEB_GATEWAY_URL=http://localhost:8080
+# Option A: Run the CLI with env var
+$env:WEB_GATEWAY_URL = "http://localhost:8080"    # PowerShell
+export WEB_GATEWAY_URL=http://localhost:8080       # Linux/Mac/bash
 python main.py
+
+# Option B: Run the API server with --gateway flag (recommended for external apps)
+python main_api.py --backend ollama --gateway http://localhost:8080
 ```
 
 ### Full Containerized Deployment
@@ -696,7 +788,8 @@ Artifex-Assistant-V5/
     gui_theme.py           # GUI theming
     terminal.py            # Terminal utilities
   api/
-    server.py              # FastAPI OpenAI-compatible REST API
+    server.py              # FastAPI OpenAI-compatible REST API (streaming for both backends, tool execution)
+    web_tools.py           # Web search tool extraction and execution (@search, @web_read only)
   tools/
     agent_tools.py         # Shell, Python, web search, file ops, edit (gateway-aware)
     codebase_tools.py      # Code analysis, symbol search, architecture mapping
@@ -738,7 +831,9 @@ Artifex-Assistant-V5/
 | `CUDA_VISIBLE_DEVICES` | `0` | GPU device index (for multi-GPU systems) |
 | `CUDA_MODULE_LOADING` | `LAZY` | Deferred CUDA kernel compilation (saves ~300-400 MB VRAM) |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True,garbage_collection_threshold:0.8` | CUDA memory allocation tuning |
-| `WEB_GATEWAY_URL` | *(none)* | Web gateway URL (e.g., `http://localhost:8080`). When set, web search/fetch/download route through the gateway for sanitization. Auto-set in Docker full profile. |
+| `WEB_GATEWAY_URL` | *(none)* | Web gateway URL for CLI/GUI (e.g., `http://localhost:8080`). For the API server, use `--gateway` flag instead. Auto-set in Docker full profile. |
+
+> **Note on environment variables in PowerShell:** Use `$env:VAR = "value"` syntax (not `set VAR=value` which is CMD-only). For the API server, the `--gateway` flag avoids env var hassles entirely.
 
 ### Context Profiles
 
