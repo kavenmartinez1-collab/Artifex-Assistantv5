@@ -11,6 +11,47 @@ Universal Local AI Hosting Platform. Run any AI model locally — text generatio
 
 **Everything runs locally. All servers bind to 127.0.0.1 only. Nothing is exposed to the network.**
 
+## Table of Contents
+
+- [Features](#features)
+- [Verified Test Results](#verified-test-results-2026-03-22)
+- [Supported GPU Tiers](#supported-gpu-tiers)
+- [Prerequisites](#prerequisites)
+- [Setup Guide](#setup-guide)
+- [Using the CLI](#using-the-cli-python-mainpy)
+- [Using the GUI](#using-the-gui-python-main_guipy)
+- [Using the API Server](#using-the-api-server-python-main_apipy)
+  - [Starting the Server](#starting-the-server)
+  - [CLI Flags](#cli-flags)
+  - [API Endpoints](#api-endpoints)
+  - [Web Tools in the API](#web-tools-in-the-api)
+  - [Authentication](#authentication)
+- [Setting Up Ollama Backend](#setting-up-ollama-backend)
+- [Web Gateway (Secure Web Search)](#web-gateway-secure-web-search)
+  - [Architecture](#architecture)
+  - [Quick Start](#quick-start)
+  - [Safety Features](#safety-features)
+  - [Port Configuration](#port-configuration)
+- [Docker Deployment](#docker-deployment)
+  - [Docker Profiles](#docker-profiles)
+  - [Network Isolation](#network-isolation-full-profile)
+- [Multi-Modal Pipelines](#multi-modal-pipelines)
+- [Agent Tools](#agent-tools)
+- [WebGPU Engine](#webgpu-engine)
+- [Project Structure](#project-structure)
+- [Configuration](#configuration)
+  - [Environment Variables](#environment-variables)
+  - [Context Profiles](#context-profiles)
+  - [Modes](#modes)
+- [Security](#security)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
+- [Requirements](#requirements)
+- [Acknowledgments](#acknowledgments)
+- [License](#license)
+
+---
+
 ## Features
 
 - **Multi-modal inference** — 10 pipeline types: text, image, image editing, 3D mesh, vision, audio, speech recognition, music, video, embeddings
