@@ -18,7 +18,7 @@ from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from urllib.parse import urlencode
 
-from core.config import IS_WINDOWS, ASSISTANT_DANGEROUS_PATTERNS, WEB_GATEWAY_URL
+from core.config import IS_WINDOWS, ASSISTANT_DANGEROUS_PATTERNS, WEB_GATEWAY_URL, GATEWAY_AUTH_TOKEN
 from core.hardware import sense_system
 
 # HTML parsing: lxml for quality, stdlib HTMLParser always available as fallback
@@ -62,7 +62,10 @@ def _gateway_post(endpoint, payload):
     """POST JSON to the web gateway. Returns (success, data_dict) or (False, error_str)."""
     url = f"{WEB_GATEWAY_URL}{endpoint}"
     body = json.dumps(payload).encode("utf-8")
-    req = Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    headers = {"Content-Type": "application/json"}
+    if GATEWAY_AUTH_TOKEN:
+        headers["X-Gateway-Token"] = GATEWAY_AUTH_TOKEN
+    req = Request(url, data=body, headers=headers, method="POST")
     try:
         with urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -80,7 +83,10 @@ def _gateway_post(endpoint, payload):
 def _gateway_delete(endpoint):
     """DELETE request to the web gateway."""
     url = f"{WEB_GATEWAY_URL}{endpoint}"
-    req = Request(url, method="DELETE")
+    headers = {}
+    if GATEWAY_AUTH_TOKEN:
+        headers["X-Gateway-Token"] = GATEWAY_AUTH_TOKEN
+    req = Request(url, method="DELETE", headers=headers)
     try:
         with urlopen(req, timeout=10) as resp:
             return True, json.loads(resp.read().decode("utf-8"))

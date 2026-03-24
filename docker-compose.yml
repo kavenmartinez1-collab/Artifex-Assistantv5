@@ -17,6 +17,9 @@ services:
     environment:
       - SEARXNG_URL=http://searxng:8080
       - QUARANTINE_DIR=/quarantine
+      # Optional: set a shared secret to require auth on gateway requests
+      # Leave empty (default) to disable. Health endpoint is always open.
+      - GATEWAY_AUTH_TOKEN=${GATEWAY_AUTH_TOKEN:-}
     tmpfs:
       - /quarantine:size=256m,mode=1777
     networks:
@@ -33,12 +36,17 @@ services:
 
   # SearXNG — self-hosted meta-search engine (API-only mode)
   # ~350 MB image (pre-built from Docker Hub)
+  # NOTE: SearXNG listens on port 8080 *inside its own container*.
+  # It is NOT exposed to the host — only reachable by web-gateway
+  # via the Docker network at http://searxng:8080.
+  # No port conflict with web-gateway (which also uses 8080 in its container).
   searxng:
     image: searxng/searxng:latest
     volumes:
       - ./web-gateway/searxng/settings.yml:/etc/searxng/settings.yml:ro
       - ./web-gateway/searxng/limiter.toml:/etc/searxng/limiter.toml:ro
     environment:
+      # SearXNG's own base URL setting (internal to its container, not exposed to host)
       - SEARXNG_BASE_URL=http://localhost:8080/
     networks:
       - ai_external
@@ -65,6 +73,7 @@ services:
       - ARTIFEX_API_KEY=${ARTIFEX_API_KEY:-}
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
       - WEB_GATEWAY_URL=http://web-gateway:8080
+      - GATEWAY_AUTH_TOKEN=${GATEWAY_AUTH_TOKEN:-}
     networks:
       - ai_internal
       - ai_external

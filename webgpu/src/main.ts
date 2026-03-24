@@ -2,16 +2,19 @@
  * Artifex WebGPU Engine — Main Entry Point
  *
  * Initializes WebGPU, runs kernel tests, and sets up the chat UI.
- * This is Phase 0-1: device detection, compute foundation, and UI shell.
+ * Phase 0-1: device detection, compute foundation, UI shell.
+ * Phase 2: SafeTensors weight loading from HuggingFace.
  */
 
 import { initWebGPU, type GPUContext } from './engine/gpu-device';
 import { reportMetric, reportError, timed } from './utils/metrics';
 import { runKernelTests } from './engine/kernel-tests';
+import { loadModel, unloadModel, previewModel, formatBytes, getCacheStats, clearCache, type LoadedModel } from './model';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
 let gpu: GPUContext | null = null;
+let currentModel: LoadedModel | null = null;
 
 // ─── DOM Elements ────────────────────────────────────────────────────────────
 
@@ -205,22 +208,74 @@ sendBtn.addEventListener('click', async () => {
   sendBtn.disabled = false;
 });
 
-// ─── Load Model (placeholder) ────────────────────────────────────────────────
+// ─── Load Model ──────────────────────────────────────────────────────────────
 
 loadBtn.addEventListener('click', async () => {
   const repo = ($('model-repo') as HTMLInputElement).value.trim();
   if (!repo) return;
 
-  const progress = $('load-progress');
-  progress.textContent = 'Loading not yet implemented — Phase 2+3+4 required';
+  if (!gpu) {
+    addMessage('system', 'No GPU — initialize WebGPU first.');
+    return;
+  }
 
-  addMessage('system',
-    `Model loading (${repo}) requires:\n` +
-    '  - SafeTensors parser (Phase 2)\n' +
-    '  - Tokenizer (Phase 3)\n' +
-    '  - Qwen3.5 forward pass (Phase 4)\n\n' +
-    'The GPU compute layer is ready. Kernel tests verify correct operation.'
-  );
+  // Unload previous model if loaded
+  if (currentModel) {
+    unloadModel(currentModel);
+    currentModel = null;
+  }
+
+  const progressEl = $('load-progress');
+  loadBtn.disabled = true;
+  setStatus(`Loading ${repo}...`);
+
+  try {
+    // Preview first (just headers, fast)
+    addMessage('system', `Connecting to HuggingFace: ${repo}...`);
+
+    const preview = await previewModel(repo, (p) => {
+      progressEl.textContent = p.message;
+    });
+
+    addMessage('system',
+      `Model: ${repo}\n` +
+      `Type: ${preview.config.model_type}\n` +
+      `Layers: ${preview.config.num_hidden_layers} | Hidden: ${preview.config.hidden_size}\n` +
+      `Tensors: ${preview.tensorCount} | Size: ${formatBytes(preview.totalBytes)}\n` +
+      `Dtypes: ${preview.dtypes.join(', ')}\n` +
+      `GPU needed: ~${formatBytes(preview.tensorCount * 4 * (preview.totalBytes / preview.tensorCount / 2))} (float32)`,
+      'model preview'
+    );
+
+    // Full load — download weights and upload to GPU
+    currentModel = await loadModel(gpu.device, repo, (p) => {
+      progressEl.textContent = p.message;
+      if (p.overallProgress !== undefined) {
+        const pct = Math.round(p.overallProgress * 100);
+        setStatus(`Loading ${repo}... ${pct}%`);
+      }
+    });
+
+    addMessage('system',
+      `Model loaded: ${currentModel.repo}\n` +
+      `Tensors: ${currentModel.tensorCount}\n` +
+      `GPU memory: ${formatBytes(currentModel.totalGPUBytes)}\n` +
+      `Load time: ${(currentModel.loadTimeMs / 1000).toFixed(1)}s`,
+      'model loaded'
+    );
+
+    setStatus(`Model ready: ${repo}`);
+    updateFooter({ model: repo.split('/').pop() || repo });
+
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    progressEl.textContent = `Error: ${msg}`;
+    addMessage('system', `Failed to load ${repo}: ${msg}`);
+    setStatus('Load failed');
+    reportError('model-load', err);
+  } finally {
+    loadBtn.disabled = false;
+  }
 });
 
 // ─── Clear / Export / Unload ─────────────────────────────────────────────────
@@ -247,9 +302,30 @@ exportBtn.addEventListener('click', () => {
   URL.revokeObjectURL(url);
 });
 
-unloadBtn.addEventListener('click', () => {
-  addMessage('system', 'Model unloaded (no model was loaded).');
-  setStatus('Model unloaded');
+unloadBtn.addEventListener('click', async () => {
+  if (currentModel) {
+    const name = currentModel.repo;
+    const freed = formatBytes(currentModel.totalGPUBytes);
+    unloadModel(currentModel);
+    currentModel = null;
+    addMessage('system', `Model unloaded: ${name} — freed ${freed} GPU memory`);
+    setStatus('Model unloaded');
+    updateFooter({ model: 'none' });
+  } else {
+    addMessage('system', 'No model loaded.');
+  }
+});
+
+// ─── Cache Management ────────────────────────────────────────────────────────
+
+// Show cache stats on boot (async, non-blocking)
+getCacheStats().then(stats => {
+  if (stats.itemCount > 0) {
+    console.log(`[Cache] ${stats.itemCount} shards cached (${formatBytes(stats.totalBytes)})`);
+    for (const [repo, info] of stats.models) {
+      console.log(`  ${repo}: ${info.shardCount} shards, ${formatBytes(info.totalBytes)}`);
+    }
+  }
 });
 
 // ─── Boot ────────────────────────────────────────────────────────────────────

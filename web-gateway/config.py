@@ -12,6 +12,11 @@ PORT = int(os.getenv("GATEWAY_PORT", "8080"))
 # SearXNG base URL (internal Docker network)
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080")
 
+# ── Authentication (optional) ───────────────────────────────────────────────
+# Set GATEWAY_AUTH_TOKEN on both the gateway and clients to require a shared
+# secret on every request. Empty string = auth disabled (default).
+GATEWAY_AUTH_TOKEN = os.getenv("GATEWAY_AUTH_TOKEN", "")
+
 # ── Rate Limits ──────────────────────────────────────────────────────────────
 # Requests per minute per session
 RATE_LIMIT_SEARCH = os.getenv("RATE_LIMIT_SEARCH", "20/minute")
