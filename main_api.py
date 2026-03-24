@@ -20,6 +20,10 @@ def main():
     parser.add_argument("--reload", action="store_true", help="Auto-reload on code changes")
     parser.add_argument("--backend", default=None, choices=["transformers", "ollama"],
                         help="Backend to use (default: auto-detect)")
+    parser.add_argument("--model", default=None,
+                        help="Model name (e.g. qwen3.5-27b-distilled for transformers, qwen3.5:27b for ollama)")
+    parser.add_argument("--gateway", default=None,
+                        help="Web gateway URL for search tools (e.g. http://localhost:8080)")
     args = parser.parse_args()
 
     setup_logging()
@@ -27,6 +31,18 @@ def main():
     if args.backend:
         from core.config import set_active_backend
         set_active_backend(args.backend)
+
+    if args.model:
+        from core.config import set_active_model, MODELS, OLLAMA_MODELS
+        if not set_active_model(args.model):
+            available = list(MODELS.keys()) or list(OLLAMA_MODELS.keys()) or ["(none found)"]
+            print(f"WARNING: Model '{args.model}' not found in registry.")
+            print(f"Available models: {', '.join(available)}")
+            print(f"Using default model instead.")
+
+    if args.gateway:
+        import api.web_tools as wt
+        wt.WEB_GATEWAY_URL = args.gateway
 
     try:
         import uvicorn
