@@ -154,6 +154,8 @@ export function createForwardPassEngine(
   const gateBuf = createStorageBuffer(device, null, maxSeq * ffnDim * 4, 'ffn-gate', true);
   const upBuf = createStorageBuffer(device, null, maxSeq * ffnDim * 4, 'ffn-up', true);
   const downBuf = createStorageBuffer(device, null, maxSeq * H * 4, 'ffn-down', true);
+  // Temp buffer for in-place elementwise ops (WebGPU can't read+write same buffer)
+  const ffnTempBuf = createStorageBuffer(device, null, maxSeq * ffnDim * 4, 'ffn-temp', true);
   const logitsBuf = createStorageBuffer(device, null, V * 4, 'logits', true);
   const tokenIdBuf = createStorageBuffer(device, null, 256 * 4, 'token-ids', true); // up to 256 tokens
 
@@ -170,7 +172,8 @@ export function createForwardPassEngine(
       { binding: 2, resource: { buffer: cBuf } },
       { binding: 3, resource: { buffer: params } },
     ], label);
-    dispatch(device, matmulPipeline, [bg], [Math.ceil(N / 16), Math.ceil(M / 16)], label);
+    // Shader: row = wid.x (M dim), col = wid.y (N dim)
+    dispatch(device, matmulPipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
     params.destroy();
   }
 
@@ -186,7 +189,8 @@ export function createForwardPassEngine(
       { binding: 2, resource: { buffer: cBuf } },
       { binding: 3, resource: { buffer: params } },
     ], label);
-    dispatch(device, matmulBTPipeline, [bg], [Math.ceil(N / 16), Math.ceil(M / 16)], label);
+    // Shader: row = wid.x (M dim), col = wid.y (N dim)
+    dispatch(device, matmulBTPipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
     params.destroy();
   }
 
@@ -370,8 +374,9 @@ export function createForwardPassEngine(
       dispatchMatmulBT(normedBuf, lw.upProj, upBuf, seqLen, ffnDim, H, `L${l}-up`);
 
       // MODEL-SPECIFIC: SiLU for most models, GELU for some
-      dispatchElementwise(siluPipeline, gateBuf, gateBuf, seqLen * ffnDim, `L${l}-silu`);
-      dispatchElementwise(mulPipeline, gateBuf, gateBuf, seqLen * ffnDim, `L${l}-mul`, upBuf);
+      // Cannot use same buffer for input and output in WebGPU — use dedicated temp
+      dispatchElementwise(siluPipeline, gateBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silu`);
+      dispatchElementwise(mulPipeline, ffnTempBuf, gateBuf, seqLen * ffnDim, `L${l}-mul`, upBuf);
 
       dispatchMatmulBT(gateBuf, lw.downProj, downBuf, seqLen, H, ffnDim, `L${l}-down`);
 

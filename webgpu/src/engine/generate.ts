@@ -175,12 +175,12 @@ function sampleFromLogits(
 // ── Generation Loop ──────────────────────────────────────────────────────
 
 /**
- * Generate text from a prompt.
+ * Generate text from a prompt (string or pre-tokenized IDs).
  *
  * @param device    - WebGPU device (for reading logits back)
  * @param engine    - Forward pass engine
- * @param tokenizer - Tokenizer for encode/decode
- * @param prompt    - Input text (or pre-formatted chat template)
+ * @param tokenizer - Tokenizer for decode
+ * @param prompt    - Input text string OR pre-tokenized token IDs (from applyChatTemplate)
  * @param sampling  - Sampling configuration
  * @param onToken   - Optional callback for streaming output
  * @returns GenerationHandle with result promise and abort function
@@ -189,7 +189,7 @@ export function generate(
   device: GPUDevice,
   engine: ForwardPassEngine,
   tokenizer: Tokenizer,
-  prompt: string,
+  prompt: string | number[],
   sampling: SamplingConfig = {},
   onToken?: OnTokenCallback,
 ): GenerationHandle {
@@ -207,8 +207,9 @@ export function generate(
     const startTime = performance.now();
 
     // ── Step 1: Tokenize ─────────────────────────────────────────────
-    const promptIds = tokenizer.encode(prompt);
+    const promptIds = typeof prompt === 'string' ? tokenizer.encode(prompt) : prompt;
     const promptTokens = promptIds.length;
+    console.log(`[Generate] Prompt: ${promptTokens} tokens, first 5: [${promptIds.slice(0, 5).join(', ')}]`);
 
     if (promptTokens === 0) {
       return {
