@@ -144,11 +144,15 @@ export async function loadModel(
     const useStreaming = shard.size > MAX_FULL_DOWNLOAD;
 
     if (useStreaming) {
-      console.log(`[WeightLoader] Shard ${shardIdx + 1}: streaming ${header.tensors.size} tensors (${formatBytes(shard.size)} too large for single download)`);
+      console.log(`[WeightLoader] Shard ${shardIdx + 1}: chunked download for ${header.tensors.size} tensors (${formatBytes(shard.size)})`);
     }
 
     // For small shards, download the whole file at once (faster, cacheable)
     let shardData: ArrayBuffer | null = null;
+    // For large shards, download in ~512MB chunks (covers many tensors per chunk)
+    const CHUNK_SIZE = 512 * 1024 * 1024; // 512 MB
+    const chunkCache = new Map<number, ArrayBuffer>(); // chunk_index → data
+
     if (!useStreaming) {
       const cached = await hasCache(cacheKey);
       if (cached) {
@@ -179,22 +183,44 @@ export async function loadModel(
 
     let tensorIdx = 0;
     for (const [name, tensorInfo] of header.tensors) {
-      // Get raw tensor bytes — either from full shard or via range request
+      // Get raw tensor bytes — either from full shard or via chunked range requests
       let rawData: ArrayBuffer;
       if (shardData) {
         rawData = extractTensorData(shardData, tensorInfo, header.headerByteLength);
       } else {
-        // Streaming: download just this tensor via HTTP range request
+        // Chunked streaming: download 512MB chunks on demand, reuse for adjacent tensors
         const dataStart = header.headerByteLength + tensorInfo.dataOffsets[0];
         const dataEnd = header.headerByteLength + tensorInfo.dataOffsets[1];
-        rawData = await fetchRange(shard.url, dataStart, dataEnd);
+        const tensorSize = dataEnd - dataStart;
+
+        if (tensorSize > CHUNK_SIZE) {
+          // Very large tensor — download directly
+          rawData = await fetchRange(shard.url, dataStart, dataEnd);
+        } else {
+          // Find which chunk this tensor falls in
+          const chunkIdx = Math.floor(dataStart / CHUNK_SIZE);
+          if (!chunkCache.has(chunkIdx)) {
+            // Download this chunk
+            const chunkStart = chunkIdx * CHUNK_SIZE;
+            const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, shard.size);
+            const totalChunks = Math.ceil(shard.size / CHUNK_SIZE);
+            progress({ phase: 'downloading',
+              message: `Shard ${shardIdx + 1}: downloading chunk ${chunkIdx + 1}/${totalChunks} (${formatBytes(chunkEnd - chunkStart)})`,
+              shard: shardIdx + 1, totalShards: shards.length,
+              shardProgress: (chunkIdx + 1) / totalChunks,
+              overallProgress: bytesDownloadedTotal / totalDownloadSize });
+            const chunkData = await fetchRange(shard.url, chunkStart, chunkEnd);
+            chunkCache.set(chunkIdx, chunkData);
+            // Free previous chunk to save memory (keep at most 2)
+            for (const [k] of chunkCache) {
+              if (k < chunkIdx - 1) chunkCache.delete(k);
+            }
+          }
+          const chunk = chunkCache.get(chunkIdx)!;
+          const offsetInChunk = dataStart - chunkIdx * CHUNK_SIZE;
+          rawData = chunk.slice(offsetInChunk, offsetInChunk + tensorSize);
+        }
         tensorIdx++;
-        progress({ phase: 'downloading',
-          message: `Shard ${shardIdx + 1}: tensor ${tensorIdx}/${header.tensors.size} (${name})`,
-          shard: shardIdx + 1, totalShards: shards.length,
-          shardProgress: tensorIdx / header.tensors.size,
-          overallProgress: bytesDownloadedTotal / totalDownloadSize,
-          tensorsLoaded: tensorsProcessed });
       }
 
       // GPTQ tensors stay in native format for GPU-side dequantization
