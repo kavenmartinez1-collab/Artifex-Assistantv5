@@ -195,7 +195,8 @@ export function generateRotationMatrix(d: number, seed = 42): Float32Array {
 
 /**
  * Generate the d×d JL sign matrix for QJL residual correction.
- * Uses a different seed than the rotation matrix.
+ * Entries are N(0, 1/d) as required by the TurboQuant paper — this
+ * ensures the correction scale factor is simply sqrt(pi/2).
  *
  * @param d   - Head dimension
  * @param seed - Deterministic seed (must match between encode and decode)
@@ -204,9 +205,10 @@ export function generateRotationMatrix(d: number, seed = 42): Float32Array {
 export function generateJLMatrix(d: number, seed = 137): Float32Array {
   const rng = createRNG(seed);
   const S = new Float32Array(d * d);
+  const scale = 1.0 / Math.sqrt(d);  // N(0, 1/d) = N(0,1) * (1/sqrt(d))
 
   for (let i = 0; i < d * d; i++) {
-    S[i] = gaussianRandom(rng);
+    S[i] = gaussianRandom(rng) * scale;
   }
 
   return S;
@@ -459,10 +461,11 @@ export function cpuDecode(
     dequantized[i] = sign * centroids[bin] * scale;
   }
 
-  // QJL correction: temporarily disabled to validate PolarQuant
-  // TODO: fix scale factor — see TurboQuant paper eq. for S ~ N(0, 1/d) vs N(0, 1)
-  const sqrtPiOver2 = Math.sqrt(Math.PI / 2);
-  const jlScale = 0; // disabled: sqrtPiOver2 / d;
+  // QJL correction is disabled for vector reconstruction — it's an inner product
+  // estimator, not a reconstruction estimator. High per-coordinate variance makes
+  // MSE worse. QJL should be applied during attention (Q·K^T) where averaging
+  // over d dimensions concentrates the estimate. See Phase 4 attention kernel.
+  const jlScale = 0;
 
   const correction = new Float32Array(d);
   for (let i = 0; i < d; i++) {

@@ -35,6 +35,12 @@ export {
 } from './cache';
 
 export {
+  // Tokenizer
+  createTokenizer, applyChatTemplate,
+  type Tokenizer, type TokenizerConfig,
+} from './tokenizer';
+
+export {
   // TurboQuant KV Cache Compression
   initTurboQuant, buildCodebook,
   generateRotationMatrix, generateJLMatrix,
