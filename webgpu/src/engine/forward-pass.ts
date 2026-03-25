@@ -91,6 +91,10 @@ export interface LayerWeights {
   linearInProjZ_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
   linearOutProj?: GPUBuffer;
   linearOutProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  // Full attention Q/K norm weights (Qwen3.5 only)
+  qNorm?: GPUBuffer;              // [head_dim] per-head RMSNorm weight for Q
+  kNorm?: GPUBuffer;              // [head_dim] per-head RMSNorm weight for K
+
   linearALog?: GPUBuffer;         // [num_key_heads, key_head_dim] diagonal state decay
   linearConv1dWeight?: GPUBuffer; // [dim, 1, kernel_size] causal conv kernel
   linearDtBias?: GPUBuffer;       // [num_key_heads * key_head_dim] time step bias
@@ -281,7 +285,9 @@ export function createForwardPassEngine(
   const hiddenBuf = createStorageBuffer(device, null, MAX_PREFILL * H * 4, 'hidden', true);
   const residualBuf = createStorageBuffer(device, null, MAX_PREFILL * H * 4, 'residual', true);
   const normedBuf = createStorageBuffer(device, null, MAX_PREFILL * H * 4, 'normed', true);
-  const qBuf = createStorageBuffer(device, null, MAX_PREFILL * nHeads * dHead * 4, 'q-proj', true);
+  // Qwen3.5: Q projection outputs 2x for gate — need double buffer
+  const qBufMul = config.attnOutputGate ? 2 : 1;
+  const qBuf = createStorageBuffer(device, null, MAX_PREFILL * nHeads * dHead * qBufMul * 4, 'q-proj', true);
   const kBuf = createStorageBuffer(device, null, MAX_PREFILL * kvDim * 4, 'k-proj', true);
   const vBuf = createStorageBuffer(device, null, MAX_PREFILL * kvDim * 4, 'v-proj', true);
   const attnOutBuf = createStorageBuffer(device, null, MAX_PREFILL * nHeads * dHead * 4, 'attn-out', true);
@@ -846,9 +852,58 @@ export function createForwardPassEngine(
         // ── STANDARD SOFTMAX ATTENTION ────────────────────────────────
 
         // Q, K, V projections (auto-selects f32 or INT4 matmul)
-        dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHead, H, `L${l}-q`);
+        if (config.attnOutputGate) {
+          // Qwen3.5: Q projection outputs 2x head_dim — first half is Q, second half is gate
+          dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHead * 2, H, `L${l}-q`);
+          // Split: first half → Q, second half → gate (stored in linZBuf for reuse)
+          const qHalf = seqLen * nHeads * dHead * 4;
+          const encQsplit = device.createCommandEncoder({ label: `L${l}-qsplit` });
+          encQsplit.copyBufferToBuffer(qBuf, qHalf, linZBuf!, 0, qHalf);
+          // Shift Q to overwrite full buffer (first half stays in place)
+          device.queue.submit([encQsplit.finish()]);
+        } else {
+          dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHead, H, `L${l}-q`);
+        }
         dispatchProjection(normedBuf, lw, 'kProj', kBuf, seqLen, kvDim, H, `L${l}-k`);
         dispatchProjection(normedBuf, lw, 'vProj', vBuf, seqLen, kvDim, H, `L${l}-v`);
+
+        // Qwen3.5: per-head RMSNorm on Q and K (q_norm, k_norm)
+        // Uses (1+weight) convention — same as input layernorm
+        if (config.attnOutputGate && lw.qNorm && lw.kNorm) {
+          // Q norm: treat [seqLen * nHeads, dHead] as rows of dHead
+          const qNormParams = new ArrayBuffer(16);
+          new Uint32Array(qNormParams, 0, 1)[0] = dHead;
+          new Float32Array(qNormParams, 4, 1)[0] = eps;
+          new Uint32Array(qNormParams, 8, 1)[0] = useResidualWeight;
+          const qnp = createUniformBuffer(device, new Uint8Array(qNormParams), `L${l}-qn-p`);
+          const qnBG = createBindGroup(device, rmsnormPipeline, 0, [
+            { binding: 0, resource: { buffer: qBuf } },
+            { binding: 1, resource: { buffer: attnOutBuf } },
+            { binding: 2, resource: { buffer: lw.qNorm } },
+            { binding: 3, resource: { buffer: qnp } },
+          ], `L${l}-qnorm`);
+          dispatch(device, rmsnormPipeline, [qnBG], [seqLen * nHeads], `L${l}-qnorm`);
+          qnp.destroy();
+          // Copy back
+          const encQn = device.createCommandEncoder({ label: `L${l}-qn-cp` });
+          encQn.copyBufferToBuffer(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHead * 4);
+          device.queue.submit([encQn.finish()]);
+
+          // K norm
+          const knp = createUniformBuffer(device, new Uint8Array(qNormParams), `L${l}-kn-p`);
+          new Uint32Array(qNormParams, 0, 1)[0] = dHead; // same params
+          const knBG = createBindGroup(device, rmsnormPipeline, 0, [
+            { binding: 0, resource: { buffer: kBuf } },
+            { binding: 1, resource: { buffer: ffnTempBuf } },
+            { binding: 2, resource: { buffer: lw.kNorm } },
+            { binding: 3, resource: { buffer: knp } },
+          ], `L${l}-knorm`);
+          dispatch(device, rmsnormPipeline, [knBG], [seqLen * nKVHeads], `L${l}-knorm`);
+          knp.destroy();
+          const encKn = device.createCommandEncoder({ label: `L${l}-kn-cp` });
+          encKn.copyBufferToBuffer(ffnTempBuf, 0, kBuf, 0, seqLen * kvDim * 4);
+          device.queue.submit([encKn.finish()]);
+        }
 
         // Add bias if model has attention_bias
         if (config.attentionBias && lw.qBias && lw.kBias && lw.vBias) {
@@ -867,13 +922,6 @@ export function createForwardPassEngine(
           encVb.copyBufferToBuffer(vBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
           device.queue.submit([encVb.finish()]);
           dispatchElementwise(addPipeline, ffnTempBuf, vBuf, seqLen * kvDim, `L${l}-vb`, lw.vBias, kvDim);
-        }
-
-        if (isDebug && l === 0) {
-          await debugRead(normedBuf, 'L0-normed', 8);
-          await debugRead(qBuf, 'L0-Q-before-rope', 8);
-          await debugRead(kBuf, 'L0-K-before-rope', 8);
-          await debugRead(vBuf, 'L0-V', 8);
         }
 
         // Apply RoPE to Q and K
@@ -932,6 +980,20 @@ export function createForwardPassEngine(
           );
         }
 
+        // Qwen3.5: output gating — attn_output = attn_output * sigmoid(gate)
+        // gate is in linZBuf (from Q projection split)
+        // gate shape is [seqLen, nHeads * dHead] — reshaped from [seqLen, nHeads, dHead]
+        if (config.attnOutputGate && linZBuf && sigmoidPipeline) {
+          const gateDim = seqLen * nHeads * dHead;
+          // sigmoid(gate) → normedBuf
+          dispatchElementwise(sigmoidPipeline, linZBuf!, normedBuf, gateDim, `L${l}-gate-sig`);
+          // attn * sigmoid(gate) → attnOutBuf (in-place via copy pattern)
+          const encGateCp = device.createCommandEncoder({ label: `L${l}-gate-cp` });
+          encGateCp.copyBufferToBuffer(attnOutBuf, 0, ffnTempBuf, 0, gateDim * 4);
+          device.queue.submit([encGateCp.finish()]);
+          dispatchElementwise(mulPipeline, ffnTempBuf, attnOutBuf, gateDim, `L${l}-attn-gate`, normedBuf);
+        }
+
         // Output projection: [seq, nHeads*dHead] → [seq, H]
         dispatchProjection(attnOutBuf, lw, 'oProj', attnProjBuf, seqLen, H, nHeads * dHead, `L${l}-o`);
 
@@ -975,8 +1037,11 @@ export function createForwardPassEngine(
       // Residual: hidden = residual + ffn_output
       dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res2`, downBuf);
 
-      if (isDebug && l === 0) {
-        await debugRead(hiddenBuf, 'L0-after-ffn-residual', 8);
+      // Dump hidden state after every layer for comparison with PyTorch reference
+      if (isDebug) {
+        await device.queue.onSubmittedWorkDone();
+        const layerOut = new Float32Array(await readBuffer(device, hiddenBuf, 8 * 4));
+        console.log(`[LAYER ${l}] output: [${Array.from(layerOut).map(v => v.toFixed(4)).join(', ')}]`);
       }
     }
 

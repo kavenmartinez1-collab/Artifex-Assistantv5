@@ -157,7 +157,7 @@ export function applyChatTemplate(
     // Try again with an explicit ChatML template (for models like Qwen3.5 GPTQ
     // that don't include a chat_template in the tokenizer config)
     try {
-      const chatml = `{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n'}}{% endfor %}{% if add_generation_prompt %}{{'<|im_start|>assistant\n'}}{% endif %}`;
+      const chatml = `{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n'}}{% endfor %}{% if add_generation_prompt %}{{'<|im_start|>assistant\n<think>\n'}}{% endif %}`;
       const result = (tokenizer.inner as any).apply_chat_template(messages, {
         add_generation_prompt: true,
         tokenize: true,

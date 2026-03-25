@@ -120,6 +120,9 @@ export interface WeightNameMap {
     kBias: string;
     vBias: string;
     oBias: string;
+    /** Q/K per-head RMSNorm weights (Qwen3.5 full attention only) */
+    qNorm?: string;
+    kNorm?: string;
     /** Post-attention layernorm (pre-FFN) */
     postAttnNorm: string;
     /** FFN gate projection (SwiGLU) */
@@ -211,6 +214,8 @@ const WEIGHT_NAME_PATTERNS: Record<string, WeightNameMap> = {
       kBias: 'model.language_model.layers.{L}.self_attn.k_proj.bias',
       vBias: 'model.language_model.layers.{L}.self_attn.v_proj.bias',
       oBias: 'model.language_model.layers.{L}.self_attn.o_proj.bias',
+      qNorm: 'model.language_model.layers.{L}.self_attn.q_norm.weight',
+      kNorm: 'model.language_model.layers.{L}.self_attn.k_norm.weight',
       postAttnNorm: 'model.language_model.layers.{L}.post_attention_layernorm.weight',
       gateProj: 'model.language_model.layers.{L}.mlp.gate_proj.weight',
       upProj: 'model.language_model.layers.{L}.mlp.up_proj.weight',
@@ -428,7 +433,8 @@ export function getAllWeightNames(config: ModelConfig): string[] {
 
   for (let l = 0; l < config.numLayers; l++) {
     for (const key of Object.keys(map.layer) as Array<keyof typeof map.layer>) {
-      names.push(resolveLayerWeightName(map.layer[key], l));
+      const pattern = map.layer[key];
+      if (pattern) names.push(resolveLayerWeightName(pattern, l));
     }
   }
 
