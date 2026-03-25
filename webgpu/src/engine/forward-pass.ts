@@ -811,35 +811,31 @@ export function createForwardPassEngine(
           console.log(`[SSM DEBUG] SSM output first 8: [${Array.from(ssmOut.slice(0, 8)).map(v => v.toFixed(6)).join(', ')}]`);
         }
 
-        // 7. GroupNorm on output
-        if (groupNormPipeline && lw.linearNormWeight) {
-          const outDim = linNKH * linGroupedVD; // = num_value_heads * value_head_dim = 4096
-          const numGroups = linNVH; // one group per value head = 32
-          const cpg = linVD; // channels per group = 128
-          // GroupNorm params: [num_channels, num_groups, channels_per_group, eps]
+        // 8. RMSNormGated on output — per-head RMSNorm then multiply by silu(Z)
+        // Reference: self.norm(core_attn_out, z) using Qwen3_5RMSNormGated
+        // Treats output as [32 heads, 128 dims], normalizes each head independently
+        // Uses weight directly (NOT 1+weight — RMSNormGated initializes to ones)
+        if (lw.linearNormWeight) {
           const gnParamData = new ArrayBuffer(16);
-          const gnU32 = new Uint32Array(gnParamData);
-          const gnF32 = new Float32Array(gnParamData);
-          gnU32[0] = outDim;
-          gnU32[1] = numGroups;
-          gnU32[2] = cpg;
-          gnF32[3] = eps;
+          new Uint32Array(gnParamData, 0, 1)[0] = linVD; // hidden_size = 128 (per head)
+          new Float32Array(gnParamData, 4, 1)[0] = eps;
+          new Uint32Array(gnParamData, 8, 1)[0] = 0; // use_residual_weight = 0 (weight directly)
           const gnParams = createUniformBuffer(device, new Uint8Array(gnParamData), `L${l}-gn-p`);
-          const gnBG = createBindGroup(device, groupNormPipeline, 0, [
+          const gnBG = createBindGroup(device, rmsnormPipeline, 0, [
             { binding: 0, resource: { buffer: linOutBuf! } },
-            { binding: 1, resource: { buffer: attnProjBuf } }, // reuse as temp output
+            { binding: 1, resource: { buffer: attnProjBuf } },
             { binding: 2, resource: { buffer: lw.linearNormWeight } },
             { binding: 3, resource: { buffer: gnParams } },
-          ], `L${l}-gn`);
-          dispatch(device, groupNormPipeline, [gnBG], [numGroups], `L${l}-group-norm`);
+          ], `L${l}-rms-gated`);
+          // Dispatch 32 workgroups — one per value head (each normalizes 128 elements)
+          dispatch(device, rmsnormPipeline, [gnBG], [linNVH], `L${l}-rms-gated`);
           gnParams.destroy();
-        }
 
-        // 8. Output gating: out = normed_output * silu(Z)
-        if (gateSiluPipeline) {
-          const outDim = linNKH * linGroupedVD;
-          // attnProjBuf has the normed output, linZBuf has the gate
-          dispatchElementwise(gateSiluPipeline, attnProjBuf, linOutBuf!, outDim, `L${l}-gate`, linZBuf!);
+          // Multiply by silu(Z): output = normed * silu(z)
+          if (gateSiluPipeline) {
+            const outDim = linNKH * linGroupedVD;
+            dispatchElementwise(gateSiluPipeline, attnProjBuf, linOutBuf!, outDim, `L${l}-gate`, linZBuf!);
+          }
         }
 
         // 9. Output projection → attnProjBuf [1, H]
