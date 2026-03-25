@@ -102,6 +102,7 @@ export interface GlobalWeights {
   embedIsF16?: boolean;    // true if embedding stored as F16 (large vocab models)
   finalNorm: GPUBuffer;    // [hidden_size]
   lmHead: GPUBuffer;       // [vocab_size, hidden_size] or same as embedTokens
+  lmHeadIsBF16?: boolean;  // true if lm_head stored as BF16 (large vocab models)
 }
 
 /** All model weights on the GPU. */
@@ -205,6 +206,7 @@ export function createForwardPassEngine(
   const matmulPipeline = createComputePipeline(device, matmulWGSL, 'matmul', 'matmul');
   // B-transposed matmul for HF weight projections (stored as [out, in])
   const matmulBTPipeline = createComputePipeline(device, matmulWGSL, 'matmul_bt', 'matmul-bt');
+  const matmulBTBF16Pipeline = createComputePipeline(device, matmulWGSL, 'matmul_bt_bf16', 'matmul-bt-bf16');
   // INT4 GPTQ dequantizing matmul (weights packed as 4-bit)
   const matmulQ4Pipeline = config.isQuantized
     ? createComputePipeline(device, matmulQ4WGSL, 'matmul_bt_q4', 'matmul-q4')
@@ -881,7 +883,20 @@ export function createForwardPassEngine(
       device.queue.submit([encLH.finish()]);
       lmInputBuf = lastHiddenBuf;
     }
-    dispatchMatmulBT(lmInputBuf, lmHeadBuf, logitsBuf, 1, V, H, 'lm-head');
+    // LM head — use BF16 kernel if weight is stored as BF16 (too large for f32)
+    if (weights.global.lmHeadIsBF16) {
+      const params = createUniformBuffer(device, new Uint32Array([1, V, H, 0]), 'lm-head-p');
+      const bg = createBindGroup(device, matmulBTBF16Pipeline, 0, [
+        { binding: 0, resource: { buffer: lmInputBuf } },
+        { binding: 2, resource: { buffer: logitsBuf } },
+        { binding: 3, resource: { buffer: params } },
+        { binding: 5, resource: { buffer: lmHeadBuf } },
+      ], 'lm-head');
+      dispatch(device, matmulBTBF16Pipeline, [bg], [Math.ceil(1 / 16), Math.ceil(V / 16)], 'lm-head');
+      params.destroy();
+    } else {
+      dispatchMatmulBT(lmInputBuf, lmHeadBuf, logitsBuf, 1, V, H, 'lm-head');
+    }
 
     // Update cache position
     kvCache.position += seqLen;
