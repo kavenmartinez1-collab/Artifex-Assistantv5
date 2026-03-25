@@ -343,11 +343,22 @@ loadBtn.addEventListener('click', async () => {
           downProj: getTensor(resolveLayerWeightName(nameMap.layer.downProj, l)),
         };
         // Add bias terms if model has them
+        if (l === 0) console.log(`[Engine] attentionBias=${config.attentionBias}, raw=${currentModel!.config.attention_bias}`);
         if (config.attentionBias) {
-          lw.qBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.qBias, l));
-          lw.kBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.kBias, l));
-          lw.vBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.vBias, l));
-          lw.oBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.oBias, l));
+          const qBiasName = resolveLayerWeightName(nameMap.layer.qBias, l);
+          const kBiasName = resolveLayerWeightName(nameMap.layer.kBias, l);
+          const vBiasName = resolveLayerWeightName(nameMap.layer.vBias, l);
+          const oBiasName = resolveLayerWeightName(nameMap.layer.oBias, l);
+          lw.qBias = tryGetTensor(qBiasName);
+          lw.kBias = tryGetTensor(kBiasName);
+          lw.vBias = tryGetTensor(vBiasName);
+          lw.oBias = tryGetTensor(oBiasName);
+          if (l === 0) {
+            console.log(`[Bias] L0 qBias=${qBiasName}: ${lw.qBias ? 'FOUND' : 'MISSING'}`);
+            console.log(`[Bias] L0 kBias=${kBiasName}: ${lw.kBias ? 'FOUND' : 'MISSING'}`);
+            console.log(`[Bias] L0 vBias=${vBiasName}: ${lw.vBias ? 'FOUND' : 'MISSING'}`);
+            console.log(`[Bias] L0 oBias=${oBiasName}: ${lw.oBias ? 'FOUND' : 'MISSING'}`);
+          }
         }
         layers.push(lw);
       }
