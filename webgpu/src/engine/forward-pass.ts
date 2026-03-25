@@ -302,9 +302,9 @@ export function createForwardPassEngine(
   const linBBuf = isHybrid ? createStorageBuffer(device, null, linNKH * 4, 'lin-beta', true) : null;
   const linZBuf = isHybrid ? createStorageBuffer(device, null, H * 4, 'lin-z', true) : null;
   const linOutBuf = isHybrid ? createStorageBuffer(device, null, linNKH * linGroupedVD * 4, 'lin-out', true) : null;
-  const linConvOutBuf = isHybrid ? createStorageBuffer(device, null, linConvDim * 4, 'lin-conv-out', true) : null;
-  const linDecayBuf = isHybrid ? createStorageBuffer(device, null, linConvDim * 4, 'lin-decay', true) : null;
-  const linDtBuf = isHybrid ? createStorageBuffer(device, null, linConvDim * 4, 'lin-dt', true) : null;
+  const linConvOutBuf = isHybrid ? createStorageBuffer(device, null, linQKVDim * 4, 'lin-conv-out', true) : null;
+  const linDecayBuf = isHybrid ? createStorageBuffer(device, null, linNVH * 4, 'lin-decay', true) : null;
+  const linDtBuf = isHybrid ? createStorageBuffer(device, null, Math.max(linNVH, linNKH) * 4, 'lin-dt', true) : null;
 
   /** C[M,N] = A[M,K] @ dequant(q4_packed, scales, zeros)^T — GPTQ INT4 */
   function dispatchMatmulQ4(
@@ -595,10 +595,39 @@ export function createForwardPassEngine(
         const hBuf = kvCache.ssmState.hiddenStates[ssmIdx];
         const csBuf = kvCache.ssmState.convStates[ssmIdx];
 
-        // 1. Fused QKV projection → split into Q, K, V
+        // 1. Fused QKV projection
         dispatchProjection(normedBuf, lw, 'linearInProjQKV', linQKVBuf!, 1, linQKVDim, H, `L${l}-lin-qkv`);
 
-        // Split QKV: Q = [0, qSize), K = [qSize, qSize+kSize), V = [qSize+kSize, end)
+        // 2. Conv1d on ENTIRE QKV (8192 channels) BEFORE split
+        // Conv1d weight is [8192, 1, 4] — all channels go through causal conv
+        if (conv1dPipeline && conv1dUpdatePipeline) {
+          const convParams = createUniformBuffer(device,
+            new Uint32Array([linQKVDim, linConvK]), `L${l}-conv-p`);
+          const convBG = createBindGroup(device, conv1dPipeline, 0, [
+            { binding: 0, resource: { buffer: linQKVBuf! } },
+            { binding: 1, resource: { buffer: csBuf } },
+            { binding: 2, resource: { buffer: lw.linearConv1dWeight! } },
+            { binding: 3, resource: { buffer: linConvOutBuf! } },
+            { binding: 4, resource: { buffer: convParams } },
+          ], `L${l}-conv`);
+          dispatch(device, conv1dPipeline, [convBG],
+            [workgroupCount(linQKVDim, 256)], `L${l}-conv1d`);
+
+          // Update conv state (shift + append raw QKV)
+          const updateBG = createBindGroup(device, conv1dUpdatePipeline, 0, [
+            { binding: 0, resource: { buffer: linQKVBuf! } },
+            { binding: 1, resource: { buffer: csBuf } },
+            { binding: 4, resource: { buffer: convParams } },
+          ], `L${l}-conv-upd`);
+          dispatch(device, conv1dUpdatePipeline, [updateBG],
+            [workgroupCount(linQKVDim, 256)], `L${l}-conv1d-update`);
+          convParams.destroy();
+
+          // SiLU on entire conv output (all 8192 channels)
+          dispatchElementwise(siluPipeline, linConvOutBuf!, linQKVBuf!, linQKVDim, `L${l}-conv-silu`);
+        }
+
+        // 3. Split QKV AFTER conv+silu
         const qSize = linNKH * linKD * 4;
         const kSize = linNKH * linKD * 4;
         const vSize = linNVH * linVD * 4;
@@ -608,12 +637,12 @@ export function createForwardPassEngine(
         encSplit.copyBufferToBuffer(linQKVBuf!, qSize + kSize, linVBuf!, 0, vSize);
         device.queue.submit([encSplit.finish()]);
 
-        // 2. Project A (decay input), B (update gate), Z (output gate)
-        dispatchProjection(normedBuf, lw, 'linearInProjA', linABuf!, 1, linConvDim, H, `L${l}-lin-a`);
+        // 4. Project A, B, Z (these use the ORIGINAL normed input, not conv output)
+        dispatchProjection(normedBuf, lw, 'linearInProjA', linABuf!, 1, linNVH, H, `L${l}-lin-a`);
         dispatchProjection(normedBuf, lw, 'linearInProjB', linBBuf!, 1, linNKH, H, `L${l}-lin-b`);
         dispatchProjection(normedBuf, lw, 'linearInProjZ', linZBuf!, 1, H, H, `L${l}-lin-z`);
 
-        // 3. Partial RoPE on Q and K (only first partialRotaryFactor * headDim dims)
+        // 5. Partial RoPE on Q and K (after conv+silu+split)
         const rotaryDim = config.partialRotaryFactor
           ? Math.floor(config.partialRotaryFactor * linKD) : 0;
         if (rotaryDim > 0) {
@@ -621,56 +650,21 @@ export function createForwardPassEngine(
           dispatchRoPE(linKBuf!, 1, linNKH, pos, `L${l}-lin-rope-k`, linKD, rotaryDim);
         }
 
-        // 4. Conv1d on K (causal, kernel_size=4) + SiLU activation
-        if (conv1dPipeline && conv1dUpdatePipeline) {
-          const convParams = createUniformBuffer(device,
-            new Uint32Array([linConvDim, linConvK]), `L${l}-conv-p`);
-          const convBG = createBindGroup(device, conv1dPipeline, 0, [
-            { binding: 0, resource: { buffer: linKBuf! } },
-            { binding: 1, resource: { buffer: csBuf } },
-            { binding: 2, resource: { buffer: lw.linearConv1dWeight! } },
-            { binding: 3, resource: { buffer: linConvOutBuf! } },
-            { binding: 4, resource: { buffer: convParams } },
-          ], `L${l}-conv`);
-          dispatch(device, conv1dPipeline, [convBG],
-            [workgroupCount(linConvDim, 256)], `L${l}-conv1d`);
-
-          // Update conv state (shift + append)
-          const updateBG = createBindGroup(device, conv1dUpdatePipeline, 0, [
-            { binding: 0, resource: { buffer: linKBuf! } },
-            { binding: 1, resource: { buffer: csBuf } },
-            { binding: 4, resource: { buffer: convParams } },
-          ], `L${l}-conv-upd`);
-          dispatch(device, conv1dUpdatePipeline, [updateBG],
-            [workgroupCount(linConvDim, 256)], `L${l}-conv1d-update`);
-          convParams.destroy();
-
-          // Apply SiLU to conv output: K = silu(conv1d(K))
-          // Can't read+write same buffer — use linKBuf as temp (K data no longer needed there)
-          dispatchElementwise(siluPipeline, linConvOutBuf!, linKBuf!, linConvDim, `L${l}-conv-silu`);
-          // Copy back to linConvOutBuf for SSM step
-          const encSilu = device.createCommandEncoder({ label: `L${l}-silu-cp` });
-          encSilu.copyBufferToBuffer(linKBuf!, 0, linConvOutBuf!, 0, linConvDim * 4);
-          device.queue.submit([encSilu.finish()]);
-        }
-
-        // 4b. Apply sigmoid to beta: beta = sigmoid(in_proj_b output)
-        // Can't read+write same buffer — write to linABuf temp then copy back
+        // 5b. Sigmoid on beta
         if (sigmoidPipeline) {
-          dispatchElementwise(sigmoidPipeline, linBBuf!, linABuf!, linNKH, `L${l}-sigmoid-beta`);
+          dispatchElementwise(sigmoidPipeline, linBBuf!, linDtBuf!, linNKH, `L${l}-sigmoid-beta`);
           const encSig = device.createCommandEncoder({ label: `L${l}-sig-cp` });
-          encSig.copyBufferToBuffer(linABuf!, 0, linBBuf!, 0, linNKH * 4);
+          encSig.copyBufferToBuffer(linDtBuf!, 0, linBBuf!, 0, linNKH * 4);
           device.queue.submit([encSig.finish()]);
         }
 
-        // 5. Compute decay: dt = softplus(alpha + dt_bias), then decay = exp(-exp(A_log) * dt)
+        // 6. Decay per VALUE HEAD [32], not per key dim
+        // A_log is [32], dt_bias is [32], in_proj_a output is [32]
         if (softplusPipeline && lw.linearDtBias) {
-          // dt = softplus(alpha + dt_bias)
-          dispatchElementwise(softplusPipeline, linABuf!, linDtBuf!, linConvDim, `L${l}-softplus`, lw.linearDtBias);
+          dispatchElementwise(softplusPipeline, linABuf!, linDtBuf!, linNVH, `L${l}-softplus`, lw.linearDtBias);
         }
         if (decayPipeline && lw.linearALog) {
-          // decay = exp(-exp(A_log) * dt) — always in (0, 1)
-          dispatchElementwise(decayPipeline, lw.linearALog, linDecayBuf!, linConvDim, `L${l}-decay`, linDtBuf!);
+          dispatchElementwise(decayPipeline, lw.linearALog, linDecayBuf!, linNVH, `L${l}-decay`, linDtBuf!);
         }
 
         // Debug SSM intermediates (layer 0, first pass)
@@ -680,9 +674,9 @@ export function createForwardPassEngine(
           const beta = new Float32Array(betaRaw);
           console.log(`[SSM DEBUG] beta (sigmoid) first 4: [${Array.from(beta.slice(0, 4)).map(v => v.toFixed(4)).join(', ')}]`);
 
-          const decayRaw = await readBuffer(device, linDecayBuf!, 8 * 4);
+          const decayRaw = await readBuffer(device, linDecayBuf!, Math.min(linNVH, 8) * 4);
           const decay = new Float32Array(decayRaw);
-          console.log(`[SSM DEBUG] decay first 8: [${Array.from(decay.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+          console.log(`[SSM DEBUG] decay (per vh, ${linNVH} total) first 8: [${Array.from(decay.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
 
           const kSiluRaw = await readBuffer(device, linConvOutBuf!, 8 * 4);
           const kSilu = new Float32Array(kSiluRaw);
@@ -697,7 +691,8 @@ export function createForwardPassEngine(
           console.log(`[SSM DEBUG] Q first 8: [${Array.from(qVals.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
         }
 
-        // 6. SSM step: update hidden state, readout via Q
+        // 7. SSM step: update hidden state, readout via Q
+        // Decay is per value head [32], not per key dim
         if (ssmStepPipeline) {
           const ssmParams = createUniformBuffer(device,
             new Uint32Array([linNKH, linNVH, linKD, linGroupedVD]), `L${l}-ssm-p`);
@@ -950,8 +945,8 @@ export function createForwardPassEngine(
       const linVD = config.linearValueHeadDim!;
       const linNKH = config.linearNumKeyHeads!;
       const linConvK = config.linearConvKernelDim!;
-      // Projected dim for conv state (num_key_heads * key_head_dim)
-      const convDim = linNKH * linKD;
+      // Conv state covers the full QKV projection dim (conv1d applied before split)
+      const convDim = linQKVDim;
 
       let ssmIdx = 0;
       for (let l = 0; l < L; l++) {

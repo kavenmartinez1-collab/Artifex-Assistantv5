@@ -29,7 +29,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read> K: array<f32>;       // [num_key_heads * key_head_dim] (after conv1d + silu)
 @group(0) @binding(2) var<storage, read> V: array<f32>;       // [num_value_heads * value_head_dim] = [grouped as num_key_heads * grouped_value_dim]
 @group(0) @binding(3) var<storage, read> beta: array<f32>;    // [num_key_heads] (after sigmoid)
-@group(0) @binding(4) var<storage, read> decay: array<f32>;   // [num_key_heads * key_head_dim]
+@group(0) @binding(4) var<storage, read> decay: array<f32>;   // [num_value_heads] — per value head (NOT per key dim)
 
 // SSM hidden state (read-write, persists across tokens)
 @group(1) @binding(0) var<storage, read_write> h: array<f32>; // [num_key_heads * key_head_dim * grouped_value_dim]
@@ -54,18 +54,23 @@ fn ssm_step(@builtin(local_invocation_id) lid: vec3u,
   let beta_val = beta[kh];
 
   // Step 1: Update h[kh, :, :] — decay and add outer product
-  // For each v in the grouped value dimension (threads split across v):
+  // Decay is per VALUE HEAD [num_value_heads], not per key dim.
+  // gvd = (num_value_heads / num_key_heads) * value_head_dim
+  // vh_per_kh = num_value_heads / num_key_heads
+  let nvh = params.num_value_heads;
+  let vh_per_kh = nvh / nkh;
+  let vhd = gvd / vh_per_kh; // value_head_dim (e.g., 128)
+
   var v = tid;
   while (v < gvd) {
-    // V is stored as [num_value_heads * value_head_dim] = [num_key_heads * grouped_value_dim]
     let v_val = V[kh * gvd + v];
+    // Which value head does this v belong to?
+    let vh = kh * vh_per_kh + v / vhd;
+    let d = decay[vh]; // per value head decay
 
     for (var k = 0u; k < kd; k = k + 1u) {
       let h_idx = h_base + k * gvd + v;
-      let d = decay[kh * kd + k];
       let k_val = K[kh * kd + k];
-
-      // State update: h = decay * h + beta * K * V
       h[h_idx] = d * h[h_idx] + beta_val * k_val * v_val;
     }
 
