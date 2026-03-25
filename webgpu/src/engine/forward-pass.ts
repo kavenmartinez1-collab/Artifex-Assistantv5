@@ -391,6 +391,9 @@ export function createForwardPassEngine(
     params.destroy();
   }
 
+  // Qwen3_5 uses (1+weight) in RMSNorm — detect from model type
+  const useResidualWeight = config.modelType === 'qwen3_5_text' ? 1 : 0;
+
   function dispatchRMSNorm(
     inputBuf: GPUBuffer, outputBuf: GPUBuffer,
     weightBuf: GPUBuffer, rows: number, label: string,
@@ -398,6 +401,7 @@ export function createForwardPassEngine(
     const paramData = new ArrayBuffer(16);
     new Uint32Array(paramData, 0, 1)[0] = H;
     new Float32Array(paramData, 4, 1)[0] = eps;
+    new Uint32Array(paramData, 8, 1)[0] = useResidualWeight;
     const paramBuf = createUniformBuffer(device, new Uint8Array(paramData), `${label}-p`);
     const bg = createBindGroup(device, rmsnormPipeline, 0, [
       { binding: 0, resource: { buffer: inputBuf } },
@@ -598,8 +602,27 @@ export function createForwardPassEngine(
         const hBuf = kvCache.ssmState.hiddenStates[ssmIdx];
         const csBuf = kvCache.ssmState.convStates[ssmIdx];
 
+        // Debug: normed input before projections
+        if (isDebug && l === 0) {
+          await debugRead(normedBuf, 'L0-normed-input', 8);
+        }
+
         // 1. Fused QKV projection
         dispatchProjection(normedBuf, lw, 'linearInProjQKV', linQKVBuf!, 1, linQKVDim, H, `L${l}-lin-qkv`);
+
+        // Debug: raw QKV projection output (before conv1d)
+        if (isDebug && l === 0) {
+          await device.queue.onSubmittedWorkDone();
+          // Read first 8 values of Q, K, V sections from the fused QKV buffer
+          // Q at [0..2047], K at [2048..4095], V at [4096..8191]
+          const fullQKV = new Float32Array(await readBuffer(device, linQKVBuf!, (4104) * 4));
+          console.log(`[REF] QKV raw Q[0:8]: [${Array.from(fullQKV.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+          console.log(`[REF] QKV raw K[0:8]: [${Array.from(fullQKV.slice(2048, 2056)).map(v => v.toFixed(4)).join(', ')}]`);
+          console.log(`[REF] QKV raw V[0:8]: [${Array.from(fullQKV.slice(4096, 4104)).map(v => v.toFixed(4)).join(', ')}]`);
+          // PyTorch ref: Q=[0.138, 0.203, 0.464, 0.496, 0.108, -0.119, -3.181, 0.365]
+          // PyTorch ref: K=[1.925, 2.020, 0.374, 0.841, 0.669, 2.595, -0.756, 0.715]
+          // PyTorch ref: V=[-0.386, 4.992, -3.642, -3.278, -5.948, 1.927, 2.007, -0.526]
+        }
 
         // 2. Conv1d on ENTIRE QKV (8192 channels) BEFORE split
         // Conv1d weight is [8192, 1, 4] — all channels go through causal conv
@@ -640,11 +663,37 @@ export function createForwardPassEngine(
         encSplit.copyBufferToBuffer(linQKVBuf!, qSize + kSize, linVBuf!, 0, vSize);
         device.queue.submit([encSplit.finish()]);
 
+        // Debug: conv1d output and silu output
+        if (isDebug && l === 0) {
+          await device.queue.onSubmittedWorkDone();
+          const qkvAfterSilu = new Float32Array(await readBuffer(device, linQKVBuf!, (4104) * 4));
+          console.log(`[REF] After conv+silu Q[0:8]: [${Array.from(qkvAfterSilu.slice(0, 8)).map(v => v.toFixed(6)).join(', ')}]`);
+          console.log(`[REF] After conv+silu K[0:8]: [${Array.from(qkvAfterSilu.slice(2048, 2056)).map(v => v.toFixed(6)).join(', ')}]`);
+          console.log(`[REF] After conv+silu V[0:8]: [${Array.from(qkvAfterSilu.slice(4096, 4104)).map(v => v.toFixed(6)).join(', ')}]`);
+          // PyTorch ref: Q=[-0.007, 0.011, 0.021, 0.020, -0.004, -7e-5, 0.007, -0.014]
+          // PyTorch ref: K=[0.008, -0.007, 0.001, -0.001, 0.001, 0.153, -0.030, -0.001]
+          // PyTorch ref: V=[0.002, 0.049, 0.034, 0.043, 0.066, 0.016, 0.018, 0.003]
+        }
+
         // 4. Project A, B, Z (these use the ORIGINAL normed input, not conv output)
         // NOTE: in_proj_b output is num_v_heads (32), NOT num_k_heads (16)!
         dispatchProjection(normedBuf, lw, 'linearInProjA', linABuf!, 1, linNVH, H, `L${l}-lin-a`);
         dispatchProjection(normedBuf, lw, 'linearInProjB', linBBuf!, 1, linNVH, H, `L${l}-lin-b`);
         dispatchProjection(normedBuf, lw, 'linearInProjZ', linZBuf!, 1, H, H, `L${l}-lin-z`);
+
+        // Debug: A, B, Z projection outputs
+        if (isDebug && l === 0) {
+          await device.queue.onSubmittedWorkDone();
+          const aVals = new Float32Array(await readBuffer(device, linABuf!, 4 * 4));
+          const bVals = new Float32Array(await readBuffer(device, linBBuf!, 4 * 4));
+          const zVals = new Float32Array(await readBuffer(device, linZBuf!, 8 * 4));
+          console.log(`[REF] A (raw) first 4: [${Array.from(aVals).map(v => v.toFixed(4)).join(', ')}]`);
+          console.log(`[REF] B (raw) first 4: [${Array.from(bVals).map(v => v.toFixed(4)).join(', ')}]`);
+          console.log(`[REF] Z first 8: [${Array.from(zVals).map(v => v.toFixed(4)).join(', ')}]`);
+          // PyTorch ref: A=[6.650, 0.602, 8.459, 12.811]
+          // PyTorch ref: B=[-3.521, 1.663, -1.692, 0.444]
+          // PyTorch ref: Z=[1.414, -0.271, -1.269, -0.706, -0.792, -0.701, 0.285, -0.571]
+        }
 
         // NOTE: NO RoPE in linear attention layers! Only full attention uses RoPE.
 

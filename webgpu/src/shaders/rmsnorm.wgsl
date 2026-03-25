@@ -5,6 +5,7 @@
 struct Params {
   hidden_size: u32,
   eps: f32,
+  use_residual_weight: u32, // 1 = use (1+weight), 0 = use weight directly
 }
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
@@ -59,7 +60,10 @@ fn rmsnorm(@builtin(global_invocation_id) gid: vec3u,
   i = col;
   while (i < hidden) {
     let idx = row * hidden + i;
-    output[idx] = input[idx] * rms_inv * weight[i];
+    // Qwen3_5 uses (1.0 + weight) — weight initialized to 0, effective scale ~1.0
+    // Standard models use weight directly — weight initialized to 1.0
+    let w = select(weight[i], 1.0 + weight[i], params.use_residual_weight == 1u);
+    output[idx] = input[idx] * rms_inv * w;
     i += 256u;
   }
 }
