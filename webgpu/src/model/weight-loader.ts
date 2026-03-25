@@ -18,7 +18,7 @@ import {
 } from './safetensors';
 
 import {
-  discoverShards, downloadFile, downloadShardHeader, fetchModelConfig,
+  discoverShards, downloadFile, downloadShardHeader, fetchModelConfig, fetchRange,
   type ShardInfo, type DownloadProgress, type HFModelConfig,
 } from './hf-hub';
 
@@ -133,60 +133,71 @@ export async function loadModel(
       overallProgress: bytesDownloadedTotal / totalDownloadSize,
     });
 
-    // Check browser cache first
-    let shardData: ArrayBuffer;
-    const cached = await hasCache(cacheKey);
+    // ── Step 3: Download header first (small — a few KB) ──────────────
 
-    if (cached) {
-      progress({
-        phase: 'downloading',
-        message: `Shard ${shardIdx + 1}: loading from cache...`,
-        shard: shardIdx + 1,
-        totalShards: shards.length,
-        shardProgress: 1,
-        overallProgress: (bytesDownloadedTotal + shard.size) / totalDownloadSize,
-      });
-      shardData = await getCache(cacheKey) as ArrayBuffer;
-    } else {
-      // Download with progress
-      shardData = await downloadFile(shard.url, (downloaded, total) => {
-        progress({
-          phase: 'downloading',
-          message: `Shard ${shardIdx + 1}: ${formatBytes(downloaded)} / ${formatBytes(total)}`,
-          shard: shardIdx + 1,
-          totalShards: shards.length,
-          shardProgress: total > 0 ? downloaded / total : 0,
-          overallProgress: (bytesDownloadedTotal + downloaded) / totalDownloadSize,
+    const headerData = await downloadShardHeader(shard.url);
+    const header = parseHeader(headerData);
+    console.log(`[WeightLoader] Shard ${shardIdx + 1}: ${summarizeHeader(header)}`);
+
+    // Decide: download whole file (small shards) or stream per-tensor (large shards)
+    const MAX_FULL_DOWNLOAD = 2 * 1024 * 1024 * 1024; // 2 GB threshold
+    const useStreaming = shard.size > MAX_FULL_DOWNLOAD;
+
+    if (useStreaming) {
+      console.log(`[WeightLoader] Shard ${shardIdx + 1}: streaming ${header.tensors.size} tensors (${formatBytes(shard.size)} too large for single download)`);
+    }
+
+    // For small shards, download the whole file at once (faster, cacheable)
+    let shardData: ArrayBuffer | null = null;
+    if (!useStreaming) {
+      const cached = await hasCache(cacheKey);
+      if (cached) {
+        progress({ phase: 'downloading', message: `Shard ${shardIdx + 1}: loading from cache...`,
+          shard: shardIdx + 1, totalShards: shards.length, shardProgress: 1,
+          overallProgress: (bytesDownloadedTotal + shard.size) / totalDownloadSize });
+        shardData = await getCache(cacheKey) as ArrayBuffer;
+      } else {
+        shardData = await downloadFile(shard.url, (downloaded, total) => {
+          progress({ phase: 'downloading',
+            message: `Shard ${shardIdx + 1}: ${formatBytes(downloaded)} / ${formatBytes(total)}`,
+            shard: shardIdx + 1, totalShards: shards.length,
+            shardProgress: total > 0 ? downloaded / total : 0,
+            overallProgress: (bytesDownloadedTotal + downloaded) / totalDownloadSize });
         });
-      });
-
-      // Cache for next time
-      await putCache(cacheKey, shardData);
+        await putCache(cacheKey, shardData);
+      }
     }
 
     bytesDownloadedTotal += shard.size;
 
-    // ── Step 3: Parse SafeTensors header ────────────────────────────────
+    // ── Step 4: Extract/download tensors and upload to GPU ────────────
 
-    const header = parseHeader(shardData);
-    console.log(`[WeightLoader] Shard ${shardIdx + 1}: ${summarizeHeader(header)}`);
-
-    // ── Step 4: Extract tensors and upload to GPU ───────────────────────
-
-    progress({
-      phase: 'uploading',
+    progress({ phase: 'uploading',
       message: `Uploading ${header.tensors.size} tensors to GPU...`,
-      shard: shardIdx + 1,
-      totalShards: shards.length,
-      tensorsLoaded: tensorsProcessed,
-    });
+      shard: shardIdx + 1, totalShards: shards.length,
+      tensorsLoaded: tensorsProcessed });
 
+    let tensorIdx = 0;
     for (const [name, tensorInfo] of header.tensors) {
-      // Extract raw tensor bytes from the shard
-      const rawData = extractTensorData(shardData, tensorInfo, header.headerByteLength);
+      // Get raw tensor bytes — either from full shard or via range request
+      let rawData: ArrayBuffer;
+      if (shardData) {
+        rawData = extractTensorData(shardData, tensorInfo, header.headerByteLength);
+      } else {
+        // Streaming: download just this tensor via HTTP range request
+        const dataStart = header.headerByteLength + tensorInfo.dataOffsets[0];
+        const dataEnd = header.headerByteLength + tensorInfo.dataOffsets[1];
+        rawData = await fetchRange(shard.url, dataStart, dataEnd);
+        tensorIdx++;
+        progress({ phase: 'downloading',
+          message: `Shard ${shardIdx + 1}: tensor ${tensorIdx}/${header.tensors.size} (${name})`,
+          shard: shardIdx + 1, totalShards: shards.length,
+          shardProgress: tensorIdx / header.tensors.size,
+          overallProgress: bytesDownloadedTotal / totalDownloadSize,
+          tensorsLoaded: tensorsProcessed });
+      }
 
-      // GPTQ tensors (.qweight, .qzeros, .scales) stay in native format
-      // for GPU-side dequantization. All other tensors convert to f32.
+      // GPTQ tensors stay in native format for GPU-side dequantization
       const isGPTQ = name.endsWith('.qweight') || name.endsWith('.qzeros')
         || name.endsWith('.scales') || name.endsWith('.g_idx');
 
@@ -195,15 +206,11 @@ export async function loadModel(
       const exceedsBufferLimit = f32Size > 1.9 * 1024 * 1024 * 1024;
 
       if (isGPTQ) {
-        // Keep native format: I32 for qweight/qzeros, F16 for scales
         gpuData = tensorToTypedArray(rawData, tensorInfo.dtype);
       } else if (exceedsBufferLimit && (tensorInfo.dtype === 'F16' || tensorInfo.dtype === 'BF16')) {
-        // Large tensors (>1.9 GB at f32) stay at F16/BF16 to fit WebGPU 2GB buffer limit
-        // The embed_f16 kernel handles conversion on the GPU
         console.log(`[WeightLoader] Keeping ${name} at ${tensorInfo.dtype} (f32 would be ${(f32Size / (1024**3)).toFixed(1)} GB)`);
         gpuData = tensorToTypedArray(rawData, tensorInfo.dtype);
       } else {
-        // Standard path: convert to f32
         gpuData = tensorToFloat32(rawData, tensorInfo.dtype);
       }
 
@@ -221,13 +228,9 @@ export async function loadModel(
       gpuBuffer.unmap();
 
       allTensors.set(name, {
-        name,
-        buffer: gpuBuffer,
-        shape: tensorInfo.shape,
-        dtype: tensorInfo.dtype,
-        byteLength: gpuData.byteLength,
-        elementCount: tensorInfo.elementCount,
-        isQuantized: isGPTQ,
+        name, buffer: gpuBuffer, shape: tensorInfo.shape,
+        dtype: tensorInfo.dtype, byteLength: gpuData.byteLength,
+        elementCount: tensorInfo.elementCount, isQuantized: isGPTQ,
       });
 
       totalGPUBytes += gpuData.byteLength;
