@@ -324,8 +324,17 @@ loadBtn.addEventListener('click', async () => {
         return t.buffer;
       };
 
+      // Auto-detect if embedding needs F16 (>2GB at f32 hits WebGPU buffer limit)
+      const embedTensor = currentModel!.tensors.get(nameMap.embedTokens);
+      const embedF32Size = embedTensor ? embedTensor.elementCount * 4 : 0;
+      const embedIsF16 = embedF32Size > 1.9 * 1024 * 1024 * 1024; // >1.9 GB → use F16
+      if (embedIsF16) {
+        console.log(`[Engine] Embedding too large for f32 (${(embedF32Size / (1024**3)).toFixed(1)} GB), using F16`);
+      }
+
       const global = {
         embedTokens: getTensor(nameMap.embedTokens),
+        embedIsF16,
         finalNorm: getTensor(nameMap.finalNorm),
         lmHead: config.tieWordEmbeddings
           ? getTensor(nameMap.embedTokens)

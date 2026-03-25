@@ -191,8 +191,16 @@ export async function loadModel(
         || name.endsWith('.scales') || name.endsWith('.g_idx');
 
       let gpuData: ArrayBufferView;
+      const f32Size = tensorInfo.elementCount * 4;
+      const exceedsBufferLimit = f32Size > 1.9 * 1024 * 1024 * 1024;
+
       if (isGPTQ) {
         // Keep native format: I32 for qweight/qzeros, F16 for scales
+        gpuData = tensorToTypedArray(rawData, tensorInfo.dtype);
+      } else if (exceedsBufferLimit && (tensorInfo.dtype === 'F16' || tensorInfo.dtype === 'BF16')) {
+        // Large tensors (>1.9 GB at f32) stay at F16/BF16 to fit WebGPU 2GB buffer limit
+        // The embed_f16 kernel handles conversion on the GPU
+        console.log(`[WeightLoader] Keeping ${name} at ${tensorInfo.dtype} (f32 would be ${(f32Size / (1024**3)).toFixed(1)} GB)`);
         gpuData = tensorToTypedArray(rawData, tensorInfo.dtype);
       } else {
         // Standard path: convert to f32
