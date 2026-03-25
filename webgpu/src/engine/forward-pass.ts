@@ -644,12 +644,21 @@ export function createForwardPassEngine(
           convParams.destroy();
 
           // Apply SiLU to conv output: K = silu(conv1d(K))
-          dispatchElementwise(siluPipeline, linConvOutBuf!, linConvOutBuf!, linConvDim, `L${l}-conv-silu`);
+          // Can't read+write same buffer — use linKBuf as temp (K data no longer needed there)
+          dispatchElementwise(siluPipeline, linConvOutBuf!, linKBuf!, linConvDim, `L${l}-conv-silu`);
+          // Copy back to linConvOutBuf for SSM step
+          const encSilu = device.createCommandEncoder({ label: `L${l}-silu-cp` });
+          encSilu.copyBufferToBuffer(linKBuf!, 0, linConvOutBuf!, 0, linConvDim * 4);
+          device.queue.submit([encSilu.finish()]);
         }
 
         // 4b. Apply sigmoid to beta: beta = sigmoid(in_proj_b output)
+        // Can't read+write same buffer — write to linABuf temp then copy back
         if (sigmoidPipeline) {
-          dispatchElementwise(sigmoidPipeline, linBBuf!, linBBuf!, linNKH, `L${l}-sigmoid-beta`);
+          dispatchElementwise(sigmoidPipeline, linBBuf!, linABuf!, linNKH, `L${l}-sigmoid-beta`);
+          const encSig = device.createCommandEncoder({ label: `L${l}-sig-cp` });
+          encSig.copyBufferToBuffer(linABuf!, 0, linBBuf!, 0, linNKH * 4);
+          device.queue.submit([encSig.finish()]);
         }
 
         // 5. Compute decay: dt = softplus(alpha + dt_bias), then decay = exp(-exp(A_log) * dt)
