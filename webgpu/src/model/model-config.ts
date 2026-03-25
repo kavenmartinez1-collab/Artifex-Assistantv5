@@ -207,7 +207,14 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
   const rmsNormEps = hfConfig.rms_norm_eps ?? hfConfig.layer_norm_eps ?? 1e-5;
   const maxPositionEmbeddings = hfConfig.max_position_embeddings ?? 4096;
   const hiddenAct = hfConfig.hidden_act ?? hfConfig.activation_function ?? 'silu';
-  const attentionBias = hfConfig.attention_bias ?? false;
+  // attention_bias defaults depend on model family:
+  // Qwen2: true (implicit, not in config.json)
+  // Llama/Mistral/Gemma: false
+  const attentionBiasDefaults: Record<string, boolean> = {
+    qwen2: true,
+    qwen2_moe: true,
+  };
+  const attentionBias = hfConfig.attention_bias ?? attentionBiasDefaults[modelType] ?? false;
   const tieWordEmbeddings = hfConfig.tie_word_embeddings ?? false;
 
   const numQPerKV = Math.floor(numAttentionHeads / numKVHeads);

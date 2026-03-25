@@ -384,15 +384,20 @@ export function createForwardPassEngine(
         dispatchElementwise(addPipeline, ffnTempBuf, vBuf, seqLen * kvDim, `L${l}-vb`, lw.vBias);
       }
 
+      if (isDebug && l === 0) {
+        await debugRead(normedBuf, 'L0-normed', 8);
+        await debugRead(qBuf, 'L0-Q-before-rope', 8);
+        await debugRead(kBuf, 'L0-K-before-rope', 8);
+        await debugRead(vBuf, 'L0-V', 8);
+      }
+
       // Apply RoPE to Q and K
       dispatchRoPE(qBuf, seqLen, nHeads, pos, `L${l}-rope-q`);
       dispatchRoPE(kBuf, seqLen, nKVHeads, pos, `L${l}-rope-k`);
 
       if (isDebug && l === 0) {
-        await debugRead(normedBuf, 'L0-normed', 8);
         await debugRead(qBuf, 'L0-Q-after-rope', 8);
         await debugRead(kBuf, 'L0-K-after-rope', 8);
-        await debugRead(vBuf, 'L0-V', 8);
       }
 
       // Write new K, V to cache
