@@ -358,31 +358,91 @@ loadBtn.addEventListener('click', async () => {
         return undefined;
       };
 
-      // Debug: log tensor names at layer 0 to discover naming convention
+      // Debug: log tensor names at layer 0 (helps diagnose weight mapping issues)
       const l0Keys = [...currentModel!.tensors.keys()].filter(k => k.includes('layers.0.'));
-      console.log(`[Engine] Layer 0 tensors (${l0Keys.length}):`, l0Keys);
+      if (l0Keys.length > 0) console.log(`[Engine] Layer 0: ${l0Keys.length} tensors`);
 
       const layers = [];
       for (let l = 0; l < config.numLayers; l++) {
-        // For quantized models, .weight tensors won't exist for linear layers.
-        // Use tryGetTensor for projection weights (may be null if GPTQ).
+        const isLinearLayer = config.layerTypes?.[l] === 'linear_attention';
+
+        // Shared weights (both layer types)
         const lw: any = {
           inputNorm: getTensor(resolveLayerWeightName(nameMap.layer.inputNorm, l)),
-          qProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.qProj, l)),
-          kProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.kProj, l)),
-          vProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.vProj, l)),
-          oProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.oProj, l)),
           postAttnNorm: getTensor(resolveLayerWeightName(nameMap.layer.postAttnNorm, l)),
           gateProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.gateProj, l)),
           upProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.upProj, l)),
           downProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.downProj, l)),
         };
 
-        // Load GPTQ quantized weights if available
+        if (isLinearLayer && nameMap.linearLayer) {
+          // ── Linear attention layer weights ──────────────────────────
+          const lin = nameMap.linearLayer;
+          lw.linearInProjQKV = tryGetTensor(resolveLayerWeightName(lin.inProjQKV, l));
+          lw.linearInProjA = tryGetTensor(resolveLayerWeightName(lin.inProjA, l));
+          lw.linearInProjB = tryGetTensor(resolveLayerWeightName(lin.inProjB, l));
+          lw.linearInProjZ = tryGetTensor(resolveLayerWeightName(lin.inProjZ, l));
+          lw.linearOutProj = tryGetTensor(resolveLayerWeightName(lin.outProj, l));
+
+          // Non-quantized weights (BF16/F16 → f32)
+          lw.linearALog = tryGetTensor(resolveLayerWeightName(lin.aLog, l));
+          lw.linearConv1dWeight = tryGetTensor(resolveLayerWeightName(lin.conv1dWeight, l));
+          lw.linearDtBias = tryGetTensor(resolveLayerWeightName(lin.dtBias, l));
+          lw.linearNormWeight = tryGetTensor(resolveLayerWeightName(lin.normWeight, l));
+
+          // GPTQ for linear attention projections
+          if (config.isQuantized) {
+            const linQ4Keys = ['linearInProjQKV', 'linearInProjA', 'linearInProjB', 'linearInProjZ', 'linearOutProj'] as const;
+            const linNameKeys = ['inProjQKV', 'inProjA', 'inProjB', 'inProjZ', 'outProj'] as const;
+            for (let k = 0; k < linQ4Keys.length; k++) {
+              const weightName = resolveLayerWeightName(lin[linNameKeys[k]], l);
+              const q4 = tryGetQ4(weightName);
+              if (q4) {
+                lw[`${linQ4Keys[k]}_q4`] = q4;
+                if (l === 0) console.log(`[Q4] L0 ${linQ4Keys[k]}: GPTQ loaded`);
+              }
+            }
+          }
+
+          if (l === 0) {
+            console.log(`[Engine] L0: linear_attention layer`);
+            console.log(`[Engine] L0 A_log: ${lw.linearALog ? 'FOUND' : 'MISSING'}`);
+            console.log(`[Engine] L0 conv1d: ${lw.linearConv1dWeight ? 'FOUND' : 'MISSING'}`);
+            console.log(`[Engine] L0 dt_bias: ${lw.linearDtBias ? 'FOUND' : 'MISSING'}`);
+            console.log(`[Engine] L0 norm: ${lw.linearNormWeight ? 'FOUND' : 'MISSING'}`);
+          }
+        } else {
+          // ── Standard softmax attention layer weights ────────────────
+          lw.qProj = tryGetTensor(resolveLayerWeightName(nameMap.layer.qProj, l));
+          lw.kProj = tryGetTensor(resolveLayerWeightName(nameMap.layer.kProj, l));
+          lw.vProj = tryGetTensor(resolveLayerWeightName(nameMap.layer.vProj, l));
+          lw.oProj = tryGetTensor(resolveLayerWeightName(nameMap.layer.oProj, l));
+
+          // GPTQ for standard attention projections
+          if (config.isQuantized) {
+            const nameKeys = ['qProj', 'kProj', 'vProj', 'oProj'] as const;
+            for (const key of nameKeys) {
+              const weightName = resolveLayerWeightName(nameMap.layer[key], l);
+              const q4 = tryGetQ4(weightName);
+              if (q4) {
+                lw[`${key}_q4`] = q4;
+                if (l === 3) console.log(`[Q4] L3 ${key}: GPTQ loaded`); // L3 is first full_attn
+              }
+            }
+          }
+
+          // Bias terms (only for full attention layers with bias)
+          if (config.attentionBias) {
+            lw.qBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.qBias, l));
+            lw.kBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.kBias, l));
+            lw.vBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.vBias, l));
+            lw.oBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.oBias, l));
+          }
+        }
+
+        // FFN GPTQ (shared for both layer types)
         if (config.isQuantized) {
-          const projNames = ['qProj', 'kProj', 'vProj', 'oProj', 'gateProj', 'upProj', 'downProj'];
-          const nameKeys = ['qProj', 'kProj', 'vProj', 'oProj', 'gateProj', 'upProj', 'downProj'] as const;
-          for (const key of nameKeys) {
+          for (const key of ['gateProj', 'upProj', 'downProj'] as const) {
             const weightName = resolveLayerWeightName(nameMap.layer[key], l);
             const q4 = tryGetQ4(weightName);
             if (q4) {
@@ -391,26 +451,16 @@ loadBtn.addEventListener('click', async () => {
             }
           }
         }
-        // Add bias terms if model has them
-        if (l === 0) console.log(`[Engine] attentionBias=${config.attentionBias}, raw=${currentModel!.config.attention_bias}`);
-        if (config.attentionBias) {
-          const qBiasName = resolveLayerWeightName(nameMap.layer.qBias, l);
-          const kBiasName = resolveLayerWeightName(nameMap.layer.kBias, l);
-          const vBiasName = resolveLayerWeightName(nameMap.layer.vBias, l);
-          const oBiasName = resolveLayerWeightName(nameMap.layer.oBias, l);
-          lw.qBias = tryGetTensor(qBiasName);
-          lw.kBias = tryGetTensor(kBiasName);
-          lw.vBias = tryGetTensor(vBiasName);
-          lw.oBias = tryGetTensor(oBiasName);
-          if (l === 0) {
-            console.log(`[Bias] L0 qBias=${qBiasName}: ${lw.qBias ? 'FOUND' : 'MISSING'}`);
-            console.log(`[Bias] L0 kBias=${kBiasName}: ${lw.kBias ? 'FOUND' : 'MISSING'}`);
-            console.log(`[Bias] L0 vBias=${vBiasName}: ${lw.vBias ? 'FOUND' : 'MISSING'}`);
-            console.log(`[Bias] L0 oBias=${oBiasName}: ${lw.oBias ? 'FOUND' : 'MISSING'}`);
-          }
-        }
+
         layers.push(lw);
       }
+
+      if (config.isHybrid) {
+        const linCount = config.layerTypes!.filter(t => t === 'linear_attention').length;
+        const fullCount = config.layerTypes!.filter(t => t === 'full_attention').length;
+        console.log(`[Engine] Hybrid model: ${linCount} linear + ${fullCount} full attention layers`);
+      }
+      if (l0Keys.length > 0) console.log(`[Engine] attentionBias=${config.attentionBias}`);
 
       const engine = createForwardPassEngine(gpu!.device, config, { global, layers });
       const tokenizer = await createTokenizer({ modelId: repo });
