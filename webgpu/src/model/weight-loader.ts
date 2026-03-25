@@ -12,7 +12,7 @@
  */
 
 import {
-  parseHeader, extractTensorData, tensorToFloat32,
+  parseHeader, extractTensorData, tensorToFloat32, tensorToTypedArray,
   formatBytes, summarizeHeader,
   type SafeTensorsHeader, type TensorInfo,
 } from './safetensors';
@@ -31,9 +31,11 @@ export interface GPUTensor {
   name: string;
   buffer: GPUBuffer;
   shape: number[];
-  dtype: string;        // original dtype (F16, BF16, etc.)
-  byteLength: number;   // size on GPU (always F32 = elementCount × 4)
+  dtype: string;        // original dtype (F16, BF16, I32, etc.)
+  byteLength: number;   // size on GPU
   elementCount: number;
+  /** True for GPTQ packed weights (.qweight, .qzeros, .scales) */
+  isQuantized?: boolean;
 }
 
 export interface LoadedModel {
@@ -183,18 +185,31 @@ export async function loadModel(
       // Extract raw tensor bytes from the shard
       const rawData = extractTensorData(shardData, tensorInfo, header.headerByteLength);
 
-      // Convert to float32 for GPU compute
-      const float32Data = tensorToFloat32(rawData, tensorInfo.dtype);
+      // GPTQ tensors (.qweight, .qzeros, .scales) stay in native format
+      // for GPU-side dequantization. All other tensors convert to f32.
+      const isGPTQ = name.endsWith('.qweight') || name.endsWith('.qzeros')
+        || name.endsWith('.scales') || name.endsWith('.g_idx');
+
+      let gpuData: ArrayBufferView;
+      if (isGPTQ) {
+        // Keep native format: I32 for qweight/qzeros, F16 for scales
+        gpuData = tensorToTypedArray(rawData, tensorInfo.dtype);
+      } else {
+        // Standard path: convert to f32
+        gpuData = tensorToFloat32(rawData, tensorInfo.dtype);
+      }
 
       // Create GPU buffer and upload
       const gpuBuffer = device.createBuffer({
-        size: float32Data.byteLength,
+        size: gpuData.byteLength,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
         label: name,
         mappedAtCreation: true,
       });
 
-      new Float32Array(gpuBuffer.getMappedRange()).set(float32Data);
+      new Uint8Array(gpuBuffer.getMappedRange()).set(
+        new Uint8Array(gpuData.buffer, gpuData.byteOffset, gpuData.byteLength)
+      );
       gpuBuffer.unmap();
 
       allTensors.set(name, {
@@ -202,11 +217,12 @@ export async function loadModel(
         buffer: gpuBuffer,
         shape: tensorInfo.shape,
         dtype: tensorInfo.dtype,
-        byteLength: float32Data.byteLength,
+        byteLength: gpuData.byteLength,
         elementCount: tensorInfo.elementCount,
+        isQuantized: isGPTQ,
       });
 
-      totalGPUBytes += float32Data.byteLength;
+      totalGPUBytes += gpuData.byteLength;
       tensorsProcessed++;
     }
   }

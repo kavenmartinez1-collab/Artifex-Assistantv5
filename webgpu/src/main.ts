@@ -338,19 +338,45 @@ loadBtn.addEventListener('click', async () => {
         return t?.buffer;
       };
 
+      // Helper to load GPTQ triplet (qweight + scales + qzeros) for a projection
+      const tryGetQ4 = (weightName: string) => {
+        const base = weightName.replace('.weight', '');
+        const qw = tryGetTensor(`${base}.qweight`);
+        const sc = tryGetTensor(`${base}.scales`);
+        const qz = tryGetTensor(`${base}.qzeros`);
+        if (qw && sc && qz) return { qweight: qw, scales: sc, qzeros: qz };
+        return undefined;
+      };
+
       const layers = [];
       for (let l = 0; l < config.numLayers; l++) {
+        // For quantized models, .weight tensors won't exist for linear layers.
+        // Use tryGetTensor for projection weights (may be null if GPTQ).
         const lw: any = {
           inputNorm: getTensor(resolveLayerWeightName(nameMap.layer.inputNorm, l)),
-          qProj: getTensor(resolveLayerWeightName(nameMap.layer.qProj, l)),
-          kProj: getTensor(resolveLayerWeightName(nameMap.layer.kProj, l)),
-          vProj: getTensor(resolveLayerWeightName(nameMap.layer.vProj, l)),
-          oProj: getTensor(resolveLayerWeightName(nameMap.layer.oProj, l)),
+          qProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.qProj, l)),
+          kProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.kProj, l)),
+          vProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.vProj, l)),
+          oProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.oProj, l)),
           postAttnNorm: getTensor(resolveLayerWeightName(nameMap.layer.postAttnNorm, l)),
-          gateProj: getTensor(resolveLayerWeightName(nameMap.layer.gateProj, l)),
-          upProj: getTensor(resolveLayerWeightName(nameMap.layer.upProj, l)),
-          downProj: getTensor(resolveLayerWeightName(nameMap.layer.downProj, l)),
+          gateProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.gateProj, l)),
+          upProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.upProj, l)),
+          downProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.downProj, l)),
         };
+
+        // Load GPTQ quantized weights if available
+        if (config.isQuantized) {
+          const projNames = ['qProj', 'kProj', 'vProj', 'oProj', 'gateProj', 'upProj', 'downProj'];
+          const nameKeys = ['qProj', 'kProj', 'vProj', 'oProj', 'gateProj', 'upProj', 'downProj'] as const;
+          for (const key of nameKeys) {
+            const weightName = resolveLayerWeightName(nameMap.layer[key], l);
+            const q4 = tryGetQ4(weightName);
+            if (q4) {
+              lw[`${key}_q4`] = q4;
+              if (l === 0) console.log(`[Q4] L0 ${key}: GPTQ loaded`);
+            }
+          }
+        }
         // Add bias terms if model has them
         if (l === 0) console.log(`[Engine] attentionBias=${config.attentionBias}, raw=${currentModel!.config.attention_bias}`);
         if (config.attentionBias) {

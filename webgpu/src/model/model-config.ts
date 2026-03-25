@@ -51,11 +51,21 @@ export interface ModelConfig {
   /** Whether the embedding and lm_head share weights */
   tieWordEmbeddings: boolean;
 
+  // ── Quantization ────────────────────────────────────────────────────
+  /** Quantization method: 'none', 'gptq', 'awq' */
+  quantMethod: string;
+  /** Quantization bits (4 for GPTQ INT4) */
+  quantBits: number;
+  /** Quantization group size (typically 128) */
+  quantGroupSize: number;
+
   // ── Derived ────────────────────────────────────────────────────────
   /** Number of Q heads per KV head group (for GQA). = numAttentionHeads / numKVHeads */
   numQPerKV: number;
   /** Whether this model uses grouped-query attention */
   isGQA: boolean;
+  /** Whether this model uses quantized weights */
+  isQuantized: boolean;
 }
 
 /**
@@ -219,6 +229,12 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
 
   const numQPerKV = Math.floor(numAttentionHeads / numKVHeads);
 
+  // Quantization detection (GPTQ, AWQ)
+  const quantConfig = hfConfig.quantization_config;
+  const quantMethod = quantConfig?.quant_method ?? 'none';
+  const quantBits = quantConfig?.bits ?? 0;
+  const quantGroupSize = quantConfig?.group_size ?? 128;
+
   return {
     modelType,
     hiddenSize,
@@ -234,8 +250,12 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
     hiddenAct,
     attentionBias,
     tieWordEmbeddings,
+    quantMethod,
+    quantBits,
+    quantGroupSize,
     numQPerKV,
     isGQA: numKVHeads !== numAttentionHeads,
+    isQuantized: quantMethod !== 'none',
   };
 }
 
