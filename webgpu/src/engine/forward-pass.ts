@@ -673,6 +673,30 @@ export function createForwardPassEngine(
           dispatchElementwise(decayPipeline, lw.linearALog, linDecayBuf!, linConvDim, `L${l}-decay`, linDtBuf!);
         }
 
+        // Debug SSM intermediates (layer 0, first pass)
+        if (isDebug && l === 0) {
+          await device.queue.onSubmittedWorkDone();
+          const betaRaw = await readBuffer(device, linBBuf!, linNKH * 4);
+          const beta = new Float32Array(betaRaw);
+          console.log(`[SSM DEBUG] beta (sigmoid) first 4: [${Array.from(beta.slice(0, 4)).map(v => v.toFixed(4)).join(', ')}]`);
+
+          const decayRaw = await readBuffer(device, linDecayBuf!, 8 * 4);
+          const decay = new Float32Array(decayRaw);
+          console.log(`[SSM DEBUG] decay first 8: [${Array.from(decay.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+
+          const kSiluRaw = await readBuffer(device, linConvOutBuf!, 8 * 4);
+          const kSilu = new Float32Array(kSiluRaw);
+          console.log(`[SSM DEBUG] K after conv+silu first 8: [${Array.from(kSilu.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+
+          const vRaw = await readBuffer(device, linVBuf!, 8 * 4);
+          const vVals = new Float32Array(vRaw);
+          console.log(`[SSM DEBUG] V first 8: [${Array.from(vVals.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+
+          const qRaw = await readBuffer(device, linQBuf!, 8 * 4);
+          const qVals = new Float32Array(qRaw);
+          console.log(`[SSM DEBUG] Q first 8: [${Array.from(qVals.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+        }
+
         // 6. SSM step: update hidden state, readout via Q
         if (ssmStepPipeline) {
           const ssmParams = createUniformBuffer(device,
@@ -694,6 +718,14 @@ export function createForwardPassEngine(
           dispatch(device, ssmStepPipeline, [ssmBG0, ssmBG1, ssmBG2],
             [linNKH], `L${l}-ssm-step`);
           ssmParams.destroy();
+        }
+
+        // Debug SSM output (layer 0, first pass)
+        if (isDebug && l === 0) {
+          await device.queue.onSubmittedWorkDone();
+          const ssmOutRaw = await readBuffer(device, linOutBuf!, 8 * 4);
+          const ssmOut = new Float32Array(ssmOutRaw);
+          console.log(`[SSM DEBUG] SSM output first 8: [${Array.from(ssmOut.slice(0, 8)).map(v => v.toFixed(6)).join(', ')}]`);
         }
 
         // 7. GroupNorm on output
