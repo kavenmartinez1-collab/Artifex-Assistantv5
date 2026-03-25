@@ -155,20 +155,35 @@ export async function loadModel(
     const chunkCache = new Map<number, ArrayBuffer | Promise<ArrayBuffer>>();
     const totalChunks = Math.ceil(shard.size / CHUNK_SIZE);
 
-    // Helper: fetch a chunk (returns ArrayBuffer)
+    // Helper: fetch a chunk (checks browser cache first, then downloads)
     async function fetchChunk(idx: number): Promise<ArrayBuffer> {
+      const chunkKey = `${cacheKey}/chunk-${idx}`;
+      // Try browser cache first
+      const cachedChunk = await getCache(chunkKey);
+      if (cachedChunk) return cachedChunk;
+      // Download and cache for next time
       const start = idx * CHUNK_SIZE;
       const end = Math.min(start + CHUNK_SIZE, shard.size);
-      return fetchRange(shard.url, start, end);
+      const data = await fetchRange(shard.url, start, end);
+      putCache(chunkKey, data).catch(() => {}); // fire-and-forget cache write
+      return data;
     }
 
     // Helper: get a chunk (from cache or download), returns ArrayBuffer
+    // Evicts failed prefetch promises so they can be re-attempted
     async function getChunk(idx: number): Promise<ArrayBuffer> {
       if (idx >= totalChunks) return new ArrayBuffer(0);
       const cached = chunkCache.get(idx);
       if (cached instanceof ArrayBuffer) return cached;
-      if (cached instanceof Promise) return cached;
-      // Not in cache — start download
+      if (cached instanceof Promise) {
+        try {
+          return await cached;
+        } catch {
+          // Prefetch failed after retries — evict and re-attempt below
+          chunkCache.delete(idx);
+        }
+      }
+      // Not in cache or evicted — start fresh download
       const promise = fetchChunk(idx);
       chunkCache.set(idx, promise);
       const data = await promise;
@@ -181,7 +196,10 @@ export async function loadModel(
       for (let i = 0; i < Math.min(PARALLEL_CHUNKS, totalChunks); i++) {
         const promise = fetchChunk(i);
         chunkCache.set(i, promise);
-        promise.then(data => { chunkCache.set(i, data); });
+        promise.then(
+          data => { chunkCache.set(i, data); },
+          () => { chunkCache.delete(i); }, // evict on failure — getChunk will retry
+        );
       }
       progress({ phase: 'downloading',
         message: `Shard ${shardIdx + 1}: downloading ${Math.min(PARALLEL_CHUNKS, totalChunks)} chunks in parallel...`,
@@ -239,7 +257,10 @@ export async function loadModel(
             if (futureIdx < totalChunks && !chunkCache.has(futureIdx)) {
               const p = fetchChunk(futureIdx);
               chunkCache.set(futureIdx, p);
-              p.then(data => { chunkCache.set(futureIdx, data); });
+              p.then(
+                data => { chunkCache.set(futureIdx, data); },
+                () => { chunkCache.delete(futureIdx); },
+              );
             }
           }
 

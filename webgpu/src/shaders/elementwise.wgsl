@@ -2,6 +2,7 @@
 
 struct Params {
   n: u32,
+  broadcast_b: u32, // if > 0, index input_b as input_b[idx % broadcast_b]
 }
 
 @group(0) @binding(0) var<storage, read> input_a: array<f32>;
@@ -32,12 +33,15 @@ fn gelu(@builtin(global_invocation_id) gid: vec3u) {
 
 @group(0) @binding(3) var<storage, read> input_b: array<f32>;
 
-// Element-wise add: output = a + b
+// Element-wise add: output = a + b (with optional broadcast on b)
+// When broadcast_b > 0, input_b is indexed as input_b[idx % broadcast_b]
+// This lets a bias vector [dim] be added to a batched tensor [seq * dim]
 @compute @workgroup_size(256)
 fn add(@builtin(global_invocation_id) gid: vec3u) {
   let idx = gid.x;
   if (idx >= params.n) { return; }
-  output[idx] = input_a[idx] + input_b[idx];
+  let b_idx = select(idx, idx % params.broadcast_b, params.broadcast_b > 0u);
+  output[idx] = input_a[idx] + input_b[b_idx];
 }
 
 // Element-wise multiply: output = a * b

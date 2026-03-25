@@ -307,20 +307,22 @@ export function initTurboQuant(
   }
   threshBuf.unmap();
 
-  // Params uniform: [headDim, bits, numCentroids, numThresholds]
+  // Params uniform: [headDim, bits, numCentroids, numThresholds, out_vec_offset]
+  // 5 fields to match the encode shader's Params struct (out_vec_offset defaults to 0)
   const paramsData = new Uint32Array([
     d,
     bits,
     centroidData.length,
     threshData.length,
+    0, // out_vec_offset — default 0, overridden per-dispatch in forward pass
   ]);
   const paramsBuf = device.createBuffer({
-    size: 16, // 4 × u32
+    size: Math.max(paramsData.byteLength, 16),
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     label: 'turboquant-params',
     mappedAtCreation: true,
   });
-  new Uint32Array(paramsBuf.getMappedRange()).set(paramsData);
+  new Uint32Array(paramsBuf.getMappedRange(0, paramsData.byteLength)).set(paramsData);
   paramsBuf.unmap();
 
   return {

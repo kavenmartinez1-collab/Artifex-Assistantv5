@@ -163,6 +163,27 @@ const WEIGHT_NAME_PATTERNS: Record<string, WeightNameMap> = {
       downProj: 'model.layers.{L}.mlp.down_proj.weight',
     },
   },
+  // Qwen3.5 adds 'language_model' prefix to all weight paths
+  qwen3_5_text: {
+    embedTokens: 'model.language_model.embed_tokens.weight',
+    finalNorm: 'model.language_model.norm.weight',
+    lmHead: 'lm_head.weight',
+    layer: {
+      inputNorm: 'model.language_model.layers.{L}.input_layernorm.weight',
+      qProj: 'model.language_model.layers.{L}.self_attn.q_proj.weight',
+      kProj: 'model.language_model.layers.{L}.self_attn.k_proj.weight',
+      vProj: 'model.language_model.layers.{L}.self_attn.v_proj.weight',
+      oProj: 'model.language_model.layers.{L}.self_attn.o_proj.weight',
+      qBias: 'model.language_model.layers.{L}.self_attn.q_proj.bias',
+      kBias: 'model.language_model.layers.{L}.self_attn.k_proj.bias',
+      vBias: 'model.language_model.layers.{L}.self_attn.v_proj.bias',
+      oBias: 'model.language_model.layers.{L}.self_attn.o_proj.bias',
+      postAttnNorm: 'model.language_model.layers.{L}.post_attention_layernorm.weight',
+      gateProj: 'model.language_model.layers.{L}.mlp.gate_proj.weight',
+      upProj: 'model.language_model.layers.{L}.mlp.up_proj.weight',
+      downProj: 'model.language_model.layers.{L}.mlp.down_proj.weight',
+    },
+  },
   // Phi models use a different structure
   phi: {
     embedTokens: 'model.embed_tokens.weight',
@@ -267,6 +288,61 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
  */
 export function getWeightNameMap(modelType: string): WeightNameMap {
   return WEIGHT_NAME_PATTERNS[modelType] ?? WEIGHT_NAME_PATTERNS.default;
+}
+
+/**
+ * Auto-detect the weight name mapping by checking which tensor names exist.
+ * Falls back to model-type lookup if auto-detect fails.
+ * This handles models with non-standard prefixes (e.g., multimodal models
+ * that nest text weights under `model.language_model.`).
+ */
+export function autoDetectWeightNameMap(
+  modelType: string,
+  tensorNames: Set<string> | Map<string, any>,
+): WeightNameMap {
+  const has = (name: string) =>
+    tensorNames instanceof Set ? tensorNames.has(name) : tensorNames.has(name);
+
+  // Try model-type specific map first
+  const typeMap = WEIGHT_NAME_PATTERNS[modelType];
+  if (typeMap && has(typeMap.embedTokens)) return typeMap;
+
+  // Try default pattern
+  if (has(WEIGHT_NAME_PATTERNS.default.embedTokens)) return WEIGHT_NAME_PATTERNS.default;
+
+  // Auto-detect: find embed_tokens.weight with any prefix
+  for (const name of (tensorNames instanceof Set ? tensorNames : tensorNames.keys())) {
+    if (name.endsWith('embed_tokens.weight')) {
+      const prefix = name.replace('embed_tokens.weight', '');
+      console.log(`[ModelConfig] Auto-detected weight prefix: "${prefix}"`);
+      // Build a name map by prepending the prefix to the default pattern
+      const base = WEIGHT_NAME_PATTERNS.default;
+      const reprefix = (s: string) => s.replace('model.', prefix);
+      return {
+        embedTokens: reprefix(base.embedTokens),
+        finalNorm: reprefix(base.finalNorm),
+        lmHead: base.lmHead, // lm_head is usually at the top level
+        layer: {
+          inputNorm: reprefix(base.layer.inputNorm),
+          qProj: reprefix(base.layer.qProj),
+          kProj: reprefix(base.layer.kProj),
+          vProj: reprefix(base.layer.vProj),
+          oProj: reprefix(base.layer.oProj),
+          qBias: reprefix(base.layer.qBias),
+          kBias: reprefix(base.layer.kBias),
+          vBias: reprefix(base.layer.vBias),
+          oBias: reprefix(base.layer.oBias),
+          postAttnNorm: reprefix(base.layer.postAttnNorm),
+          gateProj: reprefix(base.layer.gateProj),
+          upProj: reprefix(base.layer.upProj),
+          downProj: reprefix(base.layer.downProj),
+        },
+      };
+    }
+  }
+
+  // Final fallback
+  return getWeightNameMap(modelType);
 }
 
 /**

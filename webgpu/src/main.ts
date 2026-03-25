@@ -201,6 +201,7 @@ sendBtn.addEventListener('click', async () => {
 
     const temperature = parseFloat(tempSlider.value);
     const topP = parseFloat(toppSlider.value);
+    const useCompressedKV = ($('turboquant') as HTMLInputElement).checked;
 
     const systemPrompt = ($('system-prompt') as HTMLTextAreaElement).value.trim();
     const messages: Array<{ role: string; content: string }> = [];
@@ -211,7 +212,7 @@ sendBtn.addEventListener('click', async () => {
 
     const handle = session.chat(
       messages,
-      { temperature, topP, maxNewTokens: 512 },
+      { temperature, topP, maxNewTokens: 512, useCompressedKV },
       (token) => {
         fullText += token;
         responseDiv.textContent = fullText;
@@ -313,11 +314,11 @@ loadBtn.addEventListener('click', async () => {
       // Import bridgeWeights and engine builder
       const { createForwardPassEngine } = await import('./engine/forward-pass');
       const { createTokenizer } = await import('./model/tokenizer');
-      const { getWeightNameMap, resolveLayerWeightName } = await import('./model/model-config');
+      const { autoDetectWeightNameMap, resolveLayerWeightName } = await import('./model/model-config');
       const { generate } = await import('./engine/generate');
 
-      // Bridge weight tensors to structured format
-      const nameMap = getWeightNameMap(config.modelType);
+      // Bridge weight tensors to structured format (auto-detects prefix)
+      const nameMap = autoDetectWeightNameMap(config.modelType, currentModel!.tensors);
       const getTensor = (name: string) => {
         const t = currentModel!.tensors.get(name);
         if (!t) throw new Error(`Missing tensor: ${name}`);
@@ -356,6 +357,10 @@ loadBtn.addEventListener('click', async () => {
         if (qw && sc && qz) return { qweight: qw, scales: sc, qzeros: qz };
         return undefined;
       };
+
+      // Debug: log tensor names at layer 0 to discover naming convention
+      const l0Keys = [...currentModel!.tensors.keys()].filter(k => k.includes('layers.0.'));
+      console.log(`[Engine] Layer 0 tensors (${l0Keys.length}):`, l0Keys);
 
       const layers = [];
       for (let l = 0; l < config.numLayers; l++) {

@@ -37,6 +37,7 @@ import {
   createUniformBuffer,
   readBuffer,
 } from './buffers';
+import { initTurboQuant, buildCodebook } from '../model/turboquant';
 
 import matmulWGSL from '../shaders/matmul.wgsl?raw';
 import rmsnormWGSL from '../shaders/rmsnorm.wgsl?raw';
@@ -45,6 +46,8 @@ import elementwiseWGSL from '../shaders/elementwise.wgsl?raw';
 import embedWGSL from '../shaders/embed.wgsl?raw';
 import attentionWGSL from '../shaders/attention.wgsl?raw';
 import matmulQ4WGSL from '../shaders/matmul_q4.wgsl?raw';
+import tqEncodeWGSL from '../shaders/turboquant_encode.wgsl?raw';
+import tqDecodeWGSL from '../shaders/turboquant_decode.wgsl?raw';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -88,16 +91,30 @@ export interface ModelWeights {
   layers: LayerWeights[];
 }
 
+/** Compressed KV cache data (TurboQuant). */
+export interface CompressedKVData {
+  scratchK: GPUBuffer;       // shared f32 decode buffer [maxSeqLen, kvDim]
+  scratchV: GPUBuffer;       // shared f32 decode buffer [maxSeqLen, kvDim]
+  quantizedK: GPUBuffer[];   // packed u32 indices per layer
+  quantizedV: GPUBuffer[];
+  signBitsK: GPUBuffer[];    // QJL sign bits per layer
+  signBitsV: GPUBuffer[];
+  normsK: GPUBuffer[];       // f32 norms per layer
+  normsV: GPUBuffer[];
+}
+
 /** KV cache for all layers. */
 export interface KVCache {
-  /** K cache per layer: [max_seq, num_kv_heads * head_dim] */
+  /** K cache per layer: [max_seq, num_kv_heads * head_dim] (unused if compressed) */
   keys: GPUBuffer[];
-  /** V cache per layer: [max_seq, num_kv_heads * head_dim] */
+  /** V cache per layer: [max_seq, num_kv_heads * head_dim] (unused if compressed) */
   values: GPUBuffer[];
   /** Current sequence position (number of cached tokens) */
   position: number;
   /** Maximum sequence length */
   maxSeqLen: number;
+  /** TurboQuant compressed storage (when enabled) */
+  compressed?: CompressedKVData;
 }
 
 /** Output of a forward pass step. */
@@ -112,8 +129,12 @@ export interface ForwardPassEngine {
   /** Run one forward pass step (prefill or single-token decode). */
   forward(tokenIds: Uint32Array, kvCache: KVCache): Promise<ForwardOutput>;
 
-  /** Create an empty KV cache for the given max sequence length. */
-  createKVCache(maxSeqLen: number): KVCache;
+  /** Create an empty KV cache for the given max sequence length.
+   *  @param compressed — Use TurboQuant compression (saves ~80% KV memory) */
+  createKVCache(maxSeqLen: number, compressed?: boolean): KVCache;
+
+  /** Destroy all buffers in a KV cache. */
+  destroyKVCache(kvCache: KVCache): void;
 
   /** Get the model config. */
   readonly config: ModelConfig;
@@ -160,25 +181,52 @@ export function createForwardPassEngine(
   const ropePipeline = createComputePipeline(device, ropeWGSL, 'rope', 'rope');
   const attentionPipeline = createComputePipeline(device, attentionWGSL, 'attention', 'attention');
 
-  // ── Reusable intermediate buffers ──────────────────────────────────
-  // Single-token decode (seqLen=1). Prefill would need dynamic sizing.
-  const maxSeq = 1;
+  // ── TurboQuant pipelines & setup ───────────────────────────────────
+  // 4 bits for d≤64 (small models), 3 bits for d≥128 (noise averages better)
+  const TQ_BITS = dHead >= 128 ? 3 : 4;
+  const tqEncodePipeline = createComputePipeline(device, tqEncodeWGSL, 'encode', 'tq-encode');
+  const tqDecodePipeline = createComputePipeline(device, tqDecodeWGSL, 'decode', 'tq-decode');
+  const tqSetup = initTurboQuant(device, { headDim: dHead, bits: TQ_BITS });
+  const tqCodebook = buildCodebook(TQ_BITS);
+  const tqPackedWords = Math.ceil(dHead / Math.floor(32 / TQ_BITS));
+  const tqSignWords = Math.ceil(dHead / 32);
 
-  const hiddenBuf = createStorageBuffer(device, null, maxSeq * H * 4, 'hidden', true);
-  const residualBuf = createStorageBuffer(device, null, maxSeq * H * 4, 'residual', true);
-  const normedBuf = createStorageBuffer(device, null, maxSeq * H * 4, 'normed', true);
-  const qBuf = createStorageBuffer(device, null, maxSeq * nHeads * dHead * 4, 'q-proj', true);
-  const kBuf = createStorageBuffer(device, null, maxSeq * kvDim * 4, 'k-proj', true);
-  const vBuf = createStorageBuffer(device, null, maxSeq * kvDim * 4, 'v-proj', true);
-  const attnOutBuf = createStorageBuffer(device, null, maxSeq * nHeads * dHead * 4, 'attn-out', true);
-  const attnProjBuf = createStorageBuffer(device, null, maxSeq * H * 4, 'attn-proj', true);
-  const gateBuf = createStorageBuffer(device, null, maxSeq * ffnDim * 4, 'ffn-gate', true);
-  const upBuf = createStorageBuffer(device, null, maxSeq * ffnDim * 4, 'ffn-up', true);
-  const downBuf = createStorageBuffer(device, null, maxSeq * H * 4, 'ffn-down', true);
+  // Reusable bind groups for TQ matrices (group 1 — constant across all dispatches)
+  const tqEncodeMatBG = createBindGroup(device, tqEncodePipeline, 1, [
+    { binding: 0, resource: { buffer: tqSetup.rotationMatrix } },
+    { binding: 1, resource: { buffer: tqSetup.jlMatrix } },
+    { binding: 2, resource: { buffer: tqSetup.centroids } },
+    { binding: 3, resource: { buffer: tqSetup.thresholds } },
+  ], 'tq-encode-mat');
+
+  const tqDecodeMatBG = createBindGroup(device, tqDecodePipeline, 1, [
+    { binding: 0, resource: { buffer: tqSetup.rotationMatrix } },
+    { binding: 1, resource: { buffer: tqSetup.jlMatrix } },
+    { binding: 2, resource: { buffer: tqSetup.centroids } },
+  ], 'tq-decode-mat');
+
+  // ── Reusable intermediate buffers ──────────────────────────────────
+  // Sized for batch prefill (up to MAX_PREFILL tokens per forward pass).
+  // Single-token decode uses the same buffers (seqLen=1).
+  const MAX_PREFILL = 512;
+
+  const hiddenBuf = createStorageBuffer(device, null, MAX_PREFILL * H * 4, 'hidden', true);
+  const residualBuf = createStorageBuffer(device, null, MAX_PREFILL * H * 4, 'residual', true);
+  const normedBuf = createStorageBuffer(device, null, MAX_PREFILL * H * 4, 'normed', true);
+  const qBuf = createStorageBuffer(device, null, MAX_PREFILL * nHeads * dHead * 4, 'q-proj', true);
+  const kBuf = createStorageBuffer(device, null, MAX_PREFILL * kvDim * 4, 'k-proj', true);
+  const vBuf = createStorageBuffer(device, null, MAX_PREFILL * kvDim * 4, 'v-proj', true);
+  const attnOutBuf = createStorageBuffer(device, null, MAX_PREFILL * nHeads * dHead * 4, 'attn-out', true);
+  const attnProjBuf = createStorageBuffer(device, null, MAX_PREFILL * H * 4, 'attn-proj', true);
+  const gateBuf = createStorageBuffer(device, null, MAX_PREFILL * ffnDim * 4, 'ffn-gate', true);
+  const upBuf = createStorageBuffer(device, null, MAX_PREFILL * ffnDim * 4, 'ffn-up', true);
+  const downBuf = createStorageBuffer(device, null, MAX_PREFILL * H * 4, 'ffn-down', true);
   // Temp buffer for in-place elementwise ops (WebGPU can't read+write same buffer)
-  const ffnTempBuf = createStorageBuffer(device, null, maxSeq * ffnDim * 4, 'ffn-temp', true);
+  const ffnTempBuf = createStorageBuffer(device, null, MAX_PREFILL * ffnDim * 4, 'ffn-temp', true);
   const logitsBuf = createStorageBuffer(device, null, V * 4, 'logits', true);
-  const tokenIdBuf = createStorageBuffer(device, null, 256 * 4, 'token-ids', true); // up to 256 tokens
+  const tokenIdBuf = createStorageBuffer(device, null, MAX_PREFILL * 4, 'token-ids', true);
+  // Small buffer for extracting last token's hidden state (for LM head after batch prefill)
+  const lastHiddenBuf = createStorageBuffer(device, null, H * 4, 'last-hidden', true);
 
   /** C[M,N] = A[M,K] @ dequant(q4_packed, scales, zeros)^T — GPTQ INT4 */
   function dispatchMatmulQ4(
@@ -284,8 +332,9 @@ export function createForwardPassEngine(
     pipeline: GPUComputePipeline,
     inputBuf: GPUBuffer, outputBuf: GPUBuffer,
     size: number, label: string, secondBuf?: GPUBuffer,
+    broadcastB?: number,
   ) {
-    const params = createUniformBuffer(device, new Uint32Array([size]), `${label}-p`);
+    const params = createUniformBuffer(device, new Uint32Array([size, broadcastB ?? 0]), `${label}-p`);
     const entries: Array<{ binding: number; resource: GPUBindingResource }> = [
       { binding: 0, resource: { buffer: inputBuf } },
       { binding: 1, resource: { buffer: outputBuf } },
@@ -369,6 +418,51 @@ export function createForwardPassEngine(
     device.queue.submit([encoder.finish()]);
   }
 
+  // ── TurboQuant dispatch helpers ─────────────────────────────────────
+
+  function dispatchTQEncode(
+    inputBuf: GPUBuffer,
+    outQuantBuf: GPUBuffer, outSignBuf: GPUBuffer, outNormsBuf: GPUBuffer,
+    numVecs: number, outVecOffset: number, label: string,
+  ) {
+    const params = createUniformBuffer(device,
+      new Uint32Array([dHead, TQ_BITS, tqCodebook.centroids.length,
+        tqCodebook.thresholds.length, outVecOffset]),
+      `${label}-p`);
+    const bg0 = createBindGroup(device, tqEncodePipeline, 0, [
+      { binding: 0, resource: { buffer: inputBuf } },
+      { binding: 1, resource: { buffer: outQuantBuf } },
+      { binding: 2, resource: { buffer: outSignBuf } },
+      { binding: 3, resource: { buffer: outNormsBuf } },
+    ], `${label}-g0`);
+    const bg2 = createBindGroup(device, tqEncodePipeline, 2, [
+      { binding: 0, resource: { buffer: params } },
+    ], `${label}-g2`);
+    dispatch(device, tqEncodePipeline, [bg0, tqEncodeMatBG, bg2], [numVecs], label);
+    params.destroy();
+  }
+
+  function dispatchTQDecode(
+    inQuantBuf: GPUBuffer, inSignBuf: GPUBuffer, inNormsBuf: GPUBuffer,
+    outputBuf: GPUBuffer, numVecs: number, label: string,
+  ) {
+    const params = createUniformBuffer(device,
+      new Uint32Array([dHead, TQ_BITS, tqCodebook.centroids.length,
+        tqCodebook.thresholds.length]),
+      `${label}-p`);
+    const bg0 = createBindGroup(device, tqDecodePipeline, 0, [
+      { binding: 0, resource: { buffer: inQuantBuf } },
+      { binding: 1, resource: { buffer: inSignBuf } },
+      { binding: 2, resource: { buffer: outputBuf } },
+      { binding: 3, resource: { buffer: inNormsBuf } },
+    ], `${label}-g0`);
+    const bg2 = createBindGroup(device, tqDecodePipeline, 2, [
+      { binding: 0, resource: { buffer: params } },
+    ], `${label}-g2`);
+    dispatch(device, tqDecodePipeline, [bg0, tqDecodeMatBG, bg2], [numVecs], label);
+    params.destroy();
+  }
+
   // ── Forward Pass ───────────────────────────────────────────────────
 
   async function forward(tokenIds: Uint32Array, kvCache: KVCache): Promise<ForwardOutput> {
@@ -420,23 +514,26 @@ export function createForwardPassEngine(
       // Use copy-add pattern to avoid same-buffer read+write conflict:
       //   copy qBuf → temp, then temp + bias → qBuf
       if (config.attentionBias && lw.qBias && lw.kBias && lw.vBias) {
+        // Bias vectors are [dim], but Q/K/V are [seqLen, dim] — broadcast bias across positions
+        const qDim = nHeads * dHead;
+
         // Q bias: copy Q to attnOutBuf (temp), add bias back to qBuf
         const encQb = device.createCommandEncoder({ label: `L${l}-qb-copy` });
-        encQb.copyBufferToBuffer(qBuf, 0, attnOutBuf, 0, seqLen * nHeads * dHead * 4);
+        encQb.copyBufferToBuffer(qBuf, 0, attnOutBuf, 0, seqLen * qDim * 4);
         device.queue.submit([encQb.finish()]);
-        dispatchElementwise(addPipeline, attnOutBuf, qBuf, seqLen * nHeads * dHead, `L${l}-qb`, lw.qBias);
+        dispatchElementwise(addPipeline, attnOutBuf, qBuf, seqLen * qDim, `L${l}-qb`, lw.qBias, qDim);
 
         // K bias: copy K to ffnTempBuf (temp, reused), add bias
         const encKb = device.createCommandEncoder({ label: `L${l}-kb-copy` });
         encKb.copyBufferToBuffer(kBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
         device.queue.submit([encKb.finish()]);
-        dispatchElementwise(addPipeline, ffnTempBuf, kBuf, seqLen * kvDim, `L${l}-kb`, lw.kBias);
+        dispatchElementwise(addPipeline, ffnTempBuf, kBuf, seqLen * kvDim, `L${l}-kb`, lw.kBias, kvDim);
 
         // V bias: reuse ffnTempBuf
         const encVb = device.createCommandEncoder({ label: `L${l}-vb-copy` });
         encVb.copyBufferToBuffer(vBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
         device.queue.submit([encVb.finish()]);
-        dispatchElementwise(addPipeline, ffnTempBuf, vBuf, seqLen * kvDim, `L${l}-vb`, lw.vBias);
+        dispatchElementwise(addPipeline, ffnTempBuf, vBuf, seqLen * kvDim, `L${l}-vb`, lw.vBias, kvDim);
       }
 
       if (isDebug && l === 0) {
@@ -455,16 +552,53 @@ export function createForwardPassEngine(
         await debugRead(kBuf, 'L0-K-after-rope', 8);
       }
 
-      // Write new K, V to cache
-      copyToKVCache(kBuf, kvCache.keys[l], seqLen, kvDim, pos);
-      copyToKVCache(vBuf, kvCache.values[l], seqLen, kvDim, pos);
-
-      // Multi-head attention (reads full K,V cache including new tokens)
+      // Write new K, V to cache and run attention
       const isCausal = seqLen > 1; // causal mask only needed for prefill
-      dispatchAttention(
-        qBuf, kvCache.keys[l], kvCache.values[l], attnOutBuf,
-        seqLen, cacheLen, isCausal, pos, `L${l}-attn`,
-      );
+
+      if (kvCache.compressed) {
+        const c = kvCache.compressed;
+        const numVecs = seqLen * nKVHeads;
+        const outOffset = pos * nKVHeads;
+
+        // Encode new K/V into compressed cache (for future steps)
+        dispatchTQEncode(kBuf, c.quantizedK[l], c.signBitsK[l], c.normsK[l],
+          numVecs, outOffset, `L${l}-tq-enc-k`);
+        dispatchTQEncode(vBuf, c.quantizedV[l], c.signBitsV[l], c.normsV[l],
+          numVecs, outOffset, `L${l}-tq-enc-v`);
+
+        // Decode PREVIOUS positions from compressed cache (quantized)
+        if (pos > 0) {
+          const prevVecs = pos * nKVHeads;
+          dispatchTQDecode(c.quantizedK[l], c.signBitsK[l], c.normsK[l],
+            c.scratchK, prevVecs, `L${l}-tq-dec-k`);
+          dispatchTQDecode(c.quantizedV[l], c.signBitsV[l], c.normsV[l],
+            c.scratchV, prevVecs, `L${l}-tq-dec-v`);
+        }
+
+        // Copy CURRENT K/V exactly to scratch (no quantization round-trip)
+        const curOffset = pos * kvDim * 4;
+        const curSize = seqLen * kvDim * 4;
+        const encCK = device.createCommandEncoder({ label: `L${l}-tq-cpK` });
+        encCK.copyBufferToBuffer(kBuf, 0, c.scratchK, curOffset, curSize);
+        device.queue.submit([encCK.finish()]);
+        const encCV = device.createCommandEncoder({ label: `L${l}-tq-cpV` });
+        encCV.copyBufferToBuffer(vBuf, 0, c.scratchV, curOffset, curSize);
+        device.queue.submit([encCV.finish()]);
+
+
+        dispatchAttention(
+          qBuf, c.scratchK, c.scratchV, attnOutBuf,
+          seqLen, cacheLen, isCausal, pos, `L${l}-attn`,
+        );
+      } else {
+        copyToKVCache(kBuf, kvCache.keys[l], seqLen, kvDim, pos);
+        copyToKVCache(vBuf, kvCache.values[l], seqLen, kvDim, pos);
+
+        dispatchAttention(
+          qBuf, kvCache.keys[l], kvCache.values[l], attnOutBuf,
+          seqLen, cacheLen, isCausal, pos, `L${l}-attn`,
+        );
+      }
 
       // Output projection: [seq, nHeads*dHead] → [seq, H]
       dispatchProjection(attnOutBuf, lw, 'oProj', attnProjBuf, seqLen, H, nHeads * dHead, `L${l}-o`);
@@ -474,7 +608,7 @@ export function createForwardPassEngine(
         const encOb = device.createCommandEncoder({ label: `L${l}-ob-copy` });
         encOb.copyBufferToBuffer(attnProjBuf, 0, normedBuf, 0, seqLen * H * 4);
         device.queue.submit([encOb.finish()]);
-        dispatchElementwise(addPipeline, normedBuf, attnProjBuf, seqLen * H, `L${l}-ob`, lw.oBias);
+        dispatchElementwise(addPipeline, normedBuf, attnProjBuf, seqLen * H, `L${l}-ob`, lw.oBias, H);
       }
 
       // Residual: hidden = residual + attn_output
@@ -526,9 +660,17 @@ export function createForwardPassEngine(
     const lmHeadBuf = config.tieWordEmbeddings
       ? weights.global.embedTokens
       : weights.global.lmHead;
-    // For multi-token input, we'd offset to the last row of normedBuf.
-    // For seqLen=1 (decode), normedBuf IS the last token.
-    dispatchMatmulBT(normedBuf, lmHeadBuf, logitsBuf, 1, V, H, 'lm-head');
+
+    // For batch prefill (seqLen > 1), extract last row of normedBuf for LM head
+    let lmInputBuf = normedBuf;
+    if (seqLen > 1) {
+      const lastRowOffset = (seqLen - 1) * H * 4;
+      const encLH = device.createCommandEncoder({ label: 'last-hidden-copy' });
+      encLH.copyBufferToBuffer(normedBuf, lastRowOffset, lastHiddenBuf, 0, H * 4);
+      device.queue.submit([encLH.finish()]);
+      lmInputBuf = lastHiddenBuf;
+    }
+    dispatchMatmulBT(lmInputBuf, lmHeadBuf, logitsBuf, 1, V, H, 'lm-head');
 
     // Update cache position
     kvCache.position += seqLen;
@@ -538,15 +680,76 @@ export function createForwardPassEngine(
 
   // ── KV Cache ───────────────────────────────────────────────────────
 
-  function createKVCache(maxSeqLen: number): KVCache {
-    const keys: GPUBuffer[] = [];
-    const values: GPUBuffer[] = [];
-    for (let l = 0; l < L; l++) {
-      keys.push(createStorageBuffer(device, null, maxSeqLen * kvDim * 4, `kv-k-${l}`, true));
-      values.push(createStorageBuffer(device, null, maxSeqLen * kvDim * 4, `kv-v-${l}`, true));
+  function createKVCache(maxSeqLen: number, compressed = false): KVCache {
+    if (!compressed) {
+      const keys: GPUBuffer[] = [];
+      const values: GPUBuffer[] = [];
+      for (let l = 0; l < L; l++) {
+        keys.push(createStorageBuffer(device, null, maxSeqLen * kvDim * 4, `kv-k-${l}`, true));
+        values.push(createStorageBuffer(device, null, maxSeqLen * kvDim * 4, `kv-v-${l}`, true));
+      }
+      return { keys, values, position: 0, maxSeqLen };
     }
-    return { keys, values, position: 0, maxSeqLen };
+
+    // TurboQuant compressed KV cache
+    const totalVecs = maxSeqLen * nKVHeads;
+    const quantBufSize = totalVecs * tqPackedWords * 4;
+    const signBufSize = totalVecs * tqSignWords * 4;
+    const normBufSize = totalVecs * 4;
+
+    const quantizedK: GPUBuffer[] = [];
+    const quantizedV: GPUBuffer[] = [];
+    const signBitsK: GPUBuffer[] = [];
+    const signBitsV: GPUBuffer[] = [];
+    const normsK: GPUBuffer[] = [];
+    const normsV: GPUBuffer[] = [];
+
+    for (let l = 0; l < L; l++) {
+      quantizedK.push(createStorageBuffer(device, null, quantBufSize, `tq-qk-${l}`, false));
+      quantizedV.push(createStorageBuffer(device, null, quantBufSize, `tq-qv-${l}`, false));
+      signBitsK.push(createStorageBuffer(device, null, signBufSize, `tq-sk-${l}`, false));
+      signBitsV.push(createStorageBuffer(device, null, signBufSize, `tq-sv-${l}`, false));
+      normsK.push(createStorageBuffer(device, null, normBufSize, `tq-nk-${l}`, false));
+      normsV.push(createStorageBuffer(device, null, normBufSize, `tq-nv-${l}`, false));
+    }
+
+    // Shared scratch f32 buffers (reused across layers during decode)
+    const scratchK = createStorageBuffer(device, null, maxSeqLen * kvDim * 4, 'tq-scratch-k', true);
+    const scratchV = createStorageBuffer(device, null, maxSeqLen * kvDim * 4, 'tq-scratch-v', true);
+
+    const compressedBytes = L * (quantBufSize + signBufSize + normBufSize) * 2;
+    const f32Bytes = L * maxSeqLen * kvDim * 4 * 2;
+    console.log(`[KVCache] TurboQuant ${TQ_BITS}-bit: ${(compressedBytes / 1024 / 1024).toFixed(1)} MB ` +
+      `(vs ${(f32Bytes / 1024 / 1024).toFixed(1)} MB f32, saving ${((1 - compressedBytes / f32Bytes) * 100).toFixed(0)}%)`);
+
+    return {
+      keys: [], values: [], // unused in compressed mode
+      position: 0,
+      maxSeqLen,
+      compressed: {
+        scratchK, scratchV,
+        quantizedK, quantizedV,
+        signBitsK, signBitsV,
+        normsK, normsV,
+      },
+    };
   }
 
-  return { forward, createKVCache, config };
+  function destroyKVCache(kvCache: KVCache): void {
+    for (const buf of kvCache.keys) buf.destroy();
+    for (const buf of kvCache.values) buf.destroy();
+    if (kvCache.compressed) {
+      const c = kvCache.compressed;
+      c.scratchK.destroy();
+      c.scratchV.destroy();
+      for (const b of c.quantizedK) b.destroy();
+      for (const b of c.quantizedV) b.destroy();
+      for (const b of c.signBitsK) b.destroy();
+      for (const b of c.signBitsV) b.destroy();
+      for (const b of c.normsK) b.destroy();
+      for (const b of c.normsV) b.destroy();
+    }
+  }
+
+  return { forward, createKVCache, destroyKVCache, config };
 }
