@@ -17,7 +17,7 @@ export {
 
 export {
   // HuggingFace Hub
-  listModelFiles, fetchModelConfig, fetchShardIndex,
+  setAuthToken, listModelFiles, fetchModelConfig, fetchShardIndex,
   discoverShards, fetchRange, downloadFile, downloadShardHeader,
   getModelInfo,
   type HFModelFile, type HFModelConfig, type ShardInfo, type DownloadProgress,

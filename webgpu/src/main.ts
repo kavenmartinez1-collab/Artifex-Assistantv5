@@ -10,6 +10,7 @@ import { initWebGPU, type GPUContext } from './engine/gpu-device';
 import { reportMetric, reportError, timed } from './utils/metrics';
 import { runKernelTests } from './engine/kernel-tests';
 import { loadModel, unloadModel, previewModel, formatBytes, getCacheStats, clearCache, type LoadedModel } from './model';
+import { setAuthToken } from './model/hf-hub';
 import { createInferenceSession, type InferenceSession } from './engine/inference';
 import { parseModelConfig, estimateVRAM } from './model/model-config';
 
@@ -248,6 +249,14 @@ loadBtn.addEventListener('click', async () => {
   const repo = ($('model-repo') as HTMLInputElement).value.trim();
   if (!repo) return;
 
+  // Set HF auth token (for gated models like Qwen3.5)
+  const tokenInput = $('hf-token') as HTMLInputElement;
+  const hfToken = tokenInput.value.trim();
+  if (hfToken) {
+    setAuthToken(hfToken);
+    localStorage.setItem('hf-token', hfToken);
+  }
+
   if (!gpu) {
     addMessage('system', 'No GPU — initialize WebGPU first.');
     return;
@@ -469,5 +478,12 @@ getCacheStats().then(stats => {
 });
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
+
+// Restore HF auth token from localStorage
+const savedToken = localStorage.getItem('hf-token');
+if (savedToken) {
+  setAuthToken(savedToken);
+  ($('hf-token') as HTMLInputElement).value = savedToken;
+}
 
 init();

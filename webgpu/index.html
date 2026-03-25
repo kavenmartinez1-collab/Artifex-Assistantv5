@@ -262,7 +262,11 @@
       <div class="panel">
         <div class="panel-title">Model</div>
         <label>HuggingFace Repo</label>
-        <input type="text" id="model-repo" value="Qwen/Qwen3.5-0.6B" placeholder="org/model-name">
+        <input type="text" id="model-repo" value="Qwen/Qwen2.5-0.5B-Instruct" placeholder="org/model-name">
+        <div style="margin:6px 0">
+          <label style="font-size:10px;opacity:0.6">HF Token (for gated models)</label>
+          <input type="password" id="hf-token" placeholder="hf_..." style="width:100%;padding:4px 6px;background:var(--bg);color:var(--text);border:1px solid #333;border-radius:4px;font-size:11px">
+        </div>
         <button class="btn btn-primary" id="load-btn" style="width:100%">Load Model</button>
         <div id="load-progress" style="margin-top:8px;font-size:11px;color:var(--dim);font-family:var(--mono)"></div>
       </div>
