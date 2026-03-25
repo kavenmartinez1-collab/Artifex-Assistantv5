@@ -223,6 +223,9 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
   const attentionBiasDefaults: Record<string, boolean> = {
     qwen2: true,
     qwen2_moe: true,
+    qwen3: true,
+    qwen3_5_text: true,
+    qwen3_moe: true,
   };
   const attentionBias = hfConfig.attention_bias ?? attentionBiasDefaults[modelType] ?? false;
   const tieWordEmbeddings = hfConfig.tie_word_embeddings ?? false;

@@ -76,7 +76,8 @@ export interface LayerWeights {
 
 /** GPU buffers for global (non-layer) weights. */
 export interface GlobalWeights {
-  embedTokens: GPUBuffer;  // [vocab_size, hidden_size]
+  embedTokens: GPUBuffer;  // [vocab_size, hidden_size] (f32 or f16 packed)
+  embedIsF16?: boolean;    // true if embedding stored as F16 (large vocab models)
   finalNorm: GPUBuffer;    // [hidden_size]
   lmHead: GPUBuffer;       // [vocab_size, hidden_size] or same as embedTokens
 }
@@ -143,6 +144,7 @@ export function createForwardPassEngine(
   // ── Compile all pipelines ──────────────────────────────────────────
 
   const embedPipeline = createComputePipeline(device, embedWGSL, 'embed', 'embed');
+  const embedF16Pipeline = createComputePipeline(device, embedWGSL, 'embed_f16', 'embed-f16');
   const rmsnormPipeline = createComputePipeline(device, rmsnormWGSL, 'rmsnorm', 'rmsnorm');
   // MODEL-SPECIFIC: activation. Most use SiLU; Phi/some Gemma use GELU.
   const siluPipeline = createComputePipeline(device, elementwiseWGSL, 'silu', 'silu');
@@ -380,15 +382,17 @@ export function createForwardPassEngine(
     // Upload token IDs
     device.queue.writeBuffer(tokenIdBuf, 0, tokenIds.buffer, tokenIds.byteOffset, tokenIds.byteLength);
 
-    // ── Embedding ────────────────────────────────────────────────────
+    // ── Embedding (f32 or f16 depending on buffer size) ────────────
+    const useF16Embed = weights.global.embedIsF16 === true;
+    const embedPipe = useF16Embed ? embedF16Pipeline : embedPipeline;
     const embedParams = createUniformBuffer(device, new Uint32Array([H, seqLen]), 'embed-p');
-    const embedBG = createBindGroup(device, embedPipeline, 0, [
+    const embedBG = createBindGroup(device, embedPipe, 0, [
       { binding: 0, resource: { buffer: tokenIdBuf } },
       { binding: 1, resource: { buffer: hiddenBuf } },
       { binding: 2, resource: { buffer: weights.global.embedTokens } },
       { binding: 3, resource: { buffer: embedParams } },
     ], 'embed');
-    dispatch(device, embedPipeline, [embedBG], [seqLen], 'embed');
+    dispatch(device, embedPipe, [embedBG], [seqLen], 'embed');
     embedParams.destroy();
 
     if (isDebug) {
