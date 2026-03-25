@@ -70,26 +70,36 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
   const eosTokenId = hfTokenizer.eos_token_id ?? null;
   const padTokenId = hfTokenizer.pad_token_id ?? eosTokenId;
 
-  // Qwen models may have additional EOS tokens (e.g., <|im_end|>)
+  // Build EOS token set — check multiple sources for stop tokens
   const eosTokenIds = new Set<number>();
   if (eosTokenId !== null) eosTokenIds.add(eosTokenId);
 
-  // Check for chat template EOS tokens
+  // Also add the EOS token by encoding known stop strings
+  const stopStrings = ['<|endoftext|>', '<|im_end|>', '</s>', '<|eot_id|>'];
+  for (const s of stopStrings) {
+    try {
+      const ids = hfTokenizer.encode(s);
+      // If the string encodes to a single token, it's a special token
+      if (ids.length === 1) {
+        eosTokenIds.add(Number(ids[0]));
+      }
+    } catch { /* not in vocab */ }
+  }
+
+  // Check added_tokens in the tokenizer model
   const model = hfTokenizer.model;
   if (model && 'added_tokens' in model) {
     const addedTokens = (model as any).added_tokens;
     if (Array.isArray(addedTokens)) {
       for (const token of addedTokens) {
-        if (token.special && (
-          token.content === '<|im_end|>' ||
-          token.content === '<|endoftext|>' ||
-          token.content === '</s>'
-        )) {
+        if (token.special && stopStrings.includes(token.content)) {
           eosTokenIds.add(token.id);
         }
       }
     }
   }
+
+  console.log(`[Tokenizer] EOS token IDs: [${[...eosTokenIds].join(', ')}]`);
 
   // Get vocab size from the tokenizer model
   const vocabSize = hfTokenizer.model?.vocab?.length
@@ -124,25 +134,32 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
 }
 
 /**
- * Apply Qwen chat template to messages.
- * Returns the full prompt string ready for tokenization.
+ * Apply the model's chat template to messages.
+ * Uses the HF tokenizer's built-in template when available (model-agnostic),
+ * falls back to ChatML format for models without a template.
  */
 export function applyChatTemplate(
   tokenizer: Tokenizer,
   messages: Array<{ role: string; content: string }>,
 ): string {
-  // Qwen3.5 uses ChatML format:
-  // <|im_start|>system\n{content}<|im_end|>\n
-  // <|im_start|>user\n{content}<|im_end|>\n
-  // <|im_start|>assistant\n
-  const parts: string[] = [];
+  // Try the HF tokenizer's built-in template first (correct for every model)
+  try {
+    const result = (tokenizer.inner as any).apply_chat_template(messages, {
+      add_generation_prompt: true,
+      tokenize: false,
+    });
+    if (typeof result === 'string' && result.length > 0) {
+      return result;
+    }
+  } catch {
+    // Fall through to manual template
+  }
 
+  // Fallback: ChatML format (Qwen, SmolLM2, etc.)
+  const parts: string[] = [];
   for (const msg of messages) {
     parts.push(`<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`);
   }
-
-  // Add assistant start for generation
   parts.push('<|im_start|>assistant\n');
-
   return parts.join('');
 }

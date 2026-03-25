@@ -10,11 +10,14 @@ import { initWebGPU, type GPUContext } from './engine/gpu-device';
 import { reportMetric, reportError, timed } from './utils/metrics';
 import { runKernelTests } from './engine/kernel-tests';
 import { loadModel, unloadModel, previewModel, formatBytes, getCacheStats, clearCache, type LoadedModel } from './model';
+import { createInferenceSession, type InferenceSession } from './engine/inference';
+import { parseModelConfig, estimateVRAM } from './model/model-config';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
 let gpu: GPUContext | null = null;
 let currentModel: LoadedModel | null = null;
+let session: InferenceSession | null = null;
 
 // ─── DOM Elements ────────────────────────────────────────────────────────────
 
@@ -183,29 +186,60 @@ sendBtn.addEventListener('click', async () => {
   promptEl.style.height = 'auto';
   addMessage('user', text);
 
-  if (!gpu) {
-    addMessage('system', 'No GPU available. Cannot generate.');
+  if (!session) {
+    addMessage('system', 'No model loaded. Load a model first.');
     return;
   }
 
-  // TODO: Phase 4+ — actual inference
   setStatus('Generating...');
   sendBtn.disabled = true;
 
-  addMessage('assistant',
-    '[Model not loaded yet]\n\n' +
-    'The WebGPU compute foundation is ready. Next steps:\n' +
-    '  - Phase 2: SafeTensors weight loader\n' +
-    '  - Phase 3: Tokenizer\n' +
-    '  - Phase 4: Qwen3.5 model implementation\n' +
-    '  - Phase 5: INT4 quantization\n' +
-    '  - Phase 6: Sampling & generation loop\n\n' +
-    'Run kernel tests to verify GPU compute is working.',
-    'placeholder response'
-  );
+  try {
+    const responseDiv = addMessage('assistant', '');
+    let fullText = '';
 
-  setStatus('Ready');
-  sendBtn.disabled = false;
+    const temperature = parseFloat(tempSlider.value);
+    const topP = parseFloat(toppSlider.value);
+
+    const systemPrompt = ($('system-prompt') as HTMLTextAreaElement).value.trim();
+    const messages: Array<{ role: string; content: string }> = [];
+    if (systemPrompt) {
+      messages.push({ role: 'system', content: systemPrompt });
+    }
+    messages.push({ role: 'user', content: text });
+
+    const handle = session.chat(
+      messages,
+      { temperature, topP, maxNewTokens: 512 },
+      (token) => {
+        fullText += token;
+        responseDiv.textContent = fullText;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      },
+    );
+
+    const result = await handle.result;
+
+    // If no streaming happened (e.g., empty response), show the full text
+    if (!fullText && result.text) {
+      responseDiv.textContent = result.text;
+    }
+
+    const meta = `${result.numTokens} tokens | ${result.tokensPerSecond.toFixed(1)} tok/s | ${(result.totalMs / 1000).toFixed(1)}s | ${result.stopReason}`;
+    const metaEl = document.createElement('div');
+    metaEl.className = 'meta';
+    metaEl.textContent = meta;
+    responseDiv.appendChild(metaEl);
+
+    setStatus(`Generated ${result.numTokens} tokens at ${result.tokensPerSecond.toFixed(1)} tok/s`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    addMessage('system', `Generation error: ${msg}`);
+    setStatus('Generation failed');
+    reportError('generate', err);
+  } finally {
+    sendBtn.disabled = false;
+  }
 });
 
 // ─── Load Model ──────────────────────────────────────────────────────────────
@@ -257,14 +291,94 @@ loadBtn.addEventListener('click', async () => {
     });
 
     addMessage('system',
-      `Model loaded: ${currentModel.repo}\n` +
-      `Tensors: ${currentModel.tensorCount}\n` +
-      `GPU memory: ${formatBytes(currentModel.totalGPUBytes)}\n` +
+      `Weights loaded: ${currentModel.tensorCount} tensors, ${formatBytes(currentModel.totalGPUBytes)} GPU memory\n` +
       `Load time: ${(currentModel.loadTimeMs / 1000).toFixed(1)}s`,
-      'model loaded'
+      'weights loaded'
     );
 
-    setStatus(`Model ready: ${repo}`);
+    // Build inference session from loaded weights
+    setStatus('Building inference engine...');
+    try {
+      const config = parseModelConfig(currentModel.config);
+
+      // Import bridgeWeights and engine builder
+      const { createForwardPassEngine } = await import('./engine/forward-pass');
+      const { createTokenizer } = await import('./model/tokenizer');
+      const { getWeightNameMap, resolveLayerWeightName } = await import('./model/model-config');
+      const { generate } = await import('./engine/generate');
+
+      // Bridge weight tensors to structured format
+      const nameMap = getWeightNameMap(config.modelType);
+      const getTensor = (name: string) => {
+        const t = currentModel!.tensors.get(name);
+        if (!t) throw new Error(`Missing tensor: ${name}`);
+        return t.buffer;
+      };
+
+      const global = {
+        embedTokens: getTensor(nameMap.embedTokens),
+        finalNorm: getTensor(nameMap.finalNorm),
+        lmHead: config.tieWordEmbeddings
+          ? getTensor(nameMap.embedTokens)
+          : getTensor(nameMap.lmHead),
+      };
+
+      const layers = [];
+      for (let l = 0; l < config.numLayers; l++) {
+        layers.push({
+          inputNorm: getTensor(resolveLayerWeightName(nameMap.layer.inputNorm, l)),
+          qProj: getTensor(resolveLayerWeightName(nameMap.layer.qProj, l)),
+          kProj: getTensor(resolveLayerWeightName(nameMap.layer.kProj, l)),
+          vProj: getTensor(resolveLayerWeightName(nameMap.layer.vProj, l)),
+          oProj: getTensor(resolveLayerWeightName(nameMap.layer.oProj, l)),
+          postAttnNorm: getTensor(resolveLayerWeightName(nameMap.layer.postAttnNorm, l)),
+          gateProj: getTensor(resolveLayerWeightName(nameMap.layer.gateProj, l)),
+          upProj: getTensor(resolveLayerWeightName(nameMap.layer.upProj, l)),
+          downProj: getTensor(resolveLayerWeightName(nameMap.layer.downProj, l)),
+        });
+      }
+
+      const engine = createForwardPassEngine(gpu!.device, config, { global, layers });
+      const tokenizer = await createTokenizer({ modelId: repo });
+
+      // Build chat template function
+      const { applyChatTemplate } = await import('./model/tokenizer');
+
+      // Store session for the send button
+      session = {
+        run: (prompt, sampling, onToken) => generate(gpu!.device, engine, tokenizer, prompt, sampling, onToken),
+        chat: (messages, sampling, onToken) => {
+          const prompt = applyChatTemplate(tokenizer, messages);
+          return generate(gpu!.device, engine, tokenizer, prompt, sampling, onToken);
+        },
+        config,
+        tokenizer,
+        gpu: gpu!,
+        vramEstimate: estimateVRAM(config),
+        destroy: () => { unloadModel(currentModel!); session = null; },
+      } as InferenceSession;
+
+      // Enable chat input
+      promptEl.disabled = false;
+      sendBtn.disabled = false;
+
+      addMessage('system',
+        `Inference engine ready!\n` +
+        `Model: ${config.modelType} — ${config.numLayers} layers, ${config.numAttentionHeads} heads, d=${config.hiddenSize}\n` +
+        `GQA: ${config.isGQA ? `${config.numAttentionHeads}Q/${config.numKVHeads}KV` : 'no'}\n` +
+        `Vocab: ${config.vocabSize} | RoPE θ=${config.ropeTheta}\n` +
+        `Type a message to chat!`,
+        'engine ready'
+      );
+
+      setStatus(`Ready: ${repo}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addMessage('system', `Engine build failed: ${msg}\n\nWeights are loaded but inference is not available.`);
+      setStatus(`Engine error: ${msg}`);
+      reportError('engine-build', err);
+    }
+
     updateFooter({ model: repo.split('/').pop() || repo });
 
   } catch (err) {
@@ -308,6 +422,7 @@ unloadBtn.addEventListener('click', async () => {
     const freed = formatBytes(currentModel.totalGPUBytes);
     unloadModel(currentModel);
     currentModel = null;
+    session = null;
     addMessage('system', `Model unloaded: ${name} — freed ${freed} GPU memory`);
     setStatus('Model unloaded');
     updateFooter({ model: 'none' });
