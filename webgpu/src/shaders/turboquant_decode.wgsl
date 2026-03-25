@@ -75,9 +75,10 @@ fn decode(@builtin(local_invocation_id) lid: vec3u,
   workgroupBarrier();
 
   // ── Step 2: QJL correction ──────────────────────────────────────────
-  // TODO: fix QJL scale factor — currently disabled to validate PolarQuant
-  let sqrt_pi_over_2 = 1.2533141;  // sqrt(pi / 2)
-  let jl_scale = 0.0;  // disabled: sqrt_pi_over_2 / f32(d);
+  // QJL is an inner product estimator — applied during attention (Q·K^T),
+  // NOT during reconstruction. For decode, we skip it (scale = 0).
+  // The sign bits are still stored for use in the attention kernel.
+  let jl_scale = 0.0;
 
   i = tid;
   while (i < d) {
