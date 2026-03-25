@@ -682,6 +682,16 @@ export function createForwardPassEngine(
           ], `L${l}-l2norm-k`);
           dispatch(device, l2NormPipeline, [l2bgK], [workgroupCount(kDim, 256)], `L${l}-l2norm-k`);
           l2pK.destroy();
+
+          // Debug: verify L2 norm actually wrote to output
+          if (isDebug && l === 0) {
+            await device.queue.onSubmittedWorkDone();
+            const rawK = await readBuffer(device, linKBuf!, 8 * 4);
+            const normK = await readBuffer(device, linConvOutBuf!, 8 * 4);
+            console.log(`[L2 DEBUG] K input first 8: [${Array.from(new Float32Array(rawK)).map(v => v.toFixed(4)).join(', ')}]`);
+            console.log(`[L2 DEBUG] K output (linConvOutBuf) first 8: [${Array.from(new Float32Array(normK)).map(v => v.toFixed(4)).join(', ')}]`);
+          }
+
           const encK = device.createCommandEncoder({ label: `L${l}-l2k-cp` });
           encK.copyBufferToBuffer(linConvOutBuf!, 0, linKBuf!, 0, kDim * 4);
           device.queue.submit([encK.finish()]);

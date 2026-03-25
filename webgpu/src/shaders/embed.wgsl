@@ -93,7 +93,7 @@ fn embed_f16(@builtin(local_invocation_id) lid: vec3u,
     let is_upper = (elem_idx & 1u) == 1u;
     let word = embed_table_f16[word_idx];
     let f16_bits = select(word & 0xFFFFu, word >> 16u, is_upper);
-    output_f16[token_idx * hidden + i] = f16_to_f32(f16_bits);
+    output_f16[token_idx * hidden + i] = bf16_to_f32(f16_bits);
     i = i + 256u;
   }
 }
