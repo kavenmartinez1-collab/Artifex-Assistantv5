@@ -120,6 +120,65 @@ export async function dispatchAndWait(
   return elapsed;
 }
 
+/**
+ * Batched dispatcher — collects multiple compute dispatches into a single
+ * command encoder and submits them all at once via flush().
+ *
+ * For a 32-layer model this reduces ~480 separate queue.submit() calls
+ * down to 1, eliminating per-submit driver overhead.
+ */
+export class BatchedDispatcher {
+  private encoder: GPUCommandEncoder;
+  private device: GPUDevice;
+  private count = 0;
+
+  constructor(device: GPUDevice, label?: string) {
+    this.device = device;
+    this.encoder = device.createCommandEncoder({ label: label ?? 'batched-encoder' });
+  }
+
+  /** Add a compute dispatch to the batch (no GPU submission yet). */
+  dispatch(
+    pipeline: GPUComputePipeline,
+    bindGroups: GPUBindGroup[],
+    workgroupCounts: [number, number?, number?],
+    label?: string,
+  ): void {
+    const passLabel = label ? `${label}-pass` : `batch-pass-${this.count}`;
+    const pass = this.encoder.beginComputePass({ label: passLabel });
+
+    pass.setPipeline(pipeline);
+    for (let i = 0; i < bindGroups.length; i++) {
+      pass.setBindGroup(i, bindGroups[i]);
+    }
+    pass.dispatchWorkgroups(
+      workgroupCounts[0],
+      workgroupCounts[1] ?? 1,
+      workgroupCounts[2] ?? 1,
+    );
+    pass.end();
+    this.count++;
+  }
+
+  /** Submit all batched dispatches to the GPU in a single queue.submit(). */
+  flush(): void {
+    this.device.queue.submit([this.encoder.finish()]);
+  }
+
+  /** Submit and wait for all GPU work to complete. Returns elapsed ms. */
+  async flushAndWait(): Promise<number> {
+    const start = performance.now();
+    this.flush();
+    await this.device.queue.onSubmittedWorkDone();
+    return performance.now() - start;
+  }
+
+  /** Number of dispatches currently batched. */
+  get size(): number {
+    return this.count;
+  }
+}
+
 // Simple string hash for cache keys
 function simpleHash(str: string): number {
   let hash = 0;

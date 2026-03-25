@@ -288,6 +288,9 @@ export function createForwardPassEngine(
   // Qwen3.5: Q projection outputs 2x for gate — need double buffer
   const qBufMul = config.attnOutputGate ? 2 : 1;
   const qBuf = createStorageBuffer(device, null, MAX_PREFILL * nHeads * dHead * qBufMul * 4, 'q-proj', true);
+  // Separate gate buffer for full attention output gating
+  const attnGateBuf = config.attnOutputGate
+    ? createStorageBuffer(device, null, MAX_PREFILL * nHeads * dHead * 4, 'attn-gate', true) : null;
   const kBuf = createStorageBuffer(device, null, MAX_PREFILL * kvDim * 4, 'k-proj', true);
   const vBuf = createStorageBuffer(device, null, MAX_PREFILL * kvDim * 4, 'v-proj', true);
   const attnOutBuf = createStorageBuffer(device, null, MAX_PREFILL * nHeads * dHead * 4, 'attn-out', true);
@@ -565,7 +568,7 @@ export function createForwardPassEngine(
     const seqLen = tokenIds.length;
     const pos = kvCache.position;
     const cacheLen = pos + seqLen;
-    const isDebug = debugCallCount < 2; // debug first two forward passes
+    const isDebug = false; // disabled for speed — set to `debugCallCount < 2` to re-enable
     const isDebug2 = debugCallCount === 1; // extra detail on second pass
     debugCallCount++;
 
@@ -853,14 +856,24 @@ export function createForwardPassEngine(
 
         // Q, K, V projections (auto-selects f32 or INT4 matmul)
         if (config.attnOutputGate) {
-          // Qwen3.5: Q projection outputs 2x head_dim — first half is Q, second half is gate
+          // Qwen3.5: Q proj outputs [nHeads, dHead*2] — interleaved [Q_h0, gate_h0, Q_h1, gate_h1, ...]
+          // Project to qBuf (sized 2x), then deinterleave in-place
           dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHead * 2, H, `L${l}-q`);
-          // Split: first half → Q, second half → gate (stored in linZBuf for reuse)
-          const qHalf = seqLen * nHeads * dHead * 4;
-          const encQsplit = device.createCommandEncoder({ label: `L${l}-qsplit` });
-          encQsplit.copyBufferToBuffer(qBuf, qHalf, linZBuf!, 0, qHalf);
-          // Shift Q to overwrite full buffer (first half stays in place)
-          device.queue.submit([encQsplit.finish()]);
+          // Deinterleave from qBuf → attnOutBuf (Q) + attnGateBuf (gate)
+          const encDeint = device.createCommandEncoder({ label: `L${l}-deinterleave` });
+          for (let s = 0; s < seqLen; s++) {
+            for (let h = 0; h < nHeads; h++) {
+              const srcOffset = (s * nHeads * dHead * 2 + h * dHead * 2) * 4;
+              const qDst = (s * nHeads * dHead + h * dHead) * 4;
+              encDeint.copyBufferToBuffer(qBuf, srcOffset, attnOutBuf, qDst, dHead * 4);
+              encDeint.copyBufferToBuffer(qBuf, srcOffset + dHead * 4, attnGateBuf!, qDst, dHead * 4);
+            }
+          }
+          device.queue.submit([encDeint.finish()]);
+          // Copy deinterleaved Q from attnOutBuf back to qBuf
+          const encQcp = device.createCommandEncoder({ label: `L${l}-q-deint-cp` });
+          encQcp.copyBufferToBuffer(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHead * 4);
+          device.queue.submit([encQcp.finish()]);
         } else {
           dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHead, H, `L${l}-q`);
         }
@@ -983,10 +996,10 @@ export function createForwardPassEngine(
         // Qwen3.5: output gating — attn_output = attn_output * sigmoid(gate)
         // gate is in linZBuf (from Q projection split)
         // gate shape is [seqLen, nHeads * dHead] — reshaped from [seqLen, nHeads, dHead]
-        if (config.attnOutputGate && linZBuf && sigmoidPipeline) {
+        if (config.attnOutputGate && attnGateBuf && sigmoidPipeline) {
           const gateDim = seqLen * nHeads * dHead;
           // sigmoid(gate) → normedBuf
-          dispatchElementwise(sigmoidPipeline, linZBuf!, normedBuf, gateDim, `L${l}-gate-sig`);
+          dispatchElementwise(sigmoidPipeline, attnGateBuf, normedBuf, gateDim, `L${l}-gate-sig`);
           // attn * sigmoid(gate) → attnOutBuf (in-place via copy pattern)
           const encGateCp = device.createCommandEncoder({ label: `L${l}-gate-cp` });
           encGateCp.copyBufferToBuffer(attnOutBuf, 0, ffnTempBuf, 0, gateDim * 4);
