@@ -323,9 +323,15 @@ loadBtn.addEventListener('click', async () => {
           : getTensor(nameMap.lmHead),
       };
 
+      // Helper for optional tensors (bias terms)
+      const tryGetTensor = (name: string): GPUBuffer | undefined => {
+        const t = currentModel!.tensors.get(name);
+        return t?.buffer;
+      };
+
       const layers = [];
       for (let l = 0; l < config.numLayers; l++) {
-        layers.push({
+        const lw: any = {
           inputNorm: getTensor(resolveLayerWeightName(nameMap.layer.inputNorm, l)),
           qProj: getTensor(resolveLayerWeightName(nameMap.layer.qProj, l)),
           kProj: getTensor(resolveLayerWeightName(nameMap.layer.kProj, l)),
@@ -335,7 +341,15 @@ loadBtn.addEventListener('click', async () => {
           gateProj: getTensor(resolveLayerWeightName(nameMap.layer.gateProj, l)),
           upProj: getTensor(resolveLayerWeightName(nameMap.layer.upProj, l)),
           downProj: getTensor(resolveLayerWeightName(nameMap.layer.downProj, l)),
-        });
+        };
+        // Add bias terms if model has them
+        if (config.attentionBias) {
+          lw.qBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.qBias, l));
+          lw.kBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.kBias, l));
+          lw.vBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.vBias, l));
+          lw.oBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.oBias, l));
+        }
+        layers.push(lw);
       }
 
       const engine = createForwardPassEngine(gpu!.device, config, { global, layers });

@@ -43,6 +43,10 @@ export interface ModelConfig {
   /** Activation function in FFN. 'silu' for most models. */
   hiddenAct: string;
 
+  // ── Bias ────────────────────────────────────────────────────────────
+  /** Whether attention Q/K/V/O projections have bias terms */
+  attentionBias: boolean;
+
   // ── Weight Tying ───────────────────────────────────────────────────
   /** Whether the embedding and lm_head share weights */
   tieWordEmbeddings: boolean;
@@ -81,6 +85,11 @@ export interface WeightNameMap {
     vProj: string;
     /** Output projection */
     oProj: string;
+    /** Bias terms (same names + .bias instead of .weight) */
+    qBias: string;
+    kBias: string;
+    vBias: string;
+    oBias: string;
     /** Post-attention layernorm (pre-FFN) */
     postAttnNorm: string;
     /** FFN gate projection (SwiGLU) */
@@ -134,6 +143,10 @@ const WEIGHT_NAME_PATTERNS: Record<string, WeightNameMap> = {
       kProj: 'model.layers.{L}.self_attn.k_proj.weight',
       vProj: 'model.layers.{L}.self_attn.v_proj.weight',
       oProj: 'model.layers.{L}.self_attn.o_proj.weight',
+      qBias: 'model.layers.{L}.self_attn.q_proj.bias',
+      kBias: 'model.layers.{L}.self_attn.k_proj.bias',
+      vBias: 'model.layers.{L}.self_attn.v_proj.bias',
+      oBias: 'model.layers.{L}.self_attn.o_proj.bias',
       postAttnNorm: 'model.layers.{L}.post_attention_layernorm.weight',
       gateProj: 'model.layers.{L}.mlp.gate_proj.weight',
       upProj: 'model.layers.{L}.mlp.up_proj.weight',
@@ -151,6 +164,10 @@ const WEIGHT_NAME_PATTERNS: Record<string, WeightNameMap> = {
       kProj: 'model.layers.{L}.self_attn.k_proj.weight',
       vProj: 'model.layers.{L}.self_attn.v_proj.weight',
       oProj: 'model.layers.{L}.self_attn.dense.weight',
+      qBias: 'model.layers.{L}.self_attn.q_proj.bias',
+      kBias: 'model.layers.{L}.self_attn.k_proj.bias',
+      vBias: 'model.layers.{L}.self_attn.v_proj.bias',
+      oBias: 'model.layers.{L}.self_attn.dense.bias',
       postAttnNorm: 'model.layers.{L}.post_attention_layernorm.weight',
       gateProj: 'model.layers.{L}.mlp.gate_up_proj.weight',
       upProj: 'model.layers.{L}.mlp.gate_up_proj.weight',
@@ -190,6 +207,7 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
   const rmsNormEps = hfConfig.rms_norm_eps ?? hfConfig.layer_norm_eps ?? 1e-5;
   const maxPositionEmbeddings = hfConfig.max_position_embeddings ?? 4096;
   const hiddenAct = hfConfig.hidden_act ?? hfConfig.activation_function ?? 'silu';
+  const attentionBias = hfConfig.attention_bias ?? false;
   const tieWordEmbeddings = hfConfig.tie_word_embeddings ?? false;
 
   const numQPerKV = Math.floor(numAttentionHeads / numKVHeads);
@@ -207,6 +225,7 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
     ropeTheta,
     maxPositionEmbeddings,
     hiddenAct,
+    attentionBias,
     tieWordEmbeddings,
     numQPerKV,
     isGQA: numKVHeads !== numAttentionHeads,
