@@ -11,6 +11,11 @@ import matmulWGSL from '../shaders/matmul.wgsl?raw';
 import softmaxWGSL from '../shaders/softmax.wgsl?raw';
 import rmsnormWGSL from '../shaders/rmsnorm.wgsl?raw';
 import ropeWGSL from '../shaders/rope.wgsl?raw';
+import { createTurboQuantPipeline } from './turboquant-pipeline';
+import {
+  generateRotationMatrix, generateJLMatrix, buildCodebook,
+  cpuEncode, cpuDecode, computeRelativeMSE,
+} from '../model/turboquant';
 
 export interface TestResult {
   name: string;
@@ -310,6 +315,113 @@ async function testRMSNorm(device: GPUDevice): Promise<TestResult> {
   return { name: 'RMSNorm', passed: close, elapsed_ms: elapsed, maxDiff };
 }
 
+// ─── TurboQuant Round-trip Test ──────────────────────────────────────────────
+
+async function testTurboQuant3bit(device: GPUDevice): Promise<TestResult> {
+  const d = 64;       // head dimension
+  const bits = 3;
+  const numVectors = 8;
+
+  // Generate random input vectors (simulating KV cache rows)
+  const input = new Float32Array(numVectors * d);
+  for (let i = 0; i < input.length; i++) {
+    input[i] = (Math.random() - 0.5) * 2;
+  }
+
+  // CPU reference: encode → decode → measure distortion
+  const rotMatrix = generateRotationMatrix(d, 42);
+  const jlMatrix = generateJLMatrix(d, 137);
+  const codebook = buildCodebook(bits);
+
+  let cpuTotalRelMSE = 0;
+  for (let v = 0; v < numVectors; v++) {
+    const vec = input.slice(v * d, (v + 1) * d);
+    const encoded = cpuEncode(vec, rotMatrix, jlMatrix, codebook, d);
+    const decoded = cpuDecode(encoded.quantized, encoded.signBits, encoded.norm, rotMatrix, jlMatrix, codebook, d);
+    cpuTotalRelMSE += computeRelativeMSE(vec, decoded);
+  }
+  const cpuAvgRelMSE = cpuTotalRelMSE / numVectors;
+
+  // GPU: encode → decode → read back
+  const tq = createTurboQuantPipeline(device, { headDim: d, bits });
+
+  const inputBuf = createStorageBuffer(device, input, input.byteLength, 'tq-test-input');
+  const compressed = await tq.encodeAndWait(inputBuf, numVectors);
+  const gpuDecoded = await tq.decodeAndRead(compressed);
+
+  // Measure GPU distortion
+  let gpuTotalRelMSE = 0;
+  for (let v = 0; v < numVectors; v++) {
+    const orig = input.slice(v * d, (v + 1) * d);
+    const recon = gpuDecoded.slice(v * d, (v + 1) * d);
+    gpuTotalRelMSE += computeRelativeMSE(orig, recon);
+  }
+  const gpuAvgRelMSE = gpuTotalRelMSE / numVectors;
+
+  // Cleanup
+  inputBuf.destroy();
+  compressed.quantizedBuffer.destroy();
+  compressed.signBitsBuffer.destroy();
+  compressed.normsBuffer.destroy();
+
+  // Pass criteria:
+  // 1. GPU distortion should be reasonable (< 0.15 relative MSE for 3-bit)
+  // 2. GPU and CPU should produce similar distortion (within 50% of each other)
+  const distortionOk = gpuAvgRelMSE < 0.15;
+  const cpuGpuMatch = Math.abs(gpuAvgRelMSE - cpuAvgRelMSE) / Math.max(cpuAvgRelMSE, 1e-6) < 0.5;
+  const passed = distortionOk && cpuGpuMatch;
+
+  return {
+    name: `TurboQuant (3-bit, d=${d})`,
+    passed,
+    maxDiff: gpuAvgRelMSE,
+    error: passed ? undefined :
+      `GPU relMSE=${gpuAvgRelMSE.toFixed(4)}, CPU relMSE=${cpuAvgRelMSE.toFixed(4)}, ` +
+      `ratio=${compressed.ratio.toFixed(1)}x`,
+  };
+}
+
+async function testTurboQuant4bit(device: GPUDevice): Promise<TestResult> {
+  const d = 128;      // larger head dimension
+  const bits = 4;
+  const numVectors = 4;
+
+  const input = new Float32Array(numVectors * d);
+  for (let i = 0; i < input.length; i++) {
+    input[i] = (Math.random() - 0.5) * 2;
+  }
+
+  const tq = createTurboQuantPipeline(device, { headDim: d, bits });
+
+  const inputBuf = createStorageBuffer(device, input, input.byteLength, 'tq-test-input-4bit');
+  const compressed = await tq.encodeAndWait(inputBuf, numVectors);
+  const gpuDecoded = await tq.decodeAndRead(compressed);
+
+  let gpuTotalRelMSE = 0;
+  for (let v = 0; v < numVectors; v++) {
+    const orig = input.slice(v * d, (v + 1) * d);
+    const recon = gpuDecoded.slice(v * d, (v + 1) * d);
+    gpuTotalRelMSE += computeRelativeMSE(orig, recon);
+  }
+  const gpuAvgRelMSE = gpuTotalRelMSE / numVectors;
+
+  inputBuf.destroy();
+  compressed.quantizedBuffer.destroy();
+  compressed.signBitsBuffer.destroy();
+  compressed.normsBuffer.destroy();
+
+  // 4-bit should have lower distortion than 3-bit (< 0.05 relative MSE)
+  const passed = gpuAvgRelMSE < 0.05;
+
+  return {
+    name: `TurboQuant (4-bit, d=${d})`,
+    passed,
+    maxDiff: gpuAvgRelMSE,
+    error: passed ? undefined :
+      `GPU relMSE=${gpuAvgRelMSE.toFixed(4)}, ratio=${compressed.ratio.toFixed(1)}x`,
+  };
+}
+
 // ─── Run All Tests ───────────────────────────────────────────────────────────
 
 export async function runKernelTests(device: GPUDevice): Promise<TestResult[]> {
@@ -321,6 +433,8 @@ export async function runKernelTests(device: GPUDevice): Promise<TestResult[]> {
     { name: 'Matmul (tiled)', fn: testMatmulTiled },
     { name: 'Softmax', fn: testSoftmax },
     { name: 'RMSNorm', fn: testRMSNorm },
+    { name: 'TurboQuant (3-bit)', fn: testTurboQuant3bit },
+    { name: 'TurboQuant (4-bit)', fn: testTurboQuant4bit },
   ];
 
   const results: TestResult[] = [];

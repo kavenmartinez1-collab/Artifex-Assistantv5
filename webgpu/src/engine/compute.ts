@@ -29,6 +29,14 @@ export function createComputePipeline(
     label: `${label}-module`,
   });
 
+  // Log shader compilation errors (WebGPU silently fails otherwise)
+  module.getCompilationInfo().then(info => {
+    for (const msg of info.messages) {
+      const prefix = msg.type === 'error' ? '❌' : msg.type === 'warning' ? '⚠️' : 'ℹ️';
+      console.log(`[WGSL ${label}] ${prefix} ${msg.type} at line ${msg.lineNum}:${msg.linePos}: ${msg.message}`);
+    }
+  });
+
   const pipeline = device.createComputePipeline({
     layout: 'auto',
     compute: { module, entryPoint },

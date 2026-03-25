@@ -33,3 +33,11 @@ export {
   // Cache
   hasCache, getCache, putCache, removeCache, clearCache, getCacheStats,
 } from './cache';
+
+export {
+  // TurboQuant KV Cache Compression
+  initTurboQuant, buildCodebook,
+  generateRotationMatrix, generateJLMatrix,
+  cpuEncode, cpuDecode, computeMSE, computeRelativeMSE,
+  type TurboQuantConfig, type TurboQuantBuffers, type TurboQuantCodebook,
+} from './turboquant';
