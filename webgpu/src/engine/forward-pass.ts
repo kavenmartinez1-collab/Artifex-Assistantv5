@@ -877,8 +877,11 @@ export function createForwardPassEngine(
         }
 
         // Apply RoPE to Q and K
-        dispatchRoPE(qBuf, seqLen, nHeads, pos, `L${l}-rope-q`);
-        dispatchRoPE(kBuf, seqLen, nKVHeads, pos, `L${l}-rope-k`);
+        // Qwen3.5 full attention uses partial RoPE (25% of head dims)
+        const fullAttnRotaryDim = config.partialRotaryFactor
+          ? Math.floor(config.partialRotaryFactor * dHead) : 0;
+        dispatchRoPE(qBuf, seqLen, nHeads, pos, `L${l}-rope-q`, undefined, fullAttnRotaryDim);
+        dispatchRoPE(kBuf, seqLen, nKVHeads, pos, `L${l}-rope-k`, undefined, fullAttnRotaryDim);
 
         if (isDebug && l === 0) {
           await debugRead(qBuf, 'L0-Q-after-rope', 8);
