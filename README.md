@@ -767,6 +767,7 @@ npm run server    # Metrics server only
   - `elementwise.wgsl` — add, multiply, SiLU activation
   - `embed.wgsl` — parallel embedding table lookup
   - `turboquant_encode.wgsl` / `turboquant_decode.wgsl` — TurboQuant KV cache compression (Google, ICLR 2026)
+  - `matmul_q4.wgsl` — fused INT4 GPTQ dequantization matmul (unpacks 4-bit nibbles, applies group scales/zeros on the fly)
 - **Buffer management** — typed GPU buffer creation, read/write operations
 - **Kernel test suite** — correctness validation against CPU reference values
 - **Metrics collection** — browser-to-server event reporting with JSON logging
@@ -774,7 +775,7 @@ npm run server    # Metrics server only
 
 ### Status
 
-Phases 0-4 and 6 complete: GPU infrastructure, compute kernels, HuggingFace weight loading with browser caching, full transformer forward pass with GQA attention, TurboQuant KV cache compression, and autoregressive text generation with streaming. Coherent text generation is working end-to-end in the browser. Phase 5 (INT4 weight dequantization for larger models) is next.
+Phases 0-4 and 6 complete: GPU infrastructure, compute kernels, HuggingFace weight loading with browser caching, full transformer forward pass with GQA attention, TurboQuant KV cache compression, and autoregressive text generation with streaming. Coherent text generation is working end-to-end in the browser. Phase 5 (INT4 weight dequantization) infrastructure complete — GPTQ format loader and fused `matmul_bt_q4` kernel ready for quantized models up to 9B parameters on 8GB VRAM.
 
 ### Supported Models
 
@@ -876,7 +877,7 @@ Artifex-Assistant-V5/
         hf-hub.ts          # HuggingFace Hub API client
         cache.ts           # Browser IndexedDB cache for model weights
         turboquant.ts      # TurboQuant math (rotation matrix, codebook, CPU reference)
-      shaders/             # WGSL compute kernels (10 kernels)
+      shaders/             # WGSL compute kernels (11 kernels, incl. matmul_q4.wgsl)
       utils/               # Metrics reporting
     server/
       dev-server.ts        # Express metrics collection server
@@ -902,6 +903,7 @@ Artifex-Assistant-V5/
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True,garbage_collection_threshold:0.8` | CUDA memory allocation tuning |
 | `WEB_GATEWAY_URL` | *(none)* | Web gateway URL for CLI/GUI (e.g., `http://localhost:8080`). For the API server, use `--gateway` flag instead. Auto-set in Docker full profile. |
 | `GATEWAY_AUTH_TOKEN` | *(none)* | Optional shared secret for web gateway authentication. When set, all gateway requests must include a matching `X-Gateway-Token` header. The `/health` endpoint is always open (for Docker healthchecks). Leave unset to disable (default). |
+| `HF_TOKEN` | *(none)* | HuggingFace auth token for gated models (Qwen3.5, etc.). Enter in the WebGPU UI sidebar or set via browser localStorage. |
 
 > **Note on environment variables in PowerShell:** Use `$env:VAR = "value"` syntax (not `set VAR=value` which is CMD-only). For the API server, the `--gateway` flag avoids env var hassles entirely.
 
