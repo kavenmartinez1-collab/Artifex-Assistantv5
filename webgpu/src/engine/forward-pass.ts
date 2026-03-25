@@ -299,7 +299,7 @@ export function createForwardPassEngine(
   const linKBuf = isHybrid ? createStorageBuffer(device, null, linNKH * linKD * 4, 'lin-k', true) : null;
   const linVBuf = isHybrid ? createStorageBuffer(device, null, linNVH * linVD * 4, 'lin-v', true) : null;
   const linABuf = isHybrid ? createStorageBuffer(device, null, linConvDim * 4, 'lin-a', true) : null;
-  const linBBuf = isHybrid ? createStorageBuffer(device, null, linNKH * 4, 'lin-beta', true) : null;
+  const linBBuf = isHybrid ? createStorageBuffer(device, null, linNVH * 4, 'lin-beta', true) : null;
   const linZBuf = isHybrid ? createStorageBuffer(device, null, H * 4, 'lin-z', true) : null;
   const linOutBuf = isHybrid ? createStorageBuffer(device, null, linNKH * linGroupedVD * 4, 'lin-out', true) : null;
   const linConvOutBuf = isHybrid ? createStorageBuffer(device, null, linQKVDim * 4, 'lin-conv-out', true) : null;
@@ -638,25 +638,23 @@ export function createForwardPassEngine(
         device.queue.submit([encSplit.finish()]);
 
         // 4. Project A, B, Z (these use the ORIGINAL normed input, not conv output)
+        // NOTE: in_proj_b output is num_v_heads (32), NOT num_k_heads (16)!
         dispatchProjection(normedBuf, lw, 'linearInProjA', linABuf!, 1, linNVH, H, `L${l}-lin-a`);
-        dispatchProjection(normedBuf, lw, 'linearInProjB', linBBuf!, 1, linNKH, H, `L${l}-lin-b`);
+        dispatchProjection(normedBuf, lw, 'linearInProjB', linBBuf!, 1, linNVH, H, `L${l}-lin-b`);
         dispatchProjection(normedBuf, lw, 'linearInProjZ', linZBuf!, 1, H, H, `L${l}-lin-z`);
 
-        // 5. Partial RoPE on Q and K (after conv+silu+split)
-        const rotaryDim = config.partialRotaryFactor
-          ? Math.floor(config.partialRotaryFactor * linKD) : 0;
-        if (rotaryDim > 0) {
-          dispatchRoPE(linQBuf!, 1, linNKH, pos, `L${l}-lin-rope-q`, linKD, rotaryDim);
-          dispatchRoPE(linKBuf!, 1, linNKH, pos, `L${l}-lin-rope-k`, linKD, rotaryDim);
-        }
+        // NOTE: NO RoPE in linear attention layers! Only full attention uses RoPE.
 
-        // 5b. Sigmoid on beta
+        // 5. Sigmoid on beta (num_v_heads=32 scalars)
         if (sigmoidPipeline) {
-          dispatchElementwise(sigmoidPipeline, linBBuf!, linDtBuf!, linNKH, `L${l}-sigmoid-beta`);
+          dispatchElementwise(sigmoidPipeline, linBBuf!, linDtBuf!, linNVH, `L${l}-sigmoid-beta`);
           const encSig = device.createCommandEncoder({ label: `L${l}-sig-cp` });
-          encSig.copyBufferToBuffer(linDtBuf!, 0, linBBuf!, 0, linNKH * 4);
+          encSig.copyBufferToBuffer(linDtBuf!, 0, linBBuf!, 0, linNVH * 4);
           device.queue.submit([encSig.finish()]);
         }
+
+        // TODO: L2-normalize Q and K (use_qk_l2norm_in_kernel=True)
+        // TODO: repeat_interleave Q and K from 16 heads to 32 heads
 
         // 6. Decay per VALUE HEAD [32], not per key dim
         // A_log is [32], dt_bias is [32], in_proj_a output is [32]
