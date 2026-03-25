@@ -340,6 +340,12 @@ loadBtn.addEventListener('click', async () => {
         lmHead: config.tieWordEmbeddings
           ? getTensor(nameMap.embedTokens)
           : getTensor(nameMap.lmHead),
+        lmHeadIsBF16: !config.tieWordEmbeddings && (() => {
+          const t = currentModel!.tensors.get(nameMap.lmHead);
+          const isBF16 = t ? (t.dtype === 'BF16' || t.dtype === 'F16') : false;
+          if (isBF16) console.log(`[Engine] LM head is ${t!.dtype}, using BF16 matmul`);
+          return isBF16;
+        })(),
       };
 
       // Helper for optional tensors (bias terms)

@@ -112,6 +112,64 @@ fn matmul_bt(@builtin(global_invocation_id) gid: vec3u,
   }
 }
 
+// ── B-transposed matmul with BF16 weight ────────────────────────────────
+// Same as matmul_bt but B is stored as BF16 (u16 packed in u32 pairs).
+// Used for lm_head when vocab embedding exceeds 2GB at f32.
+// B_bf16 layout: [N, K/2] as u32, each u32 holds two bf16 values.
+
+@group(0) @binding(5) var<storage, read> B_bf16: array<u32>;
+
+// Convert BF16 (u16) to f32: shift left by 16 bits
+fn bf16_to_f32(val: u32) -> f32 {
+  return bitcast<f32>(val << 16u);
+}
+
+@compute @workgroup_size(16, 16)
+fn matmul_bt_bf16(@builtin(global_invocation_id) gid: vec3u,
+                  @builtin(local_invocation_id) lid: vec3u,
+                  @builtin(workgroup_id) wid: vec3u) {
+
+  let row = wid.x * TILE + lid.x;
+  let col = wid.y * TILE + lid.y;
+  let local_idx = lid.x * TILE + lid.y;
+
+  var sum: f32 = 0.0;
+  let num_tiles = (params.K + TILE - 1u) / TILE;
+
+  for (var t: u32 = 0u; t < num_tiles; t++) {
+    let a_col = t * TILE + lid.y;
+    if (row < params.M && a_col < params.K) {
+      tile_a[local_idx] = A[row * params.K + a_col];
+    } else {
+      tile_a[local_idx] = 0.0;
+    }
+
+    // B is BF16: B_bf16[col * (K/2) + k/2], extract low or high u16
+    let b_k = t * TILE + lid.x;
+    if (b_k < params.K && col < params.N) {
+      let packed_idx = col * (params.K / 2u) + b_k / 2u;
+      let packed = B_bf16[packed_idx];
+      // Even k → low 16 bits, odd k → high 16 bits
+      let bf16_val = select(packed >> 16u, packed & 0xFFFFu, (b_k % 2u) == 0u);
+      tile_b[local_idx] = bf16_to_f32(bf16_val);
+    } else {
+      tile_b[local_idx] = 0.0;
+    }
+
+    workgroupBarrier();
+
+    for (var k: u32 = 0u; k < TILE; k++) {
+      sum += tile_a[lid.x * TILE + k] * tile_b[k * TILE + lid.y];
+    }
+
+    workgroupBarrier();
+  }
+
+  if (row < params.M && col < params.N) {
+    C[row * params.N + col] = sum;
+  }
+}
+
 // ── Naive matmul (for correctness testing) ──────────────────────────────
 
 @compute @workgroup_size(256)
