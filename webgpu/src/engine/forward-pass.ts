@@ -1,28 +1,23 @@
 /**
  * Forward Pass — Transformer Inference Orchestrator
  *
- * Chains WGSL compute kernels into a full transformer forward pass.
+ * Complete end-to-end transformer forward pass using WGSL compute kernels.
  * Model-agnostic: parameterized entirely by ModelConfig from config.json.
  *
  * Architecture (standard transformer decoder):
  *   embed(token_ids)
  *   for each layer:
  *     x = rmsnorm(x, input_norm_weight)
- *     x = attention(x, q/k/v/o weights, rope, kv_cache)  + residual
- *     x = rmsnorm(x, post_attn_norm_weight)
- *     x = ffn(x, gate/up/down weights)  + residual
- *   x = rmsnorm(x, final_norm_weight)
- *   logits = x @ lm_head
+ *     q, k, v = linear projections
+ *     rope(q, k)
+ *     kv_cache.write(k, v)
+ *     attn_out = attention(q, kv_cache.k, kv_cache.v)
+ *     x = x + o_proj(attn_out)
+ *     x = rmsnorm(x, post_attn_norm)
+ *     x = x + ffn(x)
+ *   logits = lm_head(rmsnorm(x))
  *
- * Supported model families:
- *   Qwen (ChatML, GQA, RoPE θ=1M)
- *   Llama (GQA, RoPE θ=500K)
- *   Mistral (GQA, sliding window)
- *   Gemma (different norm placement — noted below)
- *   Phi (fused gate/up projection — noted below)
- *   DeepSeek (standard layout)
- *
- * MODEL-SPECIFIC NOTES (search for "MODEL-SPECIFIC" in this file):
+ * MODEL-SPECIFIC NOTES (search for "MODEL-SPECIFIC"):
  *   1. Activation function: most use SiLU, some use GELU
  *   2. Norm placement: Gemma adds 1.0 to norm weights
  *   3. Fused projections: Phi fuses gate+up into one weight
@@ -45,9 +40,9 @@ import {
 import matmulWGSL from '../shaders/matmul.wgsl?raw';
 import rmsnormWGSL from '../shaders/rmsnorm.wgsl?raw';
 import ropeWGSL from '../shaders/rope.wgsl?raw';
-import softmaxWGSL from '../shaders/softmax.wgsl?raw';
 import elementwiseWGSL from '../shaders/elementwise.wgsl?raw';
 import embedWGSL from '../shaders/embed.wgsl?raw';
+import attentionWGSL from '../shaders/attention.wgsl?raw';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -110,10 +105,6 @@ export interface ForwardPassEngine {
 
 /**
  * Create a forward pass engine.
- *
- * @param device  - WebGPU device
- * @param config  - Model configuration (from parseModelConfig)
- * @param weights - All model weights on the GPU
  */
 export function createForwardPassEngine(
   device: GPUDevice,
@@ -129,129 +120,163 @@ export function createForwardPassEngine(
     intermediateSize: ffnDim,
     vocabSize: V,
     rmsNormEps: eps,
+    ropeTheta,
   } = config;
 
-  const kvDim = nKVHeads * dHead; // total KV dimension
+  const kvDim = nKVHeads * dHead;
 
-  // ── Compile pipelines ──────────────────────────────────────────────
+  // ── Compile all pipelines ──────────────────────────────────────────
 
   const embedPipeline = createComputePipeline(device, embedWGSL, 'embed', 'embed');
   const rmsnormPipeline = createComputePipeline(device, rmsnormWGSL, 'rmsnorm', 'rmsnorm');
-  // MODEL-SPECIFIC: activation function. Most models use SiLU.
-  // If config.hiddenAct === 'gelu', use the 'gelu' entry point instead.
+  // MODEL-SPECIFIC: activation. Most use SiLU; Phi/some Gemma use GELU.
   const siluPipeline = createComputePipeline(device, elementwiseWGSL, 'silu', 'silu');
   const mulPipeline = createComputePipeline(device, elementwiseWGSL, 'mul', 'mul');
   const addPipeline = createComputePipeline(device, elementwiseWGSL, 'add', 'add');
   const matmulPipeline = createComputePipeline(device, matmulWGSL, 'matmul_tiled', 'matmul');
-  const softmaxPipeline = createComputePipeline(device, softmaxWGSL, 'softmax', 'softmax');
   const ropePipeline = createComputePipeline(device, ropeWGSL, 'rope', 'rope');
+  const attentionPipeline = createComputePipeline(device, attentionWGSL, 'attention', 'attention');
 
   // ── Reusable intermediate buffers ──────────────────────────────────
-  // Allocated once, reused across layers to minimize VRAM usage.
-  // Sized for the maximum possible dimensions.
+  // Single-token decode (seqLen=1). Prefill would need dynamic sizing.
+  const maxSeq = 1;
 
-  // Attention intermediates (sized for single-token decode, seq_len=1)
-  // For prefill with seq_len > 1, we'd need larger buffers.
-  const maxSeq = 1; // single-token decode for now
-
-  // hidden state: [seq_len, hidden_size]
   const hiddenBuf = createStorageBuffer(device, null, maxSeq * H * 4, 'hidden', true);
   const residualBuf = createStorageBuffer(device, null, maxSeq * H * 4, 'residual', true);
   const normedBuf = createStorageBuffer(device, null, maxSeq * H * 4, 'normed', true);
-
-  // Q, K, V projections
   const qBuf = createStorageBuffer(device, null, maxSeq * nHeads * dHead * 4, 'q-proj', true);
   const kBuf = createStorageBuffer(device, null, maxSeq * kvDim * 4, 'k-proj', true);
   const vBuf = createStorageBuffer(device, null, maxSeq * kvDim * 4, 'v-proj', true);
-
-  // Attention output
   const attnOutBuf = createStorageBuffer(device, null, maxSeq * nHeads * dHead * 4, 'attn-out', true);
   const attnProjBuf = createStorageBuffer(device, null, maxSeq * H * 4, 'attn-proj', true);
-
-  // FFN intermediates
   const gateBuf = createStorageBuffer(device, null, maxSeq * ffnDim * 4, 'ffn-gate', true);
   const upBuf = createStorageBuffer(device, null, maxSeq * ffnDim * 4, 'ffn-up', true);
   const downBuf = createStorageBuffer(device, null, maxSeq * H * 4, 'ffn-down', true);
-
-  // Final logits
   const logitsBuf = createStorageBuffer(device, null, V * 4, 'logits', true);
+  const tokenIdBuf = createStorageBuffer(device, null, 256 * 4, 'token-ids', true); // up to 256 tokens
 
-  // Token ID input buffer
-  const tokenIdBuf = createStorageBuffer(device, null, maxSeq * 4, 'token-ids', true);
+  // ── Dispatch helpers ───────────────────────────────────────────────
 
-  // ── Helper: dispatch matmul (C = A × B) ────────────────────────────
-  // A: [M, K], B: [K, N], C: [M, N]
   function dispatchMatmul(
     aBuf: GPUBuffer, bBuf: GPUBuffer, cBuf: GPUBuffer,
     M: number, N: number, K: number, label: string,
   ) {
-    const params = createUniformBuffer(
-      device,
-      new Uint32Array([M, N, K, 0]),
-      `${label}-params`,
-    );
+    const params = createUniformBuffer(device, new Uint32Array([M, N, K, 0]), `${label}-p`);
     const bg = createBindGroup(device, matmulPipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
       { binding: 1, resource: { buffer: bBuf } },
       { binding: 2, resource: { buffer: cBuf } },
       { binding: 3, resource: { buffer: params } },
     ], label);
-
-    // Tiled matmul uses 16×16 tiles
-    dispatch(device, matmulPipeline, [bg],
-      [Math.ceil(N / 16), Math.ceil(M / 16)], label);
+    dispatch(device, matmulPipeline, [bg], [Math.ceil(N / 16), Math.ceil(M / 16)], label);
     params.destroy();
   }
 
-  // ── Helper: dispatch rmsnorm ────────────────────────────────────────
   function dispatchRMSNorm(
     inputBuf: GPUBuffer, outputBuf: GPUBuffer,
     weightBuf: GPUBuffer, rows: number, label: string,
   ) {
-    const params = createUniformBuffer(
-      device,
-      new Float32Array([H, eps]),  // packed as [hidden_size(u32), eps(f32)]
-      `${label}-params`,
-    );
-    // Rewrite params as mixed u32/f32
-    const paramData = new ArrayBuffer(8);
+    const paramData = new ArrayBuffer(16);
     new Uint32Array(paramData, 0, 1)[0] = H;
     new Float32Array(paramData, 4, 1)[0] = eps;
-    const paramBuf = createUniformBuffer(device, new Uint8Array(paramData), `${label}-params`);
-
+    const paramBuf = createUniformBuffer(device, new Uint8Array(paramData), `${label}-p`);
     const bg = createBindGroup(device, rmsnormPipeline, 0, [
       { binding: 0, resource: { buffer: inputBuf } },
       { binding: 1, resource: { buffer: outputBuf } },
       { binding: 2, resource: { buffer: weightBuf } },
       { binding: 3, resource: { buffer: paramBuf } },
     ], label);
-
     dispatch(device, rmsnormPipeline, [bg], [rows], label);
-    params.destroy();
     paramBuf.destroy();
   }
 
-  // ── Helper: dispatch elementwise op ─────────────────────────────────
   function dispatchElementwise(
     pipeline: GPUComputePipeline,
     inputBuf: GPUBuffer, outputBuf: GPUBuffer,
     size: number, label: string, secondBuf?: GPUBuffer,
   ) {
-    const params = createUniformBuffer(
-      device, new Uint32Array([size]), `${label}-params`,
-    );
+    const params = createUniformBuffer(device, new Uint32Array([size]), `${label}-p`);
     const entries: Array<{ binding: number; resource: GPUBindingResource }> = [
       { binding: 0, resource: { buffer: inputBuf } },
       { binding: 1, resource: { buffer: outputBuf } },
       { binding: 2, resource: { buffer: params } },
     ];
-    if (secondBuf) {
-      entries.push({ binding: 3, resource: { buffer: secondBuf } });
-    }
-
+    if (secondBuf) entries.push({ binding: 3, resource: { buffer: secondBuf } });
     const bg = createBindGroup(device, pipeline, 0, entries, label);
     dispatch(device, pipeline, [bg], [workgroupCount(size, 256)], label);
     params.destroy();
+  }
+
+  function dispatchRoPE(
+    qkBuf: GPUBuffer, seqLen: number, numHeads: number,
+    posOffset: number, label: string,
+  ) {
+    // RoPE params struct: [seq_len, head_dim, num_heads, pos_offset, rope_base]
+    const paramData = new ArrayBuffer(20);
+    const u32View = new Uint32Array(paramData);
+    const f32View = new Float32Array(paramData);
+    u32View[0] = seqLen;
+    u32View[1] = dHead;
+    u32View[2] = numHeads;
+    u32View[3] = posOffset;
+    f32View[4] = ropeTheta;
+    // MODEL-SPECIFIC: RoPE theta comes from config. NTK/YaRN scaling
+    // would modify the base here based on sequence length.
+    const paramBuf = createUniformBuffer(device, new Uint8Array(paramData), `${label}-p`);
+
+    const bg = createBindGroup(device, ropePipeline, 0, [
+      { binding: 0, resource: { buffer: qkBuf } },
+      { binding: 1, resource: { buffer: paramBuf } },
+    ], label);
+
+    const halfDim = dHead / 2;
+    const totalPairs = seqLen * numHeads * halfDim;
+    dispatch(device, ropePipeline, [bg], [workgroupCount(totalPairs, 256)], label);
+    paramBuf.destroy();
+  }
+
+  function dispatchAttention(
+    qBuf: GPUBuffer, kCacheBuf: GPUBuffer, vCacheBuf: GPUBuffer,
+    outputBuf: GPUBuffer, newSeqLen: number, cacheLen: number,
+    isCausal: boolean, posOffset: number, label: string,
+  ) {
+    // Attention params struct
+    const paramData = new ArrayBuffer(32);
+    const u32View = new Uint32Array(paramData);
+    const f32View = new Float32Array(paramData);
+    u32View[0] = nHeads;
+    u32View[1] = nKVHeads;
+    u32View[2] = dHead;
+    u32View[3] = newSeqLen;
+    u32View[4] = cacheLen;
+    f32View[5] = 1.0 / Math.sqrt(dHead);
+    u32View[6] = isCausal ? 1 : 0;
+    u32View[7] = posOffset;
+    const paramBuf = createUniformBuffer(device, new Uint8Array(paramData), `${label}-p`);
+
+    const bg = createBindGroup(device, attentionPipeline, 0, [
+      { binding: 0, resource: { buffer: qBuf } },
+      { binding: 1, resource: { buffer: kCacheBuf } },
+      { binding: 2, resource: { buffer: vCacheBuf } },
+      { binding: 3, resource: { buffer: outputBuf } },
+      { binding: 4, resource: { buffer: paramBuf } },
+    ], label);
+
+    // One workgroup per (query_position, head) pair
+    dispatch(device, attentionPipeline, [bg], [newSeqLen, nHeads], label);
+    paramBuf.destroy();
+  }
+
+  function copyToKVCache(
+    srcBuf: GPUBuffer, cacheBuf: GPUBuffer,
+    seqLen: number, dim: number, position: number,
+  ) {
+    // Copy new K or V vectors into the cache at the current position
+    const srcBytes = seqLen * dim * 4;
+    const dstOffset = position * dim * 4;
+    const encoder = device.createCommandEncoder({ label: 'kv-cache-copy' });
+    encoder.copyBufferToBuffer(srcBuf, 0, cacheBuf, dstOffset, srcBytes);
+    device.queue.submit([encoder.finish()]);
   }
 
   // ── Forward Pass ───────────────────────────────────────────────────
@@ -259,14 +284,13 @@ export function createForwardPassEngine(
   function forward(tokenIds: Uint32Array, kvCache: KVCache): ForwardOutput {
     const seqLen = tokenIds.length;
     const pos = kvCache.position;
+    const cacheLen = pos + seqLen; // total cache length after adding new tokens
 
     // Upload token IDs
     device.queue.writeBuffer(tokenIdBuf, 0, tokenIds.buffer, tokenIds.byteOffset, tokenIds.byteLength);
 
-    // ── Embedding lookup ─────────────────────────────────────────────
-    const embedParams = createUniformBuffer(
-      device, new Uint32Array([H, seqLen]), 'embed-params',
-    );
+    // ── Embedding ────────────────────────────────────────────────────
+    const embedParams = createUniformBuffer(device, new Uint32Array([H, seqLen]), 'embed-p');
     const embedBG = createBindGroup(device, embedPipeline, 0, [
       { binding: 0, resource: { buffer: tokenIdBuf } },
       { binding: 1, resource: { buffer: hiddenBuf } },
@@ -280,90 +304,75 @@ export function createForwardPassEngine(
     for (let l = 0; l < L; l++) {
       const lw = weights.layers[l];
 
-      // Copy hidden state to residual for skip connection
-      const copyEncoder = device.createCommandEncoder({ label: `copy-residual-${l}` });
-      copyEncoder.copyBufferToBuffer(hiddenBuf, 0, residualBuf, 0, seqLen * H * 4);
-      device.queue.submit([copyEncoder.finish()]);
+      // Save hidden state for residual connection
+      const enc1 = device.createCommandEncoder({ label: `res1-${l}` });
+      enc1.copyBufferToBuffer(hiddenBuf, 0, residualBuf, 0, seqLen * H * 4);
+      device.queue.submit([enc1.finish()]);
 
       // Pre-attention RMSNorm
-      dispatchRMSNorm(hiddenBuf, normedBuf, lw.inputNorm, seqLen, `layer${l}-pre-attn-norm`);
+      dispatchRMSNorm(hiddenBuf, normedBuf, lw.inputNorm, seqLen, `L${l}-norm1`);
 
-      // Q, K, V projections: [seq, hidden] × [hidden, proj_dim]^T
-      // Weight matrices are stored as [out_dim, in_dim] in HF format
-      // So matmul is: normed[seq, H] × W^T[H, out_dim] = output[seq, out_dim]
-      dispatchMatmul(normedBuf, lw.qProj, qBuf, seqLen, nHeads * dHead, H, `layer${l}-q`);
-      dispatchMatmul(normedBuf, lw.kProj, kBuf, seqLen, kvDim, H, `layer${l}-k`);
-      dispatchMatmul(normedBuf, lw.vProj, vBuf, seqLen, kvDim, H, `layer${l}-v`);
+      // Q, K, V projections
+      dispatchMatmul(normedBuf, lw.qProj, qBuf, seqLen, nHeads * dHead, H, `L${l}-q`);
+      dispatchMatmul(normedBuf, lw.kProj, kBuf, seqLen, kvDim, H, `L${l}-k`);
+      dispatchMatmul(normedBuf, lw.vProj, vBuf, seqLen, kvDim, H, `L${l}-v`);
 
-      // MODEL-SPECIFIC: RoPE
-      // Apply rotary position embeddings to Q and K.
-      // The RoPE theta and head_dim are model-specific (from config).
-      // MODEL-SPECIFIC: Some models use NTK-aware or YaRN RoPE scaling
-      // for extended context. This would modify the frequency computation.
-      // TODO: dispatch RoPE on Q and K with position offset
+      // Apply RoPE to Q and K
+      dispatchRoPE(qBuf, seqLen, nHeads, pos, `L${l}-rope-q`);
+      dispatchRoPE(kBuf, seqLen, nKVHeads, pos, `L${l}-rope-k`);
 
-      // MODEL-SPECIFIC: KV Cache
-      // Store K and V in cache at position `pos`.
-      // For TurboQuant-compressed cache, encode here.
-      // TODO: copy K, V to kvCache at position offset
-      // TODO: for attention, read full K, V history from cache
+      // Write new K, V to cache
+      copyToKVCache(kBuf, kvCache.keys[l], seqLen, kvDim, pos);
+      copyToKVCache(vBuf, kvCache.values[l], seqLen, kvDim, pos);
 
-      // Attention: scores = Q @ K^T, softmax, output = scores @ V
-      // For single-token decode: Q is [1, nHeads*dHead], K_cache is [pos+1, kvDim]
-      // Full attention implementation requires head-aware batched matmul.
-      // TODO: implement multi-head attention dispatch
-      //   - Reshape Q to [nHeads, 1, dHead]
-      //   - Reshape K to [nKVHeads, pos+1, dHead] (with GQA head expansion)
-      //   - scores = Q @ K^T / sqrt(dHead)    [nHeads, 1, pos+1]
-      //   - Apply causal mask (only for prefill, not needed for single-token)
-      //   - weights = softmax(scores)
-      //   - output = weights @ V               [nHeads, 1, dHead]
-      //   - Reshape back to [1, nHeads*dHead]
+      // Multi-head attention (reads full K,V cache including new tokens)
+      const isCausal = seqLen > 1; // causal mask only needed for prefill
+      dispatchAttention(
+        qBuf, kvCache.keys[l], kvCache.values[l], attnOutBuf,
+        seqLen, cacheLen, isCausal, pos, `L${l}-attn`,
+      );
 
-      // Output projection: [seq, nHeads*dHead] × W_o^T[nHeads*dHead, H]
-      dispatchMatmul(qBuf, lw.oProj, attnProjBuf, seqLen, H, nHeads * dHead, `layer${l}-o`);
+      // Output projection: [seq, nHeads*dHead] → [seq, H]
+      dispatchMatmul(attnOutBuf, lw.oProj, attnProjBuf, seqLen, H, nHeads * dHead, `L${l}-o`);
 
-      // Residual connection: hidden = residual + attn_output
-      dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `layer${l}-attn-residual`, attnProjBuf);
+      // Residual: hidden = residual + attn_output
+      dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res1`, attnProjBuf);
 
-      // Copy for second residual
-      const copyEncoder2 = device.createCommandEncoder({ label: `copy-residual2-${l}` });
-      copyEncoder2.copyBufferToBuffer(hiddenBuf, 0, residualBuf, 0, seqLen * H * 4);
-      device.queue.submit([copyEncoder2.finish()]);
+      // Save for second residual
+      const enc2 = device.createCommandEncoder({ label: `res2-${l}` });
+      enc2.copyBufferToBuffer(hiddenBuf, 0, residualBuf, 0, seqLen * H * 4);
+      device.queue.submit([enc2.finish()]);
 
       // Post-attention RMSNorm
-      dispatchRMSNorm(hiddenBuf, normedBuf, lw.postAttnNorm, seqLen, `layer${l}-post-attn-norm`);
+      dispatchRMSNorm(hiddenBuf, normedBuf, lw.postAttnNorm, seqLen, `L${l}-norm2`);
 
       // ── FFN (SwiGLU) ───────────────────────────────────────────────
-      // MODEL-SPECIFIC: Phi models fuse gate+up into one projection.
-      // For fused models, split the output in half after projection.
-      dispatchMatmul(normedBuf, lw.gateProj, gateBuf, seqLen, ffnDim, H, `layer${l}-gate`);
-      dispatchMatmul(normedBuf, lw.upProj, upBuf, seqLen, ffnDim, H, `layer${l}-up`);
+      // MODEL-SPECIFIC: Phi fuses gate+up into one projection.
+      dispatchMatmul(normedBuf, lw.gateProj, gateBuf, seqLen, ffnDim, H, `L${l}-gate`);
+      dispatchMatmul(normedBuf, lw.upProj, upBuf, seqLen, ffnDim, H, `L${l}-up`);
 
-      // MODEL-SPECIFIC: activation function
-      // Most: SiLU(gate) * up.  GELU models: GELU(gate) * up.
-      dispatchElementwise(siluPipeline, gateBuf, gateBuf, seqLen * ffnDim, `layer${l}-silu`);
-      dispatchElementwise(mulPipeline, gateBuf, gateBuf, seqLen * ffnDim, `layer${l}-gate-mul`, upBuf);
+      // MODEL-SPECIFIC: SiLU for most models, GELU for some
+      dispatchElementwise(siluPipeline, gateBuf, gateBuf, seqLen * ffnDim, `L${l}-silu`);
+      dispatchElementwise(mulPipeline, gateBuf, gateBuf, seqLen * ffnDim, `L${l}-mul`, upBuf);
 
-      // Down projection
-      dispatchMatmul(gateBuf, lw.downProj, downBuf, seqLen, H, ffnDim, `layer${l}-down`);
+      dispatchMatmul(gateBuf, lw.downProj, downBuf, seqLen, H, ffnDim, `L${l}-down`);
 
-      // Residual connection: hidden = residual + ffn_output
-      dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `layer${l}-ffn-residual`, downBuf);
+      // Residual: hidden = residual + ffn_output
+      dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res2`, downBuf);
     }
 
     // ── Final norm + LM head ─────────────────────────────────────────
     dispatchRMSNorm(hiddenBuf, normedBuf, weights.global.finalNorm, seqLen, 'final-norm');
 
-    // For generation, we only need logits for the LAST token
-    // LM head: normed[last_token] @ lm_head^T = logits[vocab_size]
-    // TODO: for seq_len > 1, offset normedBuf to the last row
+    // LM head projection (last token only for generation)
     const lmHeadBuf = config.tieWordEmbeddings
       ? weights.global.embedTokens
       : weights.global.lmHead;
+    // For multi-token input, we'd offset to the last row of normedBuf.
+    // For seqLen=1 (decode), normedBuf IS the last token.
     dispatchMatmul(normedBuf, lmHeadBuf, logitsBuf, 1, V, H, 'lm-head');
 
-    // Update KV cache position
+    // Update cache position
     kvCache.position += seqLen;
 
     return { logitsBuffer: logitsBuf };
@@ -374,22 +383,12 @@ export function createForwardPassEngine(
   function createKVCache(maxSeqLen: number): KVCache {
     const keys: GPUBuffer[] = [];
     const values: GPUBuffer[] = [];
-
     for (let l = 0; l < L; l++) {
-      keys.push(createStorageBuffer(
-        device, null, maxSeqLen * kvDim * 4, `kv-cache-k-${l}`, true,
-      ));
-      values.push(createStorageBuffer(
-        device, null, maxSeqLen * kvDim * 4, `kv-cache-v-${l}`, true,
-      ));
+      keys.push(createStorageBuffer(device, null, maxSeqLen * kvDim * 4, `kv-k-${l}`, true));
+      values.push(createStorageBuffer(device, null, maxSeqLen * kvDim * 4, `kv-v-${l}`, true));
     }
-
     return { keys, values, position: 0, maxSeqLen };
   }
 
-  return {
-    forward,
-    createKVCache,
-    config,
-  };
+  return { forward, createKVCache, config };
 }
