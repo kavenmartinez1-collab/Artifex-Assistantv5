@@ -35,6 +35,13 @@ export {
 } from './cache';
 
 export {
+  // Model Config
+  parseModelConfig, getWeightNameMap, resolveLayerWeightName,
+  getAllWeightNames, estimateVRAM,
+  type ModelConfig, type WeightNameMap,
+} from './model-config';
+
+export {
   // Tokenizer
   createTokenizer, applyChatTemplate,
   type Tokenizer, type TokenizerConfig,

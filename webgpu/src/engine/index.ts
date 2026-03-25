@@ -7,3 +7,4 @@ export { createStorageBuffer, createUniformBuffer, readBuffer, writeBuffer, tens
 export { createComputePipeline, createBindGroup, dispatch, dispatchAndWait, workgroupCount } from './compute';
 export { runKernelTests, type TestResult } from './kernel-tests';
 export { createTurboQuantPipeline, type TurboQuantPipeline, type CompressedKV } from './turboquant-pipeline';
+export { createForwardPassEngine, type ForwardPassEngine, type ForwardOutput, type ModelWeights, type LayerWeights, type GlobalWeights, type KVCache } from './forward-pass';
