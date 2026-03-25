@@ -444,6 +444,13 @@ loadBtn.addEventListener('click', async () => {
             lw.vBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.vBias, l));
             lw.oBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.oBias, l));
           }
+
+          // Q/K per-head RMSNorm (Qwen3.5 full attention)
+          if (nameMap.layer.qNorm) {
+            lw.qNorm = tryGetTensor(resolveLayerWeightName(nameMap.layer.qNorm, l));
+            lw.kNorm = tryGetTensor(resolveLayerWeightName(nameMap.layer.kNorm!, l));
+            if (l === 3) console.log(`[Engine] L3 qNorm: ${lw.qNorm ? 'FOUND' : 'MISSING'}, kNorm: ${lw.kNorm ? 'FOUND' : 'MISSING'}`);
+          }
         }
 
         // FFN GPTQ (shared for both layer types)
