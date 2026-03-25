@@ -417,16 +417,20 @@ export function createForwardPassEngine(
   function dispatchRoPE(
     qkBuf: GPUBuffer, seqLen: number, numHeads: number,
     posOffset: number, label: string,
+    headDimOverride?: number, rotaryDimOverride?: number,
   ) {
-    // RoPE params struct: [seq_len, head_dim, num_heads, pos_offset, rope_base]
-    const paramData = new ArrayBuffer(20);
+    const hd = headDimOverride ?? dHead;
+    const rd = rotaryDimOverride ?? 0;
+    // RoPE params struct: [seq_len, head_dim, num_heads, pos_offset, rope_base, rotary_dim]
+    const paramData = new ArrayBuffer(24);
     const u32View = new Uint32Array(paramData);
     const f32View = new Float32Array(paramData);
     u32View[0] = seqLen;
-    u32View[1] = dHead;
+    u32View[1] = hd;
     u32View[2] = numHeads;
     u32View[3] = posOffset;
     f32View[4] = ropeTheta;
+    u32View[5] = rd;
     // MODEL-SPECIFIC: RoPE theta comes from config. NTK/YaRN scaling
     // would modify the base here based on sequence length.
     const paramBuf = createUniformBuffer(device, new Uint8Array(paramData), `${label}-p`);
@@ -436,7 +440,8 @@ export function createForwardPassEngine(
       { binding: 1, resource: { buffer: paramBuf } },
     ], label);
 
-    const halfDim = dHead / 2;
+    const rotDim = rd > 0 ? rd : hd;
+    const halfDim = rotDim / 2;
     const totalPairs = seqLen * numHeads * halfDim;
     dispatch(device, ropePipeline, [bg], [workgroupCount(totalPairs, 256)], label);
     paramBuf.destroy();
@@ -602,8 +607,8 @@ export function createForwardPassEngine(
         const rotaryDim = config.partialRotaryFactor
           ? Math.floor(config.partialRotaryFactor * linKD) : 0;
         if (rotaryDim > 0) {
-          dispatchRoPE(linQBuf!, 1, linNKH, pos, `L${l}-lin-rope-q`);
-          dispatchRoPE(linKBuf!, 1, linNKH, pos, `L${l}-lin-rope-k`);
+          dispatchRoPE(linQBuf!, 1, linNKH, pos, `L${l}-lin-rope-q`, linKD, rotaryDim);
+          dispatchRoPE(linKBuf!, 1, linNKH, pos, `L${l}-lin-rope-k`, linKD, rotaryDim);
         }
 
         // 4. Conv1d on K (causal, kernel_size=4)
@@ -620,12 +625,10 @@ export function createForwardPassEngine(
           dispatch(device, conv1dPipeline, [convBG],
             [workgroupCount(linConvDim, 256)], `L${l}-conv1d`);
 
-          // Update conv state (shift + append)
+          // Update conv state (shift + append) — only needs input, state, and params
           const updateBG = createBindGroup(device, conv1dUpdatePipeline, 0, [
             { binding: 0, resource: { buffer: linKBuf! } },
             { binding: 1, resource: { buffer: csBuf } },
-            { binding: 2, resource: { buffer: lw.linearConv1dWeight! } },
-            { binding: 3, resource: { buffer: linConvOutBuf! } },
             { binding: 4, resource: { buffer: convParams } },
           ], `L${l}-conv-upd`);
           dispatch(device, conv1dUpdatePipeline, [updateBG],
