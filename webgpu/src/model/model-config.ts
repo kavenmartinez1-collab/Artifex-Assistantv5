@@ -276,7 +276,9 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
   // Optional fields with fallbacks
   const numKVHeads = firstDefined(hfConfig, fieldMap.numKVHeads) ?? numAttentionHeads;
   const intermediateSize = firstDefined(hfConfig, fieldMap.intermediateSize) ?? hiddenSize * 4;
-  const ropeTheta = firstDefined(hfConfig, fieldMap.ropeTheta) ?? 10000;
+  const ropeTheta = firstDefined(hfConfig, fieldMap.ropeTheta)
+    ?? hfConfig.rope_parameters?.rope_theta  // Qwen3.5 nests rope_theta inside rope_parameters
+    ?? 10000;
   const headDim = firstDefined(hfConfig, fieldMap.headDim) ?? Math.floor(hiddenSize / numAttentionHeads);
 
   const rmsNormEps = hfConfig.rms_norm_eps ?? hfConfig.layer_norm_eps ?? 1e-5;
