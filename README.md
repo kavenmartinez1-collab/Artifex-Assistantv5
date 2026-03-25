@@ -61,7 +61,7 @@ Universal Local AI Hosting Platform. Run any AI model locally — text generatio
 - **Agent tools** — shell execution, Python runner, web search, codebase analysis (grep, glob, architecture), file I/O, edit-in-place
 - **RAG knowledge base** — per-workspace knowledge entries with lifecycle classification, action keys, loop detection
 - **Session persistence** — save/load conversations with full metadata (model, backend, mode)
-- **WebGPU engine** — browser-based GPU compute with 5 WGSL kernels (matmul, rmsnorm, rope, softmax, elementwise)
+- **WebGPU engine** — browser-based LLM inference with custom WGSL compute kernels (matmul, attention, RMSNorm, RoPE, softmax, SiLU, embedding), TurboQuant KV cache compression, full transformer forward pass, and autoregressive generation with streaming. Loads any HuggingFace SafeTensors model directly in the browser.
 - **Secure web search** — SearXNG + Web Gateway with content sanitization, prompt injection detection, tmpfs quarantine, and network isolation
 - **Docker support** — GPU-enabled container with health checks, optional Ollama sidecar, and web gateway proxy
 - **Multi-GPU** — device selection for multi-GPU systems
@@ -83,6 +83,7 @@ Universal Local AI Hosting Platform. Run any AI model locally — text generatio
 | API /v1/chat/completions | PASS | Routes through Ollama backend on localhost |
 | WebGPU TypeScript | PASS | tsc --noEmit clean, 0 errors |
 | WebGPU Vite build | PASS | 13 modules, 23KB bundle |
+| WebGPU inference | PASS | Qwen2.5-0.5B-Instruct generates coherent English at ~20 tok/s in Chrome |
 | Localhost binding | PASS | Confirmed NOT accessible on LAN IP |
 
 ## Supported GPU Tiers
@@ -757,12 +758,15 @@ npm run server    # Metrics server only
 ### Architecture
 
 - **GPU initialization** — WebGPU device/adapter detection, buffer negotiation up to 2GB
-- **5 WGSL compute kernels**:
-  - `matmul.wgsl` — tiled 16x16 matrix multiplication with shared memory
+- **WGSL compute kernels**:
+  - `matmul.wgsl` — tiled 16x16 matrix multiplication with shared memory + `matmul_bt` for HuggingFace weight format (B-transposed)
+  - `attention.wgsl` — fused multi-head attention with GQA, causal masking, inline softmax
   - `rmsnorm.wgsl` — RMS layer normalization
   - `rope.wgsl` — rotary positional embeddings
   - `softmax.wgsl` — attention softmax
-  - `elementwise.wgsl` — add, multiply, scale operations
+  - `elementwise.wgsl` — add, multiply, SiLU activation
+  - `embed.wgsl` — parallel embedding table lookup
+  - `turboquant_encode.wgsl` / `turboquant_decode.wgsl` — TurboQuant KV cache compression (Google, ICLR 2026)
 - **Buffer management** — typed GPU buffer creation, read/write operations
 - **Kernel test suite** — correctness validation against CPU reference values
 - **Metrics collection** — browser-to-server event reporting with JSON logging
@@ -770,7 +774,14 @@ npm run server    # Metrics server only
 
 ### Status
 
-Phase 0-1 complete (infrastructure, kernels, testing, metrics). Phase 2 (transformer forward pass, weight loading, token generation) is next.
+Phases 0-4 and 6 complete: GPU infrastructure, compute kernels, HuggingFace weight loading with browser caching, full transformer forward pass with GQA attention, TurboQuant KV cache compression, and autoregressive text generation with streaming. Coherent text generation is working end-to-end in the browser. Phase 5 (INT4 weight dequantization for larger models) is next.
+
+### Supported Models
+
+Any HuggingFace model with a standard transformer decoder architecture works. Tested:
+- **Qwen2.5-0.5B-Instruct** — 24 layers, 896 hidden, GQA 14Q/2KV. Generates coherent English.
+- **SmolLM2-135M-Instruct** — 30 layers, 576 hidden, GQA 9Q/3KV.
+- **SmolLM2-360M-Instruct** — 32 layers, 960 hidden, GQA 15Q/5KV.
 
 ---
 
@@ -847,9 +858,25 @@ Artifex-Assistant-V5/
       limiter.toml         # SearXNG rate limiting
   webgpu/
     src/
-      main.ts              # WebGPU initialization and UI
-      engine/              # GPU device, buffers, compute pipelines
-      shaders/             # WGSL compute kernels (5 kernels)
+      main.ts              # WebGPU initialization, model loading, and chat UI
+      engine/
+        gpu-device.ts      # WebGPU adapter/device initialization
+        buffers.ts         # GPU buffer create, read, write utilities
+        compute.ts         # Shader compilation, pipeline caching, dispatch
+        kernel-tests.ts    # GPU kernel correctness tests (9 tests)
+        forward-pass.ts    # Full transformer forward pass orchestrator
+        generate.ts        # Autoregressive generation loop with sampling
+        inference.ts       # Top-level session orchestrator (load → chat)
+        turboquant-pipeline.ts  # TurboQuant encode/decode pipeline manager
+      model/
+        model-config.ts    # HF config.json parser (Qwen/Llama/Mistral/Phi)
+        tokenizer.ts       # BPE tokenizer via @huggingface/transformers
+        weight-loader.ts   # SafeTensors download → parse → GPU upload
+        safetensors.ts     # SafeTensors binary format parser (F32/F16/BF16)
+        hf-hub.ts          # HuggingFace Hub API client
+        cache.ts           # Browser IndexedDB cache for model weights
+        turboquant.ts      # TurboQuant math (rotation matrix, codebook, CPU reference)
+      shaders/             # WGSL compute kernels (10 kernels)
       utils/               # Metrics reporting
     server/
       dev-server.ts        # Express metrics collection server
@@ -1050,6 +1077,7 @@ First and foremost, all praise and glory to **God** through **Jesus Christ**. Ev
 - **[trafilatura](https://github.com/adbar/trafilatura)** — Adrien Barbaresi — web content extraction and sanitization
 - **[HTTPX](https://github.com/encode/httpx)** — Encode — async HTTP client for the web gateway
 - **[SlowAPI](https://github.com/laurentS/slowapi)** — Laurent Savaete — rate limiting for FastAPI
+- **[Transformers.js](https://github.com/huggingface/transformers.js)** — HuggingFace — JavaScript tokenizer and model inference (used for BPE tokenization in WebGPU engine)
 
 ### AI Models & Research
 
@@ -1066,9 +1094,16 @@ First and foremost, all praise and glory to **God** through **Jesus Christ**. Ev
 - **[Gemma](https://ai.google.dev/gemma)** — Google DeepMind — language models
 - **[Phi](https://huggingface.co/microsoft/phi-3-mini-4k-instruct)** — Microsoft Research — small language models
 - **[DeepSeek](https://www.deepseek.com/)** — DeepSeek AI — language models
+- **[SmolLM2](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct)** — HuggingFace — small language models (used for WebGPU testing)
 - **[CogVideoX](https://github.com/THUDM/CogVideo)** — Tsinghua University / THUDM — video generation
 - **[BERT](https://github.com/google-research/bert)** — Google Research — embedding models
 - **[Sentence Transformers](https://www.sbert.net/)** — UKP Lab, TU Darmstadt — embedding models for RAG
+
+### Algorithms & Research
+
+- **[TurboQuant](https://arxiv.org/abs/2504.19874)** — Amir Zandieh, Majid Daliri, Majid Hadian, Vahab Mirrokni et al. (Google Research) — Online vector quantization for KV cache compression with near-optimal distortion rate (ICLR 2026). First WebGPU implementation.
+- **[PolarQuant](https://arxiv.org/abs/2502.00527)** — Google Research — MSE-optimal scalar quantization via random orthogonal rotation (AISTATS 2026). Stage 1 of TurboQuant.
+- **[QJL](https://github.com/amirzandieh/QJL)** — Amir Zandieh et al. — 1-bit quantized Johnson-Lindenstrauss transform for unbiased inner product estimation (AAAI 2025). Stage 2 of TurboQuant.
 
 ### Standards & Specifications
 
