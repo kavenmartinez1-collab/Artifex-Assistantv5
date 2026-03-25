@@ -1,41 +1,36 @@
-// SSM Step — Gated DeltaNet Single-Token Recurrence
+// SSM Step — Gated Delta Rule Single-Token Recurrence
 //
-// The core Mamba-2 / Gated DeltaNet state update for decode (seqLen=1).
+// The DELTA RULE recurrence (not simple outer product!):
+//   1. h = decay * h                              (decay state)
+//   2. kv_mem = (h * K).sum(key_dim)               (predict V from state)
+//   3. delta = (V - kv_mem) * beta                 (compute prediction error)
+//   4. h = h + outer(K, delta)                     (update state with error)
+//   5. output = (h * Q).sum(key_dim)               (readout)
+//
+// Reference: modeling_qwen3_5.py lines 426-437
 //
 // State shape: h[num_key_heads, key_head_dim, grouped_value_dim]
-//   - grouped_value_dim = (num_value_heads / num_key_heads) * value_head_dim
-//   - For Qwen3.5-9B: h[16, 128, 256] where 256 = 2 * 128
-//
-// Update rule (per key head kh, per key dim k, per grouped value dim v):
-//   h[kh, k, v] = decay[kh, k] * h[kh, k, v] + beta[kh] * K[kh, k] * V_grouped[kh, v]
-//
-// Readout:
-//   output[kh, v] = sum_k Q[kh, k] * h[kh, k, v]
-//
-// V grouping: V is [num_value_heads, value_head_dim] = [32, 128]
-//   Reshaped to [num_key_heads, grouped_value_dim] = [16, 256]
-//
-// Dispatch: one workgroup per key_head. Each thread handles a slice of the v dimension.
+// Dispatch: one workgroup per key_head
 
 struct Params {
   num_key_heads: u32,      // 16
-  num_value_heads: u32,    // 32 (for reference, not directly used in kernel)
+  num_value_heads: u32,    // 32
   key_head_dim: u32,       // 128
   grouped_value_dim: u32,  // 256 = (num_value_heads / num_key_heads) * value_head_dim
 }
 
-// Per-head vectors for the current token
+// Per-head vectors for the current token (Q and K are L2-normalized and Q is scaled by 1/sqrt(kd))
 @group(0) @binding(0) var<storage, read> Q: array<f32>;       // [num_key_heads * key_head_dim]
-@group(0) @binding(1) var<storage, read> K: array<f32>;       // [num_key_heads * key_head_dim] (after conv1d + silu)
-@group(0) @binding(2) var<storage, read> V: array<f32>;       // [num_value_heads * value_head_dim] = [grouped as num_key_heads * grouped_value_dim]
+@group(0) @binding(1) var<storage, read> K: array<f32>;       // [num_key_heads * key_head_dim]
+@group(0) @binding(2) var<storage, read> V: array<f32>;       // [num_value_heads * value_head_dim]
 @group(0) @binding(3) var<storage, read> beta: array<f32>;    // [num_value_heads] (after sigmoid)
-@group(0) @binding(4) var<storage, read> decay: array<f32>;   // [num_value_heads] — per value head (NOT per key dim)
+@group(0) @binding(4) var<storage, read> decay: array<f32>;   // [num_value_heads] (exp(g))
 
 // SSM hidden state (read-write, persists across tokens)
 @group(1) @binding(0) var<storage, read_write> h: array<f32>; // [num_key_heads * key_head_dim * grouped_value_dim]
 
 // Output
-@group(1) @binding(1) var<storage, read_write> output: array<f32>; // [num_key_heads * grouped_value_dim] = [num_value_heads * value_head_dim]
+@group(1) @binding(1) var<storage, read_write> output: array<f32>; // [num_key_heads * grouped_value_dim]
 
 @group(2) @binding(0) var<uniform> params: Params;
 
@@ -48,41 +43,61 @@ fn ssm_step(@builtin(local_invocation_id) lid: vec3u,
   let kd = params.key_head_dim;
   let gvd = params.grouped_value_dim;
   let nkh = params.num_key_heads;
-
-  // h layout: h[kh * kd * gvd + k * gvd + v]
-  let h_base = kh * kd * gvd;
-  // Decay and beta are per VALUE HEAD [num_value_heads], not per key head.
   let nvh = params.num_value_heads;
   let vh_per_kh = nvh / nkh;
   let vhd = gvd / vh_per_kh; // value_head_dim (e.g., 128)
 
+  let h_base = kh * kd * gvd;
+
+  // Step 1: Decay state — h = decay * h
+  // decay is per value head
   var v = tid;
   while (v < gvd) {
-    let v_val = V[kh * gvd + v];
-    // Which value head does this v belong to?
     let vh = kh * vh_per_kh + v / vhd;
-    let d = decay[vh];       // per value head decay
-    let beta_val = beta[vh]; // per value head beta
-
+    let d = decay[vh];
     for (var k = 0u; k < kd; k = k + 1u) {
       let h_idx = h_base + k * gvd + v;
-      let k_val = K[kh * kd + k];
-      h[h_idx] = d * h[h_idx] + beta_val * k_val * v_val;
+      h[h_idx] = d * h[h_idx];
+    }
+    v = v + 256u;
+  }
+  workgroupBarrier();
+
+  // Step 2: Compute kv_mem = (h * K).sum(key_dim) — predict V from state
+  // kv_mem[v] = sum_k h[kh, k, v] * K[kh, k]
+  v = tid;
+  while (v < gvd) {
+    var kv_mem: f32 = 0.0;
+    for (var k = 0u; k < kd; k = k + 1u) {
+      kv_mem += h[h_base + k * gvd + v] * K[kh * kd + k];
+    }
+
+    // Step 3: delta = (V - kv_mem) * beta
+    let vh = kh * vh_per_kh + v / vhd;
+    let v_val = V[kh * gvd + v];
+    let beta_val = beta[vh];
+    let delta = (v_val - kv_mem) * beta_val;
+
+    // Step 4: h = h + outer(K, delta) — update state with delta
+    for (var k = 0u; k < kd; k = k + 1u) {
+      let h_idx = h_base + k * gvd + v;
+      h[h_idx] = h[h_idx] + K[kh * kd + k] * delta;
     }
 
     v = v + 256u;
   }
   workgroupBarrier();
 
-  // Step 2: Readout — output[kh, v] = sum_k Q[kh, k] * h[kh, k, v]
+  // Step 5: Readout — output[v] = (h * Q).sum(key_dim) * scale
+  // scale = 1/sqrt(key_head_dim) — applied to Q as in the reference
+  let scale = 1.0 / sqrt(f32(kd));
   v = tid;
   while (v < gvd) {
     var dot: f32 = 0.0;
     for (var k = 0u; k < kd; k = k + 1u) {
-      dot += Q[kh * kd + k] * h[h_base + k * gvd + v];
+      dot += h[h_base + k * gvd + v] * Q[kh * kd + k];
     }
-    output[kh * gvd + v] = dot;
-
+    output[kh * gvd + v] = dot * scale;
     v = v + 256u;
   }
 }
