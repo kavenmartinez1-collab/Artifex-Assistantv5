@@ -222,42 +222,71 @@ export function generate(
     const maxSeq = promptTokens + config.maxNewTokens;
     const kvCache = engine.createKVCache(maxSeq);
 
-    // ── Step 3: Prefill (all prompt tokens at once) ──────────────────
-    // For now, we process tokens one at a time since our buffers are
-    // sized for seqLen=1. Batched prefill is a future optimization.
+    // ── Step 3: Prefill ─────────────────────────────────────────────
+    // Process all prompt tokens. The LAST call produces logits for
+    // the first generated token — we sample from those directly.
+    let prefillOutput;
     for (let i = 0; i < promptTokens; i++) {
-      engine.forward(new Uint32Array([promptIds[i]]), kvCache);
+      prefillOutput = await engine.forward(new Uint32Array([promptIds[i]]), kvCache);
     }
     await device.queue.onSubmittedWorkDone();
 
     const prefillEnd = performance.now();
     const prefillMs = prefillEnd - startTime;
 
-    // ── Step 4: Decode loop ──────────────────────────────────────────
+    // ── Step 4: Sample first token from prefill logits ───────────────
     const generatedIds: number[] = [];
-    let lastTokenId = promptIds[promptIds.length - 1];
     let stopReason: 'eos' | 'max_length' | 'aborted' = 'max_length';
-
     const decodeStart = performance.now();
 
-    for (let step = 0; step < config.maxNewTokens; step++) {
-      if (aborted) {
-        stopReason = 'aborted';
-        break;
+    // Read logits from the last prefill step
+    const firstLogitsRaw = await readBuffer(
+      device, prefillOutput!.logitsBuffer, engine.config.vocabSize * 4,
+    );
+    const firstLogits = new Float32Array(firstLogitsRaw);
+    let lastTokenId = sampleFromLogits(firstLogits, config, generatedIds);
+
+    if (tokenizer.isEos(lastTokenId)) {
+      stopReason = 'eos';
+    } else {
+      generatedIds.push(lastTokenId);
+      if (onToken) {
+        onToken(tokenizer.decode([lastTokenId]), lastTokenId, 0);
       }
 
-      // Forward pass with the last generated token
-      const input = new Uint32Array([lastTokenId]);
-      const output = engine.forward(input, kvCache);
+      // ── Step 5: Decode loop ──────────────────────────────────────
+      for (let step = 1; step < config.maxNewTokens; step++) {
+        if (aborted) {
+          stopReason = 'aborted';
+          break;
+        }
 
-      // Read logits back from GPU
-      await device.queue.onSubmittedWorkDone();
-      const logitsRaw = await readBuffer(
-        device,
-        output.logitsBuffer,
-        engine.config.vocabSize * 4,
-      );
-      const logits = new Float32Array(logitsRaw);
+        // Forward pass with the last GENERATED token (not prompt token)
+        const input = new Uint32Array([lastTokenId]);
+        const output = await engine.forward(input, kvCache);
+
+        // Read logits back from GPU
+        await device.queue.onSubmittedWorkDone();
+        const logitsRaw = await readBuffer(
+          device,
+          output.logitsBuffer,
+          engine.config.vocabSize * 4,
+        );
+        const logits = new Float32Array(logitsRaw);
+
+      // Debug: log top-5 logits on first decode step
+      if (step === 0) {
+        const indexed = Array.from(logits).map((v, i) => [i, v] as [number, number]);
+        indexed.sort((a, b) => b[1] - a[1]);
+        const top5 = indexed.slice(0, 5);
+        console.log(`[DEBUG logits] top 5:`, top5.map(([id, v]) => `${id}(${v.toFixed(2)})`).join(', '));
+        let lo = Infinity, hi = -Infinity, sum = 0;
+        for (let i = 0; i < logits.length; i++) { lo = Math.min(lo, logits[i]); hi = Math.max(hi, logits[i]); sum += logits[i]; }
+        console.log(`[DEBUG logits] min=${lo.toFixed(2)}, max=${hi.toFixed(2)}, mean=${(sum / logits.length).toFixed(4)}`);
+        // Decode top token
+        const topText = tokenizer.decode([top5[0][0]]);
+        console.log(`[DEBUG logits] top token: "${topText}" (id=${top5[0][0]})`);
+      }
 
       // Sample next token
       const nextId = sampleFromLogits(logits, config, generatedIds);
@@ -276,7 +305,8 @@ export function generate(
         const tokenText = tokenizer.decode([nextId]);
         onToken(tokenText, nextId, step);
       }
-    }
+      }
+    } // end if !eos from first token
 
     const endTime = performance.now();
     const totalMs = endTime - startTime;

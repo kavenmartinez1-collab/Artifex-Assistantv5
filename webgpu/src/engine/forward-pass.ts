@@ -35,6 +35,7 @@ import {
 import {
   createStorageBuffer,
   createUniformBuffer,
+  readBuffer,
 } from './buffers';
 
 import matmulWGSL from '../shaders/matmul.wgsl?raw';
@@ -98,7 +99,7 @@ export interface ForwardOutput {
 
 export interface ForwardPassEngine {
   /** Run one forward pass step (prefill or single-token decode). */
-  forward(tokenIds: Uint32Array, kvCache: KVCache): ForwardOutput;
+  forward(tokenIds: Uint32Array, kvCache: KVCache): Promise<ForwardOutput>;
 
   /** Create an empty KV cache for the given max sequence length. */
   createKVCache(maxSeqLen: number): KVCache;
@@ -162,6 +163,16 @@ export function createForwardPassEngine(
   const ffnTempBuf = createStorageBuffer(device, null, maxSeq * ffnDim * 4, 'ffn-temp', true);
   const logitsBuf = createStorageBuffer(device, null, V * 4, 'logits', true);
   const tokenIdBuf = createStorageBuffer(device, null, 256 * 4, 'token-ids', true); // up to 256 tokens
+
+  // ── Debug: read first N values from a GPU buffer ────────────────────
+  let debugCallCount = 0;
+  async function debugRead(buf: GPUBuffer, label: string, n = 8) {
+    await device.queue.onSubmittedWorkDone();
+    const raw = await readBuffer(device, buf, n * 4);
+    const vals = new Float32Array(raw);
+    const str = Array.from(vals).map(v => v.toFixed(4)).join(', ');
+    console.log(`[DEBUG ${label}] first ${n}: [${str}]`);
+  }
 
   // ── Dispatch helpers ───────────────────────────────────────────────
 
@@ -307,10 +318,13 @@ export function createForwardPassEngine(
 
   // ── Forward Pass ───────────────────────────────────────────────────
 
-  function forward(tokenIds: Uint32Array, kvCache: KVCache): ForwardOutput {
+  async function forward(tokenIds: Uint32Array, kvCache: KVCache): Promise<ForwardOutput> {
     const seqLen = tokenIds.length;
     const pos = kvCache.position;
-    const cacheLen = pos + seqLen; // total cache length after adding new tokens
+    const cacheLen = pos + seqLen;
+    const isDebug = debugCallCount < 2; // debug first two forward passes
+    const isDebug2 = debugCallCount === 1; // extra detail on second pass
+    debugCallCount++;
 
     // Upload token IDs
     device.queue.writeBuffer(tokenIdBuf, 0, tokenIds.buffer, tokenIds.byteOffset, tokenIds.byteLength);
@@ -325,6 +339,10 @@ export function createForwardPassEngine(
     ], 'embed');
     dispatch(device, embedPipeline, [embedBG], [seqLen], 'embed');
     embedParams.destroy();
+
+    if (isDebug) {
+      await debugRead(hiddenBuf, 'embed-out', 8);
+    }
 
     // ── Transformer layers ───────────────────────────────────────────
     for (let l = 0; l < L; l++) {
@@ -370,6 +388,13 @@ export function createForwardPassEngine(
       dispatchRoPE(qBuf, seqLen, nHeads, pos, `L${l}-rope-q`);
       dispatchRoPE(kBuf, seqLen, nKVHeads, pos, `L${l}-rope-k`);
 
+      if (isDebug && l === 0) {
+        await debugRead(normedBuf, 'L0-normed', 8);
+        await debugRead(qBuf, 'L0-Q-after-rope', 8);
+        await debugRead(kBuf, 'L0-K-after-rope', 8);
+        await debugRead(vBuf, 'L0-V', 8);
+      }
+
       // Write new K, V to cache
       copyToKVCache(kBuf, kvCache.keys[l], seqLen, kvDim, pos);
       copyToKVCache(vBuf, kvCache.values[l], seqLen, kvDim, pos);
@@ -395,6 +420,17 @@ export function createForwardPassEngine(
       // Residual: hidden = residual + attn_output
       dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res1`, attnProjBuf);
 
+      if (isDebug && l === 0) {
+        await debugRead(attnOutBuf, `L0-attn-out(pos=${pos})`, 8);
+        await debugRead(attnProjBuf, `L0-attn-proj(pos=${pos})`, 8);
+        await debugRead(hiddenBuf, `L0-after-attn-residual(pos=${pos})`, 8);
+      }
+      if (isDebug2 && l === 0) {
+        // On second token, check if attention differs from just V (it should, with 2 cache entries)
+        await debugRead(vBuf, `L0-V(pos=${pos})`, 8);
+        console.log(`[DEBUG] cache_len=${cacheLen}, pos=${pos}`);
+      }
+
       // Save for second residual
       const enc2 = device.createCommandEncoder({ label: `res2-${l}` });
       enc2.copyBufferToBuffer(hiddenBuf, 0, residualBuf, 0, seqLen * H * 4);
@@ -417,6 +453,10 @@ export function createForwardPassEngine(
 
       // Residual: hidden = residual + ffn_output
       dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res2`, downBuf);
+
+      if (isDebug && l === 0) {
+        await debugRead(hiddenBuf, 'L0-after-ffn-residual', 8);
+      }
     }
 
     // ── Final norm + LM head ─────────────────────────────────────────
