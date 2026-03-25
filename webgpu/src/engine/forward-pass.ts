@@ -44,6 +44,7 @@ import ropeWGSL from '../shaders/rope.wgsl?raw';
 import elementwiseWGSL from '../shaders/elementwise.wgsl?raw';
 import embedWGSL from '../shaders/embed.wgsl?raw';
 import attentionWGSL from '../shaders/attention.wgsl?raw';
+import matmulQ4WGSL from '../shaders/matmul_q4.wgsl?raw';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -62,6 +63,15 @@ export interface LayerWeights {
   gateProj: GPUBuffer;     // [intermediate_size, hidden_size]
   upProj: GPUBuffer;       // [intermediate_size, hidden_size]
   downProj: GPUBuffer;     // [hidden_size, intermediate_size]
+
+  // GPTQ quantized weight buffers (optional, only for INT4 models)
+  qProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  kProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  vProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  oProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  gateProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  upProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  downProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
 }
 
 /** GPU buffers for global (non-layer) weights. */
@@ -141,6 +151,10 @@ export function createForwardPassEngine(
   const matmulPipeline = createComputePipeline(device, matmulWGSL, 'matmul', 'matmul');
   // B-transposed matmul for HF weight projections (stored as [out, in])
   const matmulBTPipeline = createComputePipeline(device, matmulWGSL, 'matmul_bt', 'matmul-bt');
+  // INT4 GPTQ dequantizing matmul (weights packed as 4-bit)
+  const matmulQ4Pipeline = config.isQuantized
+    ? createComputePipeline(device, matmulQ4WGSL, 'matmul_bt_q4', 'matmul-q4')
+    : null;
   const ropePipeline = createComputePipeline(device, ropeWGSL, 'rope', 'rope');
   const attentionPipeline = createComputePipeline(device, attentionWGSL, 'attention', 'attention');
 
@@ -163,6 +177,43 @@ export function createForwardPassEngine(
   const ffnTempBuf = createStorageBuffer(device, null, maxSeq * ffnDim * 4, 'ffn-temp', true);
   const logitsBuf = createStorageBuffer(device, null, V * 4, 'logits', true);
   const tokenIdBuf = createStorageBuffer(device, null, 256 * 4, 'token-ids', true); // up to 256 tokens
+
+  /** C[M,N] = A[M,K] @ dequant(q4_packed, scales, zeros)^T — GPTQ INT4 */
+  function dispatchMatmulQ4(
+    aBuf: GPUBuffer,
+    q4: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer },
+    cBuf: GPUBuffer,
+    M: number, N: number, K: number, label: string,
+  ) {
+    if (!matmulQ4Pipeline) throw new Error('INT4 matmul not compiled (model is not quantized)');
+    const params = createUniformBuffer(device,
+      new Uint32Array([M, N, K, config.quantGroupSize]), `${label}-p`);
+    const bg = createBindGroup(device, matmulQ4Pipeline, 0, [
+      { binding: 0, resource: { buffer: aBuf } },
+      { binding: 1, resource: { buffer: q4.qweight } },
+      { binding: 2, resource: { buffer: cBuf } },
+      { binding: 3, resource: { buffer: params } },
+      { binding: 4, resource: { buffer: q4.scales } },
+      { binding: 5, resource: { buffer: q4.qzeros } },
+    ], label);
+    dispatch(device, matmulQ4Pipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
+    params.destroy();
+  }
+
+  /** Dispatch either f32 matmul_bt or INT4 matmul_q4 depending on weight type */
+  function dispatchProjection(
+    inputBuf: GPUBuffer, lw: LayerWeights, proj: string,
+    outputBuf: GPUBuffer, M: number, N: number, K: number, label: string,
+  ) {
+    const q4key = `${proj}_q4` as keyof LayerWeights;
+    const q4 = lw[q4key] as { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer } | undefined;
+    if (q4) {
+      dispatchMatmulQ4(inputBuf, q4, outputBuf, M, N, K, label);
+    } else {
+      const wkey = proj as keyof LayerWeights;
+      dispatchMatmulBT(inputBuf, lw[wkey] as GPUBuffer, outputBuf, M, N, K, label);
+    }
+  }
 
   // ── Debug: read first N values from a GPU buffer ────────────────────
   let debugCallCount = 0;
@@ -356,10 +407,10 @@ export function createForwardPassEngine(
       // Pre-attention RMSNorm
       dispatchRMSNorm(hiddenBuf, normedBuf, lw.inputNorm, seqLen, `L${l}-norm1`);
 
-      // Q, K, V projections
-      dispatchMatmulBT(normedBuf, lw.qProj, qBuf, seqLen, nHeads * dHead, H, `L${l}-q`);
-      dispatchMatmulBT(normedBuf, lw.kProj, kBuf, seqLen, kvDim, H, `L${l}-k`);
-      dispatchMatmulBT(normedBuf, lw.vProj, vBuf, seqLen, kvDim, H, `L${l}-v`);
+      // Q, K, V projections (auto-selects f32 or INT4 matmul)
+      dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHead, H, `L${l}-q`);
+      dispatchProjection(normedBuf, lw, 'kProj', kBuf, seqLen, kvDim, H, `L${l}-k`);
+      dispatchProjection(normedBuf, lw, 'vProj', vBuf, seqLen, kvDim, H, `L${l}-v`);
 
       // Add bias if model has attention_bias (Qwen2, etc.)
       // Use copy-add pattern to avoid same-buffer read+write conflict:
@@ -412,7 +463,7 @@ export function createForwardPassEngine(
       );
 
       // Output projection: [seq, nHeads*dHead] → [seq, H]
-      dispatchMatmulBT(attnOutBuf, lw.oProj, attnProjBuf, seqLen, H, nHeads * dHead, `L${l}-o`);
+      dispatchProjection(attnOutBuf, lw, 'oProj', attnProjBuf, seqLen, H, nHeads * dHead, `L${l}-o`);
 
       // O projection bias
       if (config.attentionBias && lw.oBias) {
@@ -446,15 +497,15 @@ export function createForwardPassEngine(
 
       // ── FFN (SwiGLU) ───────────────────────────────────────────────
       // MODEL-SPECIFIC: Phi fuses gate+up into one projection.
-      dispatchMatmulBT(normedBuf, lw.gateProj, gateBuf, seqLen, ffnDim, H, `L${l}-gate`);
-      dispatchMatmulBT(normedBuf, lw.upProj, upBuf, seqLen, ffnDim, H, `L${l}-up`);
+      dispatchProjection(normedBuf, lw, 'gateProj', gateBuf, seqLen, ffnDim, H, `L${l}-gate`);
+      dispatchProjection(normedBuf, lw, 'upProj', upBuf, seqLen, ffnDim, H, `L${l}-up`);
 
       // MODEL-SPECIFIC: SiLU for most models, GELU for some
       // Cannot use same buffer for input and output in WebGPU — use dedicated temp
       dispatchElementwise(siluPipeline, gateBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silu`);
       dispatchElementwise(mulPipeline, ffnTempBuf, gateBuf, seqLen * ffnDim, `L${l}-mul`, upBuf);
 
-      dispatchMatmulBT(gateBuf, lw.downProj, downBuf, seqLen, H, ffnDim, `L${l}-down`);
+      dispatchProjection(gateBuf, lw, 'downProj', downBuf, seqLen, H, ffnDim, `L${l}-down`);
 
       // Residual: hidden = residual + ffn_output
       dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res2`, downBuf);

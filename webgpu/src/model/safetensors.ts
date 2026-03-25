@@ -190,6 +190,26 @@ export function tensorToFloat32(data: ArrayBuffer, dtype: SafeTensorDtype): Floa
   throw new Error(`Unsupported dtype for float32 conversion: ${dtype}`);
 }
 
+/**
+ * Extract raw tensor bytes as a typed array without conversion.
+ * Used for GPTQ packed weights (I32) and scales (F16) that need
+ * to stay in their original format for GPU-side dequantization.
+ */
+export function tensorToTypedArray(data: ArrayBuffer, dtype: SafeTensorDtype): ArrayBufferView {
+  switch (dtype) {
+    case 'I32': return new Int32Array(data);
+    case 'U8': return new Uint8Array(data);
+    case 'I8': return new Int8Array(data);
+    case 'I16': return new Int16Array(data);
+    case 'U16': return new Uint16Array(data);
+    case 'F16': return new Uint16Array(data); // raw F16 bits
+    case 'BF16': return new Uint16Array(data); // raw BF16 bits
+    case 'F32': return new Float32Array(data);
+    case 'F64': return new Float64Array(data);
+    default: return new Uint8Array(data);
+  }
+}
+
 // ─── Float16/BFloat16 Conversion ─────────────────────────────────────────────
 
 /**
