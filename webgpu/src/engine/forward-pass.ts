@@ -53,6 +53,10 @@ export interface LayerWeights {
   kProj: GPUBuffer;        // [num_kv_heads * head_dim, hidden_size]
   vProj: GPUBuffer;        // [num_kv_heads * head_dim, hidden_size]
   oProj: GPUBuffer;        // [hidden_size, num_heads * head_dim]
+  qBias?: GPUBuffer;       // [num_heads * head_dim] (only if attention_bias)
+  kBias?: GPUBuffer;       // [num_kv_heads * head_dim]
+  vBias?: GPUBuffer;       // [num_kv_heads * head_dim]
+  oBias?: GPUBuffer;       // [hidden_size]
   postAttnNorm: GPUBuffer; // [hidden_size]
   gateProj: GPUBuffer;     // [intermediate_size, hidden_size]
   upProj: GPUBuffer;       // [intermediate_size, hidden_size]
@@ -339,6 +343,29 @@ export function createForwardPassEngine(
       dispatchMatmulBT(normedBuf, lw.kProj, kBuf, seqLen, kvDim, H, `L${l}-k`);
       dispatchMatmulBT(normedBuf, lw.vProj, vBuf, seqLen, kvDim, H, `L${l}-v`);
 
+      // Add bias if model has attention_bias (Qwen2, etc.)
+      // Use copy-add pattern to avoid same-buffer read+write conflict:
+      //   copy qBuf → temp, then temp + bias → qBuf
+      if (config.attentionBias && lw.qBias && lw.kBias && lw.vBias) {
+        // Q bias: copy Q to attnOutBuf (temp), add bias back to qBuf
+        const encQb = device.createCommandEncoder({ label: `L${l}-qb-copy` });
+        encQb.copyBufferToBuffer(qBuf, 0, attnOutBuf, 0, seqLen * nHeads * dHead * 4);
+        device.queue.submit([encQb.finish()]);
+        dispatchElementwise(addPipeline, attnOutBuf, qBuf, seqLen * nHeads * dHead, `L${l}-qb`, lw.qBias);
+
+        // K bias: copy K to ffnTempBuf (temp, reused), add bias
+        const encKb = device.createCommandEncoder({ label: `L${l}-kb-copy` });
+        encKb.copyBufferToBuffer(kBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
+        device.queue.submit([encKb.finish()]);
+        dispatchElementwise(addPipeline, ffnTempBuf, kBuf, seqLen * kvDim, `L${l}-kb`, lw.kBias);
+
+        // V bias: reuse ffnTempBuf
+        const encVb = device.createCommandEncoder({ label: `L${l}-vb-copy` });
+        encVb.copyBufferToBuffer(vBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
+        device.queue.submit([encVb.finish()]);
+        dispatchElementwise(addPipeline, ffnTempBuf, vBuf, seqLen * kvDim, `L${l}-vb`, lw.vBias);
+      }
+
       // Apply RoPE to Q and K
       dispatchRoPE(qBuf, seqLen, nHeads, pos, `L${l}-rope-q`);
       dispatchRoPE(kBuf, seqLen, nKVHeads, pos, `L${l}-rope-k`);
@@ -356,6 +383,14 @@ export function createForwardPassEngine(
 
       // Output projection: [seq, nHeads*dHead] → [seq, H]
       dispatchMatmulBT(attnOutBuf, lw.oProj, attnProjBuf, seqLen, H, nHeads * dHead, `L${l}-o`);
+
+      // O projection bias
+      if (config.attentionBias && lw.oBias) {
+        const encOb = device.createCommandEncoder({ label: `L${l}-ob-copy` });
+        encOb.copyBufferToBuffer(attnProjBuf, 0, normedBuf, 0, seqLen * H * 4);
+        device.queue.submit([encOb.finish()]);
+        dispatchElementwise(addPipeline, normedBuf, attnProjBuf, seqLen * H, `L${l}-ob`, lw.oBias);
+      }
 
       // Residual: hidden = residual + attn_output
       dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res1`, attnProjBuf);
