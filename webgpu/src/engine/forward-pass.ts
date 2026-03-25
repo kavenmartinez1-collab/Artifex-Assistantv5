@@ -269,6 +269,8 @@ export function createForwardPassEngine(
     ? createComputePipeline(device, elementwiseWGSL, 'sigmoid_op', 'sigmoid') : null;
   const decayPipeline = isHybrid
     ? createComputePipeline(device, elementwiseWGSL, 'decay_compute', 'decay') : null;
+  const l2NormPipeline = isHybrid
+    ? createComputePipeline(device, elementwiseWGSL, 'l2_normalize', 'l2-norm') : null;
 
   // ── Reusable intermediate buffers ──────────────────────────────────
   // Sized for batch prefill (up to MAX_PREFILL tokens per forward pass).
@@ -653,8 +655,22 @@ export function createForwardPassEngine(
           device.queue.submit([encSig.finish()]);
         }
 
-        // TODO: L2-normalize Q and K (use_qk_l2norm_in_kernel=True)
-        // TODO: repeat_interleave Q and K from 16 heads to 32 heads
+        // 5c. L2-normalize Q and K (use_qk_l2norm_in_kernel=True in reference)
+        // Normalizes each head vector to unit length. Critical for SSM stability.
+        if (l2NormPipeline) {
+          const qDim = linNKH * linKD;
+          const kDim = linNKH * linKD;
+          // L2 norm uses broadcast_b as head_dim
+          dispatchElementwise(l2NormPipeline, linQBuf!, linConvOutBuf!, qDim, `L${l}-l2norm-q`, undefined, linKD);
+          const encQ = device.createCommandEncoder({ label: `L${l}-l2q-cp` });
+          encQ.copyBufferToBuffer(linConvOutBuf!, 0, linQBuf!, 0, qDim * 4);
+          device.queue.submit([encQ.finish()]);
+
+          dispatchElementwise(l2NormPipeline, linKBuf!, linConvOutBuf!, kDim, `L${l}-l2norm-k`, undefined, linKD);
+          const encK = device.createCommandEncoder({ label: `L${l}-l2k-cp` });
+          encK.copyBufferToBuffer(linConvOutBuf!, 0, linKBuf!, 0, kDim * 4);
+          device.queue.submit([encK.finish()]);
+        }
 
         // 6. Decay per VALUE HEAD [32], not per key dim
         // A_log is [32], dt_bias is [32], in_proj_a output is [32]

@@ -100,3 +100,24 @@ fn decay_compute(@builtin(global_invocation_id) gid: vec3u) {
   let dt = input_b[idx];       // dt from softplus
   output[idx] = exp(A * dt);   // decay in (0, 1)
 }
+
+// L2 Normalize: normalize each head vector to unit length
+// params.n = total elements, params.broadcast_b = head_dim (elements per head)
+// One thread per element. Computes norm across the head, then divides.
+@compute @workgroup_size(256)
+fn l2_normalize(@builtin(global_invocation_id) gid: vec3u) {
+  let idx = gid.x;
+  if (idx >= params.n) { return; }
+  let head_dim = params.broadcast_b; // reuse broadcast_b as head_dim
+  let head = idx / head_dim;
+  let base = head * head_dim;
+
+  // Compute L2 norm of this head's vector
+  var sum_sq: f32 = 0.0;
+  for (var i = 0u; i < head_dim; i = i + 1u) {
+    let v = input_a[base + i];
+    sum_sq += v * v;
+  }
+  let inv_norm = 1.0 / max(sqrt(sum_sq), 1e-6);
+  output[idx] = input_a[idx] * inv_norm;
+}
