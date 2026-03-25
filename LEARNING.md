@@ -822,11 +822,14 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
 
 ✅ COHERENT TEXT GENERATION — Qwen2.5-0.5B-Instruct generates
    English at ~20 tok/s in Chrome on an RTX 5060 Ti via WebGPU
+✅ HuggingFace auth token (gated model access, localStorage persistence)
+✅ GPTQ INT4 weight loader (packed I32 qweight + F16 scales + I32 qzeros)
+✅ Fused INT4 dequantizing matmul kernel (matmul_bt_q4)
 ```
 
 ### What's remaining
 
-**Phase 5: INT4 Quantization** — Store weights as 4-bit integers, dequantize on the fly during matmul. Essential for fitting larger models (>1B parameters) in the WebGPU 2 GB buffer limit. Without this, models are loaded in FP32 which uses 4x more memory than necessary.
+**Phase 5: INT4 Quantization** — Infrastructure complete. GPTQ weight loader detects and uploads packed INT4 weights (8 values per i32) with per-group F16 scales and INT4 zero points. Fused `matmul_bt_q4` kernel dequantizes on the fly during tiled matrix multiplication. Needs end-to-end testing with a GPTQ-quantized model (e.g., Qwen3.5-9B-GPTQ). Memory impact: 9B model weights drop from ~36 GB (FP32) to ~4.5 GB (INT4).
 
 **TurboQuant KV Cache Integration** — The TurboQuant encode/decode kernels work standalone (9/9 tests passing) but are not yet wired into the forward pass. Integration would compress the KV cache by ~8-10x, extending maximum context length proportionally.
 
@@ -923,6 +926,49 @@ WebGPU  Q[4] =   1.96  (matmul only, no bias!)
 
 One line fix: `qwen2: true` in the attention bias defaults. Coherent English output immediately.
 
+### INT4 Weight Quantization
+
+Modern language models have billions of parameters (weights). A 9-billion-parameter model stored in 32-bit floats needs 9B x 4 bytes = 36 GB of memory — far more than a consumer GPU can hold. Quantization compresses these weights so they fit.
+
+**What is GPTQ?**
+
+GPTQ (Accurate Post-Training Quantization for Generative Pre-trained Transformers) is a method that compresses model weights from 16-bit floats down to 4-bit integers with minimal quality loss. It works by analyzing how each weight affects the model's output, then carefully rounding weights to 4-bit values in an order that minimizes accumulated error. The result is a model that's ~8x smaller but produces nearly identical text.
+
+**How 8 weights fit in one 32-bit integer**
+
+Each weight is stored as a 4-bit number (0-15). Since a standard 32-bit integer has 32 bits, you can pack exactly 8 weights into one integer (4 bits x 8 = 32 bits). To extract weight number `i`, you shift right by `i * 4` bits and mask off the bottom 4 bits:
+
+```
+i32 value: [w7][w6][w5][w4][w3][w2][w1][w0]   (4 bits each)
+weight_3 = (value >> 12) & 0xF                  (shift right 12 bits, keep lowest 4)
+```
+
+**Group scales and zero points**
+
+A 4-bit integer can only represent values 0-15, but real weights might range from -0.8 to +0.3. To map between these ranges, every group of 128 weights shares a *scale* and a *zero point*:
+
+```
+real_weight = scale * (quantized_value - zero_point)
+```
+
+The scale stretches the 0-15 range to match the original float range. The zero point shifts it so the mapping is centered correctly. With 128 weights per group, you only need one scale and one zero point per 128 weights — minimal overhead.
+
+**Why dequantization is "fused" into the matmul**
+
+The naive approach would be: (1) unpack all INT4 weights to float32, (2) run a normal matrix multiply. But that would temporarily need the full float32 memory — defeating the purpose.
+
+Instead, our `matmul_bt_q4` kernel dequantizes weights *during* the tile loading phase. When loading a 16x16 tile into shared memory, each thread unpacks its INT4 values, applies the group scale and zero point, and writes float32 values directly into shared memory. The matrix multiplication then proceeds normally on the float32 tile. The full float32 weight matrix never exists — only one small tile at a time.
+
+**Memory impact**
+
+| Format | Bytes per weight | 9B model size |
+|--------|-----------------|---------------|
+| FP32   | 4 bytes         | 36 GB         |
+| FP16   | 2 bytes         | 18 GB         |
+| INT4   | 0.5 bytes       | 4.5 GB        |
+
+At 4.5 GB, a 9-billion-parameter model fits comfortably on an 8 GB GPU — making models like Qwen3.5-9B accessible in the browser via WebGPU.
+
 ---
 
 ## 13. How All the Pieces Connect
@@ -1011,6 +1057,7 @@ The WebGPU path is the most ambitious because we're building the inference engin
 | **Endpoint** | A specific URL path in an API that handles a particular type of request. |
 | **FP16** | 16-bit floating point — the standard precision for model weights. 2 bytes per number. |
 | **Forward pass** | Running input data through the model from beginning to end to produce an output. |
+| **GPTQ** | A post-training quantization method that compresses model weights to 4-bit integers with per-group scale factors. Reduces memory by ~8x with minimal quality loss. Named after the paper "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers." |
 | **GQA** | Grouped-Query Attention — an optimization where multiple Q heads share K/V heads, reducing memory usage. |
 | **GGUF** | The weight format used by llama.cpp and Ollama. Self-contained (includes tokenizer and metadata). |
 | **INT4** | 4-bit integer quantization — stores weights as 4-bit numbers, reducing memory by 4x vs FP16. |
