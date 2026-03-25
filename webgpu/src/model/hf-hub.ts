@@ -52,6 +52,23 @@ export interface DownloadProgress {
 const HF_BASE = 'https://huggingface.co';
 const HF_API = 'https://huggingface.co/api/models';
 
+// ─── Auth Token ─────────────────────────────────────────────────────────────
+
+let _authToken = '';
+
+/**
+ * Set the HuggingFace auth token for gated model access.
+ * Call before any API requests. Empty string = no auth (public models only).
+ */
+export function setAuthToken(token: string): void {
+  _authToken = token.trim();
+}
+
+/** Get auth headers (empty object if no token set). */
+function authHeaders(): Record<string, string> {
+  return _authToken ? { Authorization: `Bearer ${_authToken}` } : {};
+}
+
 // ─── Model Discovery ─────────────────────────────────────────────────────────
 
 /**
@@ -59,7 +76,7 @@ const HF_API = 'https://huggingface.co/api/models';
  */
 export async function listModelFiles(repo: string): Promise<HFModelFile[]> {
   const url = `${HF_API}/${repo}/tree/main`;
-  const resp = await fetch(url);
+  const resp = await fetch(url, { headers: authHeaders() });
 
   if (!resp.ok) {
     if (resp.status === 404) {
@@ -76,7 +93,7 @@ export async function listModelFiles(repo: string): Promise<HFModelFile[]> {
  */
 export async function fetchModelConfig(repo: string): Promise<HFModelConfig> {
   const url = `${HF_BASE}/${repo}/raw/main/config.json`;
-  const resp = await fetch(url);
+  const resp = await fetch(url, { headers: authHeaders() });
 
   if (!resp.ok) {
     throw new Error(`Failed to fetch config.json for ${repo}: ${resp.status}`);
@@ -91,7 +108,7 @@ export async function fetchModelConfig(repo: string): Promise<HFModelConfig> {
  */
 export async function fetchShardIndex(repo: string): Promise<Record<string, any> | null> {
   const url = `${HF_BASE}/${repo}/raw/main/model.safetensors.index.json`;
-  const resp = await fetch(url);
+  const resp = await fetch(url, { headers: authHeaders() });
 
   if (!resp.ok) {
     // Single-shard model — no index file
@@ -148,6 +165,7 @@ export async function fetchRange(
 ): Promise<ArrayBuffer> {
   const resp = await fetch(url, {
     headers: {
+      ...authHeaders(),
       Range: `bytes=${start}-${end - 1}`, // HTTP Range is inclusive on both ends
     },
   });
@@ -171,7 +189,7 @@ export async function downloadFile(
   url: string,
   onProgress?: (downloaded: number, total: number) => void,
 ): Promise<ArrayBuffer> {
-  const resp = await fetch(url);
+  const resp = await fetch(url, { headers: authHeaders() });
 
   if (!resp.ok) {
     throw new Error(`Download failed: ${resp.status} ${resp.statusText}`);
