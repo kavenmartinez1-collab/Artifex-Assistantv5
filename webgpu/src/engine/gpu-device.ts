@@ -60,6 +60,7 @@ export async function initWebGPU(): Promise<GPUContext> {
       maxComputeWorkgroupsPerDimension: adapterLimits.maxComputeWorkgroupsPerDimension,
       maxStorageBuffersPerShaderStage: adapterLimits.maxStorageBuffersPerShaderStage,
       maxUniformBufferBindingSize: adapterLimits.maxUniformBufferBindingSize,
+      maxComputeWorkgroupStorageSize: adapterLimits.maxComputeWorkgroupStorageSize,
     },
   });
 

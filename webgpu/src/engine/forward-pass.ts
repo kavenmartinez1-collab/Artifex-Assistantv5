@@ -133,7 +133,9 @@ export function createForwardPassEngine(
   const siluPipeline = createComputePipeline(device, elementwiseWGSL, 'silu', 'silu');
   const mulPipeline = createComputePipeline(device, elementwiseWGSL, 'mul', 'mul');
   const addPipeline = createComputePipeline(device, elementwiseWGSL, 'add', 'add');
-  const matmulPipeline = createComputePipeline(device, matmulWGSL, 'matmul_tiled', 'matmul');
+  const matmulPipeline = createComputePipeline(device, matmulWGSL, 'matmul', 'matmul');
+  // B-transposed matmul for HF weight projections (stored as [out, in])
+  const matmulBTPipeline = createComputePipeline(device, matmulWGSL, 'matmul_bt', 'matmul-bt');
   const ropePipeline = createComputePipeline(device, ropeWGSL, 'rope', 'rope');
   const attentionPipeline = createComputePipeline(device, attentionWGSL, 'attention', 'attention');
 
@@ -169,6 +171,22 @@ export function createForwardPassEngine(
       { binding: 3, resource: { buffer: params } },
     ], label);
     dispatch(device, matmulPipeline, [bg], [Math.ceil(N / 16), Math.ceil(M / 16)], label);
+    params.destroy();
+  }
+
+  /** C[M,N] = A[M,K] @ B^T[K,N] where B is stored as [N,K] (HF weight format) */
+  function dispatchMatmulBT(
+    aBuf: GPUBuffer, bBuf: GPUBuffer, cBuf: GPUBuffer,
+    M: number, N: number, K: number, label: string,
+  ) {
+    const params = createUniformBuffer(device, new Uint32Array([M, N, K, 0]), `${label}-p`);
+    const bg = createBindGroup(device, matmulBTPipeline, 0, [
+      { binding: 0, resource: { buffer: aBuf } },
+      { binding: 1, resource: { buffer: bBuf } },
+      { binding: 2, resource: { buffer: cBuf } },
+      { binding: 3, resource: { buffer: params } },
+    ], label);
+    dispatch(device, matmulBTPipeline, [bg], [Math.ceil(N / 16), Math.ceil(M / 16)], label);
     params.destroy();
   }
 
@@ -313,9 +331,9 @@ export function createForwardPassEngine(
       dispatchRMSNorm(hiddenBuf, normedBuf, lw.inputNorm, seqLen, `L${l}-norm1`);
 
       // Q, K, V projections
-      dispatchMatmul(normedBuf, lw.qProj, qBuf, seqLen, nHeads * dHead, H, `L${l}-q`);
-      dispatchMatmul(normedBuf, lw.kProj, kBuf, seqLen, kvDim, H, `L${l}-k`);
-      dispatchMatmul(normedBuf, lw.vProj, vBuf, seqLen, kvDim, H, `L${l}-v`);
+      dispatchMatmulBT(normedBuf, lw.qProj, qBuf, seqLen, nHeads * dHead, H, `L${l}-q`);
+      dispatchMatmulBT(normedBuf, lw.kProj, kBuf, seqLen, kvDim, H, `L${l}-k`);
+      dispatchMatmulBT(normedBuf, lw.vProj, vBuf, seqLen, kvDim, H, `L${l}-v`);
 
       // Apply RoPE to Q and K
       dispatchRoPE(qBuf, seqLen, nHeads, pos, `L${l}-rope-q`);
@@ -333,7 +351,7 @@ export function createForwardPassEngine(
       );
 
       // Output projection: [seq, nHeads*dHead] → [seq, H]
-      dispatchMatmul(attnOutBuf, lw.oProj, attnProjBuf, seqLen, H, nHeads * dHead, `L${l}-o`);
+      dispatchMatmulBT(attnOutBuf, lw.oProj, attnProjBuf, seqLen, H, nHeads * dHead, `L${l}-o`);
 
       // Residual: hidden = residual + attn_output
       dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res1`, attnProjBuf);
@@ -348,14 +366,14 @@ export function createForwardPassEngine(
 
       // ── FFN (SwiGLU) ───────────────────────────────────────────────
       // MODEL-SPECIFIC: Phi fuses gate+up into one projection.
-      dispatchMatmul(normedBuf, lw.gateProj, gateBuf, seqLen, ffnDim, H, `L${l}-gate`);
-      dispatchMatmul(normedBuf, lw.upProj, upBuf, seqLen, ffnDim, H, `L${l}-up`);
+      dispatchMatmulBT(normedBuf, lw.gateProj, gateBuf, seqLen, ffnDim, H, `L${l}-gate`);
+      dispatchMatmulBT(normedBuf, lw.upProj, upBuf, seqLen, ffnDim, H, `L${l}-up`);
 
       // MODEL-SPECIFIC: SiLU for most models, GELU for some
       dispatchElementwise(siluPipeline, gateBuf, gateBuf, seqLen * ffnDim, `L${l}-silu`);
       dispatchElementwise(mulPipeline, gateBuf, gateBuf, seqLen * ffnDim, `L${l}-mul`, upBuf);
 
-      dispatchMatmul(gateBuf, lw.downProj, downBuf, seqLen, H, ffnDim, `L${l}-down`);
+      dispatchMatmulBT(gateBuf, lw.downProj, downBuf, seqLen, H, ffnDim, `L${l}-down`);
 
       // Residual: hidden = residual + ffn_output
       dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res2`, downBuf);
@@ -370,7 +388,7 @@ export function createForwardPassEngine(
       : weights.global.lmHead;
     // For multi-token input, we'd offset to the last row of normedBuf.
     // For seqLen=1 (decode), normedBuf IS the last token.
-    dispatchMatmul(normedBuf, lmHeadBuf, logitsBuf, 1, V, H, 'lm-head');
+    dispatchMatmulBT(normedBuf, lmHeadBuf, logitsBuf, 1, V, H, 'lm-head');
 
     // Update cache position
     kvCache.position += seqLen;

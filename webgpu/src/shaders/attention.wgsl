@@ -36,8 +36,9 @@ struct Params {
 @group(0) @binding(4) var<uniform> params: Params;
 
 // Shared memory for attention scores (one row of the attention matrix)
-// Max cache_len supported in shared memory = 4096 (16 KB at f32)
-var<workgroup> scores: array<f32, 4096>;
+// Max cache_len supported in shared memory = 3840
+// Total workgroup storage: 3840*4 + 256*4 = 16384 bytes (exactly at default limit)
+var<workgroup> scores: array<f32, 3840>;
 var<workgroup> shmem: array<f32, 256>;
 
 @compute @workgroup_size(256)
