@@ -657,16 +657,18 @@ export function createForwardPassEngine(
 
         // 5c. L2-normalize Q and K (use_qk_l2norm_in_kernel=True in reference)
         // Normalizes each head vector to unit length. Critical for SSM stability.
+        // NOTE: must pass a dummy secondBuf because the shader declares input_b at
+        // module scope and auto-layout may require it even though l2_normalize doesn't read it.
         if (l2NormPipeline) {
           const qDim = linNKH * linKD;
           const kDim = linNKH * linKD;
           // L2 norm uses broadcast_b as head_dim
-          dispatchElementwise(l2NormPipeline, linQBuf!, linConvOutBuf!, qDim, `L${l}-l2norm-q`, undefined, linKD);
+          dispatchElementwise(l2NormPipeline, linQBuf!, linConvOutBuf!, qDim, `L${l}-l2norm-q`, linDtBuf!, linKD);
           const encQ = device.createCommandEncoder({ label: `L${l}-l2q-cp` });
           encQ.copyBufferToBuffer(linConvOutBuf!, 0, linQBuf!, 0, qDim * 4);
           device.queue.submit([encQ.finish()]);
 
-          dispatchElementwise(l2NormPipeline, linKBuf!, linConvOutBuf!, kDim, `L${l}-l2norm-k`, undefined, linKD);
+          dispatchElementwise(l2NormPipeline, linKBuf!, linConvOutBuf!, kDim, `L${l}-l2norm-k`, linDtBuf!, linKD);
           const encK = device.createCommandEncoder({ label: `L${l}-l2k-cp` });
           encK.copyBufferToBuffer(linConvOutBuf!, 0, linKBuf!, 0, kDim * 4);
           device.queue.submit([encK.finish()]);
@@ -692,9 +694,9 @@ export function createForwardPassEngine(
           const decay = new Float32Array(decayRaw);
           console.log(`[SSM DEBUG] decay (per vh, ${linNVH} total) first 8: [${Array.from(decay.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
 
-          const kSiluRaw = await readBuffer(device, linConvOutBuf!, 8 * 4);
-          const kSilu = new Float32Array(kSiluRaw);
-          console.log(`[SSM DEBUG] K after conv+silu first 8: [${Array.from(kSilu.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+          const kNormRaw = await readBuffer(device, linKBuf!, 8 * 4);
+          const kNorm = new Float32Array(kNormRaw);
+          console.log(`[SSM DEBUG] K (L2-normed) first 8: [${Array.from(kNorm.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
 
           const vRaw = await readBuffer(device, linVBuf!, 8 * 4);
           const vVals = new Float32Array(vRaw);
@@ -712,7 +714,7 @@ export function createForwardPassEngine(
             new Uint32Array([linNKH, linNVH, linKD, linGroupedVD]), `L${l}-ssm-p`);
           const ssmBG0 = createBindGroup(device, ssmStepPipeline, 0, [
             { binding: 0, resource: { buffer: linQBuf! } },
-            { binding: 1, resource: { buffer: linConvOutBuf! } }, // K after conv1d + silu
+            { binding: 1, resource: { buffer: linKBuf! } }, // K after conv1d + silu + L2 norm
             { binding: 2, resource: { buffer: linVBuf! } },
             { binding: 3, resource: { buffer: linBBuf! } },       // beta (after sigmoid)
             { binding: 4, resource: { buffer: linDecayBuf! } },   // decay = exp(-exp(A_log)*dt)
