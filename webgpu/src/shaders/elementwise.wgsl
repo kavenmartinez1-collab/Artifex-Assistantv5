@@ -81,3 +81,22 @@ fn softplus(@builtin(global_invocation_id) gid: vec3u) {
   // Numerically stable softplus: for large x, softplus(x) ≈ x
   output[idx] = select(log(1.0 + exp(x)), x, x > 20.0);
 }
+
+// Sigmoid: output = 1 / (1 + exp(-a)) — used for SSM beta gate
+@compute @workgroup_size(256)
+fn sigmoid_op(@builtin(global_invocation_id) gid: vec3u) {
+  let idx = gid.x;
+  if (idx >= params.n) { return; }
+  output[idx] = 1.0 / (1.0 + exp(-input_a[idx]));
+}
+
+// Decay: output = exp(-exp(a) * b) where a=A_log, b=dt
+// Computes the SSM state decay factor. Always in (0, 1).
+@compute @workgroup_size(256)
+fn decay_compute(@builtin(global_invocation_id) gid: vec3u) {
+  let idx = gid.x;
+  if (idx >= params.n) { return; }
+  let A = -exp(input_a[idx]);  // A_log → negative A
+  let dt = input_b[idx];       // dt from softplus
+  output[idx] = exp(A * dt);   // decay in (0, 1)
+}

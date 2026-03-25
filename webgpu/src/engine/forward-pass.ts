@@ -259,6 +259,14 @@ export function createForwardPassEngine(
   const linConvK = config.linearConvKernelDim ?? 0;
   const linQKVDim = linNKH * linKD + linNKH * linKD + linNVH * linVD; // fused Q+K+V output
   const linConvDim = linNKH * linKD; // dimension that goes through conv1d (K projection)
+  const linVHPerKH = linNKH > 0 ? linNVH / linNKH : 0; // value heads per key head group (e.g., 2)
+  const linGroupedVD = linVHPerKH * linVD; // grouped value dim per key head (e.g., 256)
+
+  // Compile additional Mamba-2 kernels
+  const sigmoidPipeline = isHybrid
+    ? createComputePipeline(device, elementwiseWGSL, 'sigmoid_op', 'sigmoid') : null;
+  const decayPipeline = isHybrid
+    ? createComputePipeline(device, elementwiseWGSL, 'decay_compute', 'decay') : null;
 
   // ── Reusable intermediate buffers ──────────────────────────────────
   // Sized for batch prefill (up to MAX_PREFILL tokens per forward pass).
@@ -291,7 +299,7 @@ export function createForwardPassEngine(
   const linABuf = isHybrid ? createStorageBuffer(device, null, linConvDim * 4, 'lin-a', true) : null;
   const linBBuf = isHybrid ? createStorageBuffer(device, null, linNKH * 4, 'lin-beta', true) : null;
   const linZBuf = isHybrid ? createStorageBuffer(device, null, H * 4, 'lin-z', true) : null;
-  const linOutBuf = isHybrid ? createStorageBuffer(device, null, linNVH * linVD * 4, 'lin-out', true) : null;
+  const linOutBuf = isHybrid ? createStorageBuffer(device, null, linNKH * linGroupedVD * 4, 'lin-out', true) : null;
   const linConvOutBuf = isHybrid ? createStorageBuffer(device, null, linConvDim * 4, 'lin-conv-out', true) : null;
   const linDecayBuf = isHybrid ? createStorageBuffer(device, null, linConvDim * 4, 'lin-decay', true) : null;
   const linDtBuf = isHybrid ? createStorageBuffer(device, null, linConvDim * 4, 'lin-dt', true) : null;
@@ -611,7 +619,7 @@ export function createForwardPassEngine(
           dispatchRoPE(linKBuf!, 1, linNKH, pos, `L${l}-lin-rope-k`, linKD, rotaryDim);
         }
 
-        // 4. Conv1d on K (causal, kernel_size=4)
+        // 4. Conv1d on K (causal, kernel_size=4) + SiLU activation
         if (conv1dPipeline && conv1dUpdatePipeline) {
           const convParams = createUniformBuffer(device,
             new Uint32Array([linConvDim, linConvK]), `L${l}-conv-p`);
@@ -625,7 +633,7 @@ export function createForwardPassEngine(
           dispatch(device, conv1dPipeline, [convBG],
             [workgroupCount(linConvDim, 256)], `L${l}-conv1d`);
 
-          // Update conv state (shift + append) — only needs input, state, and params
+          // Update conv state (shift + append)
           const updateBG = createBindGroup(device, conv1dUpdatePipeline, 0, [
             { binding: 0, resource: { buffer: linKBuf! } },
             { binding: 1, resource: { buffer: csBuf } },
@@ -634,27 +642,36 @@ export function createForwardPassEngine(
           dispatch(device, conv1dUpdatePipeline, [updateBG],
             [workgroupCount(linConvDim, 256)], `L${l}-conv1d-update`);
           convParams.destroy();
+
+          // Apply SiLU to conv output: K = silu(conv1d(K))
+          dispatchElementwise(siluPipeline, linConvOutBuf!, linConvOutBuf!, linConvDim, `L${l}-conv-silu`);
         }
 
-        // 5. Compute decay: dt = softplus(A_input + dt_bias), decay = exp(-exp(A_log) * dt)
-        // For now: dt = softplus(linABuf + dt_bias) → linDtBuf
+        // 4b. Apply sigmoid to beta: beta = sigmoid(in_proj_b output)
+        if (sigmoidPipeline) {
+          dispatchElementwise(sigmoidPipeline, linBBuf!, linBBuf!, linNKH, `L${l}-sigmoid-beta`);
+        }
+
+        // 5. Compute decay: dt = softplus(alpha + dt_bias), then decay = exp(-exp(A_log) * dt)
         if (softplusPipeline && lw.linearDtBias) {
+          // dt = softplus(alpha + dt_bias)
           dispatchElementwise(softplusPipeline, linABuf!, linDtBuf!, linConvDim, `L${l}-softplus`, lw.linearDtBias);
         }
-        // decay = exp(-exp(A_log) * dt) — computed elementwise
-        // TODO: fuse this into a single kernel for efficiency
-        // For now, use the dt values directly as a simplified decay
+        if (decayPipeline && lw.linearALog) {
+          // decay = exp(-exp(A_log) * dt) — always in (0, 1)
+          dispatchElementwise(decayPipeline, lw.linearALog, linDecayBuf!, linConvDim, `L${l}-decay`, linDtBuf!);
+        }
 
         // 6. SSM step: update hidden state, readout via Q
         if (ssmStepPipeline) {
           const ssmParams = createUniformBuffer(device,
-            new Uint32Array([linNKH, linNVH, linKD, linVD]), `L${l}-ssm-p`);
+            new Uint32Array([linNKH, linNVH, linKD, linGroupedVD]), `L${l}-ssm-p`);
           const ssmBG0 = createBindGroup(device, ssmStepPipeline, 0, [
             { binding: 0, resource: { buffer: linQBuf! } },
-            { binding: 1, resource: { buffer: linConvOutBuf! } }, // K after conv1d
+            { binding: 1, resource: { buffer: linConvOutBuf! } }, // K after conv1d + silu
             { binding: 2, resource: { buffer: linVBuf! } },
-            { binding: 3, resource: { buffer: linBBuf! } },       // beta
-            { binding: 4, resource: { buffer: linDtBuf! } },      // decay (simplified)
+            { binding: 3, resource: { buffer: linBBuf! } },       // beta (after sigmoid)
+            { binding: 4, resource: { buffer: linDecayBuf! } },   // decay = exp(-exp(A_log)*dt)
           ], `L${l}-ssm-g0`);
           const ssmBG1 = createBindGroup(device, ssmStepPipeline, 1, [
             { binding: 0, resource: { buffer: hBuf } },
@@ -670,13 +687,18 @@ export function createForwardPassEngine(
 
         // 7. GroupNorm on output
         if (groupNormPipeline && lw.linearNormWeight) {
-          const outDim = linNVH * linVD;
-          const numGroups = linNVH; // one group per value head
-          const gnParams = createUniformBuffer(device,
-            new Float32Array([outDim, numGroups, linVD, eps]),
-            `L${l}-gn-p`);
-          // Note: params struct has u32 + u32 + u32 + f32, but we pass as f32 array
-          // TODO: fix params to use proper mixed types
+          const outDim = linNKH * linGroupedVD; // = num_value_heads * value_head_dim = 4096
+          const numGroups = linNVH; // one group per value head = 32
+          const cpg = linVD; // channels per group = 128
+          // GroupNorm params: [num_channels, num_groups, channels_per_group, eps]
+          const gnParamData = new ArrayBuffer(16);
+          const gnU32 = new Uint32Array(gnParamData);
+          const gnF32 = new Float32Array(gnParamData);
+          gnU32[0] = outDim;
+          gnU32[1] = numGroups;
+          gnU32[2] = cpg;
+          gnF32[3] = eps;
+          const gnParams = createUniformBuffer(device, new Uint8Array(gnParamData), `L${l}-gn-p`);
           const gnBG = createBindGroup(device, groupNormPipeline, 0, [
             { binding: 0, resource: { buffer: linOutBuf! } },
             { binding: 1, resource: { buffer: attnProjBuf } }, // reuse as temp output
@@ -689,13 +711,13 @@ export function createForwardPassEngine(
 
         // 8. Output gating: out = normed_output * silu(Z)
         if (gateSiluPipeline) {
-          const outDim = linNVH * linVD;
+          const outDim = linNKH * linGroupedVD;
           // attnProjBuf has the normed output, linZBuf has the gate
           dispatchElementwise(gateSiluPipeline, attnProjBuf, linOutBuf!, outDim, `L${l}-gate`, linZBuf!);
         }
 
         // 9. Output projection → attnProjBuf [1, H]
-        const outDim = linNVH * linVD;
+        const outDim = linNKH * linGroupedVD;
         dispatchProjection(linOutBuf!, lw, 'linearOutProj', attnProjBuf, 1, H, outDim, `L${l}-lin-out`);
 
       } else {
@@ -878,8 +900,9 @@ export function createForwardPassEngine(
       let ssmIdx = 0;
       for (let l = 0; l < L; l++) {
         if (config.layerTypes[l] === 'linear_attention') {
-          // h: [num_key_heads, key_head_dim, value_head_dim]
-          const hSize = linNKH * linKD * linVD * 4;
+          // h: [num_key_heads, key_head_dim, grouped_value_dim]
+          // grouped_value_dim = (num_value_heads / num_key_heads) * value_head_dim
+          const hSize = linNKH * linKD * linGroupedVD * 4;
           hiddenStates.push(createStorageBuffer(device, null, hSize, `ssm-h-${l}`, true));
           // conv_state: [kernel_size - 1, proj_dim]
           const csSize = (linConvK - 1) * convDim * 4;
@@ -888,7 +911,7 @@ export function createForwardPassEngine(
         }
       }
 
-      const totalSSM = ssmIdx * (linNKH * linKD * linVD * 4 + (linConvK - 1) * convDim * 4);
+      const totalSSM = ssmIdx * (linNKH * linKD * linGroupedVD * 4 + (linConvK - 1) * convDim * 4);
       console.log(`[KVCache] SSM state: ${(totalSSM / 1024 / 1024).toFixed(1)} MB for ${ssmIdx} linear layers (fixed, sequence-independent)`);
       ssmState = { hiddenStates, convStates, layerToSSMIndex };
     }
