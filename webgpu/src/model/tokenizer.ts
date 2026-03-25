@@ -154,7 +154,23 @@ export function applyChatTemplate(
       return Array.from(result).map(Number);
     }
   } catch (e) {
-    console.warn('[Tokenizer] apply_chat_template failed, using fallback:', e);
+    // Try again with an explicit ChatML template (for models like Qwen3.5 GPTQ
+    // that don't include a chat_template in the tokenizer config)
+    try {
+      const chatml = `{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n'}}{% endfor %}{% if add_generation_prompt %}{{'<|im_start|>assistant\n'}}{% endif %}`;
+      const result = (tokenizer.inner as any).apply_chat_template(messages, {
+        add_generation_prompt: true,
+        tokenize: true,
+        return_tensor: false,
+        chat_template: chatml,
+      });
+      if (result && result.length > 0) {
+        console.log('[Tokenizer] Using explicit ChatML template');
+        return Array.from(result).map(Number);
+      }
+    } catch (e2) {
+      console.warn('[Tokenizer] apply_chat_template failed, using fallback:', e);
+    }
   }
 
   // Fallback: encode with ChatML format (won't handle special tokens perfectly)
