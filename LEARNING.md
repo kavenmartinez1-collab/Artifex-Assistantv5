@@ -838,11 +838,18 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
 
 ### What's remaining
 
-**Phase 5: INT4 End-to-End** — GPTQ infrastructure complete. Weight loader, fused `matmul_bt_q4` kernel, and Qwen3.5-9B weight name mapping all ready. Currently testing `mssfj/Qwen3.5-9B-GPTQ-INT4` (7.1 GB, 1171 tensors) end-to-end. Memory budget: ~4.5 GB INT4 weights + ~0.5 GB activations + ~0.08 GB TurboQuant KV cache = ~5.1 GB (fits 8 GB VRAM with 2.9 GB headroom).
+**Qwen3.5-9B coherent output** — The model runs end-to-end through all 32 hybrid layers. All L0 intermediate values match PyTorch within GPTQ tolerance. Output has structure (EOS detection, formatting) but isn't yet coherent English. The Gated DeltaNet SSM contribution is small (~1e-5) relative to FFN output (~0.1). Remaining work: verify full attention layers against PyTorch reference, investigate SSM magnitude at later layers, and dispatch batching for speed (currently 0.6 tok/s due to 480 sequential GPU submissions per token).
 
-**Batch prefill optimization** — Prompt processing works in 512-token chunks at ~150 tok/s. Broadcast bias addition handles multi-token batches correctly (the `add` kernel's `broadcast_b` parameter wraps `input_b[idx % broadcast_b]` for bias vectors smaller than the batched tensor).
+**Key bugs found during Qwen3.5 debugging (all fixed):**
+1. BF16 embedding decoded as F16 (100x wrong)
+2. RMSNorm weight convention: Qwen3.5 uses `(1 + weight)` not `weight` (8x wrong)
+3. Full attention partial RoPE: only 25% of head dims should be rotated (75% corrupted)
+4. Conv1d applied to K only instead of full QKV (wrong channels)
+5. Delta rule not implemented (was simple outer product)
+6. Beta dimension and sigmoid missing
+7. rope_theta nested in config (1000x wrong)
 
-**TurboQuant quality notes** — 3-bit works well for d≥128 (larger models like Qwen3.5-9B). For d=64 (small models like Qwen2.5-0.5B), 4-bit is needed due to higher per-dimension quantization noise with fewer dimensions to average over. Critical design rule: never quantize the current token's K/V and use the decoded version in the same layer's attention — only compress previously cached tokens. This prevents error injection into the active computation path.
+**TurboQuant quality notes** — 3-bit works well for d≥128 (larger models like Qwen3.5-9B). For d=64 (small models like Qwen2.5-0.5B), 4-bit is needed. Critical design rule: never quantize the current token's K/V — only compress previously cached tokens.
 
 ### The 2 GB buffer limit
 

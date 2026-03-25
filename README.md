@@ -777,20 +777,23 @@ npm run server    # Metrics server only
 
 ### Status
 
-Phases 0-6 complete plus TurboQuant KV cache integration, batch prefill, and network resilience:
+Phases 0-6 complete plus Gated DeltaNet/Mamba-2 hybrid support, TurboQuant KV cache, batch prefill, and network resilience:
 
-- **Full inference pipeline** — GPU kernels, HF weight loading with browser caching, transformer forward pass with GQA, autoregressive generation with streaming
-- **TurboQuant KV cache** — 3-bit (d≥128) or 4-bit (d≤64) compressed KV cache saving ~80% memory. Current token K/V is always exact; only previously cached tokens are decoded from compressed storage. Toggle in the UI.
-- **Batch prefill** — processes prompt tokens in 512-token chunks instead of one-by-one, with broadcast bias support for multi-token batches
-- **GPTQ INT4** — weight loader and fused `matmul_bt_q4` kernel for quantized models (Qwen3.5-9B GPTQ fits in 8GB VRAM)
-- **Resilient downloads** — exponential backoff retry (3 attempts) on all HF CDN requests, parallel 4-chunk prefetch for large shards, failed prefetch eviction and re-attempt
-- **Auto-detect weight names** — automatically discovers tensor name prefixes (handles `model.language_model.` for multimodal architectures)
+- **Standard transformer inference** — full forward pass with GQA, RoPE, KV cache, autoregressive generation
+- **Gated DeltaNet (Mamba-2) hybrid** — Qwen3.5's 24 linear attention layers + 8 full attention layers. New WGSL kernels: conv1d, SSM delta rule recurrence, L2 norm, per-head RMSNormGated. Fixed-size SSM state (~50 MB) instead of growing KV cache.
+- **TurboQuant KV cache** — 3-bit (d≥128) or 4-bit (d≤64) compressed KV cache saving ~80% memory for standard attention layers. Current token K/V is always exact; only cached tokens compressed.
+- **Batch prefill** — 512-token chunks with broadcast bias support
+- **GPTQ INT4** — weight loader and fused `matmul_bt_q4` kernel for quantized models up to 9B parameters on 8GB VRAM
+- **BF16 support** — BF16 embedding lookup and BF16 LM head matmul for large-vocab models (>2GB at f32)
+- **Resilient downloads** — exponential backoff retry, parallel chunk prefetch, per-chunk browser caching for 7GB+ models
+- **Auto-detect weight names** — discovers tensor name prefixes (handles `model.language_model.*` for multimodal architectures)
+- **Model-specific RMSNorm** — auto-detects `(1 + weight)` vs `weight` convention per model family
 
 ### Supported Models
 
-Any HuggingFace model with a standard transformer decoder architecture works. Weight name prefixes are auto-detected. Tested:
+Any HuggingFace model with a standard transformer decoder architecture works. Hybrid Mamba-2 models (Qwen3.5) have experimental support. Weight name prefixes are auto-detected. Tested:
 - **Qwen2.5-0.5B-Instruct** — 24 layers, 896 hidden, GQA 14Q/2KV. Generates coherent English at ~20 tok/s (f32) / ~10 tok/s (TurboQuant 4-bit KV).
-- **Qwen3.5-9B-GPTQ-INT4** (`mssfj/Qwen3.5-9B-GPTQ-INT4`) — 32 layers, 4096 hidden, GQA. 7.1 GB INT4 weights. Testing in progress.
+- **Qwen3.5-9B-GPTQ-INT4** (`mssfj/Qwen3.5-9B-GPTQ-INT4`) — 32 layers (24 Gated DeltaNet + 8 full attention), 4096 hidden, 7.07 GB INT4 weights. Runs end-to-end at 19 tok/s prefill / 0.6 tok/s decode. All L0 intermediate values match PyTorch reference. Structured output, approaching coherence. SSM math being refined.
 - **SmolLM2-135M-Instruct** — 30 layers, 576 hidden, GQA 9Q/3KV.
 - **SmolLM2-360M-Instruct** — 32 layers, 960 hidden, GQA 15Q/5KV.
 
