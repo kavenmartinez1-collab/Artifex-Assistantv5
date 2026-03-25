@@ -134,32 +134,34 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
 }
 
 /**
- * Apply the model's chat template to messages.
- * Uses the HF tokenizer's built-in template when available (model-agnostic),
- * falls back to ChatML format for models without a template.
+ * Apply the model's chat template and return token IDs directly.
+ * Uses the HF tokenizer's built-in template (model-agnostic).
+ * Returns token IDs, NOT a string — this correctly handles special tokens
+ * like <|im_start|> as single tokens instead of encoding them as text.
  */
 export function applyChatTemplate(
   tokenizer: Tokenizer,
   messages: Array<{ role: string; content: string }>,
-): string {
-  // Try the HF tokenizer's built-in template first (correct for every model)
+): number[] {
+  // Use HF tokenizer's template to get token IDs directly
   try {
     const result = (tokenizer.inner as any).apply_chat_template(messages, {
       add_generation_prompt: true,
-      tokenize: false,
+      tokenize: true,
+      return_tensor: false,
     });
-    if (typeof result === 'string' && result.length > 0) {
-      return result;
+    if (result && result.length > 0) {
+      return Array.from(result).map(Number);
     }
-  } catch {
-    // Fall through to manual template
+  } catch (e) {
+    console.warn('[Tokenizer] apply_chat_template failed, using fallback:', e);
   }
 
-  // Fallback: ChatML format (Qwen, SmolLM2, etc.)
+  // Fallback: encode with ChatML format (won't handle special tokens perfectly)
   const parts: string[] = [];
   for (const msg of messages) {
     parts.push(`<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`);
   }
   parts.push('<|im_start|>assistant\n');
-  return parts.join('');
+  return tokenizer.encode(parts.join(''));
 }

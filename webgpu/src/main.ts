@@ -348,8 +348,8 @@ loadBtn.addEventListener('click', async () => {
       session = {
         run: (prompt, sampling, onToken) => generate(gpu!.device, engine, tokenizer, prompt, sampling, onToken),
         chat: (messages, sampling, onToken) => {
-          const prompt = applyChatTemplate(tokenizer, messages);
-          return generate(gpu!.device, engine, tokenizer, prompt, sampling, onToken);
+          const tokenIds = applyChatTemplate(tokenizer, messages);
+          return generate(gpu!.device, engine, tokenizer, tokenIds, sampling, onToken);
         },
         config,
         tokenizer,
