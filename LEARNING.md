@@ -18,8 +18,9 @@
 9. [The GPU Compute Pipeline — Why Kernels Matter](#9-the-gpu-compute-pipeline--why-kernels-matter)
 10. [Our WGSL Kernels Explained](#10-our-wgsl-kernels-explained)
 11. [The WebGPU Inference Roadmap](#11-the-webgpu-inference-roadmap)
-12. [How All the Pieces Connect](#12-how-all-the-pieces-connect)
-13. [Glossary](#13-glossary)
+12. [The Forward Pass — Step by Step](#12-the-forward-pass--step-by-step)
+13. [How All the Pieces Connect](#13-how-all-the-pieces-connect)
+14. [Glossary](#14-glossary)
 
 ---
 
@@ -791,36 +792,43 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
 
 ## 11. The WebGPU Inference Roadmap
 
-### What we've built (Phase 0-1)
+### What we've built (Phases 0-6)
 
 ```
 ✅ GPU device detection and capability reporting
 ✅ Buffer management (create, read, write GPU buffers)
-✅ Shader compilation pipeline
-✅ 7 compute kernels (all passing tests):
+✅ Shader compilation pipeline with error logging
+✅ 10 compute kernels (9/9 passing tests):
     ✅ SiLU, Add, Multiply (elementwise)
-    ✅ Matmul naive, Matmul tiled
+    ✅ Matmul tiled + Matmul B-transposed (for HF weight format)
     ✅ Softmax
     ✅ RMSNorm
-✅ RoPE shader (exists, needs test wiring)
+    ✅ RoPE (rotary position embeddings)
+    ✅ Attention (fused multi-head with GQA, causal mask, inline softmax)
+    ✅ Embedding lookup
+    ✅ TurboQuant encode/decode (PolarQuant KV cache compression)
 ✅ Metrics collection (browser → dev server)
-✅ Chat UI shell
+
+✅ SafeTensors parser (BF16/F16/F32 → Float32 conversion)
+✅ HuggingFace Hub client (model discovery, shard download)
+✅ Browser IndexedDB cache (instant reload after first download)
+✅ Tokenizer via @huggingface/transformers (any HF model)
+✅ Model-agnostic config parser (Qwen, Llama, Mistral, Phi, etc.)
+✅ Complete transformer forward pass with attention bias + GQA
+✅ KV cache with read/write per layer
+✅ Generation loop with temperature, top-k, top-p sampling
+✅ Streaming token output + abort support
+✅ Chat UI with model loading, parameter controls, and export
+
+✅ COHERENT TEXT GENERATION — Qwen2.5-0.5B-Instruct generates
+   English at ~20 tok/s in Chrome on an RTX 5060 Ti via WebGPU
 ```
 
-### What we need to build (Phase 2-6)
+### What's remaining
 
-**Phase 2: Weight Loader** — Load SafeTensors files from HuggingFace directly into GPU buffers. SafeTensors is a simple format: an 8-byte header length, then a JSON header describing each tensor's name/shape/dtype/offset, then raw binary data. We'll use HTTP range requests to stream shards without downloading the full model.
+**Phase 5: INT4 Quantization** — Store weights as 4-bit integers, dequantize on the fly during matmul. Essential for fitting larger models (>1B parameters) in the WebGPU 2 GB buffer limit. Without this, models are loaded in FP32 which uses 4x more memory than necessary.
 
-**Phase 3: Tokenizer** — Convert text to token IDs and back. We'll either implement BPE (Byte Pair Encoding) in JavaScript or use the @huggingface/transformers.js tokenizer as a dependency.
-
-**Phase 4: Forward Pass** — Wire all our kernels together to implement the Qwen3.5 transformer:
-```
-embed → [rmsnorm → attention → add → rmsnorm → ffn → add] × 28 → rmsnorm → lm_head
-```
-
-**Phase 5: INT4 Quantization** — Store weights as 4-bit integers, dequantize on the fly during matmul. This is essential for fitting larger models in the WebGPU 2 GB buffer limit.
-
-**Phase 6: Generation Loop** — Implement the autoregressive decode loop: generate one token, append to KV-cache, repeat. Add sampling (temperature, top-k, top-p).
+**TurboQuant KV Cache Integration** — The TurboQuant encode/decode kernels work standalone (9/9 tests passing) but are not yet wired into the forward pass. Integration would compress the KV cache by ~8-10x, extending maximum context length proportionally.
 
 ### The 2 GB buffer limit
 
@@ -828,7 +836,96 @@ WebGPU limits each individual buffer to ~2 GB. This means a 9B model can't be lo
 
 ---
 
-## 12. How All the Pieces Connect
+## 12. The Forward Pass — Step by Step
+
+This section explains what happens when you type a message and click Send in the WebGPU engine. Every step runs on the GPU via our WGSL compute kernels.
+
+### The big picture
+
+```
+"Hello?" → [151644, 9906, 30] → embedding → 24 layers → logits → "Hi" → repeat
+   text        token IDs         vectors      transform    scores    next token
+```
+
+1. Your text is split into **token IDs** by the tokenizer
+2. Each token ID is looked up in the **embedding table** (a giant lookup table of learned vectors)
+3. The vectors pass through **24 transformer layers**, each refining the meaning
+4. The final vector is projected to **logits** — one score per vocabulary word
+5. A token is **sampled** from the logits (with randomness controlled by temperature)
+6. That token is fed back in, and steps 2-5 repeat until the model outputs a stop token
+
+### Inside one transformer layer
+
+Each of the 24 layers does the same 10 operations:
+
+```
+input (896 numbers per token)
+  │
+  ├─ 1. RMSNorm           — normalize values to prevent explosion/vanishing
+  ├─ 2. Q, K, V projection — three matrix multiplications to create query/key/value vectors
+  ├─ 3. Add bias           — Qwen2 has large bias terms (up to ±14!) that shift Q/K
+  │                          into the correct attention subspace
+  ├─ 4. RoPE               — rotate Q and K based on position in the sequence
+  ├─ 5. KV cache write     — store K and V for future tokens to attend to
+  ├─ 6. Attention           — Q asks "what should I focus on?", K answers "here's what I have",
+  │                          softmax picks the most relevant tokens, V provides their information
+  ├─ 7. O projection       — compress attention output back to hidden size
+  ├─ 8. Residual add       — add the original input back (skip connection)
+  │
+  ├─ 9. RMSNorm            — normalize again
+  ├─ 10. FFN (SwiGLU)      — gate projection, up projection, SiLU activation,
+  │                          element-wise multiply, down projection
+  └─ 11. Residual add      — add back again
+  │
+output (896 numbers per token, transformed)
+```
+
+### The generation loop
+
+```
+PREFILL (fast — all prompt tokens processed):
+  token 0 → forward pass → cache K/V at position 0
+  token 1 → forward pass → cache K/V at position 1
+  ...
+  token 28 → forward pass → cache K/V at position 28 → READ LOGITS → sample first output
+
+DECODE (one token at a time):
+  generated token → forward pass → cache K/V → read logits → sample → stream to UI
+  repeat until EOS token or max length
+```
+
+**Prefill** processes all prompt tokens to fill the KV cache. **Decode** generates one token at a time, each attending to the full history via the cache.
+
+### Sampling — choosing the next token
+
+The model outputs 151,936 scores (one per vocabulary word). Sampling picks which one to use:
+
+- **Temperature** (0.7 default): divides all scores by this number. Lower = more confident/repetitive, higher = more creative/random. Temperature 0 = always pick the highest score (greedy).
+- **Top-k** (50): only consider the 50 highest-scoring tokens. Ignore everything else.
+- **Top-p / nucleus** (0.9): keep adding tokens from highest to lowest until their probabilities sum to 90%. This adapts — for confident predictions it might keep only 3 tokens, for uncertain ones it might keep 200.
+
+### The weight transpose discovery
+
+HuggingFace stores linear layer weights as `[output_dim, input_dim]`. Our matmul computes `C = A × B` where B should be `[input_dim, output_dim]`. The shapes don't match!
+
+The fix: `matmul_bt` — a B-transposed matmul that reads B as `[output_dim, input_dim]` and internally accesses `B[col, k]` instead of `B[k, col]`. Every weight projection in the forward pass uses this variant.
+
+### Why attention bias was the breakthrough
+
+Qwen2 trains with bias terms on the Q, K, and V projections. These biases are **enormous** — up to ±14.4 — compared to the matmul output (±0.5). Without them, the Q and K vectors live in the wrong subspace of the 896-dimensional space. The dot product Q·K (which determines what each token attends to) computes completely wrong similarity scores.
+
+The tricky part: Qwen2's `config.json` doesn't include `attention_bias: true` — it's an **implicit default** in the HuggingFace model class. Our config parser defaulted to `false`, so the biases were loaded into GPU memory but never applied. We found this by comparing our intermediate values against PyTorch:
+
+```
+PyTorch Q[4] = -12.48  (with bias -14.4 + matmul 1.96)
+WebGPU  Q[4] =   1.96  (matmul only, no bias!)
+```
+
+One line fix: `qwen2: true` in the attention bias defaults. Coherent English output immediately.
+
+---
+
+## 13. How All the Pieces Connect
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -895,15 +992,17 @@ The WebGPU path is the most ambitious because we're building the inference engin
 
 ---
 
-## 13. Glossary
+## 14. Glossary
 
 | Term | Definition |
 |------|-----------|
+| **Autoregressive** | Generating one token at a time, where each new token depends on all previous tokens. The model can't look ahead — it must commit to each word before seeing what comes next. |
 | **Activation function** | A nonlinear function applied after linear layers. Without it, stacking linear layers would just be one big linear layer. SiLU, ReLU, and GELU are common choices. |
 | **Attention** | The mechanism that lets each token "look at" other tokens to understand context. The core of the transformer architecture. |
 | **BPE** | Byte Pair Encoding — the tokenization algorithm used by Qwen and most modern models. Builds a vocabulary by repeatedly merging the most common character pairs. |
 | **Buffer** | A chunk of memory on the GPU. Data must be explicitly copied between CPU and GPU buffers. |
 | **Causal mask** | A restriction that prevents tokens from attending to future positions. Enforced by setting future attention scores to -infinity. |
+| **Chat Template** | The formatting that wraps user messages into the structure a model expects. Qwen uses ChatML: `<\|im_start\|>user\nHello<\|im_end\|>`. Different models use different templates — the tokenizer handles this automatically. |
 | **CORS** | Cross-Origin Resource Sharing — browser security headers that control which websites can call your API. |
 | **CUDA** | NVIDIA's GPU computing platform. Only works on NVIDIA GPUs. The dominant platform for AI. |
 | **Decode** | The token-by-token generation phase where the model produces one new token per forward pass. |
