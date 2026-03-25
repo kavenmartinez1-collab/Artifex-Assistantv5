@@ -8,3 +8,4 @@ export { createComputePipeline, createBindGroup, dispatch, dispatchAndWait, work
 export { runKernelTests, type TestResult } from './kernel-tests';
 export { createTurboQuantPipeline, type TurboQuantPipeline, type CompressedKV } from './turboquant-pipeline';
 export { createForwardPassEngine, type ForwardPassEngine, type ForwardOutput, type ModelWeights, type LayerWeights, type GlobalWeights, type KVCache } from './forward-pass';
+export { generate, type GenerationResult, type GenerationHandle, type SamplingConfig, type OnTokenCallback } from './generate';
