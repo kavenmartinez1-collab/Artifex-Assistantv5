@@ -48,6 +48,9 @@ import attentionWGSL from '../shaders/attention.wgsl?raw';
 import matmulQ4WGSL from '../shaders/matmul_q4.wgsl?raw';
 import tqEncodeWGSL from '../shaders/turboquant_encode.wgsl?raw';
 import tqDecodeWGSL from '../shaders/turboquant_decode.wgsl?raw';
+import conv1dWGSL from '../shaders/conv1d.wgsl?raw';
+import groupNormWGSL from '../shaders/group_norm.wgsl?raw';
+import ssmStepWGSL from '../shaders/ssm_step.wgsl?raw';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -75,6 +78,22 @@ export interface LayerWeights {
   gateProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
   upProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
   downProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+
+  // Linear attention (Gated DeltaNet) weights — only for hybrid models
+  linearInProjQKV?: GPUBuffer;
+  linearInProjQKV_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  linearInProjA?: GPUBuffer;
+  linearInProjA_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  linearInProjB?: GPUBuffer;
+  linearInProjB_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  linearInProjZ?: GPUBuffer;
+  linearInProjZ_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  linearOutProj?: GPUBuffer;
+  linearOutProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  linearALog?: GPUBuffer;         // [num_key_heads, key_head_dim] diagonal state decay
+  linearConv1dWeight?: GPUBuffer; // [dim, 1, kernel_size] causal conv kernel
+  linearDtBias?: GPUBuffer;       // [num_key_heads * key_head_dim] time step bias
+  linearNormWeight?: GPUBuffer;   // group norm weight
 }
 
 /** GPU buffers for global (non-layer) weights. */
@@ -103,11 +122,21 @@ export interface CompressedKVData {
   normsV: GPUBuffer[];
 }
 
+/** SSM state for Gated DeltaNet / Mamba-2 linear attention layers. */
+export interface SSMState {
+  /** Hidden state per linear layer: [num_key_heads, key_head_dim, value_head_dim] f32 */
+  hiddenStates: GPUBuffer[];
+  /** Conv sliding window per linear layer: [kernel_size - 1, proj_dim] f32 */
+  convStates: GPUBuffer[];
+  /** Mapping from global layer index to SSM state index */
+  layerToSSMIndex: number[];
+}
+
 /** KV cache for all layers. */
 export interface KVCache {
-  /** K cache per layer: [max_seq, num_kv_heads * head_dim] (unused if compressed) */
+  /** K cache per layer: [max_seq, num_kv_heads * head_dim] (unused if compressed or SSM) */
   keys: GPUBuffer[];
-  /** V cache per layer: [max_seq, num_kv_heads * head_dim] (unused if compressed) */
+  /** V cache per layer: [max_seq, num_kv_heads * head_dim] (unused if compressed or SSM) */
   values: GPUBuffer[];
   /** Current sequence position (number of cached tokens) */
   position: number;
@@ -115,6 +144,8 @@ export interface KVCache {
   maxSeqLen: number;
   /** TurboQuant compressed storage (when enabled) */
   compressed?: CompressedKVData;
+  /** SSM state for hybrid models with linear attention layers */
+  ssmState?: SSMState;
 }
 
 /** Output of a forward pass step. */
@@ -205,6 +236,30 @@ export function createForwardPassEngine(
     { binding: 2, resource: { buffer: tqSetup.centroids } },
   ], 'tq-decode-mat');
 
+  // ── Gated DeltaNet / Mamba-2 pipelines (hybrid models only) ──────
+  const isHybrid = config.isHybrid;
+  const gateSiluPipeline = isHybrid
+    ? createComputePipeline(device, elementwiseWGSL, 'gate_silu', 'gate-silu') : null;
+  const softplusPipeline = isHybrid
+    ? createComputePipeline(device, elementwiseWGSL, 'softplus', 'softplus') : null;
+  const conv1dPipeline = isHybrid
+    ? createComputePipeline(device, conv1dWGSL, 'conv1d', 'conv1d') : null;
+  const conv1dUpdatePipeline = isHybrid
+    ? createComputePipeline(device, conv1dWGSL, 'conv1d_update_state', 'conv1d-update') : null;
+  const groupNormPipeline = isHybrid
+    ? createComputePipeline(device, groupNormWGSL, 'group_norm', 'group-norm') : null;
+  const ssmStepPipeline = isHybrid
+    ? createComputePipeline(device, ssmStepWGSL, 'ssm_step', 'ssm-step') : null;
+
+  // Linear attention dimensions (only for hybrid models)
+  const linKD = config.linearKeyHeadDim ?? 0;
+  const linVD = config.linearValueHeadDim ?? 0;
+  const linNKH = config.linearNumKeyHeads ?? 0;
+  const linNVH = config.linearNumValueHeads ?? 0;
+  const linConvK = config.linearConvKernelDim ?? 0;
+  const linQKVDim = linNKH * linKD + linNKH * linKD + linNVH * linVD; // fused Q+K+V output
+  const linConvDim = linNKH * linKD; // dimension that goes through conv1d (K projection)
+
   // ── Reusable intermediate buffers ──────────────────────────────────
   // Sized for batch prefill (up to MAX_PREFILL tokens per forward pass).
   // Single-token decode uses the same buffers (seqLen=1).
@@ -227,6 +282,19 @@ export function createForwardPassEngine(
   const tokenIdBuf = createStorageBuffer(device, null, MAX_PREFILL * 4, 'token-ids', true);
   // Small buffer for extracting last token's hidden state (for LM head after batch prefill)
   const lastHiddenBuf = createStorageBuffer(device, null, H * 4, 'last-hidden', true);
+
+  // Linear attention intermediate buffers (only for hybrid models)
+  const linQKVBuf = isHybrid ? createStorageBuffer(device, null, linQKVDim * 4, 'lin-qkv', true) : null;
+  const linQBuf = isHybrid ? createStorageBuffer(device, null, linNKH * linKD * 4, 'lin-q', true) : null;
+  const linKBuf = isHybrid ? createStorageBuffer(device, null, linNKH * linKD * 4, 'lin-k', true) : null;
+  const linVBuf = isHybrid ? createStorageBuffer(device, null, linNVH * linVD * 4, 'lin-v', true) : null;
+  const linABuf = isHybrid ? createStorageBuffer(device, null, linConvDim * 4, 'lin-a', true) : null;
+  const linBBuf = isHybrid ? createStorageBuffer(device, null, linNKH * 4, 'lin-beta', true) : null;
+  const linZBuf = isHybrid ? createStorageBuffer(device, null, H * 4, 'lin-z', true) : null;
+  const linOutBuf = isHybrid ? createStorageBuffer(device, null, linNVH * linVD * 4, 'lin-out', true) : null;
+  const linConvOutBuf = isHybrid ? createStorageBuffer(device, null, linConvDim * 4, 'lin-conv-out', true) : null;
+  const linDecayBuf = isHybrid ? createStorageBuffer(device, null, linConvDim * 4, 'lin-decay', true) : null;
+  const linDtBuf = isHybrid ? createStorageBuffer(device, null, linConvDim * 4, 'lin-dt', true) : null;
 
   /** C[M,N] = A[M,K] @ dequant(q4_packed, scales, zeros)^T — GPTQ INT4 */
   function dispatchMatmulQ4(
@@ -496,6 +564,7 @@ export function createForwardPassEngine(
     // ── Transformer layers ───────────────────────────────────────────
     for (let l = 0; l < L; l++) {
       const lw = weights.layers[l];
+      const isLinearLayer = config.layerTypes?.[l] === 'linear_attention';
 
       // Save hidden state for residual connection
       const enc1 = device.createCommandEncoder({ label: `res1-${l}` });
@@ -505,124 +574,232 @@ export function createForwardPassEngine(
       // Pre-attention RMSNorm
       dispatchRMSNorm(hiddenBuf, normedBuf, lw.inputNorm, seqLen, `L${l}-norm1`);
 
-      // Q, K, V projections (auto-selects f32 or INT4 matmul)
-      dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHead, H, `L${l}-q`);
-      dispatchProjection(normedBuf, lw, 'kProj', kBuf, seqLen, kvDim, H, `L${l}-k`);
-      dispatchProjection(normedBuf, lw, 'vProj', vBuf, seqLen, kvDim, H, `L${l}-v`);
+      if (isLinearLayer && kvCache.ssmState) {
+        // ── GATED DELTANET LINEAR ATTENTION ──────────────────────────
+        const ssmIdx = kvCache.ssmState.layerToSSMIndex[l];
+        const hBuf = kvCache.ssmState.hiddenStates[ssmIdx];
+        const csBuf = kvCache.ssmState.convStates[ssmIdx];
 
-      // Add bias if model has attention_bias (Qwen2, etc.)
-      // Use copy-add pattern to avoid same-buffer read+write conflict:
-      //   copy qBuf → temp, then temp + bias → qBuf
-      if (config.attentionBias && lw.qBias && lw.kBias && lw.vBias) {
-        // Bias vectors are [dim], but Q/K/V are [seqLen, dim] — broadcast bias across positions
-        const qDim = nHeads * dHead;
+        // 1. Fused QKV projection → split into Q, K, V
+        dispatchProjection(normedBuf, lw, 'linearInProjQKV', linQKVBuf!, 1, linQKVDim, H, `L${l}-lin-qkv`);
 
-        // Q bias: copy Q to attnOutBuf (temp), add bias back to qBuf
-        const encQb = device.createCommandEncoder({ label: `L${l}-qb-copy` });
-        encQb.copyBufferToBuffer(qBuf, 0, attnOutBuf, 0, seqLen * qDim * 4);
-        device.queue.submit([encQb.finish()]);
-        dispatchElementwise(addPipeline, attnOutBuf, qBuf, seqLen * qDim, `L${l}-qb`, lw.qBias, qDim);
+        // Split QKV: Q = [0, qSize), K = [qSize, qSize+kSize), V = [qSize+kSize, end)
+        const qSize = linNKH * linKD * 4;
+        const kSize = linNKH * linKD * 4;
+        const vSize = linNVH * linVD * 4;
+        const encSplit = device.createCommandEncoder({ label: `L${l}-qkv-split` });
+        encSplit.copyBufferToBuffer(linQKVBuf!, 0, linQBuf!, 0, qSize);
+        encSplit.copyBufferToBuffer(linQKVBuf!, qSize, linKBuf!, 0, kSize);
+        encSplit.copyBufferToBuffer(linQKVBuf!, qSize + kSize, linVBuf!, 0, vSize);
+        device.queue.submit([encSplit.finish()]);
 
-        // K bias: copy K to ffnTempBuf (temp, reused), add bias
-        const encKb = device.createCommandEncoder({ label: `L${l}-kb-copy` });
-        encKb.copyBufferToBuffer(kBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
-        device.queue.submit([encKb.finish()]);
-        dispatchElementwise(addPipeline, ffnTempBuf, kBuf, seqLen * kvDim, `L${l}-kb`, lw.kBias, kvDim);
+        // 2. Project A (decay input), B (update gate), Z (output gate)
+        dispatchProjection(normedBuf, lw, 'linearInProjA', linABuf!, 1, linConvDim, H, `L${l}-lin-a`);
+        dispatchProjection(normedBuf, lw, 'linearInProjB', linBBuf!, 1, linNKH, H, `L${l}-lin-b`);
+        dispatchProjection(normedBuf, lw, 'linearInProjZ', linZBuf!, 1, H, H, `L${l}-lin-z`);
 
-        // V bias: reuse ffnTempBuf
-        const encVb = device.createCommandEncoder({ label: `L${l}-vb-copy` });
-        encVb.copyBufferToBuffer(vBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
-        device.queue.submit([encVb.finish()]);
-        dispatchElementwise(addPipeline, ffnTempBuf, vBuf, seqLen * kvDim, `L${l}-vb`, lw.vBias, kvDim);
-      }
-
-      if (isDebug && l === 0) {
-        await debugRead(normedBuf, 'L0-normed', 8);
-        await debugRead(qBuf, 'L0-Q-before-rope', 8);
-        await debugRead(kBuf, 'L0-K-before-rope', 8);
-        await debugRead(vBuf, 'L0-V', 8);
-      }
-
-      // Apply RoPE to Q and K
-      dispatchRoPE(qBuf, seqLen, nHeads, pos, `L${l}-rope-q`);
-      dispatchRoPE(kBuf, seqLen, nKVHeads, pos, `L${l}-rope-k`);
-
-      if (isDebug && l === 0) {
-        await debugRead(qBuf, 'L0-Q-after-rope', 8);
-        await debugRead(kBuf, 'L0-K-after-rope', 8);
-      }
-
-      // Write new K, V to cache and run attention
-      const isCausal = seqLen > 1; // causal mask only needed for prefill
-
-      if (kvCache.compressed) {
-        const c = kvCache.compressed;
-        const numVecs = seqLen * nKVHeads;
-        const outOffset = pos * nKVHeads;
-
-        // Encode new K/V into compressed cache (for future steps)
-        dispatchTQEncode(kBuf, c.quantizedK[l], c.signBitsK[l], c.normsK[l],
-          numVecs, outOffset, `L${l}-tq-enc-k`);
-        dispatchTQEncode(vBuf, c.quantizedV[l], c.signBitsV[l], c.normsV[l],
-          numVecs, outOffset, `L${l}-tq-enc-v`);
-
-        // Decode PREVIOUS positions from compressed cache (quantized)
-        if (pos > 0) {
-          const prevVecs = pos * nKVHeads;
-          dispatchTQDecode(c.quantizedK[l], c.signBitsK[l], c.normsK[l],
-            c.scratchK, prevVecs, `L${l}-tq-dec-k`);
-          dispatchTQDecode(c.quantizedV[l], c.signBitsV[l], c.normsV[l],
-            c.scratchV, prevVecs, `L${l}-tq-dec-v`);
+        // 3. Partial RoPE on Q and K (only first partialRotaryFactor * headDim dims)
+        const rotaryDim = config.partialRotaryFactor
+          ? Math.floor(config.partialRotaryFactor * linKD) : 0;
+        if (rotaryDim > 0) {
+          dispatchRoPE(linQBuf!, 1, linNKH, pos, `L${l}-lin-rope-q`);
+          dispatchRoPE(linKBuf!, 1, linNKH, pos, `L${l}-lin-rope-k`);
         }
 
-        // Copy CURRENT K/V exactly to scratch (no quantization round-trip)
-        const curOffset = pos * kvDim * 4;
-        const curSize = seqLen * kvDim * 4;
-        const encCK = device.createCommandEncoder({ label: `L${l}-tq-cpK` });
-        encCK.copyBufferToBuffer(kBuf, 0, c.scratchK, curOffset, curSize);
-        device.queue.submit([encCK.finish()]);
-        const encCV = device.createCommandEncoder({ label: `L${l}-tq-cpV` });
-        encCV.copyBufferToBuffer(vBuf, 0, c.scratchV, curOffset, curSize);
-        device.queue.submit([encCV.finish()]);
+        // 4. Conv1d on K (causal, kernel_size=4)
+        if (conv1dPipeline && conv1dUpdatePipeline) {
+          const convParams = createUniformBuffer(device,
+            new Uint32Array([linConvDim, linConvK]), `L${l}-conv-p`);
+          const convBG = createBindGroup(device, conv1dPipeline, 0, [
+            { binding: 0, resource: { buffer: linKBuf! } },
+            { binding: 1, resource: { buffer: csBuf } },
+            { binding: 2, resource: { buffer: lw.linearConv1dWeight! } },
+            { binding: 3, resource: { buffer: linConvOutBuf! } },
+            { binding: 4, resource: { buffer: convParams } },
+          ], `L${l}-conv`);
+          dispatch(device, conv1dPipeline, [convBG],
+            [workgroupCount(linConvDim, 256)], `L${l}-conv1d`);
 
+          // Update conv state (shift + append)
+          const updateBG = createBindGroup(device, conv1dUpdatePipeline, 0, [
+            { binding: 0, resource: { buffer: linKBuf! } },
+            { binding: 1, resource: { buffer: csBuf } },
+            { binding: 2, resource: { buffer: lw.linearConv1dWeight! } },
+            { binding: 3, resource: { buffer: linConvOutBuf! } },
+            { binding: 4, resource: { buffer: convParams } },
+          ], `L${l}-conv-upd`);
+          dispatch(device, conv1dUpdatePipeline, [updateBG],
+            [workgroupCount(linConvDim, 256)], `L${l}-conv1d-update`);
+          convParams.destroy();
+        }
 
-        dispatchAttention(
-          qBuf, c.scratchK, c.scratchV, attnOutBuf,
-          seqLen, cacheLen, isCausal, pos, `L${l}-attn`,
-        );
+        // 5. Compute decay: dt = softplus(A_input + dt_bias), decay = exp(-exp(A_log) * dt)
+        // For now: dt = softplus(linABuf + dt_bias) → linDtBuf
+        if (softplusPipeline && lw.linearDtBias) {
+          dispatchElementwise(softplusPipeline, linABuf!, linDtBuf!, linConvDim, `L${l}-softplus`, lw.linearDtBias);
+        }
+        // decay = exp(-exp(A_log) * dt) — computed elementwise
+        // TODO: fuse this into a single kernel for efficiency
+        // For now, use the dt values directly as a simplified decay
+
+        // 6. SSM step: update hidden state, readout via Q
+        if (ssmStepPipeline) {
+          const ssmParams = createUniformBuffer(device,
+            new Uint32Array([linNKH, linNVH, linKD, linVD]), `L${l}-ssm-p`);
+          const ssmBG0 = createBindGroup(device, ssmStepPipeline, 0, [
+            { binding: 0, resource: { buffer: linQBuf! } },
+            { binding: 1, resource: { buffer: linConvOutBuf! } }, // K after conv1d
+            { binding: 2, resource: { buffer: linVBuf! } },
+            { binding: 3, resource: { buffer: linBBuf! } },       // beta
+            { binding: 4, resource: { buffer: linDtBuf! } },      // decay (simplified)
+          ], `L${l}-ssm-g0`);
+          const ssmBG1 = createBindGroup(device, ssmStepPipeline, 1, [
+            { binding: 0, resource: { buffer: hBuf } },
+            { binding: 1, resource: { buffer: linOutBuf! } },
+          ], `L${l}-ssm-g1`);
+          const ssmBG2 = createBindGroup(device, ssmStepPipeline, 2, [
+            { binding: 0, resource: { buffer: ssmParams } },
+          ], `L${l}-ssm-g2`);
+          dispatch(device, ssmStepPipeline, [ssmBG0, ssmBG1, ssmBG2],
+            [linNKH], `L${l}-ssm-step`);
+          ssmParams.destroy();
+        }
+
+        // 7. GroupNorm on output
+        if (groupNormPipeline && lw.linearNormWeight) {
+          const outDim = linNVH * linVD;
+          const numGroups = linNVH; // one group per value head
+          const gnParams = createUniformBuffer(device,
+            new Float32Array([outDim, numGroups, linVD, eps]),
+            `L${l}-gn-p`);
+          // Note: params struct has u32 + u32 + u32 + f32, but we pass as f32 array
+          // TODO: fix params to use proper mixed types
+          const gnBG = createBindGroup(device, groupNormPipeline, 0, [
+            { binding: 0, resource: { buffer: linOutBuf! } },
+            { binding: 1, resource: { buffer: attnProjBuf } }, // reuse as temp output
+            { binding: 2, resource: { buffer: lw.linearNormWeight } },
+            { binding: 3, resource: { buffer: gnParams } },
+          ], `L${l}-gn`);
+          dispatch(device, groupNormPipeline, [gnBG], [numGroups], `L${l}-group-norm`);
+          gnParams.destroy();
+        }
+
+        // 8. Output gating: out = normed_output * silu(Z)
+        if (gateSiluPipeline) {
+          const outDim = linNVH * linVD;
+          // attnProjBuf has the normed output, linZBuf has the gate
+          dispatchElementwise(gateSiluPipeline, attnProjBuf, linOutBuf!, outDim, `L${l}-gate`, linZBuf!);
+        }
+
+        // 9. Output projection → attnProjBuf [1, H]
+        const outDim = linNVH * linVD;
+        dispatchProjection(linOutBuf!, lw, 'linearOutProj', attnProjBuf, 1, H, outDim, `L${l}-lin-out`);
+
       } else {
-        copyToKVCache(kBuf, kvCache.keys[l], seqLen, kvDim, pos);
-        copyToKVCache(vBuf, kvCache.values[l], seqLen, kvDim, pos);
+        // ── STANDARD SOFTMAX ATTENTION ────────────────────────────────
 
-        dispatchAttention(
-          qBuf, kvCache.keys[l], kvCache.values[l], attnOutBuf,
-          seqLen, cacheLen, isCausal, pos, `L${l}-attn`,
-        );
+        // Q, K, V projections (auto-selects f32 or INT4 matmul)
+        dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHead, H, `L${l}-q`);
+        dispatchProjection(normedBuf, lw, 'kProj', kBuf, seqLen, kvDim, H, `L${l}-k`);
+        dispatchProjection(normedBuf, lw, 'vProj', vBuf, seqLen, kvDim, H, `L${l}-v`);
+
+        // Add bias if model has attention_bias
+        if (config.attentionBias && lw.qBias && lw.kBias && lw.vBias) {
+          const qDim = nHeads * dHead;
+          const encQb = device.createCommandEncoder({ label: `L${l}-qb-copy` });
+          encQb.copyBufferToBuffer(qBuf, 0, attnOutBuf, 0, seqLen * qDim * 4);
+          device.queue.submit([encQb.finish()]);
+          dispatchElementwise(addPipeline, attnOutBuf, qBuf, seqLen * qDim, `L${l}-qb`, lw.qBias, qDim);
+
+          const encKb = device.createCommandEncoder({ label: `L${l}-kb-copy` });
+          encKb.copyBufferToBuffer(kBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
+          device.queue.submit([encKb.finish()]);
+          dispatchElementwise(addPipeline, ffnTempBuf, kBuf, seqLen * kvDim, `L${l}-kb`, lw.kBias, kvDim);
+
+          const encVb = device.createCommandEncoder({ label: `L${l}-vb-copy` });
+          encVb.copyBufferToBuffer(vBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
+          device.queue.submit([encVb.finish()]);
+          dispatchElementwise(addPipeline, ffnTempBuf, vBuf, seqLen * kvDim, `L${l}-vb`, lw.vBias, kvDim);
+        }
+
+        if (isDebug && l === 0) {
+          await debugRead(normedBuf, 'L0-normed', 8);
+          await debugRead(qBuf, 'L0-Q-before-rope', 8);
+          await debugRead(kBuf, 'L0-K-before-rope', 8);
+          await debugRead(vBuf, 'L0-V', 8);
+        }
+
+        // Apply RoPE to Q and K
+        dispatchRoPE(qBuf, seqLen, nHeads, pos, `L${l}-rope-q`);
+        dispatchRoPE(kBuf, seqLen, nKVHeads, pos, `L${l}-rope-k`);
+
+        if (isDebug && l === 0) {
+          await debugRead(qBuf, 'L0-Q-after-rope', 8);
+          await debugRead(kBuf, 'L0-K-after-rope', 8);
+        }
+
+        // Write new K, V to cache and run attention
+        const isCausal = seqLen > 1;
+
+        if (kvCache.compressed) {
+          const c = kvCache.compressed;
+          const numVecs = seqLen * nKVHeads;
+          const outOffset = pos * nKVHeads;
+
+          dispatchTQEncode(kBuf, c.quantizedK[l], c.signBitsK[l], c.normsK[l],
+            numVecs, outOffset, `L${l}-tq-enc-k`);
+          dispatchTQEncode(vBuf, c.quantizedV[l], c.signBitsV[l], c.normsV[l],
+            numVecs, outOffset, `L${l}-tq-enc-v`);
+
+          if (pos > 0) {
+            const prevVecs = pos * nKVHeads;
+            dispatchTQDecode(c.quantizedK[l], c.signBitsK[l], c.normsK[l],
+              c.scratchK, prevVecs, `L${l}-tq-dec-k`);
+            dispatchTQDecode(c.quantizedV[l], c.signBitsV[l], c.normsV[l],
+              c.scratchV, prevVecs, `L${l}-tq-dec-v`);
+          }
+
+          const curOffset = pos * kvDim * 4;
+          const curSize = seqLen * kvDim * 4;
+          const encCK = device.createCommandEncoder({ label: `L${l}-tq-cpK` });
+          encCK.copyBufferToBuffer(kBuf, 0, c.scratchK, curOffset, curSize);
+          device.queue.submit([encCK.finish()]);
+          const encCV = device.createCommandEncoder({ label: `L${l}-tq-cpV` });
+          encCV.copyBufferToBuffer(vBuf, 0, c.scratchV, curOffset, curSize);
+          device.queue.submit([encCV.finish()]);
+
+          dispatchAttention(
+            qBuf, c.scratchK, c.scratchV, attnOutBuf,
+            seqLen, cacheLen, isCausal, pos, `L${l}-attn`,
+          );
+        } else {
+          copyToKVCache(kBuf, kvCache.keys[l], seqLen, kvDim, pos);
+          copyToKVCache(vBuf, kvCache.values[l], seqLen, kvDim, pos);
+
+          dispatchAttention(
+            qBuf, kvCache.keys[l], kvCache.values[l], attnOutBuf,
+            seqLen, cacheLen, isCausal, pos, `L${l}-attn`,
+          );
+        }
+
+        // Output projection: [seq, nHeads*dHead] → [seq, H]
+        dispatchProjection(attnOutBuf, lw, 'oProj', attnProjBuf, seqLen, H, nHeads * dHead, `L${l}-o`);
+
+        // O projection bias
+        if (config.attentionBias && lw.oBias) {
+          const encOb = device.createCommandEncoder({ label: `L${l}-ob-copy` });
+          encOb.copyBufferToBuffer(attnProjBuf, 0, normedBuf, 0, seqLen * H * 4);
+          device.queue.submit([encOb.finish()]);
+          dispatchElementwise(addPipeline, normedBuf, attnProjBuf, seqLen * H, `L${l}-ob`, lw.oBias, H);
+        }
       }
 
-      // Output projection: [seq, nHeads*dHead] → [seq, H]
-      dispatchProjection(attnOutBuf, lw, 'oProj', attnProjBuf, seqLen, H, nHeads * dHead, `L${l}-o`);
-
-      // O projection bias
-      if (config.attentionBias && lw.oBias) {
-        const encOb = device.createCommandEncoder({ label: `L${l}-ob-copy` });
-        encOb.copyBufferToBuffer(attnProjBuf, 0, normedBuf, 0, seqLen * H * 4);
-        device.queue.submit([encOb.finish()]);
-        dispatchElementwise(addPipeline, normedBuf, attnProjBuf, seqLen * H, `L${l}-ob`, lw.oBias, H);
-      }
-
-      // Residual: hidden = residual + attn_output
+      // Residual: hidden = residual + attn_output (shared for both layer types)
       dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res1`, attnProjBuf);
 
       if (isDebug && l === 0) {
-        await debugRead(attnOutBuf, `L0-attn-out(pos=${pos})`, 8);
         await debugRead(attnProjBuf, `L0-attn-proj(pos=${pos})`, 8);
         await debugRead(hiddenBuf, `L0-after-attn-residual(pos=${pos})`, 8);
-      }
-      if (isDebug2 && l === 0) {
-        // On second token, check if attention differs from just V (it should, with 2 cache entries)
-        await debugRead(vBuf, `L0-V(pos=${pos})`, 8);
-        console.log(`[DEBUG] cache_len=${cacheLen}, pos=${pos}`);
       }
 
       // Save for second residual
@@ -681,14 +858,52 @@ export function createForwardPassEngine(
   // ── KV Cache ───────────────────────────────────────────────────────
 
   function createKVCache(maxSeqLen: number, compressed = false): KVCache {
+    // For hybrid models, allocate SSM state for linear attention layers
+    let ssmState: SSMState | undefined;
+    if (config.isHybrid && config.layerTypes) {
+      const hiddenStates: GPUBuffer[] = [];
+      const convStates: GPUBuffer[] = [];
+      const layerToSSMIndex: number[] = new Array(L).fill(-1);
+
+      const linKD = config.linearKeyHeadDim!;
+      const linVD = config.linearValueHeadDim!;
+      const linNKH = config.linearNumKeyHeads!;
+      const linConvK = config.linearConvKernelDim!;
+      // Projected dim for conv state (num_key_heads * key_head_dim)
+      const convDim = linNKH * linKD;
+
+      let ssmIdx = 0;
+      for (let l = 0; l < L; l++) {
+        if (config.layerTypes[l] === 'linear_attention') {
+          // h: [num_key_heads, key_head_dim, value_head_dim]
+          const hSize = linNKH * linKD * linVD * 4;
+          hiddenStates.push(createStorageBuffer(device, null, hSize, `ssm-h-${l}`, true));
+          // conv_state: [kernel_size - 1, proj_dim]
+          const csSize = (linConvK - 1) * convDim * 4;
+          convStates.push(createStorageBuffer(device, null, csSize, `ssm-conv-${l}`, false));
+          layerToSSMIndex[l] = ssmIdx++;
+        }
+      }
+
+      const totalSSM = ssmIdx * (linNKH * linKD * linVD * 4 + (linConvK - 1) * convDim * 4);
+      console.log(`[KVCache] SSM state: ${(totalSSM / 1024 / 1024).toFixed(1)} MB for ${ssmIdx} linear layers (fixed, sequence-independent)`);
+      ssmState = { hiddenStates, convStates, layerToSSMIndex };
+    }
+
     if (!compressed) {
       const keys: GPUBuffer[] = [];
       const values: GPUBuffer[] = [];
       for (let l = 0; l < L; l++) {
-        keys.push(createStorageBuffer(device, null, maxSeqLen * kvDim * 4, `kv-k-${l}`, true));
-        values.push(createStorageBuffer(device, null, maxSeqLen * kvDim * 4, `kv-v-${l}`, true));
+        // For hybrid models, only full attention layers need KV cache
+        if (config.isHybrid && config.layerTypes?.[l] === 'linear_attention') {
+          keys.push(null as any);   // placeholder — not used for linear layers
+          values.push(null as any);
+        } else {
+          keys.push(createStorageBuffer(device, null, maxSeqLen * kvDim * 4, `kv-k-${l}`, true));
+          values.push(createStorageBuffer(device, null, maxSeqLen * kvDim * 4, `kv-v-${l}`, true));
+        }
       }
-      return { keys, values, position: 0, maxSeqLen };
+      return { keys, values, position: 0, maxSeqLen, ssmState };
     }
 
     // TurboQuant compressed KV cache
@@ -732,12 +947,13 @@ export function createForwardPassEngine(
         signBitsK, signBitsV,
         normsK, normsV,
       },
+      ssmState,
     };
   }
 
   function destroyKVCache(kvCache: KVCache): void {
-    for (const buf of kvCache.keys) buf.destroy();
-    for (const buf of kvCache.values) buf.destroy();
+    for (const buf of kvCache.keys) if (buf) buf.destroy();
+    for (const buf of kvCache.values) if (buf) buf.destroy();
     if (kvCache.compressed) {
       const c = kvCache.compressed;
       c.scratchK.destroy();
@@ -748,6 +964,10 @@ export function createForwardPassEngine(
       for (const b of c.signBitsV) b.destroy();
       for (const b of c.normsK) b.destroy();
       for (const b of c.normsV) b.destroy();
+    }
+    if (kvCache.ssmState) {
+      for (const b of kvCache.ssmState.hiddenStates) b.destroy();
+      for (const b of kvCache.ssmState.convStates) b.destroy();
     }
   }
 

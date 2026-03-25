@@ -59,3 +59,25 @@ fn fma(@builtin(global_invocation_id) gid: vec3u) {
   if (idx >= params.n) { return; }
   output[idx] = input_a[idx] * input_b[idx] + output[idx];
 }
+
+// ── Gated DeltaNet / Mamba-2 operations ──────────────────────────────────
+
+// Gated SiLU: output = a * silu(b) — used for Mamba-2 output gating
+@compute @workgroup_size(256)
+fn gate_silu(@builtin(global_invocation_id) gid: vec3u) {
+  let idx = gid.x;
+  if (idx >= params.n) { return; }
+  let z = input_b[idx];
+  let silu_z = z / (1.0 + exp(-z));
+  output[idx] = input_a[idx] * silu_z;
+}
+
+// Softplus: output = log(1 + exp(a + b)) — used for SSM time delta
+@compute @workgroup_size(256)
+fn softplus(@builtin(global_invocation_id) gid: vec3u) {
+  let idx = gid.x;
+  if (idx >= params.n) { return; }
+  let x = input_a[idx] + input_b[idx];
+  // Numerically stable softplus: for large x, softplus(x) ≈ x
+  output[idx] = select(log(1.0 + exp(x)), x, x > 20.0);
+}

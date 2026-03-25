@@ -59,6 +59,26 @@ export interface ModelConfig {
   /** Quantization group size (typically 128) */
   quantGroupSize: number;
 
+  // ── Hybrid (Mamba-2 / Gated DeltaNet) ──────────────────────────────
+  /** Per-layer type: 'full_attention' or 'linear_attention'. Undefined for pure transformers. */
+  layerTypes?: string[];
+  /** Whether this model has mixed attention types (e.g., Qwen3.5) */
+  isHybrid: boolean;
+  /** Linear attention key head dimension (e.g., 128) */
+  linearKeyHeadDim?: number;
+  /** Linear attention value head dimension (e.g., 128) */
+  linearValueHeadDim?: number;
+  /** Number of key heads in linear attention layers (e.g., 16) */
+  linearNumKeyHeads?: number;
+  /** Number of value heads in linear attention layers (e.g., 32) */
+  linearNumValueHeads?: number;
+  /** Conv1d kernel size for linear attention (e.g., 4) */
+  linearConvKernelDim?: number;
+  /** Fraction of head dims that get RoPE (e.g., 0.25 for Qwen3.5) */
+  partialRotaryFactor?: number;
+  /** Whether attention output is gated (linear + full attention) */
+  attnOutputGate?: boolean;
+
   // ── Derived ────────────────────────────────────────────────────────
   /** Number of Q heads per KV head group (for GQA). = numAttentionHeads / numKVHeads */
   numQPerKV: number;
@@ -108,6 +128,19 @@ export interface WeightNameMap {
     upProj: string;
     /** FFN down projection */
     downProj: string;
+  };
+
+  /** Linear attention (Gated DeltaNet / Mamba-2) weight patterns. Only for hybrid models. */
+  linearLayer?: {
+    inProjQKV: string;     // fused Q/K/V projection
+    inProjA: string;       // SSM decay gate input projection
+    inProjB: string;       // SSM update gate input projection
+    inProjZ: string;       // output gate projection
+    outProj: string;       // output projection
+    aLog: string;          // diagonal state decay matrix (log-space)
+    conv1dWeight: string;  // causal conv1d kernel
+    dtBias: string;        // time step bias
+    normWeight: string;    // group norm weight
   };
 }
 
@@ -183,6 +216,17 @@ const WEIGHT_NAME_PATTERNS: Record<string, WeightNameMap> = {
       upProj: 'model.language_model.layers.{L}.mlp.up_proj.weight',
       downProj: 'model.language_model.layers.{L}.mlp.down_proj.weight',
     },
+    linearLayer: {
+      inProjQKV: 'model.language_model.layers.{L}.linear_attn.in_proj_qkv.weight',
+      inProjA: 'model.language_model.layers.{L}.linear_attn.in_proj_a.weight',
+      inProjB: 'model.language_model.layers.{L}.linear_attn.in_proj_b.weight',
+      inProjZ: 'model.language_model.layers.{L}.linear_attn.in_proj_z.weight',
+      outProj: 'model.language_model.layers.{L}.linear_attn.out_proj.weight',
+      aLog: 'model.language_model.layers.{L}.linear_attn.A_log',
+      conv1dWeight: 'model.language_model.layers.{L}.linear_attn.conv1d.weight',
+      dtBias: 'model.language_model.layers.{L}.linear_attn.dt_bias',
+      normWeight: 'model.language_model.layers.{L}.linear_attn.norm.weight',
+    },
   },
   // Phi models use a different structure
   phi: {
@@ -245,7 +289,7 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
     qwen2: true,
     qwen2_moe: true,
     qwen3: true,
-    qwen3_5_text: true,
+    qwen3_5_text: false,  // Qwen3.5 explicitly sets attention_bias: false
     qwen3_moe: true,
   };
   const attentionBias = hfConfig.attention_bias ?? attentionBiasDefaults[modelType] ?? false;
@@ -258,6 +302,10 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
   const quantMethod = quantConfig?.quant_method ?? 'none';
   const quantBits = quantConfig?.bits ?? 0;
   const quantGroupSize = quantConfig?.group_size ?? 128;
+
+  // Hybrid model detection (Mamba-2 / Gated DeltaNet)
+  const layerTypes: string[] | undefined = hfConfig.layer_types;
+  const isHybrid = Array.isArray(layerTypes) && layerTypes.includes('linear_attention');
 
   return {
     modelType,
@@ -280,6 +328,16 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
     numQPerKV,
     isGQA: numKVHeads !== numAttentionHeads,
     isQuantized: quantMethod !== 'none',
+    // Hybrid model fields
+    layerTypes,
+    isHybrid,
+    linearKeyHeadDim: isHybrid ? (hfConfig.linear_key_head_dim ?? 128) : undefined,
+    linearValueHeadDim: isHybrid ? (hfConfig.linear_value_head_dim ?? 128) : undefined,
+    linearNumKeyHeads: isHybrid ? (hfConfig.linear_num_key_heads ?? 16) : undefined,
+    linearNumValueHeads: isHybrid ? (hfConfig.linear_num_value_heads ?? 32) : undefined,
+    linearConvKernelDim: isHybrid ? (hfConfig.linear_conv_kernel_dim ?? 4) : undefined,
+    partialRotaryFactor: hfConfig.partial_rotary_factor,
+    attnOutputGate: hfConfig.attn_output_gate,
   };
 }
 

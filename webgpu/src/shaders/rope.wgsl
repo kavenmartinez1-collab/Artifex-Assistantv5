@@ -13,6 +13,7 @@ struct Params {
   num_heads: u32,   // number of heads to process
   pos_offset: u32,  // position offset (for KV-cache continuation)
   rope_base: f32,   // base frequency (10000.0 default)
+  rotary_dim: u32,  // how many dims to rotate (0 = all, else partial RoPE)
 }
 
 @group(0) @binding(0) var<storage, read_write> qk: array<f32>; // in-place rotation
@@ -21,19 +22,21 @@ struct Params {
 @compute @workgroup_size(256)
 fn rope(@builtin(global_invocation_id) gid: vec3u) {
   let idx = gid.x;
-  let half_dim = params.head_dim / 2u;
-  let total_pairs = params.seq_len * params.num_heads * half_dim;
+  // rotary_dim: 0 means rotate all dims, >0 means only first rotary_dim dims
+  let rot_dim = select(params.head_dim, params.rotary_dim, params.rotary_dim > 0u);
+  let half_rot = rot_dim / 2u;
+  let total_pairs = params.seq_len * params.num_heads * half_rot;
 
   if (idx >= total_pairs) { return; }
 
   // Decompose flat index into (seq_pos, head, pair_idx)
-  let pair_idx = idx % half_dim;
-  let remaining = idx / half_dim;
+  let pair_idx = idx % half_rot;
+  let remaining = idx / half_rot;
   let head = remaining % params.num_heads;
   let seq_pos = remaining / params.num_heads;
 
   let position = f32(seq_pos + params.pos_offset);
-  let freq = 1.0 / pow(params.rope_base, f32(2u * pair_idx) / f32(params.head_dim));
+  let freq = 1.0 / pow(params.rope_base, f32(2u * pair_idx) / f32(rot_dim));
   let angle = position * freq;
 
   let cos_val = cos(angle);
