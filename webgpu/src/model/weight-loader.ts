@@ -144,14 +144,49 @@ export async function loadModel(
     const useStreaming = shard.size > MAX_FULL_DOWNLOAD;
 
     if (useStreaming) {
-      console.log(`[WeightLoader] Shard ${shardIdx + 1}: chunked download for ${header.tensors.size} tensors (${formatBytes(shard.size)})`);
+      console.log(`[WeightLoader] Shard ${shardIdx + 1}: parallel chunked download for ${header.tensors.size} tensors (${formatBytes(shard.size)})`);
     }
 
     // For small shards, download the whole file at once (faster, cacheable)
     let shardData: ArrayBuffer | null = null;
-    // For large shards, download in ~512MB chunks (covers many tensors per chunk)
+    // For large shards, download in ~512MB chunks with parallel prefetch
     const CHUNK_SIZE = 512 * 1024 * 1024; // 512 MB
-    const chunkCache = new Map<number, ArrayBuffer>(); // chunk_index → data
+    const PARALLEL_CHUNKS = 4; // download 4 chunks at once
+    const chunkCache = new Map<number, ArrayBuffer | Promise<ArrayBuffer>>();
+    const totalChunks = Math.ceil(shard.size / CHUNK_SIZE);
+
+    // Helper: fetch a chunk (returns ArrayBuffer)
+    async function fetchChunk(idx: number): Promise<ArrayBuffer> {
+      const start = idx * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, shard.size);
+      return fetchRange(shard.url, start, end);
+    }
+
+    // Helper: get a chunk (from cache or download), returns ArrayBuffer
+    async function getChunk(idx: number): Promise<ArrayBuffer> {
+      if (idx >= totalChunks) return new ArrayBuffer(0);
+      const cached = chunkCache.get(idx);
+      if (cached instanceof ArrayBuffer) return cached;
+      if (cached instanceof Promise) return cached;
+      // Not in cache — start download
+      const promise = fetchChunk(idx);
+      chunkCache.set(idx, promise);
+      const data = await promise;
+      chunkCache.set(idx, data);
+      return data;
+    }
+
+    // Pre-fetch first N chunks in parallel for streaming mode
+    if (useStreaming) {
+      for (let i = 0; i < Math.min(PARALLEL_CHUNKS, totalChunks); i++) {
+        const promise = fetchChunk(i);
+        chunkCache.set(i, promise);
+        promise.then(data => { chunkCache.set(i, data); });
+      }
+      progress({ phase: 'downloading',
+        message: `Shard ${shardIdx + 1}: downloading ${Math.min(PARALLEL_CHUNKS, totalChunks)} chunks in parallel...`,
+        shard: shardIdx + 1, totalShards: shards.length, shardProgress: 0 });
+    }
 
     if (!useStreaming) {
       const cached = await hasCache(cacheKey);
@@ -194,29 +229,34 @@ export async function loadModel(
         const tensorSize = dataEnd - dataStart;
 
         if (tensorSize > CHUNK_SIZE) {
-          // Very large tensor — download directly
           rawData = await fetchRange(shard.url, dataStart, dataEnd);
         } else {
-          // Find which chunk this tensor falls in
           const chunkIdx = Math.floor(dataStart / CHUNK_SIZE);
-          if (!chunkCache.has(chunkIdx)) {
-            // Download this chunk
-            const chunkStart = chunkIdx * CHUNK_SIZE;
-            const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, shard.size);
-            const totalChunks = Math.ceil(shard.size / CHUNK_SIZE);
-            progress({ phase: 'downloading',
-              message: `Shard ${shardIdx + 1}: downloading chunk ${chunkIdx + 1}/${totalChunks} (${formatBytes(chunkEnd - chunkStart)})`,
-              shard: shardIdx + 1, totalShards: shards.length,
-              shardProgress: (chunkIdx + 1) / totalChunks,
-              overallProgress: bytesDownloadedTotal / totalDownloadSize });
-            const chunkData = await fetchRange(shard.url, chunkStart, chunkEnd);
-            chunkCache.set(chunkIdx, chunkData);
-            // Free previous chunk to save memory (keep at most 2)
-            for (const [k] of chunkCache) {
-              if (k < chunkIdx - 1) chunkCache.delete(k);
+
+          // Prefetch upcoming chunks in parallel
+          for (let ahead = 1; ahead <= PARALLEL_CHUNKS; ahead++) {
+            const futureIdx = chunkIdx + ahead;
+            if (futureIdx < totalChunks && !chunkCache.has(futureIdx)) {
+              const p = fetchChunk(futureIdx);
+              chunkCache.set(futureIdx, p);
+              p.then(data => { chunkCache.set(futureIdx, data); });
             }
           }
-          const chunk = chunkCache.get(chunkIdx)!;
+
+          // Get current chunk (may already be downloaded via prefetch)
+          const chunk = await getChunk(chunkIdx);
+
+          progress({ phase: 'downloading',
+            message: `Shard ${shardIdx + 1}: chunk ${chunkIdx + 1}/${totalChunks}, tensor ${tensorIdx}/${header.tensors.size}`,
+            shard: shardIdx + 1, totalShards: shards.length,
+            shardProgress: (chunkIdx + 1) / totalChunks,
+            overallProgress: bytesDownloadedTotal / totalDownloadSize });
+
+          // Free old chunks to limit memory (~1 GB max)
+          for (const [k, v] of chunkCache) {
+            if (k < chunkIdx - 1 && v instanceof ArrayBuffer) chunkCache.delete(k);
+          }
+
           const offsetInChunk = dataStart - chunkIdx * CHUNK_SIZE;
           rawData = chunk.slice(offsetInChunk, offsetInChunk + tensorSize);
         }
