@@ -61,7 +61,7 @@ Universal Local AI Hosting Platform. Run any AI model locally — text generatio
 - **Agent tools** — shell execution, Python runner, web search, codebase analysis (grep, glob, architecture), file I/O, edit-in-place
 - **RAG knowledge base** — per-workspace knowledge entries with lifecycle classification, action keys, loop detection
 - **Session persistence** — save/load conversations with full metadata (model, backend, mode)
-- **WebGPU engine** — browser-based LLM inference with custom WGSL compute kernels (matmul, attention, RMSNorm, RoPE, softmax, SiLU, embedding), TurboQuant KV cache compression, full transformer forward pass, and autoregressive generation with streaming. Loads any HuggingFace SafeTensors model directly in the browser.
+- **WebGPU engine** — browser-based LLM inference with custom WGSL compute kernels (matmul, attention, RMSNorm, RoPE, softmax, SiLU, embedding), TurboQuant KV cache compression (3-4 bit, ~80% memory savings), batch prefill, GPTQ INT4 weight support, full transformer forward pass, and autoregressive generation with streaming. Loads any HuggingFace SafeTensors model directly in the browser with retry logic and parallel chunk prefetch.
 - **Secure web search** — SearXNG + Web Gateway with content sanitization, prompt injection detection, tmpfs quarantine, and network isolation
 - **Docker support** — GPU-enabled container with health checks, optional Ollama sidecar, and web gateway proxy
 - **Multi-GPU** — device selection for multi-GPU systems
@@ -83,7 +83,9 @@ Universal Local AI Hosting Platform. Run any AI model locally — text generatio
 | API /v1/chat/completions | PASS | Routes through Ollama backend on localhost |
 | WebGPU TypeScript | PASS | tsc --noEmit clean, 0 errors |
 | WebGPU Vite build | PASS | 13 modules, 23KB bundle |
-| WebGPU inference | PASS | Qwen2.5-0.5B-Instruct generates coherent English at ~20 tok/s in Chrome |
+| WebGPU inference | PASS | Qwen2.5-0.5B-Instruct generates coherent English at ~20 tok/s in Chrome (f32), ~10 tok/s with TurboQuant 4-bit KV |
+| WebGPU kernel tests | **9/9 PASS** | SiLU, Add, Mul, Matmul naive, Matmul tiled, Softmax, RMSNorm, TurboQuant 3-bit d=64, TurboQuant 4-bit d=128 |
+| WebGPU batch prefill | PASS | 29-token prompt in 1 chunk at ~150 tok/s (vs one-by-one before) |
 | Localhost binding | PASS | Confirmed NOT accessible on LAN IP |
 
 ## Supported GPU Tiers
@@ -775,12 +777,20 @@ npm run server    # Metrics server only
 
 ### Status
 
-Phases 0-4 and 6 complete: GPU infrastructure, compute kernels, HuggingFace weight loading with browser caching, full transformer forward pass with GQA attention, TurboQuant KV cache compression, and autoregressive text generation with streaming. Coherent text generation is working end-to-end in the browser. Phase 5 (INT4 weight dequantization) infrastructure complete — GPTQ format loader and fused `matmul_bt_q4` kernel ready for quantized models up to 9B parameters on 8GB VRAM.
+Phases 0-6 complete plus TurboQuant KV cache integration, batch prefill, and network resilience:
+
+- **Full inference pipeline** — GPU kernels, HF weight loading with browser caching, transformer forward pass with GQA, autoregressive generation with streaming
+- **TurboQuant KV cache** — 3-bit (d≥128) or 4-bit (d≤64) compressed KV cache saving ~80% memory. Current token K/V is always exact; only previously cached tokens are decoded from compressed storage. Toggle in the UI.
+- **Batch prefill** — processes prompt tokens in 512-token chunks instead of one-by-one, with broadcast bias support for multi-token batches
+- **GPTQ INT4** — weight loader and fused `matmul_bt_q4` kernel for quantized models (Qwen3.5-9B GPTQ fits in 8GB VRAM)
+- **Resilient downloads** — exponential backoff retry (3 attempts) on all HF CDN requests, parallel 4-chunk prefetch for large shards, failed prefetch eviction and re-attempt
+- **Auto-detect weight names** — automatically discovers tensor name prefixes (handles `model.language_model.` for multimodal architectures)
 
 ### Supported Models
 
-Any HuggingFace model with a standard transformer decoder architecture works. Tested:
-- **Qwen2.5-0.5B-Instruct** — 24 layers, 896 hidden, GQA 14Q/2KV. Generates coherent English.
+Any HuggingFace model with a standard transformer decoder architecture works. Weight name prefixes are auto-detected. Tested:
+- **Qwen2.5-0.5B-Instruct** — 24 layers, 896 hidden, GQA 14Q/2KV. Generates coherent English at ~20 tok/s (f32) / ~10 tok/s (TurboQuant 4-bit KV).
+- **Qwen3.5-9B-GPTQ-INT4** (`mssfj/Qwen3.5-9B-GPTQ-INT4`) — 32 layers, 4096 hidden, GQA. 7.1 GB INT4 weights. Testing in progress.
 - **SmolLM2-135M-Instruct** — 30 layers, 576 hidden, GQA 9Q/3KV.
 - **SmolLM2-360M-Instruct** — 32 layers, 960 hidden, GQA 15Q/5KV.
 

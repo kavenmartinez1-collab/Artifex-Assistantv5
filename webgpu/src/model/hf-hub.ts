@@ -52,6 +52,71 @@ export interface DownloadProgress {
 const HF_BASE = 'https://huggingface.co';
 const HF_API = 'https://huggingface.co/api/models';
 
+const MAX_RETRIES = 3;
+const BASE_DELAY_MS = 1000; // 1s, 2s, 4s exponential backoff
+
+// ─── Retry Logic ────────────────────────────────────────────────────────────
+
+/** Returns true for errors that are worth retrying (transient failures). */
+function isRetryable(error: unknown): boolean {
+  if (error instanceof TypeError) {
+    // Network failures (ERR_CONTENT_LENGTH_MISMATCH, DNS, timeout, etc.)
+    return true;
+  }
+  if (error instanceof RetryableHTTPError) {
+    return true;
+  }
+  return false;
+}
+
+class RetryableHTTPError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+/**
+ * Fetch wrapper with exponential backoff retry for transient failures.
+ * Retries on: network errors, 429 (rate limit), 500-599 (server errors).
+ * Does NOT retry on: 401, 403, 404, or other client errors.
+ */
+async function fetchWithRetry(
+  input: RequestInfo,
+  init?: RequestInit,
+): Promise<Response> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const resp = await fetch(input, init);
+
+      // Don't retry client errors (except 429)
+      if (!resp.ok && resp.status !== 206) {
+        if (resp.status === 429 || resp.status >= 500) {
+          throw new RetryableHTTPError(resp.status, `HTTP ${resp.status} ${resp.statusText}`);
+        }
+      }
+
+      return resp;
+    } catch (err) {
+      lastError = err;
+
+      if (attempt < MAX_RETRIES && isRetryable(err)) {
+        const delay = BASE_DELAY_MS * Math.pow(2, attempt);
+        console.warn(
+          `[HF-Hub] Retry ${attempt + 1}/${MAX_RETRIES} after ${delay}ms — ${err instanceof Error ? err.message : err}`
+        );
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+
+      throw err;
+    }
+  }
+
+  throw lastError;
+}
+
 // ─── Auth Token ─────────────────────────────────────────────────────────────
 
 let _authToken = '';
@@ -76,7 +141,7 @@ function authHeaders(): Record<string, string> {
  */
 export async function listModelFiles(repo: string): Promise<HFModelFile[]> {
   const url = `${HF_API}/${repo}/tree/main`;
-  const resp = await fetch(url, { headers: authHeaders() });
+  const resp = await fetchWithRetry(url, { headers: authHeaders() });
 
   if (!resp.ok) {
     if (resp.status === 404) {
@@ -93,7 +158,7 @@ export async function listModelFiles(repo: string): Promise<HFModelFile[]> {
  */
 export async function fetchModelConfig(repo: string): Promise<HFModelConfig> {
   const url = `${HF_BASE}/${repo}/raw/main/config.json`;
-  const resp = await fetch(url, { headers: authHeaders() });
+  const resp = await fetchWithRetry(url, { headers: authHeaders() });
 
   if (!resp.ok) {
     throw new Error(`Failed to fetch config.json for ${repo}: ${resp.status}`);
@@ -108,7 +173,7 @@ export async function fetchModelConfig(repo: string): Promise<HFModelConfig> {
  */
 export async function fetchShardIndex(repo: string): Promise<Record<string, any> | null> {
   const url = `${HF_BASE}/${repo}/raw/main/model.safetensors.index.json`;
-  const resp = await fetch(url, { headers: authHeaders() });
+  const resp = await fetchWithRetry(url, { headers: authHeaders() });
 
   if (!resp.ok) {
     // Single-shard model — no index file
@@ -163,7 +228,7 @@ export async function fetchRange(
   start: number,
   end: number,
 ): Promise<ArrayBuffer> {
-  const resp = await fetch(url, {
+  const resp = await fetchWithRetry(url, {
     headers: {
       ...authHeaders(),
       Range: `bytes=${start}-${end - 1}`, // HTTP Range is inclusive on both ends
@@ -189,7 +254,7 @@ export async function downloadFile(
   url: string,
   onProgress?: (downloaded: number, total: number) => void,
 ): Promise<ArrayBuffer> {
-  const resp = await fetch(url, { headers: authHeaders() });
+  const resp = await fetchWithRetry(url, { headers: authHeaders() });
 
   if (!resp.ok) {
     throw new Error(`Download failed: ${resp.status} ${resp.statusText}`);

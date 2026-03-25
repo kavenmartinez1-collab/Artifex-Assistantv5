@@ -825,13 +825,24 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
 ✅ HuggingFace auth token (gated model access, localStorage persistence)
 ✅ GPTQ INT4 weight loader (packed I32 qweight + F16 scales + I32 qzeros)
 ✅ Fused INT4 dequantizing matmul kernel (matmul_bt_q4)
+
+✅ TurboQuant KV cache integration — 3-bit (d≥128) or 4-bit (d≤64)
+   compressed KV cache. ~80% memory savings. Current token exact,
+   only cached tokens decoded from compressed storage.
+✅ Batch prefill — 512-token chunks with broadcast bias addition
+   ~150 tok/s prefill vs sequential one-by-one
+✅ Retry logic with exponential backoff on all HF CDN requests
+✅ Parallel chunk prefetch with failed-prefetch eviction
+✅ Auto-detect weight name prefixes (handles model.language_model.*)
 ```
 
 ### What's remaining
 
-**Phase 5: INT4 Quantization** — Infrastructure complete. GPTQ weight loader detects and uploads packed INT4 weights (8 values per i32) with per-group F16 scales and INT4 zero points. Fused `matmul_bt_q4` kernel dequantizes on the fly during tiled matrix multiplication. Needs end-to-end testing with a GPTQ-quantized model (e.g., Qwen3.5-9B-GPTQ). Memory impact: 9B model weights drop from ~36 GB (FP32) to ~4.5 GB (INT4).
+**Phase 5: INT4 End-to-End** — GPTQ infrastructure complete. Weight loader, fused `matmul_bt_q4` kernel, and Qwen3.5-9B weight name mapping all ready. Currently testing `mssfj/Qwen3.5-9B-GPTQ-INT4` (7.1 GB, 1171 tensors) end-to-end. Memory budget: ~4.5 GB INT4 weights + ~0.5 GB activations + ~0.08 GB TurboQuant KV cache = ~5.1 GB (fits 8 GB VRAM with 2.9 GB headroom).
 
-**TurboQuant KV Cache Integration** — The TurboQuant encode/decode kernels work standalone (9/9 tests passing) but are not yet wired into the forward pass. Integration would compress the KV cache by ~8-10x, extending maximum context length proportionally.
+**Batch prefill optimization** — Prompt processing works in 512-token chunks at ~150 tok/s. Broadcast bias addition handles multi-token batches correctly (the `add` kernel's `broadcast_b` parameter wraps `input_b[idx % broadcast_b]` for bias vectors smaller than the batched tensor).
+
+**TurboQuant quality notes** — 3-bit works well for d≥128 (larger models like Qwen3.5-9B). For d=64 (small models like Qwen2.5-0.5B), 4-bit is needed due to higher per-dimension quantization noise with fewer dimensions to average over. Critical design rule: never quantize the current token's K/V and use the decoded version in the same layer's attention — only compress previously cached tokens. This prevents error injection into the active computation path.
 
 ### The 2 GB buffer limit
 

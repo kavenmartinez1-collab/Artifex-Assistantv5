@@ -13,6 +13,7 @@ struct Params {
   bits: u32,          // quantization bits (1-4)
   num_centroids: u32, // number of positive centroids = 2^(bits-1)
   num_thresholds: u32,// number of thresholds = num_centroids - 1
+  out_vec_offset: u32,// offset for output indexing (= position * num_kv_heads)
 }
 
 // Input: f32 vectors to quantize (num_vectors × head_dim)
@@ -44,7 +45,8 @@ var<workgroup> quant_indices: array<u32, 256>;
 @compute @workgroup_size(256)
 fn encode(@builtin(local_invocation_id) lid: vec3u,
           @builtin(workgroup_id) wid: vec3u) {
-  let vec_idx = wid.x;
+  let vec_idx = wid.x;           // local index within this dispatch
+  let out_idx = params.out_vec_offset + vec_idx; // global index in compressed cache
   let tid = lid.x;
   let d = params.head_dim;
   let bits = params.bits;
@@ -83,9 +85,9 @@ fn encode(@builtin(local_invocation_id) lid: vec3u,
   let norm = sqrt(shmem[0]);
   let inv_norm = select(0.0, 1.0 / norm, norm > 1e-8);
 
-  // Store norm for decode
+  // Store norm for decode (at global cache position)
   if (tid == 0u) {
-    output_norms[vec_idx] = norm;
+    output_norms[out_idx] = norm;
   }
 
   // ── Stage 1a: Rotate normalized vector ──────────────────────────────
@@ -131,7 +133,7 @@ fn encode(@builtin(local_invocation_id) lid: vec3u,
   // ── Pack quantized indices into u32 words ───────────────────────────
   let indices_per_u32 = 32u / bits;
   let packed_words = (d + indices_per_u32 - 1u) / indices_per_u32;
-  let out_offset_quant = vec_idx * packed_words;
+  let out_offset_quant = out_idx * packed_words;
 
   var w = tid;
   while (w < packed_words) {
@@ -159,7 +161,7 @@ fn encode(@builtin(local_invocation_id) lid: vec3u,
 
   // sign_bits[i] = sign(sum_j(S[i,j] * residual[j]))
   let sign_words = (d + 31u) / 32u;
-  let out_offset_sign = vec_idx * sign_words;
+  let out_offset_sign = out_idx * sign_words;
 
   var sw = tid;
   while (sw < sign_words) {

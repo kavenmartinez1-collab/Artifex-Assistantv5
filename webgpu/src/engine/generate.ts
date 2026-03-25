@@ -29,6 +29,8 @@ export interface SamplingConfig {
   maxNewTokens?: number;
   /** Repetition penalty. 1.0 = disabled. Default: 1.0 */
   repetitionPenalty?: number;
+  /** Use TurboQuant compressed KV cache (saves ~80% KV memory). Default: false */
+  useCompressedKV?: boolean;
 }
 
 // ── Generation Output ────────────────────────────────────────────────────
@@ -201,6 +203,7 @@ export function generate(
     topP: sampling.topP ?? 0.9,
     maxNewTokens: sampling.maxNewTokens ?? 512,
     repetitionPenalty: sampling.repetitionPenalty ?? 1.0,
+    useCompressedKV: sampling.useCompressedKV ?? false,
   };
 
   const result = (async (): Promise<GenerationResult> => {
@@ -220,19 +223,27 @@ export function generate(
 
     // ── Step 2: Create KV cache ──────────────────────────────────────
     const maxSeq = promptTokens + config.maxNewTokens;
-    const kvCache = engine.createKVCache(maxSeq);
+    const kvCache = engine.createKVCache(maxSeq, config.useCompressedKV);
+    if (config.useCompressedKV) {
+      console.log(`[Generate] Using TurboQuant compressed KV cache`);
+    }
 
     // ── Step 3: Prefill ─────────────────────────────────────────────
-    // Process all prompt tokens. The LAST call produces logits for
-    // the first generated token — we sample from those directly.
+    // Process prompt in chunks for batch prefill (up to 512 tokens per pass).
+    // The LAST call produces logits for the first generated token.
+    const PREFILL_CHUNK = 512;
     let prefillOutput;
-    for (let i = 0; i < promptTokens; i++) {
-      prefillOutput = await engine.forward(new Uint32Array([promptIds[i]]), kvCache);
+    for (let i = 0; i < promptTokens; i += PREFILL_CHUNK) {
+      const chunkEnd = Math.min(i + PREFILL_CHUNK, promptTokens);
+      const chunk = new Uint32Array(promptIds.slice(i, chunkEnd));
+      prefillOutput = await engine.forward(chunk, kvCache);
     }
     await device.queue.onSubmittedWorkDone();
 
     const prefillEnd = performance.now();
     const prefillMs = prefillEnd - startTime;
+    const chunks = Math.ceil(promptTokens / PREFILL_CHUNK);
+    console.log(`[Generate] Prefill: ${promptTokens} tokens in ${chunks} chunk(s), ${prefillMs.toFixed(0)}ms (${(promptTokens / prefillMs * 1000).toFixed(0)} tok/s)`);
 
     // ── Step 4: Sample first token from prefill logits ───────────────
     const generatedIds: number[] = [];
@@ -316,11 +327,10 @@ export function generate(
       : 0;
 
     // ── Step 5: Detokenize ───────────────────────────────────────────
-    const text = tokenizer.decode(generatedIds);
+    const text = generatedIds.length > 0 ? tokenizer.decode(generatedIds) : '';
 
     // Clean up KV cache buffers
-    for (const buf of kvCache.keys) buf.destroy();
-    for (const buf of kvCache.values) buf.destroy();
+    engine.destroyKVCache(kvCache);
 
     return {
       text,
