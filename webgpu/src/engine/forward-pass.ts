@@ -51,6 +51,7 @@ import tqDecodeWGSL from '../shaders/turboquant_decode.wgsl?raw';
 import conv1dWGSL from '../shaders/conv1d.wgsl?raw';
 import groupNormWGSL from '../shaders/group_norm.wgsl?raw';
 import ssmStepWGSL from '../shaders/ssm_step.wgsl?raw';
+import l2normWGSL from '../shaders/l2norm.wgsl?raw';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -270,7 +271,7 @@ export function createForwardPassEngine(
   const decayPipeline = isHybrid
     ? createComputePipeline(device, elementwiseWGSL, 'decay_compute', 'decay') : null;
   const l2NormPipeline = isHybrid
-    ? createComputePipeline(device, elementwiseWGSL, 'l2_normalize', 'l2-norm') : null;
+    ? createComputePipeline(device, l2normWGSL, 'l2_normalize', 'l2-norm') : null;
 
   // ── Reusable intermediate buffers ──────────────────────────────────
   // Sized for batch prefill (up to MAX_PREFILL tokens per forward pass).
@@ -656,19 +657,31 @@ export function createForwardPassEngine(
         }
 
         // 5c. L2-normalize Q and K (use_qk_l2norm_in_kernel=True in reference)
-        // Normalizes each head vector to unit length. Critical for SSM stability.
-        // NOTE: must pass a dummy secondBuf because the shader declares input_b at
-        // module scope and auto-layout may require it even though l2_normalize doesn't read it.
+        // Uses separate shader (l2norm.wgsl) to avoid binding conflicts with elementwise.wgsl
         if (l2NormPipeline) {
           const qDim = linNKH * linKD;
           const kDim = linNKH * linKD;
-          // L2 norm uses broadcast_b as head_dim
-          dispatchElementwise(l2NormPipeline, linQBuf!, linConvOutBuf!, qDim, `L${l}-l2norm-q`, linDtBuf!, linKD);
+
+          const l2pQ = createUniformBuffer(device, new Uint32Array([qDim, linKD]), `L${l}-l2q-p`);
+          const l2bgQ = createBindGroup(device, l2NormPipeline, 0, [
+            { binding: 0, resource: { buffer: linQBuf! } },
+            { binding: 1, resource: { buffer: linConvOutBuf! } },
+            { binding: 2, resource: { buffer: l2pQ } },
+          ], `L${l}-l2norm-q`);
+          dispatch(device, l2NormPipeline, [l2bgQ], [workgroupCount(qDim, 256)], `L${l}-l2norm-q`);
+          l2pQ.destroy();
           const encQ = device.createCommandEncoder({ label: `L${l}-l2q-cp` });
           encQ.copyBufferToBuffer(linConvOutBuf!, 0, linQBuf!, 0, qDim * 4);
           device.queue.submit([encQ.finish()]);
 
-          dispatchElementwise(l2NormPipeline, linKBuf!, linConvOutBuf!, kDim, `L${l}-l2norm-k`, linDtBuf!, linKD);
+          const l2pK = createUniformBuffer(device, new Uint32Array([kDim, linKD]), `L${l}-l2k-p`);
+          const l2bgK = createBindGroup(device, l2NormPipeline, 0, [
+            { binding: 0, resource: { buffer: linKBuf! } },
+            { binding: 1, resource: { buffer: linConvOutBuf! } },
+            { binding: 2, resource: { buffer: l2pK } },
+          ], `L${l}-l2norm-k`);
+          dispatch(device, l2NormPipeline, [l2bgK], [workgroupCount(kDim, 256)], `L${l}-l2norm-k`);
+          l2pK.destroy();
           const encK = device.createCommandEncoder({ label: `L${l}-l2k-cp` });
           encK.copyBufferToBuffer(linConvOutBuf!, 0, linKBuf!, 0, kDim * 4);
           device.queue.submit([encK.finish()]);
