@@ -86,8 +86,8 @@ def quantize_rtn_int4(weight: torch.Tensor, group_size: int = 128):
 
 def should_quantize(name: str, layer_types: list, num_layers: int) -> bool:
     """Determine if a weight should be quantized (True) or kept BF16 (False)."""
-    # Never quantize embeddings, norms, biases. Skip MTP entirely (not needed for inference)
-    skip_patterns = ['embed_tokens', 'norm', 'bias', 'A_log', 'dt_bias', 'conv1d']
+    # Never quantize norms, biases. Embeddings and lm_head CAN be quantized for VRAM savings.
+    skip_patterns = ['norm', 'bias', 'A_log', 'dt_bias', 'conv1d']
     # MTP (multi-token prediction) layer — skip entirely
     if 'mtp.' in name:
         return False
@@ -99,8 +99,8 @@ def should_quantize(name: str, layer_types: list, num_layers: int) -> bool:
     if 'linear_attn' in name and '.weight' in name:
         return False
 
-    # Quantize: FFN projections + full attention projections + lm_head + mtp
-    quant_patterns = ['gate_proj', 'up_proj', 'down_proj', 'q_proj', 'k_proj', 'v_proj', 'o_proj', 'lm_head']
+    # Quantize: FFN, full attention, lm_head, and embedding
+    quant_patterns = ['gate_proj', 'up_proj', 'down_proj', 'q_proj', 'k_proj', 'v_proj', 'o_proj', 'lm_head', 'embed_tokens']
     for pat in quant_patterns:
         if pat in name and '.weight' in name:
             return True
