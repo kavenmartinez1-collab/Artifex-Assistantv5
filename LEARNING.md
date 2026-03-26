@@ -798,18 +798,19 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
 ✅ GPU device detection and capability reporting
 ✅ Buffer management (create, read, write GPU buffers)
 ✅ Shader compilation pipeline with error logging
-✅ 10 compute kernels (9/9 passing tests):
+✅ 13 compute kernels (13/13 passing tests):
     ✅ SiLU, Add, Multiply (elementwise)
     ✅ Matmul tiled + Matmul B-transposed (for HF weight format)
+    ✅ Matmul B-transposed BF16 (native BF16 weights, no f32 conversion)
     ✅ Softmax
     ✅ RMSNorm
     ✅ RoPE (rotary position embeddings)
     ✅ Attention (fused multi-head with GQA, causal mask, inline softmax)
-    ✅ Embedding lookup
+    ✅ Embedding lookup (f32 and BF16/F16 packed)
     ✅ TurboQuant encode/decode (PolarQuant KV cache compression)
 ✅ Metrics collection (browser → dev server)
 
-✅ SafeTensors parser (BF16/F16/F32 → Float32 conversion)
+✅ SafeTensors parser (BF16/F16/F32 → Float32 conversion, or native BF16 with keepBF16)
 ✅ HuggingFace Hub client (model discovery, shard download)
 ✅ Browser IndexedDB cache (instant reload after first download)
 ✅ Tokenizer via @huggingface/transformers (any HF model)
@@ -825,6 +826,10 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
 ✅ HuggingFace auth token (gated model access, localStorage persistence)
 ✅ GPTQ INT4 weight loader (packed I32 qweight + F16 scales + I32 qzeros)
 ✅ Fused INT4 dequantizing matmul kernel (matmul_bt_q4)
+✅ BF16 native weight path — keepBF16 auto-detection halves VRAM
+   by keeping large BF16 tensors in native format on GPU.
+   dispatchProjection auto-selects f32/BF16/INT4 kernel per weight.
+✅ Qwen3.5-2B coherent output at 6.5 tok/s with 4.18 GB VRAM (BF16)
 
 ✅ TurboQuant KV cache integration — 3-bit (d≥128) or 4-bit (d≤64)
    compressed KV cache. ~80% memory savings. Current token exact,
@@ -838,7 +843,9 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
 
 ### What's remaining
 
-**Qwen3.5-9B coherent output** — The model runs end-to-end through all 32 hybrid layers. All L0 intermediate values match PyTorch within GPTQ tolerance. Output has structure (EOS detection, formatting) but isn't yet coherent English. The Gated DeltaNet SSM contribution is small (~1e-5) relative to FFN output (~0.1). Remaining work: verify full attention layers against PyTorch reference, investigate SSM magnitude at later layers, and dispatch batching for speed (currently 0.6 tok/s due to 480 sequential GPU submissions per token).
+**Qwen3.5-2B coherent output achieved** — Unquantized BF16 model produces coherent English at 6.5 tok/s with 4.18 GB VRAM. Next: improve output quality and test Qwen3.5-9B with the BF16 path.
+
+**Qwen3.5-9B** — INT4 GPTQ path runs end-to-end but SSM recurrence compounds quantization noise. BF16 weight path now working — need to test 9B model with `keepBF16` (would need ~9 GB VRAM at BF16, tight for 8 GB card). Mixed-precision (BF16 for SSM, INT4 for attention/FFN) is the planned solution.
 
 **Key bugs found during Qwen3.5 debugging (all fixed):**
 1. BF16 embedding decoded as F16 (100x wrong)
@@ -848,6 +855,11 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
 5. Delta rule not implemented (was simple outer product)
 6. Beta dimension and sigmoid missing
 7. rope_theta nested in config (1000x wrong)
+
+**Key bugs found during BF16 weight path debugging (all fixed):**
+8. **dtype tracking** — weight-loader.ts stored original SafeTensors dtype even after f32 conversion, causing `isBF16Weight()` to return true for f32 buffers → BF16 matmul dispatched on f32 data
+9. **Embedding BF16 detection** — `embedIsF16` only checked if f32 would exceed 2GB buffer limit, missed the `keepBF16` path where BF16 tensors stay native regardless of size → f32 embed shader read BF16 data as garbage
+10. **LM head tied embeddings** — `lmHeadIsBF16` was gated by `!tieWordEmbeddings`, so when embed_tokens was BF16 and tied as LM head, the f32 matmul was used on BF16 data → garbage logits
 
 **TurboQuant quality notes** — 3-bit works well for d≥128 (larger models like Qwen3.5-9B). For d=64 (small models like Qwen2.5-0.5B), 4-bit is needed. Critical design rule: never quantize the current token's K/V — only compress previously cached tokens.
 

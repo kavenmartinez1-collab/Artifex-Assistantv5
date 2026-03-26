@@ -298,6 +298,7 @@ export async function loadModel(
         || name.endsWith('.scales') || name.endsWith('.g_idx');
 
       let gpuData: ArrayBufferView;
+      let gpuDtype = tensorInfo.dtype; // Track actual format on GPU (may differ from original)
       const f32Size = tensorInfo.elementCount * 4;
       const exceedsBufferLimit = f32Size > 1.9 * 1024 * 1024 * 1024;
 
@@ -312,6 +313,7 @@ export async function loadModel(
         gpuData = tensorToTypedArray(rawData, tensorInfo.dtype);
       } else {
         gpuData = tensorToFloat32(rawData, tensorInfo.dtype);
+        gpuDtype = 'F32';
       }
 
       // Create GPU buffer and upload
@@ -329,7 +331,7 @@ export async function loadModel(
 
       allTensors.set(name, {
         name, buffer: gpuBuffer, shape: tensorInfo.shape,
-        dtype: tensorInfo.dtype, byteLength: gpuData.byteLength,
+        dtype: gpuDtype, byteLength: gpuData.byteLength,
         elementCount: tensorInfo.elementCount, isQuantized: isGPTQ,
       });
 
