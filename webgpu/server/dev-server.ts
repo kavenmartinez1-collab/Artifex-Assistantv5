@@ -98,8 +98,21 @@ const HF_CACHE_DIR = process.env.HF_HOME
   ? path.join(process.env.HF_HOME, 'hub')
   : path.join(process.env.USERPROFILE || process.env.HOME || '', '.cache', 'huggingface', 'hub');
 
-/** Resolve a repo ID to its local cache snapshot directory */
+// Project's local models directory (for custom quantized models)
+const LOCAL_MODELS_DIR = path.resolve(__dirname, '..', '..', 'models');
+
+/** Resolve a repo ID to its local directory (checks project models/ first, then HF cache) */
 function resolveSnapshot(repo: string): string | null {
+  // Check project models/ directory first (e.g., "local/qwen3.5-9b-mixed-GPTQ-Int4")
+  // Convention: "local/<dirname>" maps to models/<dirname>/
+  if (repo.startsWith('local/')) {
+    const dirName = repo.slice(6); // strip "local/"
+    const modelDir = path.join(LOCAL_MODELS_DIR, dirName);
+    if (fs.existsSync(modelDir)) return modelDir;
+    return null;
+  }
+
+  // Check HF cache
   const dirName = `models--${repo.replace(/\//g, '--')}`;
   const refsPath = path.join(HF_CACHE_DIR, dirName, 'refs', 'main');
   try {
@@ -110,23 +123,45 @@ function resolveSnapshot(repo: string): string | null {
   return null;
 }
 
-/** List all locally cached models */
+/** List all locally cached models (HF cache + project models/) */
 app.get('/api/hf-cache/models', (_req, res) => {
   try {
-    const entries = fs.readdirSync(HF_CACHE_DIR).filter(d => d.startsWith('models--'));
-    const models = entries.map(dir => {
-      const repo = dir.replace('models--', '').replace(/--/g, '/');
-      const snap = resolveSnapshot(repo);
-      if (!snap) return null;
-      const files = fs.readdirSync(snap).filter(f => f.endsWith('.safetensors') || f === 'config.json');
-      const totalSize = files.reduce((s, f) => {
-        try { return s + fs.statSync(path.join(snap, f)).size; } catch { return s; }
-      }, 0);
-      return { repo, files, totalSize };
-    }).filter(Boolean);
+    const models: Array<{ repo: string; files: string[]; totalSize: number }> = [];
+
+    // Scan HF cache
+    try {
+      const entries = fs.readdirSync(HF_CACHE_DIR).filter(d => d.startsWith('models--'));
+      for (const dir of entries) {
+        const repo = dir.replace('models--', '').replace(/--/g, '/');
+        const snap = resolveSnapshot(repo);
+        if (!snap) continue;
+        const files = fs.readdirSync(snap).filter(f => f.endsWith('.safetensors') || f === 'config.json');
+        const totalSize = files.reduce((s, f) => {
+          try { return s + fs.statSync(path.join(snap, f)).size; } catch { return s; }
+        }, 0);
+        if (files.length > 0) models.push({ repo, files, totalSize });
+      }
+    } catch {}
+
+    // Scan project models/ directory
+    try {
+      const localEntries = fs.readdirSync(LOCAL_MODELS_DIR);
+      for (const dir of localEntries) {
+        const fullDir = path.join(LOCAL_MODELS_DIR, dir);
+        if (!fs.statSync(fullDir).isDirectory()) continue;
+        // Check for config.json (indicates a model)
+        if (!fs.existsSync(path.join(fullDir, 'config.json'))) continue;
+        const files = fs.readdirSync(fullDir).filter(f => f.endsWith('.safetensors') || f === 'config.json');
+        const totalSize = files.reduce((s, f) => {
+          try { return s + fs.statSync(path.join(fullDir, f)).size; } catch { return s; }
+        }, 0);
+        models.push({ repo: `local/${dir}`, files, totalSize });
+      }
+    } catch {}
+
     res.json(models);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to read HF cache', path: HF_CACHE_DIR });
+    res.status(500).json({ error: 'Failed to read cache', paths: [HF_CACHE_DIR, LOCAL_MODELS_DIR] });
   }
 });
 

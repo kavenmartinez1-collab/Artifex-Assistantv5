@@ -329,13 +329,16 @@ loadBtn.addEventListener('click', async () => {
       'model preview'
     );
 
-    // Decide whether to keep BF16 weights (halves VRAM for unquantized models)
-    // Enable when f32 conversion would exceed ~6 GB (leave room for KV cache + intermediates)
+    // Decide whether to keep BF16 weights native on GPU (halves VRAM)
+    // Enable when: (a) unquantized model too big for f32, OR (b) mixed-precision GPTQ with BF16 tensors
     const isQuantized = preview.dtypes.includes('I32'); // GPTQ models have I32 packed weights
-    const f32Estimate = preview.totalBytes * 2; // BF16→F32 roughly doubles size
+    const hasBF16 = preview.dtypes.includes('BF16') || preview.dtypes.includes('F16');
+    const f32Estimate = preview.totalBytes * 2;
     const VRAM_THRESHOLD = 6 * 1024 * 1024 * 1024; // 6 GB
-    const keepBF16 = !isQuantized && f32Estimate > VRAM_THRESHOLD;
-    console.log(`[Engine] keepBF16=${keepBF16}: f32 would need ${formatBytes(f32Estimate)}, threshold ${formatBytes(VRAM_THRESHOLD)}`);
+    // Mixed-precision: GPTQ model that ALSO has BF16 tensors (e.g., our custom quantization)
+    const isMixedPrecision = isQuantized && hasBF16;
+    const keepBF16 = isMixedPrecision || (!isQuantized && f32Estimate > VRAM_THRESHOLD);
+    console.log(`[Engine] keepBF16=${keepBF16}: isQuantized=${isQuantized}, hasBF16=${hasBF16}, isMixedPrecision=${isMixedPrecision}`);
     if (keepBF16) {
       console.log(`[Engine] Keeping BF16 weights native — halves VRAM usage`);
     }
@@ -376,8 +379,7 @@ loadBtn.addEventListener('click', async () => {
       }
     }, keepBF16, dequantToBF16);
 
-    // Reset to CDN for future loads (if we were using local cache)
-    if (usingLocalCache) resetToRemote();
+    // Note: don't resetToRemote() here — tokenizer still needs local cache
 
     addMessage('system',
       `Weights loaded: ${currentModel.tensorCount} tensors, ${formatBytes(currentModel.totalGPUBytes)} GPU memory\n` +
@@ -413,15 +415,14 @@ loadBtn.addEventListener('click', async () => {
         console.log(`[Engine] Embedding is ${embedTensor!.dtype}, using packed-16 embed shader`);
       }
 
-      const global = {
+      const global: any = {
         embedTokens: getTensor(nameMap.embedTokens),
         embedIsF16,
         finalNorm: getTensor(nameMap.finalNorm),
         lmHead: config.tieWordEmbeddings
           ? getTensor(nameMap.embedTokens)
-          : getTensor(nameMap.lmHead),
+          : (currentModel!.tensors.get(nameMap.lmHead)?.buffer ?? getTensor(nameMap.embedTokens)),
         lmHeadIsBF16: (() => {
-          // Check the actual tensor used for LM head (may be embed_tokens if tied)
           const tensorName = config.tieWordEmbeddings ? nameMap.embedTokens : nameMap.lmHead;
           const t = currentModel!.tensors.get(tensorName);
           const isBF16 = t ? (t.dtype === 'BF16' || t.dtype === 'F16') : false;
@@ -445,6 +446,16 @@ loadBtn.addEventListener('click', async () => {
         if (qw && sc && qz) return { qweight: qw, scales: sc, qzeros: qz };
         return undefined;
       };
+
+      // Check if lm_head is GPTQ INT4 (quantized lm_head saves ~1.4 GB VRAM)
+      if (!config.tieWordEmbeddings) {
+        const lmHeadQ4 = tryGetQ4(nameMap.lmHead);
+        if (lmHeadQ4) {
+          global.lmHeadQ4 = lmHeadQ4;
+          global.lmHeadIsBF16 = false;
+          console.log(`[Engine] LM head is GPTQ INT4, using Q4 matmul`);
+        }
+      }
 
       // Track BF16 weight buffers (for BF16 matmul dispatch)
       const bf16Buffers = new Set<GPUBuffer>();
@@ -617,6 +628,9 @@ loadBtn.addEventListener('click', async () => {
       }
       const engine = createForwardPassEngine(gpu!.device, config, { global, layers, bf16Buffers });
       const tokenizer = await createTokenizer({ modelId: repo });
+
+      // Reset to CDN now that weights + tokenizer are loaded from local cache
+      if (usingLocalCache) resetToRemote();
 
       // Build chat template function
       const { applyChatTemplate } = await import('./model/tokenizer');
