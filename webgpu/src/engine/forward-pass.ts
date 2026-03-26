@@ -109,6 +109,7 @@ export interface GlobalWeights {
   finalNorm: GPUBuffer;    // [hidden_size]
   lmHead: GPUBuffer;       // [vocab_size, hidden_size] or same as embedTokens
   lmHeadIsBF16?: boolean;  // true if lm_head stored as BF16 (large vocab models)
+  lmHeadQ4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };  // GPTQ INT4 lm_head
 }
 
 /** All model weights on the GPU. */
@@ -1126,8 +1127,11 @@ export function createForwardPassEngine(
       batchCopy(normedBuf, lastRowOffset, lastHiddenBuf, 0, H * 4);
       lmInputBuf = lastHiddenBuf;
     }
-    // LM head — use BF16 kernel if weight is stored as BF16 (too large for f32)
-    if (weights.global.lmHeadIsBF16) {
+    // LM head — select kernel based on weight format (BF16, INT4 GPTQ, or f32)
+    if (weights.global.lmHeadQ4 && matmulQ4Pipeline) {
+      // GPTQ INT4 lm_head (saves ~1.4 GB vs BF16)
+      dispatchMatmulQ4(lmInputBuf, weights.global.lmHeadQ4, logitsBuf, 1, V, H, 'lm-head');
+    } else if (weights.global.lmHeadIsBF16) {
       const params = createUniformBuffer(device, new Uint32Array([1, V, H, 0]), 'lm-head-p');
       const bg = createBindGroup(device, matmulBTBF16Pipeline, 0, [
         { binding: 0, resource: { buffer: lmInputBuf } },

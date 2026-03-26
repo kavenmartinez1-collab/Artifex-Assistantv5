@@ -53,7 +53,32 @@ export interface TokenizerConfig {
  * These are small files (~2-5 MB total) and are cached by the browser.
  */
 export async function createTokenizer(config: TokenizerConfig): Promise<Tokenizer> {
-  const { modelId } = config;
+  let { modelId } = config;
+
+  // Local models (local/xxx) can't use HF CDN for tokenizer — fall back to base model
+  // The tokenizer is the same across quantization variants
+  if (modelId.startsWith('local/')) {
+    // Try to find the base model from the tokenizer_config.json served by local cache
+    try {
+      const resp = await fetch(`/api/hf-cache/${modelId}/raw/main/tokenizer_config.json`);
+      if (resp.ok) {
+        const tc = await resp.json();
+        // Use the tokenizer_class to infer the base model family
+        if (tc.chat_template && (tc.eos_token === '<|im_end|>' || tc.model_type?.includes('qwen'))) {
+          modelId = 'Qwen/Qwen3.5-9B'; // Qwen3.5 family shares tokenizers
+          console.log(`[Tokenizer] Local model, using base tokenizer: ${modelId}`);
+        }
+      }
+    } catch {}
+    // If still local/, try a generic fallback based on known patterns
+    if (modelId.startsWith('local/')) {
+      const name = modelId.toLowerCase();
+      if (name.includes('qwen3.5')) modelId = 'Qwen/Qwen3.5-9B';
+      else if (name.includes('qwen3')) modelId = 'Qwen/Qwen3-8B';
+      else if (name.includes('qwen2.5')) modelId = 'Qwen/Qwen2.5-0.5B-Instruct';
+      console.log(`[Tokenizer] Local model fallback, using tokenizer from: ${modelId}`);
+    }
+  }
 
   const hfTokenizer = await AutoTokenizer.from_pretrained(modelId, {
     progress_callback: config.onProgress
