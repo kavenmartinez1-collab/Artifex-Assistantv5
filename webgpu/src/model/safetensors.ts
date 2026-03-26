@@ -255,6 +255,19 @@ function bfloat16ToFloat32(input: Uint16Array): Float32Array {
   return output;
 }
 
+/**
+ * Convert float32 to bfloat16.
+ * BF16 = upper 16 bits of f32 (truncated, not rounded).
+ */
+export function float32ToBFloat16(input: Float32Array): Uint16Array {
+  const output = new Uint16Array(input.length);
+  const view = new DataView(input.buffer, input.byteOffset, input.byteLength);
+  for (let i = 0; i < input.length; i++) {
+    output[i] = view.getUint32(i * 4, true) >>> 16;
+  }
+  return output;
+}
+
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
 /**
