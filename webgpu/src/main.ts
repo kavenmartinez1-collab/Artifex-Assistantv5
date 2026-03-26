@@ -12,7 +12,7 @@ import { runKernelTests } from './engine/kernel-tests';
 import { loadModel, unloadModel, previewModel, formatBytes, getCacheStats, clearCache, type LoadedModel } from './model';
 import { setAuthToken } from './model/hf-hub';
 import { createInferenceSession, type InferenceSession } from './engine/inference';
-import { parseModelConfig, estimateVRAM } from './model/model-config';
+import { parseModelConfig, estimateVRAM, getWeightNameMap, resolveLayerWeightName } from './model/model-config';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -323,6 +323,33 @@ loadBtn.addEventListener('click', async () => {
       console.log(`[Engine] Keeping BF16 weights native — halves VRAM usage`);
     }
 
+    // Mixed-precision GPTQ: dequant linear_attn weights to BF16 for hybrid models
+    // This prevents INT4 quantization noise from compounding in the SSM recurrence
+    const dequantToBF16 = new Set<string>();
+    if (isQuantized) {
+      const previewConfig = parseModelConfig(preview.config);
+      if (previewConfig.isHybrid && previewConfig.layerTypes) {
+        // Add both possible prefixes (multimodal uses model.language_model.*, text-only uses model.*)
+        const projSuffixes = [
+          'linear_attn.in_proj_qkv', 'linear_attn.in_proj_a',
+          'linear_attn.in_proj_b', 'linear_attn.in_proj_z', 'linear_attn.out_proj',
+        ];
+        const prefixes = ['model.language_model.layers', 'model.layers'];
+        for (let l = 0; l < previewConfig.numLayers; l++) {
+          if (previewConfig.layerTypes[l] === 'linear_attention') {
+            for (const prefix of prefixes) {
+              for (const suffix of projSuffixes) {
+                dequantToBF16.add(`${prefix}.${l}.${suffix}`);
+              }
+            }
+          }
+        }
+        if (dequantToBF16.size > 0) {
+          console.log(`[Engine] Mixed-precision GPTQ: ${dequantToBF16.size / 2} linear_attn projections → BF16 (${dequantToBF16.size} name variants)`);
+        }
+      }
+    }
+
     // Full load — download weights and upload to GPU
     currentModel = await loadModel(gpu.device, repo, (p) => {
       progressEl.textContent = p.message;
@@ -330,7 +357,7 @@ loadBtn.addEventListener('click', async () => {
         const pct = Math.round(p.overallProgress * 100);
         setStatus(`Loading ${repo}... ${pct}%`);
       }
-    }, keepBF16);
+    }, keepBF16, dequantToBF16);
 
     addMessage('system',
       `Weights loaded: ${currentModel.tensorCount} tensors, ${formatBytes(currentModel.totalGPUBytes)} GPU memory\n` +

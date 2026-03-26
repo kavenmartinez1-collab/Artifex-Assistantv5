@@ -76,6 +76,8 @@ export async function loadModel(
   onProgress?: ProgressCallback,
   /** Keep BF16 tensors in native format (halves VRAM, uses BF16 matmul kernels) */
   keepBF16 = false,
+  /** GPTQ weight bases to dequant to BF16 (for mixed-precision SSM). E.g., 'model.layers.0.linear_attn.in_proj_qkv' */
+  dequantToBF16?: Set<string>,
 ): Promise<LoadedModel> {
   const startTime = performance.now();
 
@@ -120,6 +122,17 @@ export async function loadModel(
   const allTensors = new Map<string, GPUTensor>();
   let totalGPUBytes = 0;
   let tensorsProcessed = 0;
+
+  // Mixed-precision GPTQ: accumulate raw CPU data for triplets to dequant to BF16
+  const dequantAccum = new Map<string, {
+    qweight?: { data: ArrayBuffer; shape: number[] };
+    scales?: { data: ArrayBuffer; shape: number[] };
+    qzeros?: { data: ArrayBuffer; shape: number[] };
+  }>();
+  const dequantSet = dequantToBF16 ?? new Set<string>();
+  if (dequantSet.size > 0) {
+    console.log(`[WeightLoader] Mixed-precision: ${dequantSet.size} projections will be dequanted to BF16`);
+  }
   let bytesDownloadedTotal = 0;
 
   for (let shardIdx = 0; shardIdx < shards.length; shardIdx++) {
@@ -297,6 +310,59 @@ export async function loadModel(
       const isGPTQ = name.endsWith('.qweight') || name.endsWith('.qzeros')
         || name.endsWith('.scales') || name.endsWith('.g_idx');
 
+      // Mixed-precision: intercept GPTQ triplets that should be dequanted to BF16
+      if (isGPTQ && dequantSet.size > 0) {
+        const suffix = name.endsWith('.qweight') ? '.qweight'
+          : name.endsWith('.scales') ? '.scales'
+          : name.endsWith('.qzeros') ? '.qzeros' : '';
+        if (suffix) {
+          const base = name.slice(0, -suffix.length);
+          if (dequantSet.has(base)) {
+            // Accumulate raw CPU data for this part of the triplet
+            const entry = dequantAccum.get(base) ?? {};
+            const part = suffix.slice(1) as 'qweight' | 'scales' | 'qzeros';
+            entry[part] = { data: rawData.slice(0), shape: tensorInfo.shape };
+            dequantAccum.set(base, entry);
+
+            // Check if triplet is complete
+            if (entry.qweight && entry.scales && entry.qzeros) {
+              // Dequant to BF16 and upload as a regular weight buffer
+              const qw = new Int32Array(entry.qweight.data);
+              const sc = new Uint16Array(entry.scales.data);
+              const qz = new Int32Array(entry.qzeros.data);
+              // GPTQ layout: qweight is [K/8, N], scales is [K/gs, N]
+              const N = entry.qweight.shape[1]; // out_features
+              const K = entry.qweight.shape[0] * 8; // in_features (packed 8 per i32)
+              const gs = config.quantization_config?.group_size ?? 128;
+
+              const bf16Data = dequantGPTQtoBF16(qw, sc, qz, K, N, gs);
+
+              const gpuBuffer = device.createBuffer({
+                size: bf16Data.byteLength,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+                label: `${base}.weight`,
+                mappedAtCreation: true,
+              });
+              new Uint8Array(gpuBuffer.getMappedRange()).set(
+                new Uint8Array(bf16Data.buffer, bf16Data.byteOffset, bf16Data.byteLength)
+              );
+              gpuBuffer.unmap();
+
+              // Store as a regular (non-quantized) BF16 weight
+              allTensors.set(`${base}.weight`, {
+                name: `${base}.weight`, buffer: gpuBuffer, shape: [N, K],
+                dtype: 'BF16', byteLength: bf16Data.byteLength,
+                elementCount: N * K, isQuantized: false,
+              });
+              totalGPUBytes += bf16Data.byteLength;
+              tensorsProcessed++;
+              dequantAccum.delete(base);
+            }
+            continue; // Skip normal GPU upload for this GPTQ tensor
+          }
+        }
+      }
+
       let gpuData: ArrayBufferView;
       let gpuDtype = tensorInfo.dtype; // Track actual format on GPU (may differ from original)
       const f32Size = tensorInfo.elementCount * 4;
@@ -379,46 +445,40 @@ export async function loadModel(
  *
  * @returns Float32Array of shape [N, K] (HF weight format: [out_features, in_features])
  */
-export function dequantGPTQ(
+/** Decode IEEE 754 half-precision (F16) u16 bits to f32 number */
+function f16ToF32(bits: number): number {
+  const sign = (bits >> 15) & 1;
+  const exp = (bits >> 10) & 0x1F;
+  const frac = bits & 0x3FF;
+  if (exp === 0) return frac === 0 ? 0 : (frac / 1024) * Math.pow(2, -14) * (sign ? -1 : 1);
+  if (exp === 31) return sign ? -Infinity : Infinity;
+  return (1 + frac / 1024) * Math.pow(2, exp - 15) * (sign ? -1 : 1);
+}
+
+/**
+ * CPU-side GPTQ dequantization — converts INT4 packed weights to BF16.
+ * Used for mixed-precision: dequant SSM-critical weights to BF16
+ * while keeping attention/FFN weights in INT4 for VRAM savings.
+ *
+ * Output is a Uint16Array of BF16 values in [N, K] row-major order.
+ * When uploaded to GPU and read as array<u32>, pairs of BF16 values
+ * naturally pack into u32 words matching the matmul_bt_bf16 shader layout.
+ *
+ * @returns Uint16Array of shape [N, K] as BF16 values
+ */
+export function dequantGPTQtoBF16(
   qweight: Uint32Array | Int32Array,
   scales: Uint16Array,
   qzeros: Uint32Array | Int32Array,
   K: number,
   N: number,
   groupSize: number,
-): Float32Array {
-  const result = new Float32Array(N * K);
-  const scalesF32 = new Float32Array(scales.length);
+): Uint16Array {
+  const result = new Uint16Array(N * K);
+  // Temp buffer for f32→bf16 conversion (reuse to avoid allocations)
+  const f32Buf = new ArrayBuffer(4);
+  const f32View = new DataView(f32Buf);
 
-  // Convert F16 scales to F32
-  for (let i = 0; i < scales.length; i++) {
-    const bits = scales[i];
-    const buf = new ArrayBuffer(2);
-    new Uint16Array(buf)[0] = bits;
-    scalesF32[i] = new Float64Array(new Float32Array([new DataView(buf).getFloat16(0, true)])).length > 0
-      ? (() => {
-          // Manual F16 decode
-          const sign = (bits >> 15) & 1;
-          const exp = (bits >> 10) & 0x1F;
-          const frac = bits & 0x3FF;
-          if (exp === 0) return frac === 0 ? 0 : (frac / 1024) * Math.pow(2, -14) * (sign ? -1 : 1);
-          if (exp === 31) return sign ? -Infinity : Infinity;
-          return (1 + frac / 1024) * Math.pow(2, exp - 15) * (sign ? -1 : 1);
-        })()
-      : 0;
-  }
-
-  // Manual F16 decode (simpler version)
-  function f16ToF32(bits: number): number {
-    const sign = (bits >> 15) & 1;
-    const exp = (bits >> 10) & 0x1F;
-    const frac = bits & 0x3FF;
-    if (exp === 0) return frac === 0 ? 0 : (frac / 1024) * Math.pow(2, -14) * (sign ? -1 : 1);
-    if (exp === 31) return sign ? -Infinity : Infinity;
-    return (1 + frac / 1024) * Math.pow(2, exp - 15) * (sign ? -1 : 1);
-  }
-
-  const numGroups = Math.ceil(K / groupSize);
   const zerosPerRow = Math.ceil(N / 8);
 
   for (let k = 0; k < K; k++) {
@@ -440,7 +500,48 @@ export function dequantGPTQ(
       const zeroNibble = n % 8;
       const zero = (zeroPacked >> (zeroNibble * 4)) & 0xF;
 
-      // Dequant: (q4 - zero) * scale
+      // Dequant: (q4 - zero) * scale → f32 → bf16
+      const val = (q4 - zero) * scale;
+      f32View.setFloat32(0, val, true);
+      result[n * K + k] = f32View.getUint32(0, true) >>> 16; // BF16 = upper 16 bits
+    }
+  }
+
+  console.log(`[Dequant] GPTQ → BF16: [${N}, ${K}] (${(result.byteLength / 1024 / 1024).toFixed(1)} MB)`);
+  return result;
+}
+
+/**
+ * CPU-side GPTQ dequantization — converts INT4 packed weights to f32.
+ * @returns Float32Array of shape [N, K] (HF weight format: [out_features, in_features])
+ */
+export function dequantGPTQ(
+  qweight: Uint32Array | Int32Array,
+  scales: Uint16Array,
+  qzeros: Uint32Array | Int32Array,
+  K: number,
+  N: number,
+  groupSize: number,
+): Float32Array {
+  const result = new Float32Array(N * K);
+  const zerosPerRow = Math.ceil(N / 8);
+
+  for (let k = 0; k < K; k++) {
+    const group = Math.floor(k / groupSize);
+    const packedRow = Math.floor(k / 8);
+    const nibbleInPacked = k % 8;
+
+    for (let n = 0; n < N; n++) {
+      const packed = qweight[packedRow * N + n];
+      const q4 = (packed >> (nibbleInPacked * 4)) & 0xF;
+
+      const scaleIdx = group * N + n;
+      const scale = f16ToF32(scales[scaleIdx]);
+
+      const zeroPacked = qzeros[group * zerosPerRow + Math.floor(n / 8)];
+      const zeroNibble = n % 8;
+      const zero = (zeroPacked >> (zeroNibble * 4)) & 0xF;
+
       result[n * K + k] = (q4 - zero) * scale;
     }
   }
