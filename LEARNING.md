@@ -829,23 +829,44 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
 ✅ BF16 native weight path — keepBF16 auto-detection halves VRAM
    by keeping large BF16 tensors in native format on GPU.
    dispatchProjection auto-selects f32/BF16/INT4 kernel per weight.
-✅ Qwen3.5-2B coherent output at 6.5 tok/s with 4.18 GB VRAM (BF16)
+✅ Qwen3.5-2B coherent output at 5.2 tok/s with 4.18 GB VRAM (BF16)
 
 ✅ TurboQuant KV cache integration — 3-bit (d≥128) or 4-bit (d≤64)
    compressed KV cache. ~80% memory savings. Current token exact,
    only cached tokens decoded from compressed storage.
-✅ Batch prefill — 512-token chunks with broadcast bias addition
-   ~150 tok/s prefill vs sequential one-by-one
+✅ Batch prefill — 512-token chunks for standard transformers,
+   token-by-token for hybrid models (SSM needs sequential processing)
 ✅ Retry logic with exponential backoff on all HF CDN requests
 ✅ Parallel chunk prefetch with failed-prefetch eviction
 ✅ Auto-detect weight name prefixes (handles model.language_model.*)
+
+✅ Mixed-precision quantization (scripts/quantize_mixed_precision.py)
+   RTN INT4 for FFN/attention, original BF16 for linear_attn (SSM).
+   Pure PyTorch — no external GPTQ library needed. 80s for 9B model.
+✅ INT4 GPTQ embedding lookup shader (embed_q4) — saves ~1.4 GB VRAM
+✅ INT4 GPTQ LM head matmul — saves ~1.4 GB VRAM
+✅ Local HF cache loader — serves SafeTensors from disk via dev server
+   50-100x faster than CDN. Local-first with automatic CDN fallback.
+   Supports both ~/.cache/huggingface/hub/ and project models/ dir.
+✅ Thinking mode — Qwen3.5 <think> reasoning with visible chain display
+✅ Frequency-scaled repetition penalty + n-gram repeat detection
+✅ Qwen3.5-9B running in browser at 2.9 tok/s, 7.22 GB VRAM (8 GB card)
+   Mixed-precision: BF16 SSM + INT4 FFN + INT4 embed/lm_head
+   Correctly answers "What is the capital of France?" → "Paris!"
 ```
 
 ### What's remaining
 
-**Qwen3.5-2B coherent output achieved** — Unquantized BF16 model produces coherent English at 6.5 tok/s with 4.18 GB VRAM. Next: improve output quality and test Qwen3.5-9B with the BF16 path.
+**Qwen3.5-9B mixed-precision running!** — Answers factual questions correctly ("Paris!") at 2.9 tok/s with 7.22 GB VRAM on 8 GB card. Thinking mode shows coherent reasoning chain. Drifts on long responses due to RTN quantization noise in FFN layers.
 
-**Qwen3.5-9B** — INT4 GPTQ path runs end-to-end but SSM recurrence compounds quantization noise. BF16 weight path now working — need to test 9B model with `keepBF16` (would need ~9 GB VRAM at BF16, tight for 8 GB card). Mixed-precision (BF16 for SSM, INT4 for attention/FFN) is the planned solution.
+**Quality improvement needed:**
+- RTN (round-to-nearest) quantization introduces more error than calibrated GPTQ. Long responses drift after ~50 tokens.
+- Fix path: get `gptqmodel` or `auto-gptq` CUDA build working on Windows, or use a pre-made mixed-precision AWQ model like `cyankiwi/Qwen3.5-9B-AWQ-BF16-INT4` (needs AWQ dequant kernel).
+- Alternative: implement calibrated RTN (clip outliers before quantizing, use per-channel statistics).
+
+**Speed optimization:**
+- Prefill is 3 tok/s (token-by-token for hybrid models). Could batch through full attention layers and only go sequential for SSM layers.
+- Decode is 2.9 tok/s — reasonable for 9B on 8 GB. Kernel optimization (larger tile sizes, memory coalescing) could help.
 
 **Key bugs found during Qwen3.5 debugging (all fixed):**
 1. BF16 embedding decoded as F16 (100x wrong)
@@ -860,6 +881,15 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
 8. **dtype tracking** — weight-loader.ts stored original SafeTensors dtype even after f32 conversion, causing `isBF16Weight()` to return true for f32 buffers → BF16 matmul dispatched on f32 data
 9. **Embedding BF16 detection** — `embedIsF16` only checked if f32 would exceed 2GB buffer limit, missed the `keepBF16` path where BF16 tensors stay native regardless of size → f32 embed shader read BF16 data as garbage
 10. **LM head tied embeddings** — `lmHeadIsBF16` was gated by `!tieWordEmbeddings`, so when embed_tokens was BF16 and tied as LM head, the f32 matmul was used on BF16 data → garbage logits
+11. **SSM prefill** — Gated DeltaNet layers used M=1 during multi-token prefill, only processing the first token while residual ops acted on the full sequence. The SSM is recurrent and must process each token sequentially. Fixed: PREFILL_CHUNK=1 for hybrid models.
+12. **Chat template thinking mode** — Qwen3.5 built-in template added empty `<think></think>` blocks when thinking disabled, confusing smaller models. Qwen3.5 REQUIRES `<think>` tag or it immediately EOS. Fixed: explicit ChatML template with `<think>\n` in generation prompt.
+
+**Key insight: INT4 quantization and SSM recurrence:**
+- INT4 GPTQ models that quantize ALL layers (including linear_attn) produce garbage through the SSM because quantization noise compounds through the recurrent hidden state.
+- Dequanting INT4→BF16 does NOT help — the INT4 precision is already baked into the values.
+- The correct approach: keep linear_attn weights at ORIGINAL BF16 precision (never quantized), only quantize FFN/attention layers.
+- RTN (round-to-nearest) quantization is simpler but lower quality than calibrated GPTQ. Calibrated GPTQ minimizes error using Hessian-weighted distribution, producing much less drift.
+- On Windows, `gptqmodel` and `auto-gptq` fail to build CUDA extensions. Our workaround: pure PyTorch RTN quantization script.
 
 **TurboQuant quality notes** — 3-bit works well for d≥128 (larger models like Qwen3.5-9B). For d=64 (small models like Qwen2.5-0.5B), 4-bit is needed. Critical design rule: never quantize the current token's K/V — only compress previously cached tokens.
 
