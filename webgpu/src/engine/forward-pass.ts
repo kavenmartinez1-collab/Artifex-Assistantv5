@@ -115,6 +115,8 @@ export interface GlobalWeights {
 export interface ModelWeights {
   global: GlobalWeights;
   layers: LayerWeights[];
+  /** Set of GPU buffers that store BF16 data (not converted to f32). */
+  bf16Buffers?: Set<GPUBuffer>;
 }
 
 /** Compressed KV cache data (TurboQuant). */
@@ -341,7 +343,10 @@ export function createForwardPassEngine(
     deferDestroy(params);
   }
 
-  /** Dispatch either f32 matmul_bt or INT4 matmul_q4 depending on weight type */
+  // Set of GPU buffers stored as BF16 (need matmul_bt_bf16 kernel)
+  const bf16Set = weights.bf16Buffers ?? new Set<GPUBuffer>();
+
+  /** Dispatch f32 matmul_bt, BF16 matmul_bt_bf16, or INT4 matmul_q4 depending on weight type */
   function dispatchProjection(
     inputBuf: GPUBuffer, lw: LayerWeights, proj: string,
     outputBuf: GPUBuffer, M: number, N: number, K: number, label: string,
@@ -352,7 +357,12 @@ export function createForwardPassEngine(
       dispatchMatmulQ4(inputBuf, q4, outputBuf, M, N, K, label);
     } else {
       const wkey = proj as keyof LayerWeights;
-      dispatchMatmulBT(inputBuf, lw[wkey] as GPUBuffer, outputBuf, M, N, K, label);
+      const wBuf = lw[wkey] as GPUBuffer;
+      if (bf16Set.has(wBuf)) {
+        dispatchMatmulBTBF16(inputBuf, wBuf, outputBuf, M, N, K, label);
+      } else {
+        dispatchMatmulBT(inputBuf, wBuf, outputBuf, M, N, K, label);
+      }
     }
   }
 
@@ -449,6 +459,22 @@ export function createForwardPassEngine(
       { binding: 3, resource: { buffer: params } },
     ], label);
     bd(matmulBTPipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
+    deferDestroy(params);
+  }
+
+  /** C[M,N] = A[M,K] @ B_bf16^T[K,N] where B is stored as BF16 packed [N,K/2] u32 */
+  function dispatchMatmulBTBF16(
+    aBuf: GPUBuffer, bBuf: GPUBuffer, cBuf: GPUBuffer,
+    M: number, N: number, K: number, label: string,
+  ) {
+    const params = createUniformBuffer(device, new Uint32Array([M, N, K, 0]), `${label}-p`);
+    const bg = createBindGroup(device, matmulBTBF16Pipeline, 0, [
+      { binding: 0, resource: { buffer: aBuf } },
+      { binding: 2, resource: { buffer: cBuf } },
+      { binding: 3, resource: { buffer: params } },
+      { binding: 5, resource: { buffer: bBuf } },
+    ], label);
+    bd(matmulBTBF16Pipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
     deferDestroy(params);
   }
 
