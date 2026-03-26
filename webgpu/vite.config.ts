@@ -80,6 +80,8 @@ export default defineConfig({
     proxy: {
       // Proxy metrics to the dev server
       '/metrics': 'http://127.0.0.1:3001',
+      // Proxy local HF cache to the dev server
+      '/api/hf-cache': 'http://127.0.0.1:3001',
       // Proxy Artifex API calls
       '/v1': 'http://127.0.0.1:8000',
     },

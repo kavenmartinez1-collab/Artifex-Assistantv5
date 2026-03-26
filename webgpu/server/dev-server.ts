@@ -90,6 +90,103 @@ app.get('/metrics/recent', (_req, res) => {
   }
 });
 
+// ─── Local HuggingFace Cache ─────────────────────────────────────────────────
+// Serves SafeTensors files from the local HF cache, eliminating CDN downloads.
+// The browser's hf-hub.ts switches its base URL to use these endpoints instead.
+
+const HF_CACHE_DIR = process.env.HF_HOME
+  ? path.join(process.env.HF_HOME, 'hub')
+  : path.join(process.env.USERPROFILE || process.env.HOME || '', '.cache', 'huggingface', 'hub');
+
+/** Resolve a repo ID to its local cache snapshot directory */
+function resolveSnapshot(repo: string): string | null {
+  const dirName = `models--${repo.replace(/\//g, '--')}`;
+  const refsPath = path.join(HF_CACHE_DIR, dirName, 'refs', 'main');
+  try {
+    const hash = fs.readFileSync(refsPath, 'utf-8').trim();
+    const snapDir = path.join(HF_CACHE_DIR, dirName, 'snapshots', hash);
+    if (fs.existsSync(snapDir)) return snapDir;
+  } catch {}
+  return null;
+}
+
+/** List all locally cached models */
+app.get('/api/hf-cache/models', (_req, res) => {
+  try {
+    const entries = fs.readdirSync(HF_CACHE_DIR).filter(d => d.startsWith('models--'));
+    const models = entries.map(dir => {
+      const repo = dir.replace('models--', '').replace(/--/g, '/');
+      const snap = resolveSnapshot(repo);
+      if (!snap) return null;
+      const files = fs.readdirSync(snap).filter(f => f.endsWith('.safetensors') || f === 'config.json');
+      const totalSize = files.reduce((s, f) => {
+        try { return s + fs.statSync(path.join(snap, f)).size; } catch { return s; }
+      }, 0);
+      return { repo, files, totalSize };
+    }).filter(Boolean);
+    res.json(models);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to read HF cache', path: HF_CACHE_DIR });
+  }
+});
+
+/** Emulate HF API tree listing */
+app.get('/api/hf-cache/:org/:model/tree/main', (req, res) => {
+  const repo = `${req.params.org}/${req.params.model}`;
+  const snap = resolveSnapshot(repo);
+  if (!snap) return res.status(404).json({ error: `Model not found in local cache: ${repo}` });
+
+  const files = fs.readdirSync(snap).map(f => {
+    try {
+      const stat = fs.statSync(path.join(snap, f));
+      return { path: f, size: stat.size, type: 'file' as const };
+    } catch { return null; }
+  }).filter(Boolean);
+  res.json(files);
+});
+
+/** Serve files with HTTP Range support (for chunked downloads) */
+app.get('/api/hf-cache/:org/:model/:action(resolve|raw)/main/*', (req, res) => {
+  const repo = `${req.params.org}/${req.params.model}`;
+  const filename = (req.params as any)[0] as string; // wildcard capture after /main/
+  const snap = resolveSnapshot(repo);
+  if (!snap) return res.status(404).json({ error: `Model not found: ${repo}` });
+
+  const filePath = path.join(snap, filename);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: `File not found: ${filename}` });
+
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+
+  // JSON files (config.json, index.json)
+  if (filename.endsWith('.json')) {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Length', fileSize);
+    return fs.createReadStream(filePath).pipe(res);
+  }
+
+  // Binary files with Range support
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Content-Type', 'application/octet-stream');
+
+  const rangeHeader = req.headers.range;
+  if (rangeHeader) {
+    const [startStr, endStr] = rangeHeader.replace('bytes=', '').split('-');
+    const start = parseInt(startStr, 10);
+    const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
+    const chunkSize = end - start + 1;
+
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Content-Length': chunkSize,
+    });
+    fs.createReadStream(filePath, { start, end }).pipe(res);
+  } else {
+    res.setHeader('Content-Length', fileSize);
+    fs.createReadStream(filePath).pipe(res);
+  }
+});
+
 // ─── Start ───────────────────────────────────────────────────────────────────
 
 app.listen(PORT, '127.0.0.1', () => {
