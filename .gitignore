@@ -78,6 +78,12 @@ coverage.xml
 *.tar
 *.tar.gz
 
+# ── Debug output and session notes (personal, not project code) ───
+SESSION-NOTES.md
+debug*.json
+webgpu/debug-output.json
+scripts/reference_output.txt
+
 # ── Runtime / temp files ────────────────────────────────────────────
 *.log
 *.pid
