@@ -292,6 +292,16 @@ loadBtn.addEventListener('click', async () => {
       'model preview'
     );
 
+    // Decide whether to keep BF16 weights (halves VRAM for unquantized models)
+    // Enable when f32 conversion would exceed ~6 GB (leave room for KV cache + intermediates)
+    const isQuantized = preview.dtypes.includes('I32'); // GPTQ models have I32 packed weights
+    const f32Estimate = preview.totalBytes * 2; // BF16→F32 roughly doubles size
+    const VRAM_THRESHOLD = 6 * 1024 * 1024 * 1024; // 6 GB
+    const keepBF16 = false; // TODO: disabled while debugging BF16 matmul — enable after fixing
+    if (keepBF16) {
+      console.log(`[Engine] keepBF16=true: f32 would need ${formatBytes(f32Estimate)}, threshold ${formatBytes(VRAM_THRESHOLD)}`);
+    }
+
     // Full load — download weights and upload to GPU
     currentModel = await loadModel(gpu.device, repo, (p) => {
       progressEl.textContent = p.message;
@@ -299,7 +309,7 @@ loadBtn.addEventListener('click', async () => {
         const pct = Math.round(p.overallProgress * 100);
         setStatus(`Loading ${repo}... ${pct}%`);
       }
-    });
+    }, keepBF16);
 
     addMessage('system',
       `Weights loaded: ${currentModel.tensorCount} tensors, ${formatBytes(currentModel.totalGPUBytes)} GPU memory\n` +
@@ -365,6 +375,32 @@ loadBtn.addEventListener('click', async () => {
         return undefined;
       };
 
+      // Track BF16 weight buffers (for BF16 matmul dispatch)
+      const bf16Buffers = new Set<GPUBuffer>();
+      const isBF16Weight = (name: string): boolean => {
+        const t = currentModel!.tensors.get(name);
+        return t ? (t.dtype === 'BF16' || t.dtype === 'F16') : false;
+      };
+      const trackBF16 = (name: string, buf: GPUBuffer | undefined) => {
+        if (buf && isBF16Weight(name)) bf16Buffers.add(buf);
+      };
+
+      // Helper: CPU-side GPTQ dequant to f32 GPU buffer (for mixed-precision SSM)
+      const { dequantGPTQ } = await import('./model/weight-loader');
+      const dequantToF32Buffer = (weightName: string): GPUBuffer | undefined => {
+        const base = weightName.replace('.weight', '');
+        const qwTensor = currentModel!.tensors.get(`${base}.qweight`);
+        const scTensor = currentModel!.tensors.get(`${base}.scales`);
+        const qzTensor = currentModel!.tensors.get(`${base}.qzeros`);
+        if (!qwTensor || !scTensor || !qzTensor) return undefined;
+
+        // Read raw data from GPU buffers back — we need CPU arrays
+        // Actually, the raw tensor data is in the GPU buffer. We need the original CPU data.
+        // For now, skip CPU dequant — the raw safetensors data isn't easily accessible here.
+        // TODO: implement by keeping raw GPTQ arrays during loading
+        return undefined;
+      };
+
       // Debug: log tensor names at layer 0 (helps diagnose weight mapping issues)
       const l0Keys = [...currentModel!.tensors.keys()].filter(k => k.includes('layers.0.'));
       if (l0Keys.length > 0) console.log(`[Engine] Layer 0: ${l0Keys.length} tensors`);
@@ -374,22 +410,41 @@ loadBtn.addEventListener('click', async () => {
         const isLinearLayer = config.layerTypes?.[l] === 'linear_attention';
 
         // Shared weights (both layer types)
+        const gateName = resolveLayerWeightName(nameMap.layer.gateProj, l);
+        const upName = resolveLayerWeightName(nameMap.layer.upProj, l);
+        const downName = resolveLayerWeightName(nameMap.layer.downProj, l);
         const lw: any = {
           inputNorm: getTensor(resolveLayerWeightName(nameMap.layer.inputNorm, l)),
           postAttnNorm: getTensor(resolveLayerWeightName(nameMap.layer.postAttnNorm, l)),
-          gateProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.gateProj, l)),
-          upProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.upProj, l)),
-          downProj: tryGetTensor(resolveLayerWeightName(nameMap.layer.downProj, l)),
+          gateProj: tryGetTensor(gateName),
+          upProj: tryGetTensor(upName),
+          downProj: tryGetTensor(downName),
         };
+        trackBF16(gateName, lw.gateProj);
+        trackBF16(upName, lw.upProj);
+        trackBF16(downName, lw.downProj);
 
         if (isLinearLayer && nameMap.linearLayer) {
           // ── Linear attention layer weights ──────────────────────────
           const lin = nameMap.linearLayer;
-          lw.linearInProjQKV = tryGetTensor(resolveLayerWeightName(lin.inProjQKV, l));
-          lw.linearInProjA = tryGetTensor(resolveLayerWeightName(lin.inProjA, l));
-          lw.linearInProjB = tryGetTensor(resolveLayerWeightName(lin.inProjB, l));
-          lw.linearInProjZ = tryGetTensor(resolveLayerWeightName(lin.inProjZ, l));
-          lw.linearOutProj = tryGetTensor(resolveLayerWeightName(lin.outProj, l));
+          const linNames = {
+            qkv: resolveLayerWeightName(lin.inProjQKV, l),
+            a: resolveLayerWeightName(lin.inProjA, l),
+            b: resolveLayerWeightName(lin.inProjB, l),
+            z: resolveLayerWeightName(lin.inProjZ, l),
+            out: resolveLayerWeightName(lin.outProj, l),
+          };
+          lw.linearInProjQKV = tryGetTensor(linNames.qkv);
+          lw.linearInProjA = tryGetTensor(linNames.a);
+          lw.linearInProjB = tryGetTensor(linNames.b);
+          lw.linearInProjZ = tryGetTensor(linNames.z);
+          lw.linearOutProj = tryGetTensor(linNames.out);
+          // Track BF16 SSM weights
+          trackBF16(linNames.qkv, lw.linearInProjQKV);
+          trackBF16(linNames.a, lw.linearInProjA);
+          trackBF16(linNames.b, lw.linearInProjB);
+          trackBF16(linNames.z, lw.linearInProjZ);
+          trackBF16(linNames.out, lw.linearOutProj);
 
           // Non-quantized weights (BF16/F16 → f32)
           lw.linearALog = tryGetTensor(resolveLayerWeightName(lin.aLog, l));
@@ -420,10 +475,18 @@ loadBtn.addEventListener('click', async () => {
           }
         } else {
           // ── Standard softmax attention layer weights ────────────────
-          lw.qProj = tryGetTensor(resolveLayerWeightName(nameMap.layer.qProj, l));
-          lw.kProj = tryGetTensor(resolveLayerWeightName(nameMap.layer.kProj, l));
-          lw.vProj = tryGetTensor(resolveLayerWeightName(nameMap.layer.vProj, l));
-          lw.oProj = tryGetTensor(resolveLayerWeightName(nameMap.layer.oProj, l));
+          const qName = resolveLayerWeightName(nameMap.layer.qProj, l);
+          const kName = resolveLayerWeightName(nameMap.layer.kProj, l);
+          const vName = resolveLayerWeightName(nameMap.layer.vProj, l);
+          const oName = resolveLayerWeightName(nameMap.layer.oProj, l);
+          lw.qProj = tryGetTensor(qName);
+          lw.kProj = tryGetTensor(kName);
+          lw.vProj = tryGetTensor(vName);
+          lw.oProj = tryGetTensor(oName);
+          trackBF16(qName, lw.qProj);
+          trackBF16(kName, lw.kProj);
+          trackBF16(vName, lw.vProj);
+          trackBF16(oName, lw.oProj);
 
           // GPTQ for standard attention projections
           if (config.isQuantized) {
@@ -476,7 +539,10 @@ loadBtn.addEventListener('click', async () => {
       }
       if (l0Keys.length > 0) console.log(`[Engine] attentionBias=${config.attentionBias}`);
 
-      const engine = createForwardPassEngine(gpu!.device, config, { global, layers });
+      if (bf16Buffers.size > 0) {
+        console.log(`[Engine] ${bf16Buffers.size} weight buffers kept in BF16 (using BF16 matmul kernel)`);
+      }
+      const engine = createForwardPassEngine(gpu!.device, config, { global, layers, bf16Buffers });
       const tokenizer = await createTokenizer({ modelId: repo });
 
       // Build chat template function

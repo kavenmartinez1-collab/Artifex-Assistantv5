@@ -74,6 +74,8 @@ export async function loadModel(
   device: GPUDevice,
   repo: string,
   onProgress?: ProgressCallback,
+  /** Keep BF16 tensors in native format (halves VRAM, uses BF16 matmul kernels) */
+  keepBF16 = false,
 ): Promise<LoadedModel> {
   const startTime = performance.now();
 
@@ -301,6 +303,10 @@ export async function loadModel(
 
       if (isGPTQ) {
         gpuData = tensorToTypedArray(rawData, tensorInfo.dtype);
+      } else if (keepBF16 && tensorInfo.dtype === 'BF16' && tensorInfo.byteLength > 1024 * 1024) {
+        // Keep large BF16 tensors (projections) in native format — halves VRAM
+        // Small tensors (norms, biases) always convert to f32 for compatibility
+        gpuData = tensorToTypedArray(rawData, tensorInfo.dtype);
       } else if (exceedsBufferLimit && (tensorInfo.dtype === 'F16' || tensorInfo.dtype === 'BF16')) {
         console.log(`[WeightLoader] Keeping ${name} at ${tensorInfo.dtype} (f32 would be ${(f32Size / (1024**3)).toFixed(1)} GB)`);
         gpuData = tensorToTypedArray(rawData, tensorInfo.dtype);
@@ -362,6 +368,83 @@ export async function loadModel(
     tensorCount: tensorsProcessed,
     loadTimeMs,
   };
+}
+
+/**
+ * CPU-side GPTQ dequantization — converts INT4 packed weights back to f32.
+ * Used for mixed-precision: dequant SSM-critical weights to full precision
+ * while keeping attention/FFN weights in INT4 for VRAM savings.
+ *
+ * @returns Float32Array of shape [N, K] (HF weight format: [out_features, in_features])
+ */
+export function dequantGPTQ(
+  qweight: Uint32Array | Int32Array,
+  scales: Uint16Array,
+  qzeros: Uint32Array | Int32Array,
+  K: number,
+  N: number,
+  groupSize: number,
+): Float32Array {
+  const result = new Float32Array(N * K);
+  const scalesF32 = new Float32Array(scales.length);
+
+  // Convert F16 scales to F32
+  for (let i = 0; i < scales.length; i++) {
+    const bits = scales[i];
+    const buf = new ArrayBuffer(2);
+    new Uint16Array(buf)[0] = bits;
+    scalesF32[i] = new Float64Array(new Float32Array([new DataView(buf).getFloat16(0, true)])).length > 0
+      ? (() => {
+          // Manual F16 decode
+          const sign = (bits >> 15) & 1;
+          const exp = (bits >> 10) & 0x1F;
+          const frac = bits & 0x3FF;
+          if (exp === 0) return frac === 0 ? 0 : (frac / 1024) * Math.pow(2, -14) * (sign ? -1 : 1);
+          if (exp === 31) return sign ? -Infinity : Infinity;
+          return (1 + frac / 1024) * Math.pow(2, exp - 15) * (sign ? -1 : 1);
+        })()
+      : 0;
+  }
+
+  // Manual F16 decode (simpler version)
+  function f16ToF32(bits: number): number {
+    const sign = (bits >> 15) & 1;
+    const exp = (bits >> 10) & 0x1F;
+    const frac = bits & 0x3FF;
+    if (exp === 0) return frac === 0 ? 0 : (frac / 1024) * Math.pow(2, -14) * (sign ? -1 : 1);
+    if (exp === 31) return sign ? -Infinity : Infinity;
+    return (1 + frac / 1024) * Math.pow(2, exp - 15) * (sign ? -1 : 1);
+  }
+
+  const numGroups = Math.ceil(K / groupSize);
+  const zerosPerRow = Math.ceil(N / 8);
+
+  for (let k = 0; k < K; k++) {
+    const group = Math.floor(k / groupSize);
+    const packedRow = Math.floor(k / 8);
+    const nibbleInPacked = k % 8;
+
+    for (let n = 0; n < N; n++) {
+      // Extract 4-bit weight
+      const packed = qweight[packedRow * N + n];
+      const q4 = (packed >> (nibbleInPacked * 4)) & 0xF;
+
+      // Get scale (F16 stored as u16)
+      const scaleIdx = group * N + n;
+      const scale = f16ToF32(scales[scaleIdx]);
+
+      // Get zero point (packed INT4)
+      const zeroPacked = qzeros[group * zerosPerRow + Math.floor(n / 8)];
+      const zeroNibble = n % 8;
+      const zero = (zeroPacked >> (zeroNibble * 4)) & 0xF;
+
+      // Dequant: (q4 - zero) * scale
+      result[n * K + k] = (q4 - zero) * scale;
+    }
+  }
+
+  console.log(`[Dequant] GPTQ → f32: [${N}, ${K}] (${(result.byteLength / 1024 / 1024).toFixed(1)} MB)`);
+  return result;
 }
 
 /**
