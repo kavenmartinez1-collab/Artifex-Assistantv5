@@ -160,9 +160,26 @@ export class BatchedDispatcher {
     this.count++;
   }
 
+  /** Add a buffer-to-buffer copy to the batch (no GPU submission yet). */
+  copyBuffer(
+    src: GPUBuffer, srcOffset: number,
+    dst: GPUBuffer, dstOffset: number,
+    size: number,
+  ): void {
+    this.encoder.copyBufferToBuffer(src, srcOffset, dst, dstOffset, size);
+    this.count++;
+  }
+
   /** Submit all batched dispatches to the GPU in a single queue.submit(). */
   flush(): void {
+    if (this.count === 0) return;
     this.device.queue.submit([this.encoder.finish()]);
+  }
+
+  /** Reset the encoder for reuse after a flush (e.g. after debug reads). */
+  reset(label?: string): void {
+    this.encoder = this.device.createCommandEncoder({ label: label ?? 'batched-encoder' });
+    this.count = 0;
   }
 
   /** Submit and wait for all GPU work to complete. Returns elapsed ms. */

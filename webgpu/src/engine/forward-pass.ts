@@ -31,6 +31,7 @@ import {
   createBindGroup,
   dispatch,
   workgroupCount,
+  BatchedDispatcher,
 } from './compute';
 import {
   createStorageBuffer,
@@ -336,8 +337,8 @@ export function createForwardPassEngine(
       { binding: 4, resource: { buffer: q4.scales } },
       { binding: 5, resource: { buffer: q4.qzeros } },
     ], label);
-    dispatch(device, matmulQ4Pipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
-    params.destroy();
+    bd(matmulQ4Pipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
+    deferDestroy(params);
   }
 
   /** Dispatch either f32 matmul_bt or INT4 matmul_q4 depending on weight type */
@@ -365,6 +366,59 @@ export function createForwardPassEngine(
     console.log(`[DEBUG ${label}] first ${n}: [${str}]`);
   }
 
+  // ── Batched dispatch support ─────────────────────────────────────
+  // When currentBatch is set, all dispatches and buffer copies are accumulated
+  // in a single GPUCommandEncoder and submitted together via flushBatch().
+  // This reduces ~900 queue.submit() calls per forward pass to 1.
+  let currentBatch: BatchedDispatcher | null = null;
+  let deferredDestroys: GPUBuffer[] = [];
+
+  /** Dispatch a compute pass — batched if currentBatch is set, else immediate. */
+  function bd(
+    pipeline: GPUComputePipeline, bindGroups: GPUBindGroup[],
+    workgroupCounts: [number, number?, number?], label?: string,
+  ) {
+    if (currentBatch) {
+      currentBatch.dispatch(pipeline, bindGroups, workgroupCounts, label);
+    } else {
+      dispatch(device, pipeline, bindGroups, workgroupCounts, label ?? '');
+    }
+  }
+
+  /** Destroy a buffer — deferred if batching, immediate otherwise. */
+  function deferDestroy(buf: GPUBuffer) {
+    if (currentBatch) {
+      deferredDestroys.push(buf);
+    } else {
+      buf.destroy();
+    }
+  }
+
+  /** Copy buffer — batched if currentBatch is set, else immediate submit. */
+  function batchCopy(
+    src: GPUBuffer, srcOff: number,
+    dst: GPUBuffer, dstOff: number,
+    size: number,
+  ) {
+    if (currentBatch) {
+      currentBatch.copyBuffer(src, srcOff, dst, dstOff, size);
+    } else {
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(src, srcOff, dst, dstOff, size);
+      device.queue.submit([enc.finish()]);
+    }
+  }
+
+  /** Flush current batch, destroy deferred buffers, reset for more work. */
+  function flushBatch() {
+    if (currentBatch) {
+      currentBatch.flush();
+      for (const buf of deferredDestroys) buf.destroy();
+      deferredDestroys = [];
+      currentBatch.reset('forward-cont');
+    }
+  }
+
   // ── Dispatch helpers ───────────────────────────────────────────────
 
   function dispatchMatmul(
@@ -378,9 +432,8 @@ export function createForwardPassEngine(
       { binding: 2, resource: { buffer: cBuf } },
       { binding: 3, resource: { buffer: params } },
     ], label);
-    // Shader: row = wid.x (M dim), col = wid.y (N dim)
-    dispatch(device, matmulPipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
-    params.destroy();
+    bd(matmulPipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
+    deferDestroy(params);
   }
 
   /** C[M,N] = A[M,K] @ B^T[K,N] where B is stored as [N,K] (HF weight format) */
@@ -395,9 +448,8 @@ export function createForwardPassEngine(
       { binding: 2, resource: { buffer: cBuf } },
       { binding: 3, resource: { buffer: params } },
     ], label);
-    // Shader: row = wid.x (M dim), col = wid.y (N dim)
-    dispatch(device, matmulBTPipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
-    params.destroy();
+    bd(matmulBTPipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
+    deferDestroy(params);
   }
 
   // Qwen3_5 uses (1+weight) in RMSNorm — detect from model type
@@ -418,8 +470,8 @@ export function createForwardPassEngine(
       { binding: 2, resource: { buffer: weightBuf } },
       { binding: 3, resource: { buffer: paramBuf } },
     ], label);
-    dispatch(device, rmsnormPipeline, [bg], [rows], label);
-    paramBuf.destroy();
+    bd(rmsnormPipeline, [bg], [rows], label);
+    deferDestroy(paramBuf);
   }
 
   function dispatchElementwise(
@@ -436,8 +488,8 @@ export function createForwardPassEngine(
     ];
     if (secondBuf) entries.push({ binding: 3, resource: { buffer: secondBuf } });
     const bg = createBindGroup(device, pipeline, 0, entries, label);
-    dispatch(device, pipeline, [bg], [workgroupCount(size, 256)], label);
-    params.destroy();
+    bd(pipeline, [bg], [workgroupCount(size, 256)], label);
+    deferDestroy(params);
   }
 
   function dispatchRoPE(
@@ -457,8 +509,6 @@ export function createForwardPassEngine(
     u32View[3] = posOffset;
     f32View[4] = ropeTheta;
     u32View[5] = rd;
-    // MODEL-SPECIFIC: RoPE theta comes from config. NTK/YaRN scaling
-    // would modify the base here based on sequence length.
     const paramBuf = createUniformBuffer(device, new Uint8Array(paramData), `${label}-p`);
 
     const bg = createBindGroup(device, ropePipeline, 0, [
@@ -469,8 +519,8 @@ export function createForwardPassEngine(
     const rotDim = rd > 0 ? rd : hd;
     const halfDim = rotDim / 2;
     const totalPairs = seqLen * numHeads * halfDim;
-    dispatch(device, ropePipeline, [bg], [workgroupCount(totalPairs, 256)], label);
-    paramBuf.destroy();
+    bd(ropePipeline, [bg], [workgroupCount(totalPairs, 256)], label);
+    deferDestroy(paramBuf);
   }
 
   function dispatchAttention(
@@ -478,7 +528,6 @@ export function createForwardPassEngine(
     outputBuf: GPUBuffer, newSeqLen: number, cacheLen: number,
     isCausal: boolean, posOffset: number, label: string,
   ) {
-    // Attention params struct
     const paramData = new ArrayBuffer(32);
     const u32View = new Uint32Array(paramData);
     const f32View = new Float32Array(paramData);
@@ -500,21 +549,17 @@ export function createForwardPassEngine(
       { binding: 4, resource: { buffer: paramBuf } },
     ], label);
 
-    // One workgroup per (query_position, head) pair
-    dispatch(device, attentionPipeline, [bg], [newSeqLen, nHeads], label);
-    paramBuf.destroy();
+    bd(attentionPipeline, [bg], [newSeqLen, nHeads], label);
+    deferDestroy(paramBuf);
   }
 
   function copyToKVCache(
     srcBuf: GPUBuffer, cacheBuf: GPUBuffer,
     seqLen: number, dim: number, position: number,
   ) {
-    // Copy new K or V vectors into the cache at the current position
     const srcBytes = seqLen * dim * 4;
     const dstOffset = position * dim * 4;
-    const encoder = device.createCommandEncoder({ label: 'kv-cache-copy' });
-    encoder.copyBufferToBuffer(srcBuf, 0, cacheBuf, dstOffset, srcBytes);
-    device.queue.submit([encoder.finish()]);
+    batchCopy(srcBuf, 0, cacheBuf, dstOffset, srcBytes);
   }
 
   // ── TurboQuant dispatch helpers ─────────────────────────────────────
@@ -537,8 +582,8 @@ export function createForwardPassEngine(
     const bg2 = createBindGroup(device, tqEncodePipeline, 2, [
       { binding: 0, resource: { buffer: params } },
     ], `${label}-g2`);
-    dispatch(device, tqEncodePipeline, [bg0, tqEncodeMatBG, bg2], [numVecs], label);
-    params.destroy();
+    bd(tqEncodePipeline, [bg0, tqEncodeMatBG, bg2], [numVecs], label);
+    deferDestroy(params);
   }
 
   function dispatchTQDecode(
@@ -558,8 +603,8 @@ export function createForwardPassEngine(
     const bg2 = createBindGroup(device, tqDecodePipeline, 2, [
       { binding: 0, resource: { buffer: params } },
     ], `${label}-g2`);
-    dispatch(device, tqDecodePipeline, [bg0, tqDecodeMatBG, bg2], [numVecs], label);
-    params.destroy();
+    bd(tqDecodePipeline, [bg0, tqDecodeMatBG, bg2], [numVecs], label);
+    deferDestroy(params);
   }
 
   // ── Forward Pass ───────────────────────────────────────────────────
@@ -568,12 +613,18 @@ export function createForwardPassEngine(
     const seqLen = tokenIds.length;
     const pos = kvCache.position;
     const cacheLen = pos + seqLen;
-    const isDebug = false; // disabled for speed — set to `debugCallCount < 2` to re-enable
-    const isDebug2 = debugCallCount === 1; // extra detail on second pass
+    // Check global debug flag — auto-test sets this before each run
+    const isDebug = (globalThis as any).__DEBUG_FORWARD_PASS__ === true && pos === 0;
+    const isDebug2 = false;
+    if (isDebug) (globalThis as any).__DEBUG_FORWARD_PASS__ = false; // one-shot
     debugCallCount++;
 
     // Upload token IDs
     device.queue.writeBuffer(tokenIdBuf, 0, tokenIds.buffer, tokenIds.byteOffset, tokenIds.byteLength);
+
+    // Batch all GPU work into a single submit for speed
+    currentBatch = new BatchedDispatcher(device, 'forward');
+    deferredDestroys = [];
 
     // ── Embedding (f32 or f16 depending on buffer size) ────────────
     const useF16Embed = weights.global.embedIsF16 === true;
@@ -585,10 +636,11 @@ export function createForwardPassEngine(
       { binding: 2, resource: { buffer: weights.global.embedTokens } },
       { binding: 3, resource: { buffer: embedParams } },
     ], 'embed');
-    dispatch(device, embedPipe, [embedBG], [seqLen], 'embed');
-    embedParams.destroy();
+    bd(embedPipe, [embedBG], [seqLen], 'embed');
+    deferDestroy(embedParams);
 
     if (isDebug) {
+      flushBatch();
       await debugRead(hiddenBuf, 'embed-out', 8);
     }
 
@@ -598,9 +650,7 @@ export function createForwardPassEngine(
       const isLinearLayer = config.layerTypes?.[l] === 'linear_attention';
 
       // Save hidden state for residual connection
-      const enc1 = device.createCommandEncoder({ label: `res1-${l}` });
-      enc1.copyBufferToBuffer(hiddenBuf, 0, residualBuf, 0, seqLen * H * 4);
-      device.queue.submit([enc1.finish()]);
+      batchCopy(hiddenBuf, 0, residualBuf, 0, seqLen * H * 4);
 
       // Pre-attention RMSNorm
       dispatchRMSNorm(hiddenBuf, normedBuf, lw.inputNorm, seqLen, `L${l}-norm1`);
@@ -613,6 +663,7 @@ export function createForwardPassEngine(
 
         // Debug: normed input before projections
         if (isDebug && l === 0) {
+          flushBatch();
           await debugRead(normedBuf, 'L0-normed-input', 8);
         }
 
@@ -621,6 +672,7 @@ export function createForwardPassEngine(
 
         // Debug: raw QKV projection output (before conv1d)
         if (isDebug && l === 0) {
+          flushBatch();
           await device.queue.onSubmittedWorkDone();
           // Read first 8 values of Q, K, V sections from the fused QKV buffer
           // Q at [0..2047], K at [2048..4095], V at [4096..8191]
@@ -645,7 +697,7 @@ export function createForwardPassEngine(
             { binding: 3, resource: { buffer: linConvOutBuf! } },
             { binding: 4, resource: { buffer: convParams } },
           ], `L${l}-conv`);
-          dispatch(device, conv1dPipeline, [convBG],
+          bd(conv1dPipeline, [convBG],
             [workgroupCount(linQKVDim, 256)], `L${l}-conv1d`);
 
           // Update conv state (shift + append raw QKV)
@@ -654,9 +706,9 @@ export function createForwardPassEngine(
             { binding: 1, resource: { buffer: csBuf } },
             { binding: 4, resource: { buffer: convParams } },
           ], `L${l}-conv-upd`);
-          dispatch(device, conv1dUpdatePipeline, [updateBG],
+          bd(conv1dUpdatePipeline, [updateBG],
             [workgroupCount(linQKVDim, 256)], `L${l}-conv1d-update`);
-          convParams.destroy();
+          deferDestroy(convParams);
 
           // SiLU on entire conv output (all 8192 channels)
           dispatchElementwise(siluPipeline, linConvOutBuf!, linQKVBuf!, linQKVDim, `L${l}-conv-silu`);
@@ -666,14 +718,13 @@ export function createForwardPassEngine(
         const qSize = linNKH * linKD * 4;
         const kSize = linNKH * linKD * 4;
         const vSize = linNVH * linVD * 4;
-        const encSplit = device.createCommandEncoder({ label: `L${l}-qkv-split` });
-        encSplit.copyBufferToBuffer(linQKVBuf!, 0, linQBuf!, 0, qSize);
-        encSplit.copyBufferToBuffer(linQKVBuf!, qSize, linKBuf!, 0, kSize);
-        encSplit.copyBufferToBuffer(linQKVBuf!, qSize + kSize, linVBuf!, 0, vSize);
-        device.queue.submit([encSplit.finish()]);
+        batchCopy(linQKVBuf!, 0, linQBuf!, 0, qSize);
+        batchCopy(linQKVBuf!, qSize, linKBuf!, 0, kSize);
+        batchCopy(linQKVBuf!, qSize + kSize, linVBuf!, 0, vSize);
 
         // Debug: conv1d output and silu output
         if (isDebug && l === 0) {
+          flushBatch();
           await device.queue.onSubmittedWorkDone();
           const qkvAfterSilu = new Float32Array(await readBuffer(device, linQKVBuf!, (4104) * 4));
           console.log(`[REF] After conv+silu Q[0:8]: [${Array.from(qkvAfterSilu.slice(0, 8)).map(v => v.toFixed(6)).join(', ')}]`);
@@ -692,6 +743,7 @@ export function createForwardPassEngine(
 
         // Debug: A, B, Z projection outputs
         if (isDebug && l === 0) {
+          flushBatch();
           await device.queue.onSubmittedWorkDone();
           const aVals = new Float32Array(await readBuffer(device, linABuf!, 4 * 4));
           const bVals = new Float32Array(await readBuffer(device, linBBuf!, 4 * 4));
@@ -709,9 +761,7 @@ export function createForwardPassEngine(
         // 5. Sigmoid on beta (num_v_heads=32 scalars)
         if (sigmoidPipeline) {
           dispatchElementwise(sigmoidPipeline, linBBuf!, linDtBuf!, linNVH, `L${l}-sigmoid-beta`);
-          const encSig = device.createCommandEncoder({ label: `L${l}-sig-cp` });
-          encSig.copyBufferToBuffer(linDtBuf!, 0, linBBuf!, 0, linNVH * 4);
-          device.queue.submit([encSig.finish()]);
+          batchCopy(linDtBuf!, 0, linBBuf!, 0, linNVH * 4);
         }
 
         // 5c. L2-normalize Q and K (use_qk_l2norm_in_kernel=True in reference)
@@ -726,11 +776,9 @@ export function createForwardPassEngine(
             { binding: 1, resource: { buffer: linConvOutBuf! } },
             { binding: 2, resource: { buffer: l2pQ } },
           ], `L${l}-l2norm-q`);
-          dispatch(device, l2NormPipeline, [l2bgQ], [workgroupCount(qDim, 256)], `L${l}-l2norm-q`);
-          l2pQ.destroy();
-          const encQ = device.createCommandEncoder({ label: `L${l}-l2q-cp` });
-          encQ.copyBufferToBuffer(linConvOutBuf!, 0, linQBuf!, 0, qDim * 4);
-          device.queue.submit([encQ.finish()]);
+          bd(l2NormPipeline, [l2bgQ], [workgroupCount(qDim, 256)], `L${l}-l2norm-q`);
+          deferDestroy(l2pQ);
+          batchCopy(linConvOutBuf!, 0, linQBuf!, 0, qDim * 4);
 
           const l2pK = createUniformBuffer(device, new Uint32Array([kDim, linKD]), `L${l}-l2k-p`);
           const l2bgK = createBindGroup(device, l2NormPipeline, 0, [
@@ -738,11 +786,12 @@ export function createForwardPassEngine(
             { binding: 1, resource: { buffer: linConvOutBuf! } },
             { binding: 2, resource: { buffer: l2pK } },
           ], `L${l}-l2norm-k`);
-          dispatch(device, l2NormPipeline, [l2bgK], [workgroupCount(kDim, 256)], `L${l}-l2norm-k`);
-          l2pK.destroy();
+          bd(l2NormPipeline, [l2bgK], [workgroupCount(kDim, 256)], `L${l}-l2norm-k`);
+          deferDestroy(l2pK);
 
           // Debug: verify L2 norm actually wrote to output
           if (isDebug && l === 0) {
+            flushBatch();
             await device.queue.onSubmittedWorkDone();
             const rawK = await readBuffer(device, linKBuf!, 8 * 4);
             const normK = await readBuffer(device, linConvOutBuf!, 8 * 4);
@@ -750,9 +799,7 @@ export function createForwardPassEngine(
             console.log(`[L2 DEBUG] K output (linConvOutBuf) first 8: [${Array.from(new Float32Array(normK)).map(v => v.toFixed(4)).join(', ')}]`);
           }
 
-          const encK = device.createCommandEncoder({ label: `L${l}-l2k-cp` });
-          encK.copyBufferToBuffer(linConvOutBuf!, 0, linKBuf!, 0, kDim * 4);
-          device.queue.submit([encK.finish()]);
+          batchCopy(linConvOutBuf!, 0, linKBuf!, 0, kDim * 4);
         }
 
         // 6. Decay per VALUE HEAD [32], not per key dim
@@ -766,6 +813,7 @@ export function createForwardPassEngine(
 
         // Debug SSM intermediates (layer 0, first pass)
         if (isDebug && l === 0) {
+          flushBatch();
           await device.queue.onSubmittedWorkDone();
           const betaRaw = await readBuffer(device, linBBuf!, linNKH * 4);
           const beta = new Float32Array(betaRaw);
@@ -807,13 +855,14 @@ export function createForwardPassEngine(
           const ssmBG2 = createBindGroup(device, ssmStepPipeline, 2, [
             { binding: 0, resource: { buffer: ssmParams } },
           ], `L${l}-ssm-g2`);
-          dispatch(device, ssmStepPipeline, [ssmBG0, ssmBG1, ssmBG2],
+          bd(ssmStepPipeline, [ssmBG0, ssmBG1, ssmBG2],
             [linNKH], `L${l}-ssm-step`);
-          ssmParams.destroy();
+          deferDestroy(ssmParams);
         }
 
         // Debug SSM output (layer 0, first pass)
         if (isDebug && l === 0) {
+          flushBatch();
           await device.queue.onSubmittedWorkDone();
           const ssmOutRaw = await readBuffer(device, linOutBuf!, 8 * 4);
           const ssmOut = new Float32Array(ssmOutRaw);
@@ -837,8 +886,8 @@ export function createForwardPassEngine(
             { binding: 3, resource: { buffer: gnParams } },
           ], `L${l}-rms-gated`);
           // Dispatch 32 workgroups — one per value head (each normalizes 128 elements)
-          dispatch(device, rmsnormPipeline, [gnBG], [linNVH], `L${l}-rms-gated`);
-          gnParams.destroy();
+          bd(rmsnormPipeline, [gnBG], [linNVH], `L${l}-rms-gated`);
+          deferDestroy(gnParams);
 
           // Multiply by silu(Z): output = normed * silu(z)
           if (gateSiluPipeline) {
@@ -860,20 +909,16 @@ export function createForwardPassEngine(
           // Project to qBuf (sized 2x), then deinterleave in-place
           dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHead * 2, H, `L${l}-q`);
           // Deinterleave from qBuf → attnOutBuf (Q) + attnGateBuf (gate)
-          const encDeint = device.createCommandEncoder({ label: `L${l}-deinterleave` });
           for (let s = 0; s < seqLen; s++) {
             for (let h = 0; h < nHeads; h++) {
               const srcOffset = (s * nHeads * dHead * 2 + h * dHead * 2) * 4;
               const qDst = (s * nHeads * dHead + h * dHead) * 4;
-              encDeint.copyBufferToBuffer(qBuf, srcOffset, attnOutBuf, qDst, dHead * 4);
-              encDeint.copyBufferToBuffer(qBuf, srcOffset + dHead * 4, attnGateBuf!, qDst, dHead * 4);
+              batchCopy(qBuf, srcOffset, attnOutBuf, qDst, dHead * 4);
+              batchCopy(qBuf, srcOffset + dHead * 4, attnGateBuf!, qDst, dHead * 4);
             }
           }
-          device.queue.submit([encDeint.finish()]);
           // Copy deinterleaved Q from attnOutBuf back to qBuf
-          const encQcp = device.createCommandEncoder({ label: `L${l}-q-deint-cp` });
-          encQcp.copyBufferToBuffer(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHead * 4);
-          device.queue.submit([encQcp.finish()]);
+          batchCopy(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHead * 4);
         } else {
           dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHead, H, `L${l}-q`);
         }
@@ -895,12 +940,9 @@ export function createForwardPassEngine(
             { binding: 2, resource: { buffer: lw.qNorm } },
             { binding: 3, resource: { buffer: qnp } },
           ], `L${l}-qnorm`);
-          dispatch(device, rmsnormPipeline, [qnBG], [seqLen * nHeads], `L${l}-qnorm`);
-          qnp.destroy();
-          // Copy back
-          const encQn = device.createCommandEncoder({ label: `L${l}-qn-cp` });
-          encQn.copyBufferToBuffer(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHead * 4);
-          device.queue.submit([encQn.finish()]);
+          bd(rmsnormPipeline, [qnBG], [seqLen * nHeads], `L${l}-qnorm`);
+          deferDestroy(qnp);
+          batchCopy(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHead * 4);
 
           // K norm
           const knp = createUniformBuffer(device, new Uint8Array(qNormParams), `L${l}-kn-p`);
@@ -911,29 +953,21 @@ export function createForwardPassEngine(
             { binding: 2, resource: { buffer: lw.kNorm } },
             { binding: 3, resource: { buffer: knp } },
           ], `L${l}-knorm`);
-          dispatch(device, rmsnormPipeline, [knBG], [seqLen * nKVHeads], `L${l}-knorm`);
-          knp.destroy();
-          const encKn = device.createCommandEncoder({ label: `L${l}-kn-cp` });
-          encKn.copyBufferToBuffer(ffnTempBuf, 0, kBuf, 0, seqLen * kvDim * 4);
-          device.queue.submit([encKn.finish()]);
+          bd(rmsnormPipeline, [knBG], [seqLen * nKVHeads], `L${l}-knorm`);
+          deferDestroy(knp);
+          batchCopy(ffnTempBuf, 0, kBuf, 0, seqLen * kvDim * 4);
         }
 
         // Add bias if model has attention_bias
         if (config.attentionBias && lw.qBias && lw.kBias && lw.vBias) {
           const qDim = nHeads * dHead;
-          const encQb = device.createCommandEncoder({ label: `L${l}-qb-copy` });
-          encQb.copyBufferToBuffer(qBuf, 0, attnOutBuf, 0, seqLen * qDim * 4);
-          device.queue.submit([encQb.finish()]);
+          batchCopy(qBuf, 0, attnOutBuf, 0, seqLen * qDim * 4);
           dispatchElementwise(addPipeline, attnOutBuf, qBuf, seqLen * qDim, `L${l}-qb`, lw.qBias, qDim);
 
-          const encKb = device.createCommandEncoder({ label: `L${l}-kb-copy` });
-          encKb.copyBufferToBuffer(kBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
-          device.queue.submit([encKb.finish()]);
+          batchCopy(kBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
           dispatchElementwise(addPipeline, ffnTempBuf, kBuf, seqLen * kvDim, `L${l}-kb`, lw.kBias, kvDim);
 
-          const encVb = device.createCommandEncoder({ label: `L${l}-vb-copy` });
-          encVb.copyBufferToBuffer(vBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
-          device.queue.submit([encVb.finish()]);
+          batchCopy(vBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
           dispatchElementwise(addPipeline, ffnTempBuf, vBuf, seqLen * kvDim, `L${l}-vb`, lw.vBias, kvDim);
         }
 
@@ -945,6 +979,7 @@ export function createForwardPassEngine(
         dispatchRoPE(kBuf, seqLen, nKVHeads, pos, `L${l}-rope-k`, undefined, fullAttnRotaryDim);
 
         if (isDebug && l === 0) {
+          flushBatch();
           await debugRead(qBuf, 'L0-Q-after-rope', 8);
           await debugRead(kBuf, 'L0-K-after-rope', 8);
         }
@@ -972,12 +1007,8 @@ export function createForwardPassEngine(
 
           const curOffset = pos * kvDim * 4;
           const curSize = seqLen * kvDim * 4;
-          const encCK = device.createCommandEncoder({ label: `L${l}-tq-cpK` });
-          encCK.copyBufferToBuffer(kBuf, 0, c.scratchK, curOffset, curSize);
-          device.queue.submit([encCK.finish()]);
-          const encCV = device.createCommandEncoder({ label: `L${l}-tq-cpV` });
-          encCV.copyBufferToBuffer(vBuf, 0, c.scratchV, curOffset, curSize);
-          device.queue.submit([encCV.finish()]);
+          batchCopy(kBuf, 0, c.scratchK, curOffset, curSize);
+          batchCopy(vBuf, 0, c.scratchV, curOffset, curSize);
 
           dispatchAttention(
             qBuf, c.scratchK, c.scratchV, attnOutBuf,
@@ -1001,9 +1032,7 @@ export function createForwardPassEngine(
           // sigmoid(gate) → normedBuf
           dispatchElementwise(sigmoidPipeline, attnGateBuf, normedBuf, gateDim, `L${l}-gate-sig`);
           // attn * sigmoid(gate) → attnOutBuf (in-place via copy pattern)
-          const encGateCp = device.createCommandEncoder({ label: `L${l}-gate-cp` });
-          encGateCp.copyBufferToBuffer(attnOutBuf, 0, ffnTempBuf, 0, gateDim * 4);
-          device.queue.submit([encGateCp.finish()]);
+          batchCopy(attnOutBuf, 0, ffnTempBuf, 0, gateDim * 4);
           dispatchElementwise(mulPipeline, ffnTempBuf, attnOutBuf, gateDim, `L${l}-attn-gate`, normedBuf);
         }
 
@@ -1012,9 +1041,7 @@ export function createForwardPassEngine(
 
         // O projection bias
         if (config.attentionBias && lw.oBias) {
-          const encOb = device.createCommandEncoder({ label: `L${l}-ob-copy` });
-          encOb.copyBufferToBuffer(attnProjBuf, 0, normedBuf, 0, seqLen * H * 4);
-          device.queue.submit([encOb.finish()]);
+          batchCopy(attnProjBuf, 0, normedBuf, 0, seqLen * H * 4);
           dispatchElementwise(addPipeline, normedBuf, attnProjBuf, seqLen * H, `L${l}-ob`, lw.oBias, H);
         }
       }
@@ -1023,14 +1050,13 @@ export function createForwardPassEngine(
       dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res1`, attnProjBuf);
 
       if (isDebug && l === 0) {
+        flushBatch();
         await debugRead(attnProjBuf, `L0-attn-proj(pos=${pos})`, 8);
         await debugRead(hiddenBuf, `L0-after-attn-residual(pos=${pos})`, 8);
       }
 
       // Save for second residual
-      const enc2 = device.createCommandEncoder({ label: `res2-${l}` });
-      enc2.copyBufferToBuffer(hiddenBuf, 0, residualBuf, 0, seqLen * H * 4);
-      device.queue.submit([enc2.finish()]);
+      batchCopy(hiddenBuf, 0, residualBuf, 0, seqLen * H * 4);
 
       // Post-attention RMSNorm
       dispatchRMSNorm(hiddenBuf, normedBuf, lw.postAttnNorm, seqLen, `L${l}-norm2`);
@@ -1052,6 +1078,7 @@ export function createForwardPassEngine(
 
       // Dump hidden state after every layer for comparison with PyTorch reference
       if (isDebug) {
+        flushBatch();
         await device.queue.onSubmittedWorkDone();
         const layerOut = new Float32Array(await readBuffer(device, hiddenBuf, 8 * 4));
         console.log(`[LAYER ${l}] output: [${Array.from(layerOut).map(v => v.toFixed(4)).join(', ')}]`);
@@ -1070,9 +1097,7 @@ export function createForwardPassEngine(
     let lmInputBuf = normedBuf;
     if (seqLen > 1) {
       const lastRowOffset = (seqLen - 1) * H * 4;
-      const encLH = device.createCommandEncoder({ label: 'last-hidden-copy' });
-      encLH.copyBufferToBuffer(normedBuf, lastRowOffset, lastHiddenBuf, 0, H * 4);
-      device.queue.submit([encLH.finish()]);
+      batchCopy(normedBuf, lastRowOffset, lastHiddenBuf, 0, H * 4);
       lmInputBuf = lastHiddenBuf;
     }
     // LM head — use BF16 kernel if weight is stored as BF16 (too large for f32)
@@ -1084,10 +1109,18 @@ export function createForwardPassEngine(
         { binding: 3, resource: { buffer: params } },
         { binding: 5, resource: { buffer: lmHeadBuf } },
       ], 'lm-head');
-      dispatch(device, matmulBTBF16Pipeline, [bg], [Math.ceil(1 / 16), Math.ceil(V / 16)], 'lm-head');
-      params.destroy();
+      bd(matmulBTBF16Pipeline, [bg], [Math.ceil(1 / 16), Math.ceil(V / 16)], 'lm-head');
+      deferDestroy(params);
     } else {
       dispatchMatmulBT(lmInputBuf, lmHeadBuf, logitsBuf, 1, V, H, 'lm-head');
+    }
+
+    // Flush batched GPU work (if batching is enabled)
+    if (currentBatch) {
+      currentBatch.flush();
+      for (const buf of deferredDestroys) buf.destroy();
+      deferredDestroys = [];
+      currentBatch = null;
     }
 
     // Update cache position

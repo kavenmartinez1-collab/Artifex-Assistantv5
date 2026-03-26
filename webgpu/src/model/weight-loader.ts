@@ -229,6 +229,8 @@ export async function loadModel(
 
     // ── Step 4: Extract/download tensors and upload to GPU ────────────
 
+    const t_upload_start = performance.now();
+
     progress({ phase: 'uploading',
       message: `Uploading ${header.tensors.size} tensors to GPU...`,
       shard: shardIdx + 1, totalShards: shards.length,
@@ -236,6 +238,11 @@ export async function loadModel(
 
     let tensorIdx = 0;
     for (const [name, tensorInfo] of header.tensors) {
+      // Skip g_idx tensors — unused by our matmul_q4 shader
+      if (name.endsWith('.g_idx')) {
+        tensorIdx++;
+        continue;
+      }
       // Get raw tensor bytes — either from full shard or via chunked range requests
       let rawData: ArrayBuffer;
       if (shardData) {
@@ -323,6 +330,9 @@ export async function loadModel(
       totalGPUBytes += gpuData.byteLength;
       tensorsProcessed++;
     }
+
+    const t_upload_end = performance.now();
+    console.log(`[Perf] Shard ${shardIdx + 1}/${shards.length}: process+upload ${(t_upload_end - t_upload_start).toFixed(0)}ms (${header.tensors.size} tensors)`);
   }
 
   const loadTimeMs = performance.now() - startTime;
