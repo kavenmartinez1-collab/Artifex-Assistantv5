@@ -297,9 +297,10 @@ loadBtn.addEventListener('click', async () => {
     const isQuantized = preview.dtypes.includes('I32'); // GPTQ models have I32 packed weights
     const f32Estimate = preview.totalBytes * 2; // BF16→F32 roughly doubles size
     const VRAM_THRESHOLD = 6 * 1024 * 1024 * 1024; // 6 GB
-    const keepBF16 = false; // TODO: disabled while debugging BF16 matmul — enable after fixing
+    const keepBF16 = !isQuantized && f32Estimate > VRAM_THRESHOLD;
+    console.log(`[Engine] keepBF16=${keepBF16}: f32 would need ${formatBytes(f32Estimate)}, threshold ${formatBytes(VRAM_THRESHOLD)}`);
     if (keepBF16) {
-      console.log(`[Engine] keepBF16=true: f32 would need ${formatBytes(f32Estimate)}, threshold ${formatBytes(VRAM_THRESHOLD)}`);
+      console.log(`[Engine] Keeping BF16 weights native — halves VRAM usage`);
     }
 
     // Full load — download weights and upload to GPU
@@ -336,12 +337,12 @@ loadBtn.addEventListener('click', async () => {
         return t.buffer;
       };
 
-      // Auto-detect if embedding needs F16 (>2GB at f32 hits WebGPU buffer limit)
+      // Auto-detect if embedding is stored as packed 16-bit (BF16/F16)
+      // This happens when: (a) keepBF16=true and tensor is >1MB, or (b) f32 would exceed 2GB buffer limit
       const embedTensor = currentModel!.tensors.get(nameMap.embedTokens);
-      const embedF32Size = embedTensor ? embedTensor.elementCount * 4 : 0;
-      const embedIsF16 = embedF32Size > 1.9 * 1024 * 1024 * 1024; // >1.9 GB → use F16
+      const embedIsF16 = embedTensor ? (embedTensor.dtype === 'BF16' || embedTensor.dtype === 'F16') : false;
       if (embedIsF16) {
-        console.log(`[Engine] Embedding too large for f32 (${(embedF32Size / (1024**3)).toFixed(1)} GB), using F16`);
+        console.log(`[Engine] Embedding is ${embedTensor!.dtype}, using packed-16 embed shader`);
       }
 
       const global = {
@@ -351,10 +352,12 @@ loadBtn.addEventListener('click', async () => {
         lmHead: config.tieWordEmbeddings
           ? getTensor(nameMap.embedTokens)
           : getTensor(nameMap.lmHead),
-        lmHeadIsBF16: !config.tieWordEmbeddings && (() => {
-          const t = currentModel!.tensors.get(nameMap.lmHead);
+        lmHeadIsBF16: (() => {
+          // Check the actual tensor used for LM head (may be embed_tokens if tied)
+          const tensorName = config.tieWordEmbeddings ? nameMap.embedTokens : nameMap.lmHead;
+          const t = currentModel!.tensors.get(tensorName);
           const isBF16 = t ? (t.dtype === 'BF16' || t.dtype === 'F16') : false;
-          if (isBF16) console.log(`[Engine] LM head is ${t!.dtype}, using BF16 matmul`);
+          if (isBF16) console.log(`[Engine] LM head is ${t!.dtype}${config.tieWordEmbeddings ? ' (tied)' : ''}, using BF16 matmul`);
           return isBF16;
         })(),
       };
@@ -541,6 +544,8 @@ loadBtn.addEventListener('click', async () => {
 
       if (bf16Buffers.size > 0) {
         console.log(`[Engine] ${bf16Buffers.size} weight buffers kept in BF16 (using BF16 matmul kernel)`);
+      } else {
+        console.log(`[Engine] All weights in f32 (bf16Buffers empty)`);
       }
       const engine = createForwardPassEngine(gpu!.device, config, { global, layers, bf16Buffers });
       const tokenizer = await createTokenizer({ modelId: repo });

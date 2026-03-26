@@ -72,6 +72,37 @@ function cpuMatmul(a: Float32Array, b: Float32Array, M: number, N: number, K: nu
   return out;
 }
 
+/** C[M,N] = A[M,K] @ B^T where B is stored as [N,K] (row-major, HF weight layout) */
+function cpuMatmulBT(a: Float32Array, b: Float32Array, M: number, N: number, K: number): Float32Array {
+  const out = new Float32Array(M * N);
+  for (let i = 0; i < M; i++) {
+    for (let j = 0; j < N; j++) {
+      let sum = 0;
+      for (let k = 0; k < K; k++) {
+        sum += a[i * K + k] * b[j * K + k];
+      }
+      out[i * N + j] = sum;
+    }
+  }
+  return out;
+}
+
+/** Encode f32 values as BF16 packed into u32 pairs (little-endian: even=low16, odd=high16) */
+function f32ToBF16Packed(values: Float32Array): Uint32Array {
+  if (values.length % 2 !== 0) throw new Error('BF16 packing requires even element count');
+  const packed = new Uint32Array(values.length / 2);
+  const f32View = new DataView(new ArrayBuffer(4));
+  for (let i = 0; i < values.length; i += 2) {
+    // BF16 = upper 16 bits of f32
+    f32View.setFloat32(0, values[i], true);
+    const bf16_even = (f32View.getUint32(0, true) >>> 16) & 0xFFFF;
+    f32View.setFloat32(0, values[i + 1], true);
+    const bf16_odd = (f32View.getUint32(0, true) >>> 16) & 0xFFFF;
+    packed[i / 2] = bf16_even | (bf16_odd << 16);
+  }
+  return packed;
+}
+
 function cpuSoftmax(x: Float32Array, cols: number): Float32Array {
   const rows = x.length / cols;
   const out = new Float32Array(x.length);
@@ -315,6 +346,169 @@ async function testRMSNorm(device: GPUDevice): Promise<TestResult> {
   return { name: 'RMSNorm', passed: close, elapsed_ms: elapsed, maxDiff };
 }
 
+// ─── B-Transposed Matmul Tests ───────────────────────────────────────────────
+
+async function testMatmulBT(device: GPUDevice): Promise<TestResult> {
+  const M = 1, K = 64, N = 32;
+  const a = new Float32Array(M * K);
+  const b = new Float32Array(N * K); // [N, K] layout (B-transposed)
+  for (let i = 0; i < a.length; i++) a[i] = Math.random() * 0.5 - 0.25;
+  for (let i = 0; i < b.length; i++) b[i] = Math.random() * 0.5 - 0.25;
+
+  const expected = cpuMatmulBT(a, b, M, N, K);
+
+  const aBuf = createStorageBuffer(device, a, a.byteLength, 'bt-a');
+  const bBuf = createStorageBuffer(device, b, b.byteLength, 'bt-b');
+  const cBuf = createStorageBuffer(device, null, M * N * 4, 'bt-c', true);
+  const paramsBuf = createUniformBuffer(device, new Uint32Array([M, N, K, 0]), 'bt-params');
+
+  const pipeline = createComputePipeline(device, matmulWGSL, 'matmul_bt', 'test-mm-bt');
+  const bg = createBindGroup(device, pipeline, 0, [
+    { binding: 0, resource: { buffer: aBuf } },
+    { binding: 1, resource: { buffer: bBuf } },
+    { binding: 2, resource: { buffer: cBuf } },
+    { binding: 3, resource: { buffer: paramsBuf } },
+  ]);
+
+  const TILE = 16;
+  const elapsed = await dispatchAndWait(device, pipeline, [bg],
+    [Math.ceil(M / TILE), Math.ceil(N / TILE)], 'mm-bt');
+  const result = new Float32Array(await readBuffer(device, cBuf));
+  const { close, maxDiff } = arrClose(result, expected, 1e-3);
+
+  aBuf.destroy(); bBuf.destroy(); cBuf.destroy(); paramsBuf.destroy();
+  return { name: 'Matmul BT (f32)', passed: close, elapsed_ms: elapsed, maxDiff };
+}
+
+async function testMatmulBTBF16Small(device: GPUDevice): Promise<TestResult> {
+  // Small test: M=1, N=4, K=8 (single tile, verifies BF16 decode + accumulation)
+  const M = 1, K = 8, N = 4;
+  const a = new Float32Array(M * K);
+  const bF32 = new Float32Array(N * K); // [N, K] layout
+  for (let i = 0; i < a.length; i++) a[i] = (i + 1) * 0.1; // [0.1, 0.2, ..., 0.8]
+  for (let i = 0; i < bF32.length; i++) bF32[i] = ((i % K) + 1) * 0.25; // repeating pattern
+
+  const expected = cpuMatmulBT(a, bF32, M, N, K);
+  const bPacked = f32ToBF16Packed(bF32); // [N * K / 2] u32 values
+
+  // Pre-fill output with sentinel (99.0) to distinguish "writes zeros" from "doesn't write"
+  const sentinel = new Float32Array(M * N).fill(99.0);
+  const aBuf = createStorageBuffer(device, a, a.byteLength, 'bf16s-a');
+  const bBuf = createStorageBuffer(device, bPacked, bPacked.byteLength, 'bf16s-b');
+  const cBuf = createStorageBuffer(device, sentinel, M * N * 4, 'bf16s-c', true);
+  const paramsBuf = createUniformBuffer(device, new Uint32Array([M, N, K, 0]), 'bf16s-params');
+
+  const pipeline = createComputePipeline(device, matmulWGSL, 'matmul_bt_bf16', 'test-mm-bt-bf16-s');
+  const bg = createBindGroup(device, pipeline, 0, [
+    { binding: 0, resource: { buffer: aBuf } },
+    { binding: 2, resource: { buffer: cBuf } },
+    { binding: 3, resource: { buffer: paramsBuf } },
+    { binding: 5, resource: { buffer: bBuf } },
+  ]);
+
+  const TILE = 16;
+  const elapsed = await dispatchAndWait(device, pipeline, [bg],
+    [Math.ceil(M / TILE), Math.ceil(N / TILE)], 'mm-bt-bf16-s');
+  const result = new Float32Array(await readBuffer(device, cBuf));
+  // BF16 truncates mantissa so allow slightly larger tolerance
+  const { close, maxDiff } = arrClose(result, expected, 5e-3);
+
+  if (!close) {
+    const allSentinel = Array.from(result).every(v => v === 99.0);
+    const allZero = Array.from(result).every(v => v === 0.0);
+    console.log(`[BF16 small] expected: [${Array.from(expected).map(v => v.toFixed(4)).join(', ')}]`);
+    console.log(`[BF16 small] got:      [${Array.from(result).map(v => v.toFixed(4)).join(', ')}]`);
+    console.log(`[BF16 small] sentinel=${allSentinel} (kernel never wrote), allZero=${allZero} (kernel wrote zeros)`);
+    console.log(`[BF16 small] A: [${Array.from(a).map(v => v.toFixed(4)).join(', ')}]`);
+    console.log(`[BF16 small] B packed u32: [${Array.from(bPacked).map(v => '0x' + v.toString(16).padStart(8, '0')).join(', ')}]`);
+  }
+
+  aBuf.destroy(); bBuf.destroy(); cBuf.destroy(); paramsBuf.destroy();
+  return { name: 'Matmul BT BF16 (small)', passed: close, elapsed_ms: elapsed, maxDiff };
+}
+
+async function testMatmulBTBF16Large(device: GPUDevice): Promise<TestResult> {
+  // Larger test: M=1, N=64, K=128 — multiple tiles, realistic projection sizes
+  const M = 1, K = 128, N = 64;
+  const a = new Float32Array(M * K);
+  const bF32 = new Float32Array(N * K);
+  for (let i = 0; i < a.length; i++) a[i] = Math.random() * 0.5 - 0.25;
+  for (let i = 0; i < bF32.length; i++) bF32[i] = Math.random() * 0.5 - 0.25;
+
+  const expected = cpuMatmulBT(a, bF32, M, N, K);
+  const bPacked = f32ToBF16Packed(bF32);
+
+  const aBuf = createStorageBuffer(device, a, a.byteLength, 'bf16l-a');
+  const bBuf = createStorageBuffer(device, bPacked, bPacked.byteLength, 'bf16l-b');
+  const cBuf = createStorageBuffer(device, null, M * N * 4, 'bf16l-c', true);
+  const paramsBuf = createUniformBuffer(device, new Uint32Array([M, N, K, 0]), 'bf16l-params');
+
+  const pipeline = createComputePipeline(device, matmulWGSL, 'matmul_bt_bf16', 'test-mm-bt-bf16-l');
+  const bg = createBindGroup(device, pipeline, 0, [
+    { binding: 0, resource: { buffer: aBuf } },
+    { binding: 2, resource: { buffer: cBuf } },
+    { binding: 3, resource: { buffer: paramsBuf } },
+    { binding: 5, resource: { buffer: bBuf } },
+  ]);
+
+  const TILE = 16;
+  const elapsed = await dispatchAndWait(device, pipeline, [bg],
+    [Math.ceil(M / TILE), Math.ceil(N / TILE)], 'mm-bt-bf16-l');
+  const result = new Float32Array(await readBuffer(device, cBuf));
+  const { close, maxDiff } = arrClose(result, expected, 5e-3);
+
+  if (!close) {
+    console.log(`[BF16 large] expected first 8: [${Array.from(expected.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+    console.log(`[BF16 large] got first 8:      [${Array.from(result.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+  }
+
+  aBuf.destroy(); bBuf.destroy(); cBuf.destroy(); paramsBuf.destroy();
+  return { name: 'Matmul BT BF16 (large)', passed: close, elapsed_ms: elapsed, maxDiff };
+}
+
+async function testMatmulBTBF16RealDims(device: GPUDevice): Promise<TestResult> {
+  // Real model dimensions: M=1, K=2048 (hidden_size), N=5632 (intermediate_size)
+  const M = 1, K = 2048, N = 256; // Use N=256 (not 5632) to avoid huge buffers in test
+  const a = new Float32Array(M * K);
+  const bF32 = new Float32Array(N * K);
+  for (let i = 0; i < a.length; i++) a[i] = (Math.random() - 0.5) * 0.1;
+  for (let i = 0; i < bF32.length; i++) bF32[i] = (Math.random() - 0.5) * 0.1;
+
+  const expected = cpuMatmulBT(a, bF32, M, N, K);
+  const bPacked = f32ToBF16Packed(bF32);
+
+  const sentinel = new Float32Array(M * N).fill(99.0);
+  const aBuf = createStorageBuffer(device, a, a.byteLength, 'bf16r-a');
+  const bBuf = createStorageBuffer(device, bPacked, bPacked.byteLength, 'bf16r-b');
+  const cBuf = createStorageBuffer(device, sentinel, M * N * 4, 'bf16r-c', true);
+  const paramsBuf = createUniformBuffer(device, new Uint32Array([M, N, K, 0]), 'bf16r-params');
+
+  const pipeline = createComputePipeline(device, matmulWGSL, 'matmul_bt_bf16', 'test-mm-bt-bf16-r');
+  const bg = createBindGroup(device, pipeline, 0, [
+    { binding: 0, resource: { buffer: aBuf } },
+    { binding: 2, resource: { buffer: cBuf } },
+    { binding: 3, resource: { buffer: paramsBuf } },
+    { binding: 5, resource: { buffer: bBuf } },
+  ]);
+
+  const TILE = 16;
+  const elapsed = await dispatchAndWait(device, pipeline, [bg],
+    [Math.ceil(M / TILE), Math.ceil(N / TILE)], 'mm-bt-bf16-r');
+  const result = new Float32Array(await readBuffer(device, cBuf));
+  const { close, maxDiff } = arrClose(result, expected, 0.02); // BF16 + K=2048 accumulation
+
+  if (!close) {
+    const allSentinel = Array.from(result.slice(0, 8)).every(v => v === 99.0);
+    const allZero = Array.from(result.slice(0, 8)).every(v => v === 0.0);
+    console.log(`[BF16 real] expected[0:8]: [${Array.from(expected.slice(0, 8)).map(v => v.toFixed(6)).join(', ')}]`);
+    console.log(`[BF16 real] got[0:8]:      [${Array.from(result.slice(0, 8)).map(v => v.toFixed(6)).join(', ')}]`);
+    console.log(`[BF16 real] sentinel=${allSentinel}, allZero=${allZero}, M=${M} N=${N} K=${K}`);
+  }
+
+  aBuf.destroy(); bBuf.destroy(); cBuf.destroy(); paramsBuf.destroy();
+  return { name: 'Matmul BT BF16 (K=2048)', passed: close, elapsed_ms: elapsed, maxDiff };
+}
+
 // ─── TurboQuant Round-trip Test ──────────────────────────────────────────────
 
 async function testTurboQuant3bit(device: GPUDevice): Promise<TestResult> {
@@ -431,6 +625,10 @@ export async function runKernelTests(device: GPUDevice): Promise<TestResult[]> {
     { name: 'Multiply', fn: testMul },
     { name: 'Matmul (naive)', fn: testMatmulNaive },
     { name: 'Matmul (tiled)', fn: testMatmulTiled },
+    { name: 'Matmul BT (f32)', fn: testMatmulBT },
+    { name: 'Matmul BT BF16 (small)', fn: testMatmulBTBF16Small },
+    { name: 'Matmul BT BF16 (large)', fn: testMatmulBTBF16Large },
+    { name: 'Matmul BT BF16 (K=2048)', fn: testMatmulBTBF16RealDims },
     { name: 'Softmax', fn: testSoftmax },
     { name: 'RMSNorm', fn: testRMSNorm },
     { name: 'TurboQuant (3-bit)', fn: testTurboQuant3bit },

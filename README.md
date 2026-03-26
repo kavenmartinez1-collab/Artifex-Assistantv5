@@ -761,7 +761,7 @@ npm run server    # Metrics server only
 
 - **GPU initialization** — WebGPU device/adapter detection, buffer negotiation up to 2GB
 - **WGSL compute kernels**:
-  - `matmul.wgsl` — tiled 16x16 matrix multiplication with shared memory + `matmul_bt` for HuggingFace weight format (B-transposed)
+  - `matmul.wgsl` — tiled 16x16 matrix multiplication with shared memory + `matmul_bt` (B-transposed) + `matmul_bt_bf16` (BF16 native weights)
   - `attention.wgsl` — fused multi-head attention with GQA, causal masking, inline softmax
   - `rmsnorm.wgsl` — RMS layer normalization
   - `rope.wgsl` — rotary positional embeddings
@@ -771,7 +771,7 @@ npm run server    # Metrics server only
   - `turboquant_encode.wgsl` / `turboquant_decode.wgsl` — TurboQuant KV cache compression (Google, ICLR 2026)
   - `matmul_q4.wgsl` — fused INT4 GPTQ dequantization matmul (unpacks 4-bit nibbles, applies group scales/zeros on the fly)
 - **Buffer management** — typed GPU buffer creation, read/write operations
-- **Kernel test suite** — correctness validation against CPU reference values
+- **Kernel test suite** — 13 correctness tests against CPU reference values (elementwise, matmul, BF16 matmul, softmax, RMSNorm, TurboQuant)
 - **Metrics collection** — browser-to-server event reporting with JSON logging
 - **Dev server** — Express metrics endpoint with color-coded console output
 
@@ -784,7 +784,7 @@ Phases 0-6 complete plus Gated DeltaNet/Mamba-2 hybrid support, TurboQuant KV ca
 - **TurboQuant KV cache** — 3-bit (d≥128) or 4-bit (d≤64) compressed KV cache saving ~80% memory for standard attention layers. Current token K/V is always exact; only cached tokens compressed.
 - **Batch prefill** — 512-token chunks with broadcast bias support
 - **GPTQ INT4** — weight loader and fused `matmul_bt_q4` kernel for quantized models up to 9B parameters on 8GB VRAM
-- **BF16 support** — BF16 embedding lookup and BF16 LM head matmul for large-vocab models (>2GB at f32)
+- **BF16 native weights** — `keepBF16` auto-detection keeps large BF16 tensors in native format on GPU, halving VRAM usage. Auto-selects between f32/BF16/INT4 matmul kernels per projection. BF16 embedding lookup and BF16 LM head matmul (including tied-embedding models).
 - **Resilient downloads** — exponential backoff retry, parallel chunk prefetch, per-chunk browser caching for 7GB+ models
 - **Auto-detect weight names** — discovers tensor name prefixes (handles `model.language_model.*` for multimodal architectures)
 - **Model-specific RMSNorm** — auto-detects `(1 + weight)` vs `weight` convention per model family
@@ -793,6 +793,7 @@ Phases 0-6 complete plus Gated DeltaNet/Mamba-2 hybrid support, TurboQuant KV ca
 
 Any HuggingFace model with a standard transformer decoder architecture works. Hybrid Mamba-2 models (Qwen3.5) have experimental support. Weight name prefixes are auto-detected. Tested:
 - **Qwen2.5-0.5B-Instruct** — 24 layers, 896 hidden, GQA 14Q/2KV. Generates coherent English at ~20 tok/s (f32) / ~10 tok/s (TurboQuant 4-bit KV).
+- **Qwen3.5-2B** (`Qwen/Qwen3.5-2B`) — 24 layers (18 Gated DeltaNet + 6 full attention), 2048 hidden, GQA 8Q/2KV. **Coherent English at 6.5 tok/s** with native BF16 weights (4.18 GB VRAM vs 8.47 GB at f32). Uses `keepBF16` to halve memory — auto-selects BF16 matmul for 150 projection weights, BF16 embedding lookup, and BF16 LM head (tied).
 - **Qwen3.5-9B-GPTQ-INT4** (`mssfj/Qwen3.5-9B-GPTQ-INT4`) — 32 layers (24 Gated DeltaNet + 8 full attention), 4096 hidden, 7.07 GB INT4 weights. Runs end-to-end at 19 tok/s prefill / 0.6 tok/s decode. All L0 intermediate values match PyTorch reference. Structured output, approaching coherence. SSM math being refined.
 - **SmolLM2-135M-Instruct** — 30 layers, 576 hidden, GQA 9Q/3KV.
 - **SmolLM2-360M-Instruct** — 32 layers, 960 hidden, GQA 15Q/5KV.
