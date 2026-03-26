@@ -49,8 +49,22 @@ export interface DownloadProgress {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const HF_BASE = 'https://huggingface.co';
-const HF_API = 'https://huggingface.co/api/models';
+let HF_BASE = 'https://huggingface.co';
+let HF_API = 'https://huggingface.co/api/models';
+
+/** Switch to local HF cache served by the dev server (50-100x faster than CDN) */
+export function useLocalCache(devServerBase = '/api/hf-cache'): void {
+  HF_BASE = devServerBase;
+  HF_API = devServerBase;
+  console.log(`[HF Hub] Using local cache: ${devServerBase}`);
+}
+
+/** Switch back to HuggingFace CDN */
+export function resetToRemote(): void {
+  HF_BASE = 'https://huggingface.co';
+  HF_API = 'https://huggingface.co/api/models';
+  console.log(`[HF Hub] Using remote CDN`);
+}
 
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000; // 1s, 2s, 4s exponential backoff

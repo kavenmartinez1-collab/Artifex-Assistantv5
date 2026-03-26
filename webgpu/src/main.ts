@@ -10,7 +10,7 @@ import { initWebGPU, type GPUContext } from './engine/gpu-device';
 import { reportMetric, reportError, timed } from './utils/metrics';
 import { runKernelTests } from './engine/kernel-tests';
 import { loadModel, unloadModel, previewModel, formatBytes, getCacheStats, clearCache, type LoadedModel } from './model';
-import { setAuthToken } from './model/hf-hub';
+import { setAuthToken, useLocalCache, resetToRemote } from './model/hf-hub';
 import { createInferenceSession, type InferenceSession } from './engine/inference';
 import { parseModelConfig, estimateVRAM, getWeightNameMap, resolveLayerWeightName } from './model/model-config';
 
@@ -295,8 +295,25 @@ loadBtn.addEventListener('click', async () => {
   setStatus(`Loading ${repo}...`);
 
   try {
+    // Check if model is available in local HF cache (50-100x faster than CDN)
+    let usingLocalCache = false;
+    try {
+      const cacheResp = await fetch('/api/hf-cache/models');
+      if (cacheResp.ok) {
+        const cached = await cacheResp.json() as Array<{ repo: string }>;
+        if (cached.some(m => m.repo === repo)) {
+          useLocalCache();
+          usingLocalCache = true;
+          addMessage('system', `Loading ${repo} from local HF cache (fast)...`);
+        }
+      }
+    } catch { /* dev server not running, use CDN */ }
+
+    if (!usingLocalCache) {
+      addMessage('system', `Connecting to HuggingFace: ${repo}...`);
+    }
+
     // Preview first (just headers, fast)
-    addMessage('system', `Connecting to HuggingFace: ${repo}...`);
 
     const preview = await previewModel(repo, (p) => {
       progressEl.textContent = p.message;
@@ -359,9 +376,13 @@ loadBtn.addEventListener('click', async () => {
       }
     }, keepBF16, dequantToBF16);
 
+    // Reset to CDN for future loads (if we were using local cache)
+    if (usingLocalCache) resetToRemote();
+
     addMessage('system',
       `Weights loaded: ${currentModel.tensorCount} tensors, ${formatBytes(currentModel.totalGPUBytes)} GPU memory\n` +
-      `Load time: ${(currentModel.loadTimeMs / 1000).toFixed(1)}s`,
+      `Load time: ${(currentModel.loadTimeMs / 1000).toFixed(1)}s` +
+      (usingLocalCache ? ' (from local cache)' : ''),
       'weights loaded'
     );
 
