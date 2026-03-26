@@ -71,6 +71,24 @@ export interface GenerationHandle {
  * This runs on the CPU after reading logits back from the GPU.
  * For a 150K vocabulary, this takes < 1ms — not a bottleneck.
  */
+/** Detect if the last N tokens form a repeating n-gram pattern */
+function detectRepetition(ids: number[], ngramSize = 3, minRepeats = 3): boolean {
+  if (ids.length < ngramSize * minRepeats) return false;
+  // Check if the last ngramSize tokens have appeared minRepeats times consecutively
+  const tail = ids.slice(-ngramSize);
+  let repeats = 0;
+  for (let i = ids.length - ngramSize; i >= 0; i -= ngramSize) {
+    const chunk = ids.slice(i, i + ngramSize);
+    if (chunk.length === ngramSize && chunk.every((v, j) => v === tail[j])) {
+      repeats++;
+      if (repeats >= minRepeats) return true;
+    } else {
+      break;
+    }
+  }
+  return false;
+}
+
 function sampleFromLogits(
   logits: Float32Array,
   config: Required<SamplingConfig>,
@@ -78,15 +96,18 @@ function sampleFromLogits(
 ): number {
   const vocabSize = logits.length;
 
-  // Apply repetition penalty
+  // Apply repetition penalty — frequency-scaled (stronger for tokens seen more often)
   if (config.repetitionPenalty !== 1.0) {
-    const seen = new Set(generatedIds);
-    for (const id of seen) {
+    const freq = new Map<number, number>();
+    for (const id of generatedIds) freq.set(id, (freq.get(id) ?? 0) + 1);
+    for (const [id, count] of freq) {
       if (id < vocabSize) {
+        // Scale penalty with frequency: penalty^(1 + log2(count))
+        const scaledPenalty = Math.pow(config.repetitionPenalty, 1 + Math.log2(count));
         if (logits[id] > 0) {
-          logits[id] /= config.repetitionPenalty;
+          logits[id] /= scaledPenalty;
         } else {
-          logits[id] *= config.repetitionPenalty;
+          logits[id] *= scaledPenalty;
         }
       }
     }
@@ -319,6 +340,13 @@ export function generate(
       if (onToken) {
         const tokenText = tokenizer.decode([nextId]);
         onToken(tokenText, nextId, step);
+      }
+
+      // Stop if stuck in a repeating loop (saves wasted tokens)
+      if (detectRepetition(generatedIds, 3, 4) || detectRepetition(generatedIds, 2, 6)) {
+        stopReason = 'eos';
+        console.log(`[Generate] Stopping: repetition detected at step ${step}`);
+        break;
       }
       }
     } // end if !eos from first token
