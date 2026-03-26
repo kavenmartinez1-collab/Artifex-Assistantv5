@@ -300,8 +300,9 @@ loadBtn.addEventListener('click', async () => {
     try {
       const cacheResp = await fetch('/api/hf-cache/models');
       if (cacheResp.ok) {
-        const cached = await cacheResp.json() as Array<{ repo: string }>;
-        if (cached.some(m => m.repo === repo)) {
+        const cached = await cacheResp.json() as Array<{ repo: string; files: string[] }>;
+        const localModel = cached.find(m => m.repo === repo);
+        if (localModel) {
           useLocalCache();
           usingLocalCache = true;
           addMessage('system', `Loading ${repo} from local HF cache (fast)...`);
