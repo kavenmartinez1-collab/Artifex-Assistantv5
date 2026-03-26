@@ -206,10 +206,23 @@ sendBtn.addEventListener('click', async () => {
 
     // /raw prefix: skip chat template, use raw text completion (for debugging)
     const isRaw = text.startsWith('/raw ');
-    const sampling = { temperature, topP, maxNewTokens, useCompressedKV, repetitionPenalty: 1.15 };
+    const sampling = { temperature, topP, maxNewTokens, useCompressedKV, repetitionPenalty: 1.5 };
+    let thinkingDone = false;
     const onToken = (token: string) => {
       fullText += token;
-      responseDiv.textContent = fullText;
+
+      // Show thinking content dimmed, final answer bold
+      if (fullText.includes('</think>')) {
+        thinkingDone = true;
+        const parts = fullText.split('</think>');
+        const thinking = parts[0].replace('<think>', '').trim();
+        const answer = parts.slice(1).join('</think>').trimStart();
+        responseDiv.innerHTML = (thinking ? `<span style="opacity:0.4;font-size:0.85em">${thinking}</span><br><br>` : '') + answer;
+      } else {
+        // Still thinking — show content with dim styling
+        const thinking = fullText.replace('<think>', '').trim();
+        responseDiv.innerHTML = `<span style="opacity:0.4;font-size:0.85em">💭 ${thinking}</span>`;
+      }
       messagesEl.scrollTop = messagesEl.scrollHeight;
     };
 
@@ -225,7 +238,7 @@ sendBtn.addEventListener('click', async () => {
         messages.push({ role: 'system', content: systemPrompt });
       }
       messages.push({ role: 'user', content: text });
-      handle = session.chat(messages, sampling, onToken);
+      handle = (session as any).chat(messages, sampling, onToken, { enableThinking: true });
     }
 
     const result = await handle.result;
@@ -563,8 +576,8 @@ loadBtn.addEventListener('click', async () => {
       // Store session for the send button
       session = {
         run: (prompt, sampling, onToken) => generate(gpu!.device, engine, tokenizer, prompt, sampling, onToken),
-        chat: (messages, sampling, onToken) => {
-          const tokenIds = applyChatTemplate(tokenizer, messages);
+        chat: (messages: Array<{role: string; content: string}>, sampling: any, onToken: any, opts?: { enableThinking?: boolean }) => {
+          const tokenIds = applyChatTemplate(tokenizer, messages, opts);
           return generate(gpu!.device, engine, tokenizer, tokenIds, sampling, onToken);
         },
         config,
