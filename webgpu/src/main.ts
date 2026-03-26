@@ -201,6 +201,7 @@ sendBtn.addEventListener('click', async () => {
 
     const temperature = parseFloat(tempSlider.value);
     const topP = parseFloat(toppSlider.value);
+    const maxNewTokens = parseInt(($('max-tokens') as HTMLInputElement).value) || 512;
     const useCompressedKV = ($('turboquant') as HTMLInputElement).checked;
 
     const systemPrompt = ($('system-prompt') as HTMLTextAreaElement).value.trim();
@@ -212,7 +213,7 @@ sendBtn.addEventListener('click', async () => {
 
     const handle = session.chat(
       messages,
-      { temperature, topP, maxNewTokens: 512, useCompressedKV },
+      { temperature, topP, maxNewTokens, useCompressedKV, repetitionPenalty: 1.15 },
       (token) => {
         fullText += token;
         responseDiv.textContent = fullText;
@@ -509,6 +510,69 @@ loadBtn.addEventListener('click', async () => {
       );
 
       setStatus(`Ready: ${repo}`);
+
+      // ── Auto-test polling: check /api/test for queued prompts ─────
+      // Intercept console.log to capture debug output from forward pass
+      const _origLog = console.log;
+      let debugLogs: string[] = [];
+
+      (async function pollTests() {
+        while (session) {
+          try {
+            const resp = await fetch('/api/test');
+            const test = await resp.json();
+            if (test && test.prompt) {
+              _origLog(`[AutoTest] Running: "${test.prompt}"`);
+
+              // Enable debug mode for this run's first forward pass
+              (globalThis as any).__DEBUG_FORWARD_PASS__ = true;
+
+              // Capture console.log output during inference
+              debugLogs = [];
+              console.log = (...args: any[]) => {
+                const line = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+                debugLogs.push(line);
+                _origLog(...args);
+              };
+
+              const messages = [
+                { role: 'system', content: 'You are Artifex, a helpful AI assistant.' },
+                { role: 'user', content: test.prompt },
+              ];
+              const t0 = performance.now();
+              const handle = session.chat(
+                messages,
+                { temperature: test.temperature ?? 0, topP: 0.9, maxNewTokens: test.maxTokens ?? 50, repetitionPenalty: test.repetitionPenalty ?? 1.15 },
+                () => {},
+              );
+              const result = await handle.result;
+              const elapsed = performance.now() - t0;
+
+              // Restore console.log
+              console.log = _origLog;
+
+              const debugData = {
+                prompt: test.prompt,
+                output: result.text,
+                tokens: result.numTokens,
+                tokPerSec: result.tokensPerSecond,
+                stopReason: result.stopReason,
+                elapsedMs: Math.round(elapsed),
+                promptTokens: result.promptTokens,
+                consoleLogs: debugLogs,
+              };
+              console.log(`[AutoTest] Result: "${result.text}" (${result.numTokens} tok, ${result.tokensPerSecond.toFixed(1)} tok/s)`);
+              await fetch('/api/debug', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(debugData),
+              });
+            }
+          } catch { /* server not available */ }
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      })();
+
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       addMessage('system', `Engine build failed: ${msg}\n\nWeights are loaded but inference is not available.`);

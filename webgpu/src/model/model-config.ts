@@ -261,6 +261,18 @@ const WEIGHT_NAME_PATTERNS: Record<string, WeightNameMap> = {
  * Handles field name differences across model families automatically.
  */
 export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
+  // Qwen3.5 multimodal wraps text config under text_config — flatten it
+  if (hfConfig.text_config && !hfConfig.hidden_size) {
+    const textCfg = hfConfig.text_config;
+    // Merge text_config fields into top level (text_config takes priority)
+    hfConfig = { ...hfConfig, ...textCfg };
+    // Fix model_type: qwen3_5 → qwen3_5_text (our internal convention)
+    if (hfConfig.model_type === 'qwen3_5' || (hfConfig as any).model_type === 'qwen3_5') {
+      hfConfig.model_type = 'qwen3_5_text';
+    }
+    console.log(`[Config] Flattened text_config for ${hfConfig.model_type}`);
+  }
+
   const modelType = (hfConfig.model_type ?? 'unknown').toLowerCase();
   const fieldMap = HF_FIELD_MAPS[modelType] ?? HF_FIELD_MAPS.default;
 
