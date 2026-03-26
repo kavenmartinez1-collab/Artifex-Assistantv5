@@ -104,8 +104,9 @@ export interface LayerWeights {
 
 /** GPU buffers for global (non-layer) weights. */
 export interface GlobalWeights {
-  embedTokens: GPUBuffer;  // [vocab_size, hidden_size] (f32 or f16 packed)
-  embedIsF16?: boolean;    // true if embedding stored as F16 (large vocab models)
+  embedTokens: GPUBuffer;  // [vocab_size, hidden_size] (f32, f16 packed, or dummy if Q4)
+  embedIsF16?: boolean;    // true if embedding stored as F16/BF16 (large vocab models)
+  embedQ4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };  // GPTQ INT4 embedding
   finalNorm: GPUBuffer;    // [hidden_size]
   lmHead: GPUBuffer;       // [vocab_size, hidden_size] or same as embedTokens
   lmHeadIsBF16?: boolean;  // true if lm_head stored as BF16 (large vocab models)
@@ -207,6 +208,8 @@ export function createForwardPassEngine(
 
   const embedPipeline = createComputePipeline(device, embedWGSL, 'embed', 'embed');
   const embedF16Pipeline = createComputePipeline(device, embedWGSL, 'embed_f16', 'embed-f16');
+  const embedQ4Pipeline = config.isQuantized
+    ? createComputePipeline(device, embedWGSL, 'embed_q4', 'embed-q4') : null;
   const rmsnormPipeline = createComputePipeline(device, rmsnormWGSL, 'rmsnorm', 'rmsnorm');
   // MODEL-SPECIFIC: activation. Most use SiLU; Phi/some Gemma use GELU.
   const siluPipeline = createComputePipeline(device, elementwiseWGSL, 'silu', 'silu');
@@ -653,18 +656,35 @@ export function createForwardPassEngine(
     currentBatch = new BatchedDispatcher(device, 'forward');
     deferredDestroys = [];
 
-    // ── Embedding (f32 or f16 depending on buffer size) ────────────
-    const useF16Embed = weights.global.embedIsF16 === true;
-    const embedPipe = useF16Embed ? embedF16Pipeline : embedPipeline;
-    const embedParams = createUniformBuffer(device, new Uint32Array([H, seqLen]), 'embed-p');
-    const embedBG = createBindGroup(device, embedPipe, 0, [
-      { binding: 0, resource: { buffer: tokenIdBuf } },
-      { binding: 1, resource: { buffer: hiddenBuf } },
-      { binding: 2, resource: { buffer: weights.global.embedTokens } },
-      { binding: 3, resource: { buffer: embedParams } },
-    ], 'embed');
-    bd(embedPipe, [embedBG], [seqLen], 'embed');
-    deferDestroy(embedParams);
+    // ── Embedding (f32, BF16/F16, or GPTQ INT4) ────────────────────
+    if (weights.global.embedQ4 && embedQ4Pipeline) {
+      // GPTQ INT4 embedding — dequant on the fly per token
+      const eq4 = weights.global.embedQ4;
+      const embedParams = createUniformBuffer(device,
+        new Uint32Array([H, seqLen, config.quantGroupSize || 128, V]), 'embed-q4-p');
+      const embedBG = createBindGroup(device, embedQ4Pipeline, 0, [
+        { binding: 0, resource: { buffer: tokenIdBuf } },
+        { binding: 1, resource: { buffer: hiddenBuf } },
+        { binding: 2, resource: { buffer: eq4.qweight } },
+        { binding: 3, resource: { buffer: embedParams } },
+        { binding: 4, resource: { buffer: eq4.scales } },
+        { binding: 5, resource: { buffer: eq4.qzeros } },
+      ], 'embed-q4');
+      bd(embedQ4Pipeline, [embedBG], [seqLen], 'embed-q4');
+      deferDestroy(embedParams);
+    } else {
+      const useF16Embed = weights.global.embedIsF16 === true;
+      const embedPipe = useF16Embed ? embedF16Pipeline : embedPipeline;
+      const embedParams = createUniformBuffer(device, new Uint32Array([H, seqLen]), 'embed-p');
+      const embedBG = createBindGroup(device, embedPipe, 0, [
+        { binding: 0, resource: { buffer: tokenIdBuf } },
+        { binding: 1, resource: { buffer: hiddenBuf } },
+        { binding: 2, resource: { buffer: weights.global.embedTokens } },
+        { binding: 3, resource: { buffer: embedParams } },
+      ], 'embed');
+      bd(embedPipe, [embedBG], [seqLen], 'embed');
+      deferDestroy(embedParams);
+    }
 
     if (isDebug) {
       flushBatch();

@@ -415,20 +415,27 @@ loadBtn.addEventListener('click', async () => {
         console.log(`[Engine] Embedding is ${embedTensor!.dtype}, using packed-16 embed shader`);
       }
 
+      // Embedding may be f32, BF16, or GPTQ INT4
+      const embedBuf = currentModel!.tensors.get(nameMap.embedTokens)?.buffer ?? null;
+      const lmHeadBuf = config.tieWordEmbeddings
+        ? embedBuf
+        : (currentModel!.tensors.get(nameMap.lmHead)?.buffer ?? null);
+
+      // Use a dummy buffer for embedTokens/lmHead when they're GPTQ (the Q4 path is used instead)
+      const dummyBuf = embedBuf ?? lmHeadBuf ?? getTensor(nameMap.finalNorm);
+
       const global: any = {
-        embedTokens: getTensor(nameMap.embedTokens),
-        embedIsF16,
+        embedTokens: embedBuf ?? dummyBuf,
+        embedIsF16: embedBuf ? embedIsF16 : false,
         finalNorm: getTensor(nameMap.finalNorm),
-        lmHead: config.tieWordEmbeddings
-          ? getTensor(nameMap.embedTokens)
-          : (currentModel!.tensors.get(nameMap.lmHead)?.buffer ?? getTensor(nameMap.embedTokens)),
-        lmHeadIsBF16: (() => {
+        lmHead: lmHeadBuf ?? dummyBuf,
+        lmHeadIsBF16: lmHeadBuf ? (() => {
           const tensorName = config.tieWordEmbeddings ? nameMap.embedTokens : nameMap.lmHead;
           const t = currentModel!.tensors.get(tensorName);
           const isBF16 = t ? (t.dtype === 'BF16' || t.dtype === 'F16') : false;
           if (isBF16) console.log(`[Engine] LM head is ${t!.dtype}${config.tieWordEmbeddings ? ' (tied)' : ''}, using BF16 matmul`);
           return isBF16;
-        })(),
+        })() : false,
       };
 
       // Helper for optional tensors (bias terms)
@@ -447,7 +454,15 @@ loadBtn.addEventListener('click', async () => {
         return undefined;
       };
 
-      // Check if lm_head is GPTQ INT4 (quantized lm_head saves ~1.4 GB VRAM)
+      // Check if embedding is GPTQ INT4 (saves ~1.4 GB VRAM)
+      const embedQ4 = tryGetQ4(nameMap.embedTokens);
+      if (embedQ4) {
+        global.embedQ4 = embedQ4;
+        global.embedIsF16 = false;
+        console.log(`[Engine] Embedding is GPTQ INT4, using Q4 embed shader`);
+      }
+
+      // Check if lm_head is GPTQ INT4 (saves ~1.4 GB VRAM)
       if (!config.tieWordEmbeddings) {
         const lmHeadQ4 = tryGetQ4(nameMap.lmHead);
         if (lmHeadQ4) {
@@ -455,6 +470,11 @@ loadBtn.addEventListener('click', async () => {
           global.lmHeadIsBF16 = false;
           console.log(`[Engine] LM head is GPTQ INT4, using Q4 matmul`);
         }
+      } else if (embedQ4) {
+        // Tied embeddings: lm_head uses same Q4 weights as embedding
+        global.lmHeadQ4 = embedQ4;
+        global.lmHeadIsBF16 = false;
+        console.log(`[Engine] LM head is GPTQ INT4 (tied), using Q4 matmul`);
       }
 
       // Track BF16 weight buffers (for BF16 matmul dispatch)

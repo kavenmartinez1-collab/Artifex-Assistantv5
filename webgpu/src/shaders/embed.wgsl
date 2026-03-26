@@ -1,5 +1,10 @@
 // Embedding Lookup — Gather rows from the embedding table by token ID.
 //
+// Three variants:
+//   embed       — f32 embedding table
+//   embed_f16   — BF16/F16 packed embedding table
+//   embed_q4    — GPTQ INT4 packed embedding (qweight + scales + qzeros)
+//
 // Each workgroup handles one token. Threads within the workgroup
 // cooperatively copy the embedding vector (hidden_size elements).
 //
@@ -95,5 +100,81 @@ fn embed_f16(@builtin(local_invocation_id) lid: vec3u,
     let f16_bits = select(word & 0xFFFFu, word >> 16u, is_upper);
     output_f16[token_idx * hidden + i] = bf16_to_f32(f16_bits);
     i = i + 256u;
+  }
+}
+
+// ── GPTQ INT4 Embedding Lookup ──────────────────────────────────────
+// Embedding stored as GPTQ: qweight[hidden/8, vocab] I32 (8 nibbles per i32),
+// scales[hidden/group_size, vocab] F16, qzeros[hidden/group_size, vocab/8] I32.
+// Dequant: val = (nibble - zero) * scale
+//
+// GPTQ packs weights column-major: qweight[k/8, n] has 8 k-values for column n.
+// For embedding lookup, n=token_id, k=hidden dimension index.
+
+struct Q4Params {
+  hidden_size: u32,
+  seq_len: u32,
+  group_size: u32,
+  vocab_size: u32,
+}
+
+@group(0) @binding(0) var<storage, read> token_ids_q4: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output_q4: array<f32>;
+@group(0) @binding(2) var<storage, read> qweight: array<i32>;    // [hidden/8, vocab]
+@group(0) @binding(3) var<uniform> params_q4: Q4Params;
+@group(0) @binding(4) var<storage, read> scales: array<u32>;     // F16 as u16 pairs in u32
+@group(0) @binding(5) var<storage, read> qzeros: array<i32>;     // [hidden/gs, vocab/8]
+
+fn f16_to_f32_embed(bits: u32) -> f32 {
+  let sign = (bits >> 15u) & 1u;
+  let exp = (bits >> 10u) & 0x1Fu;
+  let frac = bits & 0x3FFu;
+  if (exp == 0u) {
+    if (frac == 0u) { return select(0.0, -0.0, sign == 1u); }
+    let f = f32(frac) / 1024.0 * pow(2.0, -14.0);
+    return select(f, -f, sign == 1u);
+  }
+  if (exp == 31u) { return select(1e30, -1e30, sign == 1u); }
+  let f = (1.0 + f32(frac) / 1024.0) * pow(2.0, f32(exp) - 15.0);
+  return select(f, -f, sign == 1u);
+}
+
+@compute @workgroup_size(256)
+fn embed_q4(@builtin(local_invocation_id) lid: vec3u,
+            @builtin(workgroup_id) wid: vec3u) {
+  let token_idx = wid.x;
+  let tid = lid.x;
+  let hidden = params_q4.hidden_size;
+  let gs = params_q4.group_size;
+  let V = params_q4.vocab_size;
+
+  if (token_idx >= params_q4.seq_len) { return; }
+
+  let n = token_ids_q4[token_idx]; // token_id = column index in qweight
+
+  var k = tid;
+  while (k < hidden) {
+    // Extract 4-bit weight from qweight[k/8, n]
+    let packed_row = k / 8u;
+    let nibble_idx = k % 8u;
+    let packed = qweight[packed_row * V + n];
+    let q4 = (u32(packed) >> (nibble_idx * 4u)) & 0xFu;
+
+    // Get scale: scales[group, n] stored as F16
+    let group = k / gs;
+    let scale_flat = group * V + n;
+    let scale_word = scales[scale_flat / 2u];
+    let scale_bits = select(scale_word & 0xFFFFu, scale_word >> 16u, (scale_flat & 1u) == 1u);
+    let scale = f16_to_f32_embed(scale_bits);
+
+    // Get zero: qzeros[group, n/8] packed nibbles
+    let zero_packed = qzeros[group * ((V + 7u) / 8u) + n / 8u];
+    let zero_nibble = n % 8u;
+    let zero = (u32(zero_packed) >> (zero_nibble * 4u)) & 0xFu;
+
+    // Dequant
+    output_q4[token_idx * hidden + k] = (f32(q4) - f32(zero)) * scale;
+
+    k = k + 256u;
   }
 }
