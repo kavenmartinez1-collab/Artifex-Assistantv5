@@ -213,6 +213,8 @@ export function generate(
     const promptIds = typeof prompt === 'string' ? tokenizer.encode(prompt) : prompt;
     const promptTokens = promptIds.length;
     console.log(`[Generate] Prompt: ${promptTokens} tokens, first 5: [${promptIds.slice(0, 5).join(', ')}]`);
+    // Debug: decode the full prompt to see what the model actually sees
+    console.log(`[Generate] Decoded prompt: "${tokenizer.decode(promptIds)}"`);
 
     if (promptTokens === 0) {
       return {
@@ -229,9 +231,11 @@ export function generate(
     }
 
     // ── Step 3: Prefill ─────────────────────────────────────────────
-    // Process prompt in chunks for batch prefill (up to 512 tokens per pass).
-    // The LAST call produces logits for the first generated token.
-    const PREFILL_CHUNK = 512;
+    // Hybrid models (with Gated DeltaNet linear attention) need token-by-token
+    // prefill because the SSM recurrence must process each token sequentially.
+    // Standard transformer models can batch prefill up to 512 tokens at once.
+    const isHybrid = engine.config.isHybrid === true;
+    const PREFILL_CHUNK = isHybrid ? 1 : 512;
     let prefillOutput;
     for (let i = 0; i < promptTokens; i += PREFILL_CHUNK) {
       const chunkEnd = Math.min(i + PREFILL_CHUNK, promptTokens);

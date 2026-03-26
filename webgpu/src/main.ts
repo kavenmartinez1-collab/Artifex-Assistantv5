@@ -204,22 +204,29 @@ sendBtn.addEventListener('click', async () => {
     const maxNewTokens = parseInt(($('max-tokens') as HTMLInputElement).value) || 512;
     const useCompressedKV = ($('turboquant') as HTMLInputElement).checked;
 
-    const systemPrompt = ($('system-prompt') as HTMLTextAreaElement).value.trim();
-    const messages: Array<{ role: string; content: string }> = [];
-    if (systemPrompt) {
-      messages.push({ role: 'system', content: systemPrompt });
-    }
-    messages.push({ role: 'user', content: text });
+    // /raw prefix: skip chat template, use raw text completion (for debugging)
+    const isRaw = text.startsWith('/raw ');
+    const sampling = { temperature, topP, maxNewTokens, useCompressedKV, repetitionPenalty: 1.15 };
+    const onToken = (token: string) => {
+      fullText += token;
+      responseDiv.textContent = fullText;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    };
 
-    const handle = session.chat(
-      messages,
-      { temperature, topP, maxNewTokens, useCompressedKV, repetitionPenalty: 1.15 },
-      (token) => {
-        fullText += token;
-        responseDiv.textContent = fullText;
-        messagesEl.scrollTop = messagesEl.scrollHeight;
-      },
-    );
+    let handle;
+    if (isRaw) {
+      const rawText = text.slice(5); // strip "/raw "
+      console.log(`[Raw mode] Sending: "${rawText}"`);
+      handle = session.run(rawText, sampling, onToken);
+    } else {
+      const systemPrompt = ($('system-prompt') as HTMLTextAreaElement).value.trim();
+      const messages: Array<{ role: string; content: string }> = [];
+      if (systemPrompt) {
+        messages.push({ role: 'system', content: systemPrompt });
+      }
+      messages.push({ role: 'user', content: text });
+      handle = session.chat(messages, sampling, onToken);
+    }
 
     const result = await handle.result;
 
