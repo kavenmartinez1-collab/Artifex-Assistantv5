@@ -142,35 +142,33 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
 export function applyChatTemplate(
   tokenizer: Tokenizer,
   messages: Array<{ role: string; content: string }>,
+  options?: { enableThinking?: boolean },
 ): number[] {
-  // Use HF tokenizer's template to get token IDs directly
+  const enableThinking = options?.enableThinking ?? true;
+
+  // Use a clean ChatML template — Qwen3.5's built-in template adds empty <think></think>
+  // blocks when thinking is disabled, which confuses smaller models. We control thinking
+  // explicitly: when enabled, end with <think>\n so the model generates its own reasoning;
+  // when disabled, end with just assistant\n for direct response.
+  const genPrompt = enableThinking
+    ? `<|im_start|>assistant\n<think>\n`
+    : `<|im_start|>assistant\n`;
+
+  // Try the HF tokenizer's apply_chat_template with our explicit template
   try {
+    const chatml = `{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '${genPrompt}' }}{% endif %}`;
     const result = (tokenizer.inner as any).apply_chat_template(messages, {
       add_generation_prompt: true,
       tokenize: true,
       return_tensor: false,
+      chat_template: chatml,
     });
     if (result && result.length > 0) {
+      console.log(`[Tokenizer] ChatML template applied (thinking=${enableThinking})`);
       return Array.from(result).map(Number);
     }
   } catch (e) {
-    // Try again with an explicit ChatML template (for models like Qwen3.5 GPTQ
-    // that don't include a chat_template in the tokenizer config)
-    try {
-      const chatml = `{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n'}}{% endfor %}{% if add_generation_prompt %}{{'<|im_start|>assistant\n<think>\n'}}{% endif %}`;
-      const result = (tokenizer.inner as any).apply_chat_template(messages, {
-        add_generation_prompt: true,
-        tokenize: true,
-        return_tensor: false,
-        chat_template: chatml,
-      });
-      if (result && result.length > 0) {
-        console.log('[Tokenizer] Using explicit ChatML template');
-        return Array.from(result).map(Number);
-      }
-    } catch (e2) {
-      console.warn('[Tokenizer] apply_chat_template failed, using fallback:', e);
-    }
+    console.warn('[Tokenizer] apply_chat_template failed, using fallback:', e);
   }
 
   // Fallback: encode with ChatML format (won't handle special tokens perfectly)
@@ -178,6 +176,6 @@ export function applyChatTemplate(
   for (const msg of messages) {
     parts.push(`<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`);
   }
-  parts.push('<|im_start|>assistant\n');
+  parts.push(enableThinking ? '<|im_start|>assistant\n<think>\n' : '<|im_start|>assistant\n');
   return tokenizer.encode(parts.join(''));
 }
