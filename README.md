@@ -748,14 +748,21 @@ npm run preview   # Preview production build
 npm run server    # Metrics server only
 ```
 
+### Running (Two Terminals)
+
+```bash
+cd webgpu
+npx vite                      # Terminal 1: Vite dev server (:5173)
+npx tsx server/dev-server.ts  # Terminal 2: metrics + local cache server (:3001)
+```
+
 ### Testing the Kernels
 
-1. Run `npm run dev` from the `webgpu/` directory
-2. Open `http://localhost:5173` in Chrome/Edge
-3. The page auto-detects your GPU (vendor, architecture, limits)
-4. Click **"Run GPU Tests"** in the sidebar
-5. All 5 WGSL kernels run against CPU reference values
-6. Results appear in the browser and log to the metrics server at `:3001`
+1. Open `http://localhost:5173` in Chrome/Edge
+2. The page auto-detects your GPU (vendor, architecture, limits)
+3. Click **"Run GPU Tests"** in the sidebar
+4. All 13 WGSL kernels run against CPU reference values
+5. Results appear in the browser and log to the metrics server at `:3001`
 
 ### Architecture
 
@@ -767,36 +774,82 @@ npm run server    # Metrics server only
   - `rope.wgsl` — rotary positional embeddings
   - `softmax.wgsl` — attention softmax
   - `elementwise.wgsl` — add, multiply, SiLU activation
-  - `embed.wgsl` — parallel embedding table lookup
+  - `embed.wgsl` — parallel embedding table lookup (f32, BF16/F16 packed, and GPTQ INT4 with per-group dequant)
   - `turboquant_encode.wgsl` / `turboquant_decode.wgsl` — TurboQuant KV cache compression (Google, ICLR 2026)
   - `matmul_q4.wgsl` — fused INT4 GPTQ dequantization matmul (unpacks 4-bit nibbles, applies group scales/zeros on the fly)
 - **Buffer management** — typed GPU buffer creation, read/write operations
 - **Kernel test suite** — 13 correctness tests against CPU reference values (elementwise, matmul, BF16 matmul, softmax, RMSNorm, TurboQuant)
 - **Metrics collection** — browser-to-server event reporting with JSON logging
-- **Dev server** — Express metrics endpoint with color-coded console output
+- **Dev server** — Express metrics endpoint, local HF cache file serving with Range support
+- **Local model loading** — serves SafeTensors from `~/.cache/huggingface/hub/` and project `models/` directory via dev server (50-100x faster than CDN). Local-first with automatic CDN fallback for missing files.
 
 ### Status
 
-Phases 0-6 complete plus Gated DeltaNet/Mamba-2 hybrid support, TurboQuant KV cache, batch prefill, and network resilience:
+Phases 0-6 complete plus Gated DeltaNet/Mamba-2 hybrid support, TurboQuant KV cache, mixed-precision quantization, and local model loading:
 
 - **Standard transformer inference** — full forward pass with GQA, RoPE, KV cache, autoregressive generation
-- **Gated DeltaNet (Mamba-2) hybrid** — Qwen3.5's 24 linear attention layers + 8 full attention layers. New WGSL kernels: conv1d, SSM delta rule recurrence, L2 norm, per-head RMSNormGated. Fixed-size SSM state (~50 MB) instead of growing KV cache.
+- **Gated DeltaNet (Mamba-2) hybrid** — Qwen3.5's 24 linear attention layers + 8 full attention layers. New WGSL kernels: conv1d, SSM delta rule recurrence, L2 norm, per-head RMSNormGated. Fixed-size SSM state (~50 MB) instead of growing KV cache. Token-by-token prefill for correct SSM recurrence.
 - **TurboQuant KV cache** — 3-bit (d≥128) or 4-bit (d≤64) compressed KV cache saving ~80% memory for standard attention layers. Current token K/V is always exact; only cached tokens compressed.
-- **Batch prefill** — 512-token chunks with broadcast bias support
-- **GPTQ INT4** — weight loader and fused `matmul_bt_q4` kernel for quantized models up to 9B parameters on 8GB VRAM
-- **BF16 native weights** — `keepBF16` auto-detection keeps large BF16 tensors in native format on GPU, halving VRAM usage. Auto-selects between f32/BF16/INT4 matmul kernels per projection. BF16 embedding lookup and BF16 LM head matmul (including tied-embedding models).
+- **Batch prefill** — 512-token chunks for standard transformers, token-by-token for hybrid models (SSM recurrence requires sequential processing)
+- **Mixed-precision quantization** — custom quantization pipeline (`scripts/quantize_mixed_precision.py`) that keeps SSM-critical linear_attn layers in original BF16 precision while quantizing FFN and attention to INT4. `dispatchProjection` auto-selects f32/BF16/INT4 kernel per weight buffer. See [Mixed-Precision Quantization](#mixed-precision-quantization) below.
+- **GPTQ INT4** — weight loader and fused `matmul_bt_q4` kernel for quantized models. INT4 embedding lookup (`embed_q4`) and INT4 LM head matmul.
+- **BF16 native weights** — `keepBF16` auto-detection keeps large BF16 tensors in native format on GPU, halving VRAM usage. Works for both unquantized models and mixed-precision GPTQ. BF16 embedding lookup and BF16 LM head matmul (including tied-embedding models).
+- **Local model loading** — dev server serves SafeTensors from local HF cache and project `models/` directory. Local-first with automatic CDN fallback. 50-100x faster than CDN downloads.
+- **Thinking mode** — Qwen3.5 `<think>` reasoning with visible thinking display and `</think>` answer extraction
 - **Resilient downloads** — exponential backoff retry, parallel chunk prefetch, per-chunk browser caching for 7GB+ models
 - **Auto-detect weight names** — discovers tensor name prefixes (handles `model.language_model.*` for multimodal architectures)
 - **Model-specific RMSNorm** — auto-detects `(1 + weight)` vs `weight` convention per model family
 
 ### Supported Models
 
-Any HuggingFace model with a standard transformer decoder architecture works. Hybrid Mamba-2 models (Qwen3.5) have experimental support. Weight name prefixes are auto-detected. Tested:
+Any HuggingFace model with a standard transformer decoder architecture works. Hybrid Mamba-2 models (Qwen3.5) have full support with mixed-precision quantization. Weight name prefixes are auto-detected. Tested:
+
+- **Qwen3.5-9B mixed-precision** (`local/qwen3.5-9b-mixed-GPTQ-Int4`) — 32 layers (24 Gated DeltaNet + 8 full attention), 4096 hidden. **Answers factual questions correctly at 2.9 tok/s** with 7.22 GB VRAM on 8 GB GPU. Mixed-precision: BF16 linear_attn (SSM) + INT4 FFN/attention + INT4 embedding/lm_head. Loaded in 21s from local cache. Uses TurboQuant 3-bit KV cache for full attention layers.
+- **Qwen3.5-2B** (`Qwen/Qwen3.5-2B`) — 24 layers (18 Gated DeltaNet + 6 full attention), 2048 hidden, GQA 8Q/2KV. **Coherent English at 5.2 tok/s** with native BF16 weights (4.18 GB VRAM vs 8.47 GB at f32). Uses `keepBF16` to halve memory — auto-selects BF16 matmul for 150 projection weights, BF16 embedding lookup, and BF16 LM head (tied). Thinking mode with visible reasoning chain.
 - **Qwen2.5-0.5B-Instruct** — 24 layers, 896 hidden, GQA 14Q/2KV. Generates coherent English at ~20 tok/s (f32) / ~10 tok/s (TurboQuant 4-bit KV).
-- **Qwen3.5-2B** (`Qwen/Qwen3.5-2B`) — 24 layers (18 Gated DeltaNet + 6 full attention), 2048 hidden, GQA 8Q/2KV. **Coherent English at 6.5 tok/s** with native BF16 weights (4.18 GB VRAM vs 8.47 GB at f32). Uses `keepBF16` to halve memory — auto-selects BF16 matmul for 150 projection weights, BF16 embedding lookup, and BF16 LM head (tied).
-- **Qwen3.5-9B-GPTQ-INT4** (`mssfj/Qwen3.5-9B-GPTQ-INT4`) — 32 layers (24 Gated DeltaNet + 8 full attention), 4096 hidden, 7.07 GB INT4 weights. Runs end-to-end at 19 tok/s prefill / 0.6 tok/s decode. All L0 intermediate values match PyTorch reference. Structured output, approaching coherence. SSM math being refined.
 - **SmolLM2-135M-Instruct** — 30 layers, 576 hidden, GQA 9Q/3KV.
 - **SmolLM2-360M-Instruct** — 32 layers, 960 hidden, GQA 15Q/5KV.
+
+### Mixed-Precision Quantization
+
+For hybrid models like Qwen3.5 that combine Gated DeltaNet (linear attention / SSM) with standard softmax attention, INT4 quantization of SSM layers causes recurrence noise to compound — each token's error accumulates in the hidden state. The solution: **keep SSM-critical weights in original BF16 precision, only quantize FFN and attention layers to INT4**.
+
+```bash
+# Quantize Qwen3.5-9B with mixed precision (requires PyTorch + safetensors)
+python scripts/quantize_mixed_precision.py --model ./models/qwen3.5-9b
+
+# Output: models/qwen3.5-9b-mixed-GPTQ-Int4/ (~7.4 GB)
+# Load in browser as: local/qwen3.5-9b-mixed-GPTQ-Int4
+```
+
+**How it works:**
+1. Loads the unquantized BF16 model (18 GB for 9B)
+2. For each weight tensor, decides: **quantize** (FFN, full attention, lm_head, embedding) or **keep BF16** (linear_attn projections, norms, biases)
+3. Quantized weights use RTN (round-to-nearest) with group_size=128, packed as GPTQ-compatible INT4 (qweight/scales/qzeros)
+4. BF16 weights are copied unchanged
+5. MTP (multi-token prediction) layer is skipped entirely (not needed for inference)
+
+**VRAM budget for Qwen3.5-9B on 8 GB:**
+
+| Component | Format | Size |
+|-----------|--------|------|
+| Embedding (248K × 4096) | INT4 GPTQ | 0.5 GB |
+| 24 linear_attn layers (5 proj each) | BF16 | 3.1 GB |
+| 32 FFN layers (3 proj each) | INT4 GPTQ | 1.2 GB |
+| 8 full attention layers (4 proj each) | INT4 GPTQ | 0.3 GB |
+| LM head (248K × 4096) | INT4 GPTQ | 0.5 GB |
+| Norms, biases, SSM state | f32/BF16 | 0.3 GB |
+| KV cache (TurboQuant 3-bit) | compressed | 0.1 GB |
+| Intermediates | f32 | 0.5 GB |
+| **Total** | | **~6.5 GB** |
+
+The engine auto-detects mixed-precision models and routes each weight through the correct kernel:
+- `dispatchProjection` checks `bf16Set` → `matmul_bt_bf16` for BF16 weights
+- Falls back to `matmul_bt_q4` for INT4 GPTQ weights
+- `embed_q4` shader for INT4 embedding lookup
+- Token-by-token prefill for correct SSM recurrence
+
+**Note:** RTN quantization is simpler but lower quality than calibrated GPTQ. Long responses may drift. For production quality, use a properly calibrated GPTQ or AWQ model with `modules_not_to_quantize` excluding linear_attn layers (e.g., `cyankiwi/Qwen3.5-9B-AWQ-BF16-INT4`).
 
 ---
 
