@@ -1,179 +1,266 @@
 #!/usr/bin/env python3
 """
-Mixed-Precision GPTQ Quantization for Qwen3.5-9B
+Mixed-Precision RTN Quantization for Qwen3.5-9B
 
-Quantizes ONLY the FFN and full-attention layers to INT4 GPTQ,
+Quantizes FFN and full-attention layers to INT4 (RTN round-to-nearest),
 keeping all linear_attn (Gated DeltaNet) layers in original BF16.
-This prevents INT4 quantization noise from compounding through
-the SSM recurrence while saving ~60% VRAM vs full BF16.
 
-Output: SafeTensors file(s) that the WebGPU engine can load directly
-with mixed-precision dispatch (BF16 matmul for SSM, INT4 matmul for FFN).
+Output format is GPTQ-compatible SafeTensors:
+  - .qweight (I32, packed 8 nibbles per int32)
+  - .scales (F16, per group)
+  - .qzeros (I32, packed 8 nibbles per int32)
 
-Requirements:
-    pip install optimum auto-gptq transformers torch safetensors datasets
+No external GPTQ library needed — just PyTorch + safetensors.
 
 Usage:
     python scripts/quantize_mixed_precision.py
-    python scripts/quantize_mixed_precision.py --model Qwen/Qwen3.5-9B --bits 4
+    python scripts/quantize_mixed_precision.py --model ./models/qwen3.5-9b --bits 4
 """
 
 import argparse
+import json
 import os
 import sys
 import time
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-from optimum.gptq import GPTQQuantizer
+from safetensors.torch import load_file, save_file
 
 
-def get_modules_not_to_quantize(config) -> list[str]:
-    """Build the list of module names to EXCLUDE from quantization."""
-    layer_types = getattr(config, 'layer_types', None)
-    if hasattr(config, 'text_config'):
-        layer_types = getattr(config.text_config, 'layer_types', layer_types)
+def quantize_rtn_int4(weight: torch.Tensor, group_size: int = 128):
+    """
+    Round-to-nearest INT4 quantization with group-wise scaling.
 
-    if layer_types is None:
-        print("WARNING: Could not determine layer types. Excluding all linear_attn patterns.")
-        return []
+    Input:  weight [N, K] (out_features, in_features) as float/bf16
+    Output: qweight [K//8, N] as int32 (packed nibbles)
+            scales  [K//group_size, N] as float16
+            qzeros  [K//group_size, N//8] as int32 (packed nibbles)
+    """
+    N, K = weight.shape
+    w = weight.float()
 
-    modules = []
-    proj_suffixes = [
-        'linear_attn.in_proj_qkv',
-        'linear_attn.in_proj_a',
-        'linear_attn.in_proj_b',
-        'linear_attn.in_proj_z',
-        'linear_attn.out_proj',
-    ]
+    num_groups = K // group_size
+    assert K % group_size == 0, f"K={K} not divisible by group_size={group_size}"
 
-    for layer_idx, ltype in enumerate(layer_types):
-        if ltype == 'linear_attention':
-            for suffix in proj_suffixes:
-                modules.append(f'model.language_model.layers.{layer_idx}.{suffix}')
-                modules.append(f'model.layers.{layer_idx}.{suffix}')
+    # Reshape to [N, num_groups, group_size]
+    w_grouped = w.reshape(N, num_groups, group_size)
 
-    num_linear = sum(1 for t in layer_types if t == 'linear_attention')
-    num_full = sum(1 for t in layer_types if t == 'full_attention')
-    print(f"  {len(layer_types)} layers: {num_linear} linear_attention + {num_full} full_attention")
-    print(f"  Excluding {len(modules)} module patterns from quantization")
+    # Per-group min/max
+    w_min = w_grouped.min(dim=2).values  # [N, num_groups]
+    w_max = w_grouped.max(dim=2).values  # [N, num_groups]
 
-    return modules
+    # Symmetric quantization around zero (zero_point = 8 for signed-ish 4-bit)
+    # Use asymmetric for better range: scale = (max - min) / 15
+    scales = (w_max - w_min) / 15.0  # [N, num_groups]
+    scales = scales.clamp(min=1e-10)  # avoid division by zero
+    zeros = torch.round(-w_min / scales).clamp(0, 15).to(torch.int32)  # [N, num_groups]
+
+    # Quantize: q = round(w / scale + zero), clamp to [0, 15]
+    scales_expanded = scales.unsqueeze(2).expand_as(w_grouped)  # [N, num_groups, group_size]
+    zeros_expanded = zeros.unsqueeze(2).expand_as(w_grouped).float()
+
+    q = torch.round(w_grouped / scales_expanded + zeros_expanded)
+    q = q.clamp(0, 15).to(torch.int32)  # [N, num_groups, group_size]
+    q = q.reshape(N, K)  # [N, K]
+
+    # Pack qweight: [K//8, N] — 8 nibbles per int32, column-major packing
+    # The WebGPU matmul_bt_q4 shader reads: qweight[k//8 * N + n], nibble at (k%8)*4
+    qweight = torch.zeros(K // 8, N, dtype=torch.int32)
+    for nibble in range(8):
+        k_indices = torch.arange(nibble, K, 8)
+        qweight[k_indices // 8] |= (q[:, k_indices].T << (nibble * 4))
+
+    # Scales: [num_groups, N] as float16 (transposed from [N, num_groups])
+    scales_packed = scales.T.contiguous().to(torch.float16)  # [num_groups, N]
+
+    # Pack qzeros: [num_groups, N//8] — 8 nibbles per int32
+    qzeros = torch.zeros(num_groups, N // 8, dtype=torch.int32)
+    zeros_t = zeros.T.contiguous()  # [num_groups, N]
+    for nibble in range(8):
+        n_indices = torch.arange(nibble, N, 8)
+        qzeros[:, n_indices // 8] |= (zeros_t[:, n_indices] << (nibble * 4))
+
+    return qweight, scales_packed, qzeros
 
 
-def get_calibration_dataset(tokenizer, num_samples=128, seq_len=2048):
-    """Load calibration data for GPTQ quantization."""
-    from datasets import load_dataset
+def should_quantize(name: str, layer_types: list, num_layers: int) -> bool:
+    """Determine if a weight should be quantized (True) or kept BF16 (False)."""
+    # Never quantize embeddings, norms, biases. Skip MTP entirely (not needed for inference)
+    skip_patterns = ['embed_tokens', 'norm', 'bias', 'A_log', 'dt_bias', 'conv1d']
+    # MTP (multi-token prediction) layer — skip entirely
+    if 'mtp.' in name:
+        return False
+    for pat in skip_patterns:
+        if pat in name:
+            return False
 
-    print(f"  Loading wikitext-2 calibration data...")
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-    text = "\n\n".join([t for t in dataset["text"] if len(t.strip()) > 0])
+    # Never quantize linear_attn projections (SSM recurrence is sensitive)
+    if 'linear_attn' in name and '.weight' in name:
+        return False
 
-    tokenized = tokenizer(text, return_tensors="pt", truncation=False)
-    all_ids = tokenized["input_ids"][0]
+    # Quantize: FFN projections + full attention projections + lm_head + mtp
+    quant_patterns = ['gate_proj', 'up_proj', 'down_proj', 'q_proj', 'k_proj', 'v_proj', 'o_proj', 'lm_head']
+    for pat in quant_patterns:
+        if pat in name and '.weight' in name:
+            return True
 
-    samples = []
-    for i in range(num_samples):
-        start = (i * seq_len) % max(1, len(all_ids) - seq_len)
-        chunk = all_ids[start:start + seq_len]
-        if len(chunk) < seq_len:
-            chunk = all_ids[:seq_len]
-        samples.append({"input_ids": chunk.unsqueeze(0)})
-
-    print(f"  {len(samples)} calibration samples ready (seq_len={seq_len})")
-    return samples
+    return False
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Mixed-precision GPTQ quantization for Qwen3.5")
-    parser.add_argument("--model", default="Qwen/Qwen3.5-9B", help="HuggingFace model ID")
-    parser.add_argument("--bits", type=int, default=4, help="Quantization bits (default: 4)")
-    parser.add_argument("--group-size", type=int, default=128, help="GPTQ group size (default: 128)")
-    parser.add_argument("--num-samples", type=int, default=128, help="Calibration samples")
-    parser.add_argument("--seq-len", type=int, default=2048, help="Calibration sequence length")
-    parser.add_argument("--output", default=None, help="Output directory (default: auto)")
-    parser.add_argument("--damp-percent", type=float, default=0.1, help="GPTQ dampening (default: 0.1)")
+    parser = argparse.ArgumentParser(description="Mixed-precision INT4 quantization for Qwen3.5")
+    parser.add_argument("--model", default="./models/qwen3.5-9b", help="Model path or HF repo")
+    parser.add_argument("--bits", type=int, default=4, help="Quantization bits")
+    parser.add_argument("--group-size", type=int, default=128, help="Group size")
+    parser.add_argument("--output", default=None, help="Output directory")
     args = parser.parse_args()
 
     if args.output is None:
-        model_short = args.model.split("/")[-1]
+        model_short = Path(args.model).name
         args.output = str(Path(__file__).parent.parent / "models" / f"{model_short}-mixed-GPTQ-Int{args.bits}")
 
+    model_path = Path(args.model)
+
     print(f"{'='*60}")
-    print(f"Mixed-Precision GPTQ Quantization")
+    print(f"Mixed-Precision INT4 Quantization (RTN)")
     print(f"{'='*60}")
-    print(f"Model:       {args.model}")
-    print(f"Bits:        {args.bits}")
-    print(f"Group size:  {args.group_size}")
-    print(f"Dampening:   {args.damp_percent}")
-    print(f"Calibration: {args.num_samples} samples × {args.seq_len} tokens")
-    print(f"Output:      {args.output}")
+    print(f"Model:      {model_path}")
+    print(f"Bits:       {args.bits}")
+    print(f"Group size: {args.group_size}")
+    print(f"Output:     {args.output}")
     print(f"{'='*60}")
 
-    # Step 1: Load config and determine which modules to exclude
-    print("\n[1/5] Analyzing model architecture...")
-    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-    exclude_modules = get_modules_not_to_quantize(config)
+    # Load config
+    config_path = model_path / "config.json"
+    with open(config_path) as f:
+        config = json.load(f)
 
-    # Step 2: Load tokenizer
-    print("\n[2/5] Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    # Handle nested text_config
+    if 'text_config' in config:
+        text_config = config['text_config']
+        config = {**config, **text_config}
 
-    # Step 3: Load calibration data
-    print(f"\n[3/5] Preparing calibration data...")
-    calibration_dataset = get_calibration_dataset(tokenizer, args.num_samples, args.seq_len)
+    layer_types = config.get('layer_types', [])
+    num_layers = len(layer_types)
+    num_linear = sum(1 for t in layer_types if t == 'linear_attention')
+    num_full = sum(1 for t in layer_types if t == 'full_attention')
+    print(f"\nArchitecture: {num_layers} layers ({num_linear} linear + {num_full} full attention)")
 
-    # Step 4: Load model and quantize
-    print(f"\n[4/5] Loading model (device_map=auto for CPU offloading)...")
-    print(f"  9B BF16 model needs ~18GB — will split across GPU + CPU RAM")
+    # Find all safetensors shards
+    shards = sorted(model_path.glob("model*.safetensors"))
+    print(f"Shards: {len(shards)}")
+
+    # Process each shard
+    os.makedirs(args.output, exist_ok=True)
+    total_original = 0
+    total_quantized = 0
+    quantized_count = 0
+    kept_count = 0
     t0 = time.time()
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    print(f"  Model loaded in {time.time() - t0:.1f}s")
+    for shard_idx, shard_path in enumerate(shards):
+        print(f"\n[Shard {shard_idx+1}/{len(shards)}] {shard_path.name}")
+        tensors = load_file(str(shard_path))
 
-    # Create quantizer with excluded modules
-    quantizer = GPTQQuantizer(
-        bits=args.bits,
-        group_size=args.group_size,
-        damp_percent=args.damp_percent,
-        dataset=calibration_dataset,
-        modules_not_to_quantize=exclude_modules,
-    )
+        output_tensors = {}
 
-    print(f"  Starting quantization (this may take 30-60 minutes with CPU offloading)...")
-    t1 = time.time()
+        for name, tensor in tensors.items():
+            original_bytes = tensor.numel() * tensor.element_size()
+            total_original += original_bytes
 
-    quantized_model = quantizer.quantize_model(model, tokenizer)
-    print(f"  Quantization complete in {time.time() - t1:.1f}s")
+            # Skip MTP (multi-token prediction) layer entirely — not needed for inference
+            if 'mtp.' in name:
+                print(f"  SKIP MTP: {name}")
+                continue
 
-    # Step 5: Save
-    print(f"\n[5/5] Saving to {args.output}...")
-    os.makedirs(args.output, exist_ok=True)
+            if should_quantize(name, layer_types, num_layers):
+                # Quantize to INT4
+                base = name.replace('.weight', '')
+                N, K = tensor.shape
 
-    quantized_model.save_pretrained(args.output)
-    tokenizer.save_pretrained(args.output)
+                # Check dimensions are compatible
+                if K % args.group_size != 0:
+                    print(f"  SKIP {name} — K={K} not divisible by {args.group_size}")
+                    output_tensors[name] = tensor
+                    kept_count += 1
+                    total_quantized += original_bytes
+                    continue
+                if N % 8 != 0:
+                    print(f"  SKIP {name} — N={N} not divisible by 8")
+                    output_tensors[name] = tensor
+                    kept_count += 1
+                    total_quantized += original_bytes
+                    continue
 
-    # Also save the quantizer config
-    quantizer.save(quantized_model, args.output)
+                qweight, scales, qzeros = quantize_rtn_int4(tensor, args.group_size)
 
-    # Report sizes
-    total_size = sum(f.stat().st_size for f in Path(args.output).rglob("*.safetensors"))
+                output_tensors[f"{base}.qweight"] = qweight
+                output_tensors[f"{base}.scales"] = scales
+                output_tensors[f"{base}.qzeros"] = qzeros
+
+                q_bytes = qweight.numel() * 4 + scales.numel() * 2 + qzeros.numel() * 4
+                total_quantized += q_bytes
+                ratio = original_bytes / q_bytes
+                quantized_count += 1
+                print(f"  Q4 {name}: [{N},{K}] {original_bytes/1024/1024:.1f}MB -> {q_bytes/1024/1024:.1f}MB ({ratio:.1f}x)")
+            else:
+                # Keep as-is (BF16/F32)
+                output_tensors[name] = tensor
+                total_quantized += original_bytes
+                kept_count += 1
+
+        # Save output shard
+        out_path = os.path.join(args.output, shard_path.name)
+        save_file(output_tensors, out_path)
+        print(f"  Saved {out_path} ({len(output_tensors)} tensors)")
+
+    # Copy config files
+    for cfg_file in ['config.json', 'tokenizer.json', 'tokenizer_config.json',
+                     'merges.txt', 'vocab.json', 'chat_template.jinja',
+                     'preprocessor_config.json']:
+        src = model_path / cfg_file
+        if src.exists():
+            import shutil
+            shutil.copy2(src, os.path.join(args.output, cfg_file))
+
+    # Write quantization config (so WebGPU engine knows it's GPTQ)
+    quant_config = {
+        "quantization_config": {
+            "quant_method": "gptq",
+            "bits": args.bits,
+            "group_size": args.group_size,
+            "checkpoint_format": "gptq_v2",
+            "mixed_precision": True,
+            "modules_not_quantized": [
+                "linear_attn", "embed_tokens", "lm_head", "norm"
+            ],
+        }
+    }
+    # Merge into config
+    with open(os.path.join(args.output, "config.json")) as f:
+        out_config = json.load(f)
+    out_config.update(quant_config)
+    with open(os.path.join(args.output, "config.json"), "w") as f:
+        json.dump(out_config, f, indent=2)
+
+    # Write safetensors index if multi-shard
+    if len(shards) > 1:
+        index_src = model_path / "model.safetensors.index.json"
+        if index_src.exists():
+            import shutil
+            shutil.copy2(index_src, os.path.join(args.output, "model.safetensors.index.json"))
+
     elapsed = time.time() - t0
-
     print(f"\n{'='*60}")
-    print(f"Done! Mixed-precision GPTQ model saved.")
-    print(f"  Output:       {args.output}")
-    print(f"  Total size:   {total_size / 1024**3:.2f} GB")
-    print(f"  Total time:   {elapsed:.0f}s ({elapsed/60:.1f} min)")
-    print(f"  INT4 layers:  FFN + full_attention")
-    print(f"  BF16 layers:  linear_attention (SSM) + lm_head + embeddings")
-    print(f"\nLoad in WebGPU with the local HF cache loader or upload to HuggingFace.")
+    print(f"Done!")
+    print(f"  Original:   {total_original / 1024**3:.2f} GB")
+    print(f"  Quantized:  {total_quantized / 1024**3:.2f} GB")
+    print(f"  Compression: {total_original / total_quantized:.1f}x")
+    print(f"  INT4:       {quantized_count} weights (FFN + full attention)")
+    print(f"  BF16:       {kept_count} weights (linear_attn + norms + lm_head)")
+    print(f"  Time:       {elapsed:.0f}s")
+    print(f"  Output:     {args.output}")
     print(f"{'='*60}")
 
 
