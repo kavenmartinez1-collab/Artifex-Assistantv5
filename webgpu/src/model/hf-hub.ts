@@ -49,11 +49,16 @@ export interface DownloadProgress {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-let HF_BASE = 'https://huggingface.co';
-let HF_API = 'https://huggingface.co/api/models';
+const REMOTE_BASE = 'https://huggingface.co';
+const REMOTE_API = 'https://huggingface.co/api/models';
+
+let HF_BASE = REMOTE_BASE;
+let HF_API = REMOTE_API;
+let _localBase = '';
 
 /** Switch to local HF cache served by the dev server (50-100x faster than CDN) */
 export function useLocalCache(devServerBase = '/api/hf-cache'): void {
+  _localBase = devServerBase;
   HF_BASE = devServerBase;
   HF_API = devServerBase;
   console.log(`[HF Hub] Using local cache: ${devServerBase}`);
@@ -61,9 +66,29 @@ export function useLocalCache(devServerBase = '/api/hf-cache'): void {
 
 /** Switch back to HuggingFace CDN */
 export function resetToRemote(): void {
-  HF_BASE = 'https://huggingface.co';
-  HF_API = 'https://huggingface.co/api/models';
+  _localBase = '';
+  HF_BASE = REMOTE_BASE;
+  HF_API = REMOTE_API;
   console.log(`[HF Hub] Using remote CDN`);
+}
+
+/** Fetch with local-first, CDN-fallback. If local returns 404, retry from CDN. */
+async function fetchLocalFirst(localUrl: string, remoteUrl: string, init?: RequestInit): Promise<Response> {
+  if (_localBase) {
+    try {
+      const resp = await fetch(localUrl, init);
+      if (resp.ok || resp.status === 206) return resp;
+      // Local 404 — fall back to CDN
+      if (resp.status === 404) {
+        console.log(`[HF Hub] Local miss, falling back to CDN: ${remoteUrl.split('/').slice(-1)[0]}`);
+        return fetchWithRetry(remoteUrl, init);
+      }
+    } catch {
+      // Local fetch failed entirely — fall back to CDN
+      return fetchWithRetry(remoteUrl, init);
+    }
+  }
+  return fetchWithRetry(localUrl, init);
 }
 
 const MAX_RETRIES = 3;
@@ -154,8 +179,9 @@ function authHeaders(): Record<string, string> {
  * List all files in a HuggingFace model repo.
  */
 export async function listModelFiles(repo: string): Promise<HFModelFile[]> {
-  const url = `${HF_API}/${repo}/tree/main`;
-  const resp = await fetchWithRetry(url, { headers: authHeaders() });
+  const localUrl = `${HF_API}/${repo}/tree/main`;
+  const remoteUrl = `${REMOTE_API}/${repo}/tree/main`;
+  const resp = await fetchLocalFirst(localUrl, remoteUrl, { headers: authHeaders() });
 
   if (!resp.ok) {
     if (resp.status === 404) {
@@ -171,8 +197,9 @@ export async function listModelFiles(repo: string): Promise<HFModelFile[]> {
  * Fetch the model's config.json.
  */
 export async function fetchModelConfig(repo: string): Promise<HFModelConfig> {
-  const url = `${HF_BASE}/${repo}/raw/main/config.json`;
-  const resp = await fetchWithRetry(url, { headers: authHeaders() });
+  const localUrl = `${HF_BASE}/${repo}/raw/main/config.json`;
+  const remoteUrl = `${REMOTE_BASE}/${repo}/raw/main/config.json`;
+  const resp = await fetchLocalFirst(localUrl, remoteUrl, { headers: authHeaders() });
 
   if (!resp.ok) {
     throw new Error(`Failed to fetch config.json for ${repo}: ${resp.status}`);
@@ -186,8 +213,9 @@ export async function fetchModelConfig(repo: string): Promise<HFModelConfig> {
  * Returns null if the model is single-shard.
  */
 export async function fetchShardIndex(repo: string): Promise<Record<string, any> | null> {
-  const url = `${HF_BASE}/${repo}/raw/main/model.safetensors.index.json`;
-  const resp = await fetchWithRetry(url, { headers: authHeaders() });
+  const localUrl = `${HF_BASE}/${repo}/raw/main/model.safetensors.index.json`;
+  const remoteUrl = `${REMOTE_BASE}/${repo}/raw/main/model.safetensors.index.json`;
+  const resp = await fetchLocalFirst(localUrl, remoteUrl, { headers: authHeaders() });
 
   if (!resp.ok) {
     // Single-shard model — no index file
@@ -242,12 +270,17 @@ export async function fetchRange(
   start: number,
   end: number,
 ): Promise<ArrayBuffer> {
-  const resp = await fetchWithRetry(url, {
+  // Build CDN fallback URL if using local cache
+  const remoteUrl = _localBase && url.startsWith(_localBase)
+    ? url.replace(_localBase, REMOTE_BASE)
+    : url;
+  const init = {
     headers: {
       ...authHeaders(),
       Range: `bytes=${start}-${end - 1}`, // HTTP Range is inclusive on both ends
     },
-  });
+  };
+  const resp = await fetchLocalFirst(url, remoteUrl, init);
 
   if (!resp.ok && resp.status !== 206) {
     throw new Error(`Range request failed: ${resp.status} ${resp.statusText}`);
