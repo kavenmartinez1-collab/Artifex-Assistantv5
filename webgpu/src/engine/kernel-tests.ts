@@ -13,8 +13,8 @@ import rmsnormWGSL from '../shaders/rmsnorm.wgsl?raw';
 import ropeWGSL from '../shaders/rope.wgsl?raw';
 import { createTurboQuantPipeline } from './turboquant-pipeline';
 import {
-  generateRotationMatrix, generateJLMatrix, buildCodebook,
-  cpuEncode, cpuDecode, computeRelativeMSE,
+  generateRotationMatrix, generateJLMatrix, generateSPiMatrix, buildCodebook,
+  cpuEncode, cpuDecode, computeMSE, computeRelativeMSE, cpuAsymmetricScore,
 } from '../model/turboquant';
 
 export interface TestResult {
@@ -557,6 +557,7 @@ async function testTurboQuant3bit(device: GPUDevice): Promise<TestResult> {
   compressed.quantizedBuffer.destroy();
   compressed.signBitsBuffer.destroy();
   compressed.normsBuffer.destroy();
+  compressed.residualNormsBuffer.destroy();
 
   // Pass criteria:
   // 1. GPU distortion should be reasonable (< 0.15 relative MSE for 3-bit)
@@ -603,6 +604,7 @@ async function testTurboQuant4bit(device: GPUDevice): Promise<TestResult> {
   compressed.quantizedBuffer.destroy();
   compressed.signBitsBuffer.destroy();
   compressed.normsBuffer.destroy();
+  compressed.residualNormsBuffer.destroy();
 
   // 4-bit should have lower distortion than 3-bit (< 0.05 relative MSE)
   const passed = gpuAvgRelMSE < 0.05;
@@ -613,6 +615,134 @@ async function testTurboQuant4bit(device: GPUDevice): Promise<TestResult> {
     maxDiff: gpuAvgRelMSE,
     error: passed ? undefined :
       `GPU relMSE=${gpuAvgRelMSE.toFixed(4)}, ratio=${compressed.ratio.toFixed(1)}x`,
+  };
+}
+
+// ─── Lloyd-Max Codebook MSE Validation ────────────────────────────────────────
+// Validates our codebook against tonbistudio's numbers from real Qwen2.5-3B KV tensors:
+//   3-bit MSE: 0.034 (paper bound: 0.043)
+//   4-bit MSE: 0.009 (paper bound: 0.011)
+// We test with N(0,1) vectors (ideal case) so our numbers should be at or below theirs.
+
+async function testLloydMaxMSE(device: GPUDevice): Promise<TestResult> {
+  const numVectors = 1000;
+  const d = 128;
+  const errors: string[] = [];
+
+  for (const bits of [3, 4] as const) {
+    const codebook = buildCodebook(bits);
+    const scale = 1.0 / Math.sqrt(d);
+
+    // Generate N(0,1) vectors and measure quantization MSE
+    // After rotation, each coord is ~N(0, 1/d). The codebook targets N(0,1),
+    // so we test on N(0,1) directly (pre-scaling) for codebook validation.
+    let totalMSE = 0;
+    for (let v = 0; v < numVectors; v++) {
+      let vecMSE = 0;
+      for (let i = 0; i < d; i++) {
+        // Box-Muller for N(0,1)
+        const u1 = Math.random();
+        const u2 = Math.random();
+        const val = Math.sqrt(-2 * Math.log(Math.max(u1, 1e-10))) * Math.cos(2 * Math.PI * u2);
+
+        // Quantize: find closest centroid
+        const absVal = Math.abs(val);
+        let bin = 0;
+        for (let t = 0; t < codebook.thresholds.length; t++) {
+          if (absVal > codebook.thresholds[t]) bin = t + 1;
+        }
+        const recon = (val >= 0 ? 1 : -1) * codebook.centroids[bin];
+        const diff = val - recon;
+        vecMSE += diff * diff;
+      }
+      totalMSE += vecMSE / d;
+    }
+    const avgMSE = totalMSE / numVectors;
+
+    // tonbistudio reference: 3-bit=0.034, 4-bit=0.009. Paper bounds: 0.043, 0.011.
+    // Our ideal-case MSE should be at or below the paper bounds.
+    const paperBound = bits === 3 ? 0.043 : 0.011;
+    if (avgMSE > paperBound * 1.1) { // 10% tolerance
+      errors.push(`${bits}-bit MSE=${avgMSE.toFixed(4)} exceeds paper bound ${paperBound}`);
+    }
+  }
+
+  return {
+    name: 'Lloyd-Max Codebook MSE',
+    passed: errors.length === 0,
+    error: errors.length > 0 ? errors.join('; ') : undefined,
+  };
+}
+
+// ─── Asymmetric Inner Product Test ────────────────────────────────────────────
+// Validates that cpuAsymmetricScore gives a more accurate <q,k> estimate
+// than the naive <q, k̂_PQ> (decode-then-dot).
+
+async function testAsymmetricScore(device: GPUDevice): Promise<TestResult> {
+  const d = 128;
+  const bits = 3;
+  const numPairs = 50;
+
+  const rotMatrix = generateRotationMatrix(d, 42);
+  const jlMatrix = generateJLMatrix(d, 137);
+  const spiMatrix = generateSPiMatrix(jlMatrix, rotMatrix, d);
+  const codebook = buildCodebook(bits);
+
+  let naiveTotalError = 0;
+  let asymTotalError = 0;
+  let trueTotalMag = 0;
+
+  for (let p = 0; p < numPairs; p++) {
+    // Random query and key vectors
+    const query = new Float32Array(d);
+    const key = new Float32Array(d);
+    for (let i = 0; i < d; i++) {
+      const u1 = Math.random(), u2 = Math.random();
+      query[i] = Math.sqrt(-2 * Math.log(Math.max(u1, 1e-10))) * Math.cos(2 * Math.PI * u2);
+      const u3 = Math.random(), u4 = Math.random();
+      key[i] = Math.sqrt(-2 * Math.log(Math.max(u3, 1e-10))) * Math.cos(2 * Math.PI * u4);
+    }
+
+    // True inner product
+    let trueDot = 0;
+    for (let i = 0; i < d; i++) trueDot += query[i] * key[i];
+
+    // Encode key
+    const encoded = cpuEncode(key, rotMatrix, jlMatrix, codebook, d);
+
+    // Decode (PolarQuant only, no QJL — same as our GPU decode)
+    const decoded = cpuDecode(encoded.quantized, encoded.signBits, encoded.norm,
+      rotMatrix, jlMatrix, codebook, d);
+
+    // Naive: <q, k̂_PQ>
+    let naiveDot = 0;
+    for (let i = 0; i < d; i++) naiveDot += query[i] * decoded[i];
+
+    // Asymmetric: <q, k̂_PQ> + QJL correction
+    const asymDot = cpuAsymmetricScore(
+      query, decoded, encoded.signBits,
+      encoded.norm, encoded.residualNorm, spiMatrix, d,
+    );
+
+    naiveTotalError += Math.abs(naiveDot - trueDot);
+    asymTotalError += Math.abs(asymDot - trueDot);
+    trueTotalMag += Math.abs(trueDot);
+  }
+
+  const naiveRelError = naiveTotalError / trueTotalMag;
+  const asymRelError = asymTotalError / trueTotalMag;
+  const improvement = (naiveRelError - asymRelError) / naiveRelError;
+
+  // Asymmetric should have lower error than naive in most cases
+  const passed = asymRelError < naiveRelError;
+
+  return {
+    name: `Asymmetric Score (3-bit, d=${d})`,
+    passed,
+    maxDiff: asymRelError,
+    error: passed ? undefined :
+      `Asymmetric relErr=${asymRelError.toFixed(4)} >= naive relErr=${naiveRelError.toFixed(4)} ` +
+      `(improvement=${(improvement * 100).toFixed(1)}%)`,
   };
 }
 
@@ -633,6 +763,8 @@ export async function runKernelTests(device: GPUDevice): Promise<TestResult[]> {
     { name: 'RMSNorm', fn: testRMSNorm },
     { name: 'TurboQuant (3-bit)', fn: testTurboQuant3bit },
     { name: 'TurboQuant (4-bit)', fn: testTurboQuant4bit },
+    { name: 'Lloyd-Max Codebook MSE', fn: testLloydMaxMSE },
+    { name: 'Asymmetric Score', fn: testAsymmetricScore },
   ];
 
   const results: TestResult[] = [];

@@ -24,6 +24,8 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> output_sign_bits: array<u32>;
 // Output: norms per vector (num_vectors × 1 f32)
 @group(0) @binding(3) var<storage, read_write> output_norms: array<f32>;
+// Output: residual norms per vector (||rotated - dequantized||, for QJL correction)
+@group(0) @binding(4) var<storage, read_write> output_residual_norms: array<f32>;
 
 // Rotation matrix Pi (d × d, column-major f32)
 @group(1) @binding(0) var<storage, read> rotation_matrix: array<f32>;
@@ -158,6 +160,38 @@ fn encode(@builtin(local_invocation_id) lid: vec3u,
     i = i + 256u;
   }
   workgroupBarrier();
+
+  // ── Compute residual L2 norm (for asymmetric attention correction) ─
+  // Reuse dequantized[] as reduction scratch (no longer needed)
+  var partial_res_sq: f32 = 0.0;
+  i = tid;
+  while (i < d) {
+    partial_res_sq += shmem[i] * shmem[i];
+    i = i + 256u;
+  }
+  dequantized[tid] = partial_res_sq;
+  workgroupBarrier();
+
+  if (tid < 128u) { dequantized[tid] = dequantized[tid] + dequantized[tid + 128u]; }
+  workgroupBarrier();
+  if (tid < 64u) { dequantized[tid] = dequantized[tid] + dequantized[tid + 64u]; }
+  workgroupBarrier();
+  if (tid < 32u) { dequantized[tid] = dequantized[tid] + dequantized[tid + 32u]; }
+  workgroupBarrier();
+  if (tid < 16u) { dequantized[tid] = dequantized[tid] + dequantized[tid + 16u]; }
+  workgroupBarrier();
+  if (tid < 8u) { dequantized[tid] = dequantized[tid] + dequantized[tid + 8u]; }
+  workgroupBarrier();
+  if (tid < 4u) { dequantized[tid] = dequantized[tid] + dequantized[tid + 4u]; }
+  workgroupBarrier();
+  if (tid < 2u) { dequantized[tid] = dequantized[tid] + dequantized[tid + 2u]; }
+  workgroupBarrier();
+  if (tid < 1u) { dequantized[0] = dequantized[0] + dequantized[1]; }
+  workgroupBarrier();
+
+  if (tid == 0u) {
+    output_residual_norms[out_idx] = sqrt(dequantized[0]);
+  }
 
   // sign_bits[i] = sign(sum_j(S[i,j] * residual[j]))
   let sign_words = (d + 31u) / 32u;

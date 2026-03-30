@@ -41,13 +41,15 @@ export interface CompressedKV {
   signBitsBuffer: GPUBuffer;
   /** Norms per vector (f32 array) */
   normsBuffer: GPUBuffer;
+  /** Residual norms per vector — ||rotated - dequantized|| for QJL correction (f32 array) */
+  residualNormsBuffer: GPUBuffer;
   /** Number of vectors encoded */
   numVectors: number;
   /** Words per vector for quantized data */
   packedWordsPerVector: number;
   /** Words per vector for sign bits */
   signWordsPerVector: number;
-  /** Total bytes used (quantized + sign bits + norms) */
+  /** Total bytes used (quantized + sign bits + norms + residualNorms) */
   compressedBytes: number;
   /** Original bytes (uncompressed f32) */
   originalBytes: number;
@@ -157,6 +159,9 @@ export function createTurboQuantPipeline(
     const normsBuffer = createStorageBuffer(
       device, null, normsSize, 'tq-norms', true,
     );
+    const residualNormsBuffer = createStorageBuffer(
+      device, null, normsSize, 'tq-residual-norms', true,
+    );
 
     // Bind group 0: input/output buffers (changes per call)
     const ioBindGroup = createBindGroup(
@@ -166,6 +171,7 @@ export function createTurboQuantPipeline(
         { binding: 1, resource: { buffer: quantizedBuffer } },
         { binding: 2, resource: { buffer: signBitsBuffer } },
         { binding: 3, resource: { buffer: normsBuffer } },
+        { binding: 4, resource: { buffer: residualNormsBuffer } },
       ],
       'tq-encode-io',
     );
@@ -179,12 +185,13 @@ export function createTurboQuantPipeline(
     );
 
     const originalBytes = numVectors * d * 4;
-    const compressedBytes = quantizedSize + signBitsSize + normsSize;
+    const compressedBytes = quantizedSize + signBitsSize + normsSize * 2;
 
     return {
       quantizedBuffer,
       signBitsBuffer,
       normsBuffer,
+      residualNormsBuffer,
       numVectors,
       packedWordsPerVector,
       signWordsPerVector,

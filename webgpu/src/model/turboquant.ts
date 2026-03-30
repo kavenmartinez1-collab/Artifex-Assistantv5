@@ -215,6 +215,34 @@ export function generateJLMatrix(d: number, seed = 137): Float32Array {
 }
 
 
+// ── Precomputed S·Π Matrix ─────────────────────────────────────────────────
+//
+// For the asymmetric attention kernel, we need S·Π·q for each query vector.
+// Precomputing M = S·Π once at initialization saves a d×d matmul per query.
+// Both S and Π are stored row-major, so M[i][j] = Σ_k S[i][k] * Π[k][j].
+
+/**
+ * Compute M = S · Π (row-major d×d).
+ * Used in the asymmetric attention kernel: sq = M · q = S · Π · q
+ */
+export function generateSPiMatrix(
+  jlMatrix: Float32Array,
+  rotMatrix: Float32Array,
+  d: number,
+): Float32Array {
+  const M = new Float32Array(d * d);
+  for (let i = 0; i < d; i++) {
+    for (let j = 0; j < d; j++) {
+      let sum = 0;
+      for (let k = 0; k < d; k++) {
+        sum += jlMatrix[i * d + k] * rotMatrix[k * d + j];
+      }
+      M[i * d + j] = sum;
+    }
+  }
+  return M;
+}
+
 // ── GPU Buffer Setup ───────────────────────────────────────────────────────
 
 export interface TurboQuantBuffers {
@@ -222,6 +250,8 @@ export interface TurboQuantBuffers {
   rotationMatrix: GPUBuffer;
   /** d×d JL matrix (column-major f32) */
   jlMatrix: GPUBuffer;
+  /** d×d precomputed S·Π matrix (row-major f32) for asymmetric attention */
+  spiMatrix: GPUBuffer;
   /** Positive centroids (f32, length = 2^(bits-1)) */
   centroids: GPUBuffer;
   /** Decision thresholds (f32, length = 2^(bits-1) - 1) */
@@ -259,6 +289,7 @@ export function initTurboQuant(
   // Generate CPU-side data
   const rotMatrix = generateRotationMatrix(d, rotationSeed);
   const jlMatrix = generateJLMatrix(d, jlSeed);
+  const spiMatrix = generateSPiMatrix(jlMatrix, rotMatrix, d);
   const codebook = buildCodebook(bits);
 
   // Upload rotation matrix (d×d × 4 bytes)
@@ -280,6 +311,16 @@ export function initTurboQuant(
   });
   new Float32Array(jlBuf.getMappedRange()).set(jlMatrix);
   jlBuf.unmap();
+
+  // Upload S·Π matrix (for asymmetric attention kernel)
+  const spiBuf = device.createBuffer({
+    size: d * d * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    label: 'turboquant-spi',
+    mappedAtCreation: true,
+  });
+  new Float32Array(spiBuf.getMappedRange()).set(spiMatrix);
+  spiBuf.unmap();
 
   // Upload centroids — pad to minimum 16 bytes for WebGPU alignment
   const centroidData = codebook.centroids;
@@ -328,6 +369,7 @@ export function initTurboQuant(
   return {
     rotationMatrix: rotBuf,
     jlMatrix: jlBuf,
+    spiMatrix: spiBuf,
     centroids: centBuf,
     thresholds: threshBuf,
     params: paramsBuf,
@@ -349,7 +391,7 @@ export function cpuEncode(
   jlMatrix: Float32Array,
   codebook: TurboQuantCodebook,
   d: number,
-): { quantized: Uint32Array; signBits: Uint32Array; norm: number } {
+): { quantized: Uint32Array; signBits: Uint32Array; norm: number; residualNorm: number } {
   const bits = codebook.bits;
   const scale = 1.0 / Math.sqrt(d);
 
@@ -409,9 +451,12 @@ export function cpuEncode(
   // Stage 2: QJL residual correction
   // residual = rotated - dequantized (in rotated space)
   const residual = new Float32Array(d);
+  let residualSq = 0;
   for (let i = 0; i < d; i++) {
     residual[i] = rotated[i] - dequantized[i];
+    residualSq += residual[i] * residual[i];
   }
+  const residualNorm = Math.sqrt(residualSq);
 
   // sign_bits = sign(S · residual)
   const signWordsLen = Math.ceil(d / 32);
@@ -427,7 +472,7 @@ export function cpuEncode(
     }
   }
 
-  return { quantized, signBits, norm };
+  return { quantized, signBits, norm, residualNorm };
 }
 
 /**
@@ -524,4 +569,57 @@ export function computeRelativeMSE(original: Float32Array, reconstructed: Float3
     normSq += original[i] * original[i];
   }
   return normSq > 0 ? errorSq / normSq : 0;
+}
+
+/**
+ * CPU-side asymmetric inner product estimator for testing.
+ * Computes <q, k> ≈ <q, k̂_PQ> + ||k|| · ||r|| · sqrt(π/2)/√d · <S·Π·q, sign(S·r)>
+ *
+ * @param query       - Query vector (f32, length d)
+ * @param decoded     - PolarQuant-decoded key (from cpuDecode with jlScale=0)
+ * @param signBits    - QJL sign bits from cpuEncode
+ * @param norm        - Original key vector norm (from cpuEncode)
+ * @param residualNorm - Quantization residual norm (from cpuEncode)
+ * @param spiMatrix   - Precomputed S·Π matrix (from generateSPiMatrix)
+ * @param d           - Head dimension
+ * @returns Estimated <q, k> inner product
+ */
+export function cpuAsymmetricScore(
+  query: Float32Array,
+  decoded: Float32Array,
+  signBits: Uint32Array,
+  norm: number,
+  residualNorm: number,
+  spiMatrix: Float32Array,
+  d: number,
+): number {
+  // Base: <q, k̂_PQ>
+  let baseDot = 0;
+  for (let i = 0; i < d; i++) {
+    baseDot += query[i] * decoded[i];
+  }
+
+  // Compute sq = S·Π·q
+  const sq = new Float32Array(d);
+  for (let i = 0; i < d; i++) {
+    let sum = 0;
+    for (let j = 0; j < d; j++) {
+      sum += spiMatrix[i * d + j] * query[j];
+    }
+    sq[i] = sum;
+  }
+
+  // QJL correction: <sq, sign_bits>
+  let correctionDot = 0;
+  for (let i = 0; i < d; i++) {
+    const bit = (signBits[Math.floor(i / 32)] >> (i % 32)) & 1;
+    const signVal = bit ? 1.0 : -1.0;
+    correctionDot += sq[i] * signVal;
+  }
+
+  // sqrt(π/2) / √d — adjusted for our S with entries N(0, 1/d)
+  const qjlConstant = Math.sqrt(Math.PI / 2) / Math.sqrt(d);
+  const correction = norm * residualNorm * qjlConstant * correctionDot;
+
+  return baseDot + correction;
 }
