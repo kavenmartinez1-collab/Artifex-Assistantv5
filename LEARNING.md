@@ -788,6 +788,69 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
 
 **Used for**: Position encoding in attention (applied to Q and K at every layer).
 
+### Kernel 6: TurboQuant Encode/Decode (`turboquant_encode.wgsl` / `turboquant_decode.wgsl`)
+
+**What it does**: Compresses KV cache vectors from 32-bit floats to 3-4 bits per coordinate using Google's TurboQuant algorithm (ICLR 2026).
+
+**The two-stage algorithm**:
+
+1. **PolarQuant** (Stage 1):
+   - Compute the vector's L2 norm (parallel reduction), normalize to unit length
+   - Multiply by a random orthogonal matrix Π (makes coordinates ~independent N(0, 1/d))
+   - Scalar quantize each coordinate using Lloyd-Max optimal centroids for N(0,1)
+   - Pack quantized indices into u32 words (3 bits = 10 indices per u32)
+
+2. **QJL** (Stage 2):
+   - Compute the quantization residual: `r = rotated - dequantized`
+   - Compute residual L2 norm (stored for asymmetric attention correction)
+   - Project residual through JL matrix S: `sign(S · r)` → 1 bit per coordinate
+   - Store these sign bits alongside the packed indices
+
+**Decode** only reverses Stage 1 (unpack → centroid lookup → inverse rotation → rescale by norm). Stage 2's sign bits are NOT applied during reconstruction — they're used in the attention kernel instead.
+
+**Why this works**: Random rotation makes coordinates near-independent. The Lloyd-Max quantizer is optimal for the resulting Gaussian distribution. No per-block scales or zero-points needed — the rotation IS the normalization.
+
+**Memory savings**: 3-bit = 10.67x compression. For Qwen3.5-9B's 8 full attention layers with 256-dim heads: KV cache drops from ~400 MB to ~38 MB at 2K context.
+
+### Kernel 7: Asymmetric Attention (`attention_tq.wgsl`)
+
+**What it does**: A modified attention kernel that adds a QJL correction term to attention scores, making compressed KV cache produce near-lossless attention despite 3-4 bit quantization.
+
+**The problem with naive decode-then-attend**: PolarQuant reconstruction has 23-44% per-vector error. Standard attention on these reconstructed vectors produces poor scores — confirmed by tonbistudio's analysis on real Qwen2.5-3B KV tensors.
+
+**The asymmetric inner product estimator**:
+
+Instead of `score = <q, decode(k)>`, we compute:
+
+```
+score = <q, k̂_PQ> + ||k|| · ||r|| · √(π/2)/√d · <S·Π·q, sign(S·r)>
+         \_________/   \________________   _________________________/
+          standard            QJL correction term
+          dot product
+```
+
+Where:
+- `k̂_PQ` = PolarQuant-only reconstruction (from decode kernel)
+- `||k||` = original vector norm (stored during encode)
+- `||r||` = quantization residual norm (stored during encode)
+- `S·Π·q` = query projected through JL and rotation matrices (precomputed once per workgroup)
+- `sign(S·r)` = stored sign bits from encode (1 bit per coordinate, packed in u32)
+
+**How it works in the kernel**:
+
+1. **Precompute S·Π·q** in shared memory (d×d matrix-vector product, once per query/head)
+2. For each cache position j:
+   - Standard dot product: `<q, k̂_PQ_j>`
+   - If j < pos_offset (compressed): add `norm_j · residual_norm_j · C · <sq, sign_bits_j>`
+   - If j >= pos_offset (current token): K is exact, no correction needed
+3. Softmax and V weighting proceed as normal
+
+**Why QJL correction works in attention but not reconstruction**: QJL sign bits add high per-coordinate variance. In reconstruction, you'd need every coordinate to be accurate → high variance is bad. But in an inner product, you're summing over d terms → the Law of Large Numbers averages out the variance. For d=128 or d=256, the estimate converges tightly.
+
+**Shared memory budget**: `sq[256] + scores[3584] + shmem[256]` = exactly 16 KB (WebGPU default workgroup memory limit). Max cache length = 3584 tokens.
+
+**Used for**: Every full attention layer when TurboQuant KV cache is enabled (8 layers per token for Qwen3.5-9B).
+
 ---
 
 ## 11. The WebGPU Inference Roadmap
@@ -808,6 +871,7 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
     ✅ Attention (fused multi-head with GQA, causal mask, inline softmax)
     ✅ Embedding lookup (f32 and BF16/F16 packed)
     ✅ TurboQuant encode/decode (PolarQuant KV cache compression)
+    ✅ Asymmetric attention with QJL correction (attention_tq.wgsl)
 ✅ Metrics collection (browser → dev server)
 
 ✅ SafeTensors parser (BF16/F16/F32 → Float32 conversion, or native BF16 with keepBF16)
@@ -834,6 +898,10 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
 ✅ TurboQuant KV cache integration — 3-bit (d≥128) or 4-bit (d≤64)
    compressed KV cache. ~80% memory savings. Current token exact,
    only cached tokens decoded from compressed storage.
+✅ Asymmetric attention kernel (attention_tq.wgsl) — QJL inner
+   product correction applied during Q·K^T scoring, not reconstruction.
+   Precomputes S·Π·q once per workgroup, adds correction to compressed
+   positions only. Validated against tonbistudio MSE benchmarks.
 ✅ Batch prefill — 512-token chunks for standard transformers,
    token-by-token for hybrid models (SSM needs sequential processing)
 ✅ Retry logic with exponential backoff on all HF CDN requests
@@ -892,6 +960,10 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
 - On Windows, `gptqmodel` and `auto-gptq` fail to build CUDA extensions. Our workaround: pure PyTorch RTN quantization script.
 
 **TurboQuant quality notes** — 3-bit works well for d≥128 (larger models like Qwen3.5-9B). For d=64 (small models like Qwen2.5-0.5B), 4-bit is needed. Critical design rule: never quantize the current token's K/V — only compress previously cached tokens.
+
+**Why asymmetric attention matters** — PolarQuant reconstruction has 23-44% per-vector error (confirmed by tonbistudio on real Qwen2.5-3B KV tensors). If you decompress the vectors and feed them to standard attention, the model produces garbage. The fix: the QJL asymmetric inner product estimator. Instead of `score = <q, decode(k)>`, we compute `score = <q, k̂_PQ> + ||k||·||r||·√(π/2)/√d · <S·Π·q, sign(S·r)>`. This is mathematically unbiased — the sign bits from encoding correct the quantization error during the inner product itself, not during reconstruction. The key insight is that QJL correction increases per-coordinate variance (bad for reconstruction) but averaging over d dimensions during the dot product concentrates the estimate (good for inner products). tonbistudio's validation shows 99.5% cosine similarity on attention scores with 86% top-1 retrieval accuracy at 3-bit, 8K context.
+
+**Lloyd-Max codebook validation** — Our hardcoded centroids for N(0,1) produce MSE matching tonbistudio's measurements within the paper's theoretical bounds (3-bit MSE ≤ 0.043, 4-bit MSE ≤ 0.011). This was confirmed by a dedicated kernel test quantizing 1000 random N(0,1) vectors.
 
 ### The 2 GB buffer limit
 

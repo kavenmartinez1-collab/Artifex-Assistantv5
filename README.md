@@ -61,7 +61,7 @@ Universal Local AI Hosting Platform. Run any AI model locally — text generatio
 - **Agent tools** — shell execution, Python runner, web search, codebase analysis (grep, glob, architecture), file I/O, edit-in-place
 - **RAG knowledge base** — per-workspace knowledge entries with lifecycle classification, action keys, loop detection
 - **Session persistence** — save/load conversations with full metadata (model, backend, mode)
-- **WebGPU engine** — browser-based LLM inference with custom WGSL compute kernels (matmul, attention, RMSNorm, RoPE, softmax, SiLU, embedding), TurboQuant KV cache compression (3-4 bit, ~80% memory savings), batch prefill, GPTQ INT4 weight support, full transformer forward pass, and autoregressive generation with streaming. Loads any HuggingFace SafeTensors model directly in the browser with retry logic and parallel chunk prefetch.
+- **WebGPU engine** — browser-based LLM inference with custom WGSL compute kernels (matmul, attention, RMSNorm, RoPE, softmax, SiLU, embedding), TurboQuant KV cache compression (3-4 bit, ~80% memory savings) with asymmetric attention for near-lossless compressed scores, batch prefill, GPTQ INT4 weight support, full transformer forward pass, and autoregressive generation with streaming. Loads any HuggingFace SafeTensors model directly in the browser with retry logic and parallel chunk prefetch.
 - **Secure web search** — SearXNG + Web Gateway with content sanitization, prompt injection detection, tmpfs quarantine, and network isolation
 - **Docker support** — GPU-enabled container with health checks, optional Ollama sidecar, and web gateway proxy
 - **Multi-GPU** — device selection for multi-GPU systems
@@ -84,7 +84,7 @@ Universal Local AI Hosting Platform. Run any AI model locally — text generatio
 | WebGPU TypeScript | PASS | tsc --noEmit clean, 0 errors |
 | WebGPU Vite build | PASS | 13 modules, 23KB bundle |
 | WebGPU inference | PASS | Qwen2.5-0.5B-Instruct generates coherent English at ~20 tok/s in Chrome (f32), ~10 tok/s with TurboQuant 4-bit KV |
-| WebGPU kernel tests | **9/9 PASS** | SiLU, Add, Mul, Matmul naive, Matmul tiled, Softmax, RMSNorm, TurboQuant 3-bit d=64, TurboQuant 4-bit d=128 |
+| WebGPU kernel tests | **15/15 PASS** | SiLU, Add, Mul, Matmul (naive, tiled, BT, BT-BF16 x3), Softmax, RMSNorm, TurboQuant 3-bit, TurboQuant 4-bit, Lloyd-Max codebook MSE, Asymmetric score |
 | WebGPU batch prefill | PASS | 29-token prompt in 1 chunk at ~150 tok/s (vs one-by-one before) |
 | Localhost binding | PASS | Confirmed NOT accessible on LAN IP |
 
@@ -761,7 +761,7 @@ npx tsx server/dev-server.ts  # Terminal 2: metrics + local cache server (:3001)
 1. Open `http://localhost:5173` in Chrome/Edge
 2. The page auto-detects your GPU (vendor, architecture, limits)
 3. Click **"Run GPU Tests"** in the sidebar
-4. All 13 WGSL kernels run against CPU reference values
+4. All 15 WGSL kernels run against CPU reference values
 5. Results appear in the browser and log to the metrics server at `:3001`
 
 ### Architecture
@@ -770,15 +770,16 @@ npx tsx server/dev-server.ts  # Terminal 2: metrics + local cache server (:3001)
 - **WGSL compute kernels**:
   - `matmul.wgsl` — tiled 16x16 matrix multiplication with shared memory + `matmul_bt` (B-transposed) + `matmul_bt_bf16` (BF16 native weights)
   - `attention.wgsl` — fused multi-head attention with GQA, causal masking, inline softmax
+  - `attention_tq.wgsl` — asymmetric attention with QJL correction for TurboQuant-compressed KV cache (near-lossless scores despite 3-4 bit compression)
   - `rmsnorm.wgsl` — RMS layer normalization
   - `rope.wgsl` — rotary positional embeddings
   - `softmax.wgsl` — attention softmax
   - `elementwise.wgsl` — add, multiply, SiLU activation
   - `embed.wgsl` — parallel embedding table lookup (f32, BF16/F16 packed, and GPTQ INT4 with per-group dequant)
-  - `turboquant_encode.wgsl` / `turboquant_decode.wgsl` — TurboQuant KV cache compression (Google, ICLR 2026)
+  - `turboquant_encode.wgsl` / `turboquant_decode.wgsl` — TurboQuant KV cache compression with residual norm output (Google, ICLR 2026)
   - `matmul_q4.wgsl` — fused INT4 GPTQ dequantization matmul (unpacks 4-bit nibbles, applies group scales/zeros on the fly)
 - **Buffer management** — typed GPU buffer creation, read/write operations
-- **Kernel test suite** — 13 correctness tests against CPU reference values (elementwise, matmul, BF16 matmul, softmax, RMSNorm, TurboQuant)
+- **Kernel test suite** — 15 correctness tests against CPU reference values (elementwise, matmul, BF16 matmul, softmax, RMSNorm, TurboQuant round-trip, Lloyd-Max codebook MSE validation, asymmetric inner product estimation)
 - **Metrics collection** — browser-to-server event reporting with JSON logging
 - **Dev server** — Express metrics endpoint, local HF cache file serving with Range support
 - **Local model loading** — serves SafeTensors from `~/.cache/huggingface/hub/` and project `models/` directory via dev server (50-100x faster than CDN). Local-first with automatic CDN fallback for missing files.
@@ -789,7 +790,7 @@ Phases 0-6 complete plus Gated DeltaNet/Mamba-2 hybrid support, TurboQuant KV ca
 
 - **Standard transformer inference** — full forward pass with GQA, RoPE, KV cache, autoregressive generation
 - **Gated DeltaNet (Mamba-2) hybrid** — Qwen3.5's 24 linear attention layers + 8 full attention layers. New WGSL kernels: conv1d, SSM delta rule recurrence, L2 norm, per-head RMSNormGated. Fixed-size SSM state (~50 MB) instead of growing KV cache. Token-by-token prefill for correct SSM recurrence.
-- **TurboQuant KV cache** — 3-bit (d≥128) or 4-bit (d≤64) compressed KV cache saving ~80% memory for standard attention layers. Current token K/V is always exact; only cached tokens compressed.
+- **TurboQuant KV cache with asymmetric attention** — 3-bit (d≥128) or 4-bit (d≤64) compressed KV cache saving ~80% memory. Uses the QJL unbiased inner product estimator to correct attention scores directly from compressed data, avoiding the 23-44% per-vector reconstruction error of naive decode-then-attend. Current token K/V is always exact; only cached tokens get QJL correction. Validated against tonbistudio's real-model MSE numbers.
 - **Batch prefill** — 512-token chunks for standard transformers, token-by-token for hybrid models (SSM recurrence requires sequential processing)
 - **Mixed-precision quantization** — custom quantization pipeline (`scripts/quantize_mixed_precision.py`) that keeps SSM-critical linear_attn layers in original BF16 precision while quantizing FFN and attention to INT4. `dispatchProjection` auto-selects f32/BF16/INT4 kernel per weight buffer. See [Mixed-Precision Quantization](#mixed-precision-quantization) below.
 - **GPTQ INT4** — weight loader and fused `matmul_bt_q4` kernel for quantized models. INT4 embedding lookup (`embed_q4`) and INT4 LM head matmul.
@@ -1170,9 +1171,14 @@ First and foremost, all praise and glory to **God** through **Jesus Christ**. Ev
 
 ### Algorithms & Research
 
-- **[TurboQuant](https://arxiv.org/abs/2504.19874)** — Amir Zandieh, Majid Daliri, Majid Hadian, Vahab Mirrokni et al. (Google Research) — Online vector quantization for KV cache compression with near-optimal distortion rate (ICLR 2026). First WebGPU implementation.
+- **[TurboQuant](https://arxiv.org/abs/2504.19874)** — Amir Zandieh, Majid Daliri, Majid Hadian, Vahab Mirrokni et al. (Google Research) — Online vector quantization for KV cache compression with near-optimal distortion rate (ICLR 2026). Our implementation includes the full two-stage pipeline (PolarQuant + QJL) with an asymmetric attention kernel that applies the QJL inner product correction directly during score computation, avoiding the quality loss of naive decode-then-attend.
 - **[PolarQuant](https://arxiv.org/abs/2502.00527)** — Google Research — MSE-optimal scalar quantization via random orthogonal rotation (AISTATS 2026). Stage 1 of TurboQuant.
-- **[QJL](https://github.com/amirzandieh/QJL)** — Amir Zandieh et al. — 1-bit quantized Johnson-Lindenstrauss transform for unbiased inner product estimation (AAAI 2025). Stage 2 of TurboQuant.
+- **[QJL](https://github.com/amirzandieh/QJL)** — Amir Zandieh et al. — 1-bit quantized Johnson-Lindenstrauss transform for unbiased inner product estimation (AAAI 2025). Stage 2 of TurboQuant. The asymmetric estimator `<q, k̂> + ||k||·||r||·√(π/2)/√d · <S·Π·q, sign(S·r)>` is implemented as a dedicated WGSL attention kernel.
+- **[Lloyd-Max quantizer](https://en.wikipedia.org/wiki/Lloyd%27s_algorithm)** — Stuart Lloyd (Bell Labs, 1957/1982) — Optimal scalar quantization for known distributions. Our hardcoded codebook centroids and thresholds for N(0,1) match the Lloyd-Max optimal values.
+
+### Validation & Reference Implementations
+
+- **[tonbistudio/TurboQuant](https://github.com/tonbistudio/TurboQuant)** — tonbistudio — PyTorch reference implementation with Lloyd-Max codebook computation and real-model KV validation on Qwen2.5-3B. Their MSE measurements (3-bit: 0.034, 4-bit: 0.009) and the critical insight that naive decode-then-attend produces garbage (23-44% per-vector error) motivated our asymmetric attention kernel. Their `asymmetric_attention_scores()` in `compressors.py` served as algorithmic reference for the QJL inner product correction.
 
 ### Standards & Specifications
 

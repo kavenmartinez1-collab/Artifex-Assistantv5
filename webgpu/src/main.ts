@@ -38,6 +38,67 @@ const tempSlider = $('temperature') as HTMLInputElement;
 const toppSlider = $('top-p') as HTMLInputElement;
 const tempVal = $('temp-val');
 const toppVal = $('topp-val');
+const browseBtn = $('browse-btn') as HTMLButtonElement;
+const modelBrowser = $('model-browser');
+const modelList = $('model-list');
+
+// ─── Browse Local Models ─────────────────────────────────────────────────────
+
+let browseOpen = false;
+
+browseBtn.addEventListener('click', async () => {
+  if (browseOpen) {
+    modelBrowser.style.display = 'none';
+    browseOpen = false;
+    return;
+  }
+
+  modelList.innerHTML = '<div style="padding:8px;color:var(--dim)">Scanning...</div>';
+  modelBrowser.style.display = 'block';
+  browseOpen = true;
+
+  try {
+    const resp = await fetch('/api/hf-cache/models');
+    if (!resp.ok) throw new Error(`${resp.status}`);
+    const models = await resp.json() as Array<{ repo: string; files: string[]; totalSize: number }>;
+
+    if (models.length === 0) {
+      modelList.innerHTML = '<div style="padding:8px;color:var(--dim)">No local models found</div>';
+      return;
+    }
+
+    // Sort: local/ models first, then by size descending
+    models.sort((a, b) => {
+      const aLocal = a.repo.startsWith('local/') ? 0 : 1;
+      const bLocal = b.repo.startsWith('local/') ? 0 : 1;
+      if (aLocal !== bLocal) return aLocal - bLocal;
+      return b.totalSize - a.totalSize;
+    });
+
+    modelList.innerHTML = '';
+    for (const m of models) {
+      const el = document.createElement('div');
+      const sizeGB = (m.totalSize / 1024 / 1024 / 1024).toFixed(1);
+      const safetensors = m.files.filter(f => f.endsWith('.safetensors')).length;
+      const isLocal = m.repo.startsWith('local/');
+      el.style.cssText = 'padding:6px 8px;cursor:pointer;border-bottom:1px solid #222;display:flex;justify-content:space-between;align-items:center';
+      el.innerHTML = `
+        <span style="color:${isLocal ? 'var(--accent)' : 'var(--text)'}">${isLocal ? '📁 ' : ''}${m.repo}</span>
+        <span style="color:var(--dim);font-size:10px;white-space:nowrap;margin-left:8px">${sizeGB} GB · ${safetensors} shard${safetensors !== 1 ? 's' : ''}</span>
+      `;
+      el.addEventListener('mouseenter', () => { el.style.background = '#1a1e33'; });
+      el.addEventListener('mouseleave', () => { el.style.background = 'none'; });
+      el.addEventListener('click', () => {
+        ($('model-repo') as HTMLInputElement).value = m.repo;
+        modelBrowser.style.display = 'none';
+        browseOpen = false;
+      });
+      modelList.appendChild(el);
+    }
+  } catch (err) {
+    modelList.innerHTML = `<div style="padding:8px;color:var(--error)">Failed to scan: ${err}</div>`;
+  }
+});
 
 // ─── UI Helpers ──────────────────────────────────────────────────────────────
 

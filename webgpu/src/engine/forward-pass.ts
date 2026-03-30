@@ -49,6 +49,7 @@ import attentionWGSL from '../shaders/attention.wgsl?raw';
 import matmulQ4WGSL from '../shaders/matmul_q4.wgsl?raw';
 import tqEncodeWGSL from '../shaders/turboquant_encode.wgsl?raw';
 import tqDecodeWGSL from '../shaders/turboquant_decode.wgsl?raw';
+import attentionTqWGSL from '../shaders/attention_tq.wgsl?raw';
 import conv1dWGSL from '../shaders/conv1d.wgsl?raw';
 import groupNormWGSL from '../shaders/group_norm.wgsl?raw';
 import ssmStepWGSL from '../shaders/ssm_step.wgsl?raw';
@@ -123,14 +124,16 @@ export interface ModelWeights {
 
 /** Compressed KV cache data (TurboQuant). */
 export interface CompressedKVData {
-  scratchK: GPUBuffer;       // shared f32 decode buffer [maxSeqLen, kvDim]
-  scratchV: GPUBuffer;       // shared f32 decode buffer [maxSeqLen, kvDim]
-  quantizedK: GPUBuffer[];   // packed u32 indices per layer
+  scratchK: GPUBuffer;           // shared f32 decode buffer [maxSeqLen, kvDim]
+  scratchV: GPUBuffer;           // shared f32 decode buffer [maxSeqLen, kvDim]
+  quantizedK: GPUBuffer[];       // packed u32 indices per layer
   quantizedV: GPUBuffer[];
-  signBitsK: GPUBuffer[];    // QJL sign bits per layer
+  signBitsK: GPUBuffer[];        // QJL sign bits per layer
   signBitsV: GPUBuffer[];
-  normsK: GPUBuffer[];       // f32 norms per layer
+  normsK: GPUBuffer[];           // f32 norms per layer (||k||)
   normsV: GPUBuffer[];
+  residualNormsK: GPUBuffer[];   // f32 residual norms per layer (||r||, for QJL correction)
+  residualNormsV: GPUBuffer[];
 }
 
 /** SSM state for Gated DeltaNet / Mamba-2 linear attention layers. */
@@ -225,6 +228,7 @@ export function createForwardPassEngine(
     : null;
   const ropePipeline = createComputePipeline(device, ropeWGSL, 'rope', 'rope');
   const attentionPipeline = createComputePipeline(device, attentionWGSL, 'attention', 'attention');
+  const attentionTqPipeline = createComputePipeline(device, attentionTqWGSL, 'attention_tq', 'attention-tq');
 
   // ── TurboQuant pipelines & setup ───────────────────────────────────
   // 4 bits for d≤64 (small models), 3 bits for d≥128 (noise averages better)
@@ -583,6 +587,48 @@ export function createForwardPassEngine(
     deferDestroy(paramBuf);
   }
 
+  function dispatchAttentionTQ(
+    qBuf: GPUBuffer, kCacheBuf: GPUBuffer, vCacheBuf: GPUBuffer,
+    outputBuf: GPUBuffer, newSeqLen: number, cacheLen: number,
+    isCausal: boolean, posOffset: number,
+    signBitsK: GPUBuffer, normsK: GPUBuffer, residualNormsK: GPUBuffer,
+    label: string,
+  ) {
+    // Params: standard attention params + qjl_constant + sign_words_per_vec
+    const paramData = new ArrayBuffer(48); // 10 fields * 4 bytes, padded to 48
+    const u32View = new Uint32Array(paramData);
+    const f32View = new Float32Array(paramData);
+    u32View[0] = nHeads;
+    u32View[1] = nKVHeads;
+    u32View[2] = dHead;
+    u32View[3] = newSeqLen;
+    u32View[4] = cacheLen;
+    f32View[5] = 1.0 / Math.sqrt(dHead);
+    u32View[6] = isCausal ? 1 : 0;
+    u32View[7] = posOffset;
+    f32View[8] = Math.sqrt(Math.PI / 2) / Math.sqrt(dHead); // qjl_constant
+    u32View[9] = tqSignWords; // sign_words_per_vec
+    const paramBuf = createUniformBuffer(device, new Uint8Array(paramData), `${label}-p`);
+
+    const bg0 = createBindGroup(device, attentionTqPipeline, 0, [
+      { binding: 0, resource: { buffer: qBuf } },
+      { binding: 1, resource: { buffer: kCacheBuf } },
+      { binding: 2, resource: { buffer: vCacheBuf } },
+      { binding: 3, resource: { buffer: outputBuf } },
+      { binding: 4, resource: { buffer: paramBuf } },
+    ], `${label}-g0`);
+
+    const bg1 = createBindGroup(device, attentionTqPipeline, 1, [
+      { binding: 0, resource: { buffer: signBitsK } },
+      { binding: 1, resource: { buffer: normsK } },
+      { binding: 2, resource: { buffer: residualNormsK } },
+      { binding: 3, resource: { buffer: tqSetup.spiMatrix } },
+    ], `${label}-g1`);
+
+    bd(attentionTqPipeline, [bg0, bg1], [newSeqLen, nHeads], label);
+    deferDestroy(paramBuf);
+  }
+
   function copyToKVCache(
     srcBuf: GPUBuffer, cacheBuf: GPUBuffer,
     seqLen: number, dim: number, position: number,
@@ -597,6 +643,7 @@ export function createForwardPassEngine(
   function dispatchTQEncode(
     inputBuf: GPUBuffer,
     outQuantBuf: GPUBuffer, outSignBuf: GPUBuffer, outNormsBuf: GPUBuffer,
+    outResidualNormsBuf: GPUBuffer,
     numVecs: number, outVecOffset: number, label: string,
   ) {
     const params = createUniformBuffer(device,
@@ -608,6 +655,7 @@ export function createForwardPassEngine(
       { binding: 1, resource: { buffer: outQuantBuf } },
       { binding: 2, resource: { buffer: outSignBuf } },
       { binding: 3, resource: { buffer: outNormsBuf } },
+      { binding: 4, resource: { buffer: outResidualNormsBuf } },
     ], `${label}-g0`);
     const bg2 = createBindGroup(device, tqEncodePipeline, 2, [
       { binding: 0, resource: { buffer: params } },
@@ -1039,11 +1087,13 @@ export function createForwardPassEngine(
           const numVecs = seqLen * nKVHeads;
           const outOffset = pos * nKVHeads;
 
+          // Encode K/V to compressed cache (now also stores residual norms)
           dispatchTQEncode(kBuf, c.quantizedK[l], c.signBitsK[l], c.normsK[l],
-            numVecs, outOffset, `L${l}-tq-enc-k`);
+            c.residualNormsK[l], numVecs, outOffset, `L${l}-tq-enc-k`);
           dispatchTQEncode(vBuf, c.quantizedV[l], c.signBitsV[l], c.normsV[l],
-            numVecs, outOffset, `L${l}-tq-enc-v`);
+            c.residualNormsV[l], numVecs, outOffset, `L${l}-tq-enc-v`);
 
+          // Decode previous K/V (PolarQuant only — QJL correction applied in attention)
           if (pos > 0) {
             const prevVecs = pos * nKVHeads;
             dispatchTQDecode(c.quantizedK[l], c.signBitsK[l], c.normsK[l],
@@ -1052,11 +1102,16 @@ export function createForwardPassEngine(
               c.scratchV, prevVecs, `L${l}-tq-dec-v`);
           }
 
+          // Copy current (exact) K/V to scratch at the current position
           const curOffset = pos * kvDim * 4;
           const curSize = seqLen * kvDim * 4;
           batchCopy(kBuf, 0, c.scratchK, curOffset, curSize);
           batchCopy(vBuf, 0, c.scratchV, curOffset, curSize);
 
+          // Attention on decoded K + exact current K in scratch buffers.
+          // NOTE: Asymmetric attention (dispatchAttentionTQ) is available but currently
+          // disabled — QJL correction variance compounds through autoregressive generation
+          // with RTN-quantized weights. Re-enable once GPTQ weights reduce FFN noise.
           dispatchAttention(
             qBuf, c.scratchK, c.scratchV, attnOutBuf,
             seqLen, cacheLen, isCausal, pos, `L${l}-attn`,
@@ -1243,6 +1298,8 @@ export function createForwardPassEngine(
     const signBitsV: GPUBuffer[] = [];
     const normsK: GPUBuffer[] = [];
     const normsV: GPUBuffer[] = [];
+    const residualNormsK: GPUBuffer[] = [];
+    const residualNormsV: GPUBuffer[] = [];
 
     for (let l = 0; l < L; l++) {
       quantizedK.push(createStorageBuffer(device, null, quantBufSize, `tq-qk-${l}`, false));
@@ -1251,13 +1308,15 @@ export function createForwardPassEngine(
       signBitsV.push(createStorageBuffer(device, null, signBufSize, `tq-sv-${l}`, false));
       normsK.push(createStorageBuffer(device, null, normBufSize, `tq-nk-${l}`, false));
       normsV.push(createStorageBuffer(device, null, normBufSize, `tq-nv-${l}`, false));
+      residualNormsK.push(createStorageBuffer(device, null, normBufSize, `tq-rnk-${l}`, false));
+      residualNormsV.push(createStorageBuffer(device, null, normBufSize, `tq-rnv-${l}`, false));
     }
 
     // Shared scratch f32 buffers (reused across layers during decode)
     const scratchK = createStorageBuffer(device, null, maxSeqLen * kvDim * 4, 'tq-scratch-k', true);
     const scratchV = createStorageBuffer(device, null, maxSeqLen * kvDim * 4, 'tq-scratch-v', true);
 
-    const compressedBytes = L * (quantBufSize + signBufSize + normBufSize) * 2;
+    const compressedBytes = L * (quantBufSize + signBufSize + normBufSize * 2) * 2;
     const f32Bytes = L * maxSeqLen * kvDim * 4 * 2;
     console.log(`[KVCache] TurboQuant ${TQ_BITS}-bit: ${(compressedBytes / 1024 / 1024).toFixed(1)} MB ` +
       `(vs ${(f32Bytes / 1024 / 1024).toFixed(1)} MB f32, saving ${((1 - compressedBytes / f32Bytes) * 100).toFixed(0)}%)`);
@@ -1271,6 +1330,7 @@ export function createForwardPassEngine(
         quantizedK, quantizedV,
         signBitsK, signBitsV,
         normsK, normsV,
+        residualNormsK, residualNormsV,
       },
       ssmState,
     };
@@ -1289,6 +1349,8 @@ export function createForwardPassEngine(
       for (const b of c.signBitsV) b.destroy();
       for (const b of c.normsK) b.destroy();
       for (const b of c.normsV) b.destroy();
+      for (const b of c.residualNormsK) b.destroy();
+      for (const b of c.residualNormsV) b.destroy();
     }
     if (kvCache.ssmState) {
       for (const b of kvCache.ssmState.hiddenStates) b.destroy();
