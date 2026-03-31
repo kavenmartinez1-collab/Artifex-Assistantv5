@@ -57,21 +57,21 @@ fn embed(@builtin(local_invocation_id) lid: vec3u,
 @group(0) @binding(2) var<storage, read> embed_table_f16: array<u32>;
 @group(0) @binding(3) var<uniform> params_f16: Params;
 
-// Decode IEEE 754 half-precision to f32
+// Decode IEEE 754 half-precision to f32 (exact bitwise construction)
 fn f16_to_f32(bits: u32) -> f32 {
   let sign = (bits >> 15u) & 1u;
   let exp = (bits >> 10u) & 0x1Fu;
   let frac = bits & 0x3FFu;
   if (exp == 0u) {
     if (frac == 0u) { return select(0.0, -0.0, sign == 1u); }
-    let f = f32(frac) / 1024.0 * pow(2.0, -14.0);
+    let f = f32(frac) * bitcast<f32>(0x33800000u); // 2^-24
     return select(f, -f, sign == 1u);
   }
   if (exp == 31u) {
     return select(1e30, -1e30, sign == 1u);
   }
-  let f = (1.0 + f32(frac) / 1024.0) * pow(2.0, f32(exp) - 15.0);
-  return select(f, -f, sign == 1u);
+  let f32_bits = (sign << 31u) | ((exp + 112u) << 23u) | (frac << 13u);
+  return bitcast<f32>(f32_bits);
 }
 
 // Decode BF16 to f32 (just shift left 16 bits)
@@ -131,12 +131,14 @@ fn f16_to_f32_embed(bits: u32) -> f32 {
   let frac = bits & 0x3FFu;
   if (exp == 0u) {
     if (frac == 0u) { return select(0.0, -0.0, sign == 1u); }
-    let f = f32(frac) / 1024.0 * pow(2.0, -14.0);
+    // Subnormal f16: value = (-1)^sign * frac/1024 * 2^-14
+    let f = f32(frac) * bitcast<f32>(0x33800000u); // 2^-24
     return select(f, -f, sign == 1u);
   }
   if (exp == 31u) { return select(1e30, -1e30, sign == 1u); }
-  let f = (1.0 + f32(frac) / 1024.0) * pow(2.0, f32(exp) - 15.0);
-  return select(f, -f, sign == 1u);
+  // Normal f16 -> f32: exact bitwise construction
+  let f32_bits = (sign << 31u) | ((exp + 112u) << 23u) | (frac << 13u);
+  return bitcast<f32>(f32_bits);
 }
 
 @compute @workgroup_size(256)

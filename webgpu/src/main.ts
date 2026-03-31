@@ -373,7 +373,7 @@ sendBtn.addEventListener('click', async () => {
 
     // /raw prefix: skip chat template, use raw text completion (for debugging)
     const isRaw = text.startsWith('/raw ');
-    const sampling = { temperature, topP, maxNewTokens, useCompressedKV, repetitionPenalty: 1.5 };
+    const sampling = { temperature, topP, maxNewTokens, useCompressedKV, repetitionPenalty: 1.1 };
     let thinkingDone = false;
     const onToken = (token: string) => {
       fullText += token;
@@ -625,13 +625,50 @@ loadBtn.addEventListener('click', async () => {
         return t?.buffer;
       };
 
-      // Helper to load GPTQ triplet (qweight + scales + qzeros) for a projection
+      // Helper to load GPTQ quad (qweight + scales + qzeros + g_idx) for a projection
+      // If g_idx is missing (non-actorder model), generates trivial g_idx[k] = k / gs
+      const trivialGIdxCache = new Map<number, GPUBuffer>();
+      const getOrCreateTrivialGIdx = (K: number): GPUBuffer => {
+        if (trivialGIdxCache.has(K)) return trivialGIdxCache.get(K)!;
+        const gs = config.quantGroupSize || 128;
+        const data = new Uint32Array(K);
+        for (let k = 0; k < K; k++) data[k] = Math.floor(k / gs);
+        const buf = gpu!.device.createBuffer({
+          size: data.byteLength,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+          label: `trivial-g_idx-K${K}`,
+          mappedAtCreation: true,
+        });
+        new Uint32Array(buf.getMappedRange()).set(data);
+        buf.unmap();
+        trivialGIdxCache.set(K, buf);
+        return buf;
+      };
       const tryGetQ4 = (weightName: string) => {
         const base = weightName.replace('.weight', '');
         const qw = tryGetTensor(`${base}.qweight`);
         const sc = tryGetTensor(`${base}.scales`);
         const qz = tryGetTensor(`${base}.qzeros`);
-        if (qw && sc && qz) return { qweight: qw, scales: sc, qzeros: qz };
+        if (qw && sc && qz) {
+          // Try to load actorder g_idx, fall back to trivial
+          let gIdx = tryGetTensor(`${base}.g_idx`);
+          if (!gIdx) {
+            // Derive K from qweight: shape is [K/8, N], stored as int32
+            const qwTensor = currentModel!.tensors.get(`${base}.qweight`);
+            const K = qwTensor ? qwTensor.shape[0] * 8 : 0;
+            if (K > 0) {
+              console.log(`[Q4] ${base}: no g_idx tensor, generating trivial (K=${K})`);
+              gIdx = getOrCreateTrivialGIdx(K);
+            } else {
+              console.warn(`[Q4] ${base}: no g_idx and cannot derive K from qweight!`);
+            }
+          }
+          if (!gIdx) {
+            console.error(`[Q4] ${base}: FAILED to get g_idx — q4 object will be skipped!`);
+            return undefined;
+          }
+          return { qweight: qw, scales: sc, qzeros: qz, g_idx: gIdx };
+        }
         return undefined;
       };
 
@@ -854,11 +891,14 @@ loadBtn.addEventListener('click', async () => {
       promptEl.disabled = false;
       sendBtn.disabled = false;
 
+      const rotaryInfo = config.partialRotaryFactor
+        ? `partial=${config.partialRotaryFactor} (${Math.floor(config.partialRotaryFactor * config.headDim)} of ${config.headDim} dims)`
+        : `full (all ${config.headDim} dims)`;
       addMessage('system',
         `Inference engine ready!\n` +
         `Model: ${config.modelType} — ${config.numLayers} layers, ${config.numAttentionHeads} heads, d=${config.hiddenSize}\n` +
         `GQA: ${config.isGQA ? `${config.numAttentionHeads}Q/${config.numKVHeads}KV` : 'no'}\n` +
-        `Vocab: ${config.vocabSize} | RoPE θ=${config.ropeTheta}\n` +
+        `Vocab: ${config.vocabSize} | RoPE θ=${config.ropeTheta} | Rotary: ${rotaryInfo}\n` +
         `Type a message to chat!`,
         'engine ready'
       );

@@ -193,10 +193,23 @@ const WEIGHT_NAME_PATTERNS: Record<string, WeightNameMap> = {
       kBias: 'model.layers.{L}.self_attn.k_proj.bias',
       vBias: 'model.layers.{L}.self_attn.v_proj.bias',
       oBias: 'model.layers.{L}.self_attn.o_proj.bias',
+      qNorm: 'model.layers.{L}.self_attn.q_norm.weight',
+      kNorm: 'model.layers.{L}.self_attn.k_norm.weight',
       postAttnNorm: 'model.layers.{L}.post_attention_layernorm.weight',
       gateProj: 'model.layers.{L}.mlp.gate_proj.weight',
       upProj: 'model.layers.{L}.mlp.up_proj.weight',
       downProj: 'model.layers.{L}.mlp.down_proj.weight',
+    },
+    linearLayer: {
+      inProjQKV: 'model.layers.{L}.linear_attn.in_proj_qkv.weight',
+      inProjA: 'model.layers.{L}.linear_attn.in_proj_a.weight',
+      inProjB: 'model.layers.{L}.linear_attn.in_proj_b.weight',
+      inProjZ: 'model.layers.{L}.linear_attn.in_proj_z.weight',
+      outProj: 'model.layers.{L}.linear_attn.out_proj.weight',
+      aLog: 'model.layers.{L}.linear_attn.A_log',
+      conv1dWeight: 'model.layers.{L}.linear_attn.conv1d.weight',
+      dtBias: 'model.layers.{L}.linear_attn.dt_bias',
+      normWeight: 'model.layers.{L}.linear_attn.norm.weight',
     },
   },
   // Qwen3.5 adds 'language_model' prefix to all weight paths
@@ -355,7 +368,8 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
     linearNumKeyHeads: isHybrid ? (hfConfig.linear_num_key_heads ?? 16) : undefined,
     linearNumValueHeads: isHybrid ? (hfConfig.linear_num_value_heads ?? 32) : undefined,
     linearConvKernelDim: isHybrid ? (hfConfig.linear_conv_kernel_dim ?? 4) : undefined,
-    partialRotaryFactor: hfConfig.partial_rotary_factor,
+    partialRotaryFactor: hfConfig.partial_rotary_factor
+      ?? hfConfig.rope_parameters?.partial_rotary_factor,
     attnOutputGate: hfConfig.attn_output_gate,
   };
 }
@@ -381,21 +395,23 @@ export function autoDetectWeightNameMap(
     tensorNames instanceof Set ? tensorNames.has(name) : tensorNames.has(name);
 
   // Try model-type specific map first
+  // Also check for quantized variant (.qweight) since embed may be INT4
   const typeMap = WEIGHT_NAME_PATTERNS[modelType];
-  if (typeMap && has(typeMap.embedTokens)) return typeMap;
+  if (typeMap && (has(typeMap.embedTokens) || has(typeMap.embedTokens.replace('.weight', '.qweight')))) return typeMap;
 
   // Try default pattern
-  if (has(WEIGHT_NAME_PATTERNS.default.embedTokens)) return WEIGHT_NAME_PATTERNS.default;
+  const defaultMap = WEIGHT_NAME_PATTERNS.default;
+  if (has(defaultMap.embedTokens) || has(defaultMap.embedTokens.replace('.weight', '.qweight'))) return defaultMap;
 
-  // Auto-detect: find embed_tokens.weight with any prefix
+  // Auto-detect: find embed_tokens with any prefix (supports .weight or .qweight)
   for (const name of (tensorNames instanceof Set ? tensorNames : tensorNames.keys())) {
-    if (name.endsWith('embed_tokens.weight')) {
-      const prefix = name.replace('embed_tokens.weight', '');
+    if (name.endsWith('embed_tokens.weight') || name.endsWith('embed_tokens.qweight')) {
+      const prefix = name.replace(/embed_tokens\.(weight|qweight)$/, '');
       console.log(`[ModelConfig] Auto-detected weight prefix: "${prefix}"`);
       // Build a name map by prepending the prefix to the default pattern
       const base = WEIGHT_NAME_PATTERNS.default;
       const reprefix = (s: string) => s.replace('model.', prefix);
-      return {
+      const result: any = {
         embedTokens: reprefix(base.embedTokens),
         finalNorm: reprefix(base.finalNorm),
         lmHead: base.lmHead, // lm_head is usually at the top level
@@ -409,12 +425,29 @@ export function autoDetectWeightNameMap(
           kBias: reprefix(base.layer.kBias),
           vBias: reprefix(base.layer.vBias),
           oBias: reprefix(base.layer.oBias),
+          qNorm: base.layer.qNorm ? reprefix(base.layer.qNorm) : undefined,
+          kNorm: base.layer.kNorm ? reprefix(base.layer.kNorm) : undefined,
           postAttnNorm: reprefix(base.layer.postAttnNorm),
           gateProj: reprefix(base.layer.gateProj),
           upProj: reprefix(base.layer.upProj),
           downProj: reprefix(base.layer.downProj),
         },
       };
+      if (base.linearLayer) {
+        const lin = base.linearLayer;
+        result.linearLayer = {
+          inProjQKV: reprefix(lin.inProjQKV),
+          inProjA: reprefix(lin.inProjA),
+          inProjB: reprefix(lin.inProjB),
+          inProjZ: reprefix(lin.inProjZ),
+          outProj: reprefix(lin.outProj),
+          aLog: reprefix(lin.aLog),
+          conv1dWeight: reprefix(lin.conv1dWeight),
+          dtBias: reprefix(lin.dtBias),
+          normWeight: reprefix(lin.normWeight),
+        };
+      }
+      return result;
     }
   }
 
