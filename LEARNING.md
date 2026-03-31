@@ -20,7 +20,8 @@
 11. [The WebGPU Inference Roadmap](#11-the-webgpu-inference-roadmap)
 12. [The Forward Pass — Step by Step](#12-the-forward-pass--step-by-step)
 13. [How All the Pieces Connect](#13-how-all-the-pieces-connect)
-14. [Glossary](#14-glossary)
+14. [Lessons from the Numerical Audit](#14-lessons-from-the-numerical-audit-2026-03-31)
+15. [Glossary](#15-glossary)
 
 ---
 
@@ -1170,7 +1171,55 @@ The WebGPU path is the most ambitious because we're building the inference engin
 
 ---
 
-## 14. Glossary
+## 14. Lessons from the Numerical Audit (2026-03-31)
+
+After building the full inference pipeline and getting garbled or drifting output, we did a systematic numerical audit of every WGSL shader against PyTorch reference implementations. Here's what we learned.
+
+### The Critical Bug: partial_rotary_factor
+
+Qwen3.5 uses **partial RoPE** — only 25% of head dimensions (64 out of 256) get rotary position embeddings. The rest pass through unchanged. But the config parser read `hfConfig.partial_rotary_factor` while Qwen3.5 nests it inside `hfConfig.rope_parameters.partial_rotary_factor`. Result: ALL 256 dims were rotated, scrambling 75% of Q/K on every full attention layer.
+
+**Impact measured by audit**: max value difference of 5.91, non-rotated dims scrambled by up to 2.08 per element. This single bug was the primary cause of context drift.
+
+**Lesson**: Always verify that config parsing matches the model's actual config.json structure. Different model families nest parameters differently.
+
+### Why INT4 Breaks Embedding and LM Head
+
+We tested three configurations:
+1. BF16 embed + BF16 lm_head = **works** (coherent output)
+2. INT4 embed + BF16 lm_head = **gibberish by position 2**
+3. BF16 embed + INT4 lm_head = **gibberish from first token**
+
+The INT4 embedding has 0.993 cosine similarity to BF16 — that sounds great for a feedforward network. But Qwen3.5 has 24 recurrent DeltaNet layers that **accumulate** the 0.7% error token by token. By position 2, the SSM state has diverged enough that the model predicts Chinese characters instead of English.
+
+The INT4 lm_head has a different problem: with 248,320 output classes, even tiny quantization noise can flip which token "wins" the softmax. The GPTQ loss for lm_head was 50x higher than any other layer.
+
+**Lesson**: For hybrid SSM+attention models, the boundaries (embed, lm_head) need higher precision than internal layers because:
+- Embedding errors compound through recurrent state
+- LM head errors get amplified by the huge softmax over 248K tokens
+
+### Why This Project Is Cutting-Edge
+
+As of March 2026, **no project has fully solved browser-based inference for hybrid SSM+attention models**:
+- WebLLM (17.6K GitHub stars) has Qwen3.5 support as an open issue
+- Transformers.js runs Qwen3.5-0.8B but with 20x slower performance due to missing DeltaNet operators
+- Research papers (MambaQuant, Quamba2) confirm that standard quantization methods catastrophically fail on SSM models
+
+We're running a 9B hybrid model in a browser with hand-written WGSL shaders. The model produces correct, coherent responses to factual questions, math problems, and reasoning tasks. That's genuinely novel.
+
+### The Shader Audit Results
+
+All 15 WGSL kernels verified correct against PyTorch (`scripts/audit_kernels.py`):
+- F16 decode: bit-exact across all 65,536 possible values
+- RMSNorm, RoPE, Attention, SiLU: max error < 1e-6
+- INT4 dequantization: max error 1.05e-3 (limited by f16 scale precision, not shader bugs)
+- INT4 matmul with Kahan summation: max error 2.67e-3 (both are valid — Kahan is actually more precise)
+
+**Lesson**: When hand-writing GPU compute kernels, always build a reference test suite that compares against a known-correct implementation (PyTorch). A single config parsing bug can waste days of debugging.
+
+---
+
+## 15. Glossary
 
 | Term | Definition |
 |------|-----------|

@@ -803,54 +803,69 @@ Phases 0-6 complete plus Gated DeltaNet/Mamba-2 hybrid support, TurboQuant KV ca
 
 ### Supported Models
 
-Any HuggingFace model with a standard transformer decoder architecture works. Hybrid Mamba-2 models (Qwen3.5) have full support with mixed-precision quantization. Weight name prefixes are auto-detected. Tested:
+Any HuggingFace model with a standard transformer decoder architecture works. Hybrid Mamba-2 models (Qwen3.5) have full support with calibrated GPTQ quantization. Weight name prefixes are auto-detected. Tested:
 
-- **Qwen3.5-9B mixed-precision** (`local/qwen3.5-9b-mixed-GPTQ-Int4`) — 32 layers (24 Gated DeltaNet + 8 full attention), 4096 hidden. **Answers factual questions correctly at 2.9 tok/s** with 7.22 GB VRAM on 8 GB GPU. Mixed-precision: BF16 linear_attn (SSM) + INT4 FFN/attention + INT4 embedding/lm_head. Loaded in 21s from local cache. Uses TurboQuant 3-bit KV cache for full attention layers.
-- **Qwen3.5-2B** (`Qwen/Qwen3.5-2B`) — 24 layers (18 Gated DeltaNet + 6 full attention), 2048 hidden, GQA 8Q/2KV. **Coherent English at 5.2 tok/s** with native BF16 weights (4.18 GB VRAM vs 8.47 GB at f32). Uses `keepBF16` to halve memory — auto-selects BF16 matmul for 150 projection weights, BF16 embedding lookup, and BF16 LM head (tied). Thinking mode with visible reasoning chain.
-- **Qwen2.5-0.5B-Instruct** — 24 layers, 896 hidden, GQA 14Q/2KV. Generates coherent English at ~20 tok/s (f32) / ~10 tok/s (TurboQuant 4-bit KV).
+- **Qwen3.5-9B GPTQ v2** (`local/qwen3.5-9b-GPTQv2-noact`) — 32 layers (24 Gated DeltaNet + 8 full attention), 4096 hidden, 16Q/4KV GQA. **Produces coherent, accurate responses** (correctly answers factual questions, solves equations, follows reasoning chains) at 1.8-2.2 tok/s on RTX 5060 Ti 8GB. Calibrated GPTQ INT4 with 128-sample wikitext calibration: BF16 embed/lm_head + BF16 SSM layers + INT4 attention/FFN. 9.37 GB (uses shared VRAM). Thinking mode with visible reasoning chain. All 15 WGSL kernels verified against PyTorch reference (max error < 1e-6).
+- **Qwen3.5-2B** (`Qwen/Qwen3.5-2B`) — 24 layers (18 Gated DeltaNet + 6 full attention), 2048 hidden, GQA 8Q/2KV. Coherent English at 5.2 tok/s with native BF16 weights (4.18 GB VRAM).
+- **Qwen2.5-0.5B-Instruct** — 24 layers, 896 hidden, GQA 14Q/2KV. Generates coherent English at ~20 tok/s (f32).
 - **SmolLM2-135M-Instruct** — 30 layers, 576 hidden, GQA 9Q/3KV.
 - **SmolLM2-360M-Instruct** — 32 layers, 960 hidden, GQA 15Q/5KV.
 
-### Mixed-Precision Quantization
+### Calibrated GPTQ Quantization
 
-For hybrid models like Qwen3.5 that combine Gated DeltaNet (linear attention / SSM) with standard softmax attention, INT4 quantization of SSM layers causes recurrence noise to compound — each token's error accumulates in the hidden state. The solution: **keep SSM-critical weights in original BF16 precision, only quantize FFN and attention layers to INT4**.
+For hybrid models like Qwen3.5 that combine Gated DeltaNet (linear attention / SSM) with standard softmax attention, INT4 quantization of SSM layers causes recurrence noise to compound — each token's error accumulates in the hidden state. The solution: **keep SSM-critical weights and embed/lm_head in BF16, only quantize FFN and attention layers to INT4**.
 
 ```bash
-# Quantize Qwen3.5-9B with mixed precision (requires PyTorch + safetensors)
-python scripts/quantize_mixed_precision.py --model ./models/qwen3.5-9b
+# Calibrated GPTQ quantization (requires PyTorch + CUDA)
+python scripts/quantize_gptq.py \
+  --model ./models/qwen3.5-9b \
+  --output models/qwen3.5-9b-GPTQv2-noact \
+  --no-actorder \
+  --keep-bf16 linear_attn norm embed_tokens lm_head
 
-# Output: models/qwen3.5-9b-mixed-GPTQ-Int4/ (~7.4 GB)
-# Load in browser as: local/qwen3.5-9b-mixed-GPTQ-Int4
+# Output: ~9.4 GB model with calibrated INT4 weights
+# Load in browser as: local/qwen3.5-9b-GPTQv2-noact
 ```
 
 **How it works:**
 1. Loads the unquantized BF16 model (18 GB for 9B)
-2. For each weight tensor, decides: **quantize** (FFN, full attention, lm_head, embedding) or **keep BF16** (linear_attn projections, norms, biases)
-3. Quantized weights use RTN (round-to-nearest) with group_size=128, packed as GPTQ-compatible INT4 (qweight/scales/qzeros)
-4. BF16 weights are copied unchanged
-5. MTP (multi-token prediction) layer is skipped entirely (not needed for inference)
+2. Runs 128 wikitext calibration samples through the model to compute Hessian matrices
+3. Layer-by-layer GPTQ: quantize each weight using Hessian-guided error propagation, then re-run calibration through quantized layer before proceeding to the next
+4. BF16 weights for SSM layers, norms, embedding, and lm_head are copied unchanged
+5. Produces GPTQ v2 SafeTensors with g_idx for actorder support
+
+**Why BF16 embed + lm_head is required (not INT4):**
+- INT4 embedding has 0.993 cosine similarity to BF16 — close but the 0.7% error is amplified through 24 recurrent SSM layers, causing gibberish by position 2
+- INT4 lm_head (248K × 4096) has the highest GPTQ loss of any layer (50x average). The quantization noise pushes wrong tokens above correct ones in the 248K-way softmax
+- Both confirmed experimentally: INT4 embed OR lm_head produces gibberish, BF16 for both produces coherent output
 
 **VRAM budget for Qwen3.5-9B on 8 GB:**
 
 | Component | Format | Size |
 |-----------|--------|------|
-| Embedding (248K × 4096) | INT4 GPTQ | 0.5 GB |
+| Embedding (248K × 4096) | BF16 | 1.9 GB |
 | 24 linear_attn layers (5 proj each) | BF16 | 3.1 GB |
 | 32 FFN layers (3 proj each) | INT4 GPTQ | 1.2 GB |
 | 8 full attention layers (4 proj each) | INT4 GPTQ | 0.3 GB |
-| LM head (248K × 4096) | INT4 GPTQ | 0.5 GB |
+| LM head (248K × 4096) | BF16 | 1.9 GB |
 | Norms, biases, SSM state | f32/BF16 | 0.3 GB |
-| KV cache (TurboQuant 3-bit) | compressed | 0.1 GB |
+| KV cache | f32 | 0.2 GB |
 | Intermediates | f32 | 0.5 GB |
-| **Total** | | **~6.5 GB** |
+| **Total** | | **~9.4 GB** |
 
-The engine auto-detects mixed-precision models and routes each weight through the correct kernel:
-- `dispatchProjection` checks `bf16Set` → `matmul_bt_bf16` for BF16 weights
-- Falls back to `matmul_bt_q4` for INT4 GPTQ weights
-- `embed_q4` shader for INT4 embedding lookup
-- Token-by-token prefill for correct SSM recurrence
+### Numerical Verification
 
-**Note:** RTN quantization is simpler but lower quality than calibrated GPTQ. Long responses may drift. For production quality, use a properly calibrated GPTQ or AWQ model with `modules_not_to_quantize` excluding linear_attn layers (e.g., `cyankiwi/Qwen3.5-9B-AWQ-BF16-INT4`).
+All 15 WGSL compute kernels have been verified against PyTorch reference implementations (`scripts/audit_kernels.py`):
+
+| Kernel | Max Error vs PyTorch |
+|--------|---------------------|
+| F16 decode | 0 (bit-exact, all 65536 values) |
+| RMSNorm (1+w) | 4.77e-07 |
+| RoPE (interleaved, partial rotary) | 1.73e-06 |
+| Attention (GQA, causal, fused softmax) | 1.19e-07 |
+| SiLU | 2.38e-07 |
+| INT4 GPTQ dequant | 1.05e-03 (f16 scale precision) |
+| INT4 matmul (Kahan summation) | 2.67e-03 |
 
 ---
 

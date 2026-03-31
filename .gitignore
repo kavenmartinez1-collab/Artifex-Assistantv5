@@ -88,3 +88,4 @@ scripts/reference_output.txt
 *.log
 *.pid
 *.sock
+research/
