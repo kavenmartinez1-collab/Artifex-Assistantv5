@@ -251,6 +251,7 @@
   <!-- Header -->
   <header>
     <h1>ARTIFEX <span>WebGPU Engine</span></h1>
+    <select id="gpu-select" class="gpu-badge" style="background:var(--surface);color:var(--text);border:1px solid #444;border-radius:4px;padding:2px 6px;font-size:11px;cursor:pointer;display:none"></select>
     <div id="gpu-badge" class="gpu-badge">Detecting GPU...</div>
     <div class="spacer"></div>
     <div id="status" class="status-text">Initializing...</div>
@@ -306,6 +307,12 @@
           <button class="btn btn-dim" id="export-btn">Export</button>
           <button class="btn btn-danger" id="unload-btn">Unload</button>
         </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">GPU Cluster</div>
+        <a href="/worker.html" target="_blank" class="btn btn-dim" style="width:100%;text-align:center;text-decoration:none;display:block;margin-bottom:6px">Launch GPU Worker</a>
+        <div id="cluster-status" style="font-size:11px;font-family:var(--mono);color:var(--dim)">No workers connected</div>
       </div>
 
       <div class="panel">

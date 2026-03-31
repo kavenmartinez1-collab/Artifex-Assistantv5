@@ -11,7 +11,9 @@ import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
+import http from 'http';
 import { fileURLToPath } from 'url';
+import { OrchestrationHub } from './ws-hub.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const METRICS_FILE = path.join(__dirname, '..', 'metrics.jsonl');
@@ -224,10 +226,16 @@ app.get('/api/hf-cache/:org/:model/:action(resolve|raw)/main/*', (req, res) => {
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 
-app.listen(PORT, '127.0.0.1', () => {
+// ─── Start with WebSocket Hub ─────────────────────────────────────────────
+
+const server = http.createServer(app);
+const hub = new OrchestrationHub(server);
+
+server.listen(PORT, '127.0.0.1', () => {
   console.log(`\x1b[36m╔════════════════════════════════════════════╗\x1b[0m`);
   console.log(`\x1b[36m║  Artifex WebGPU Dev Server                 ║\x1b[0m`);
   console.log(`\x1b[36m║  Metrics endpoint: http://localhost:${PORT}   ║\x1b[0m`);
+  console.log(`\x1b[36m║  WebSocket hub:    ws://localhost:${PORT}/ws  ║\x1b[0m`);
   console.log(`\x1b[36m║  POST /metrics — receive browser metrics    ║\x1b[0m`);
   console.log(`\x1b[36m║  GET  /metrics/recent — view last 50        ║\x1b[0m`);
   console.log(`\x1b[36m╚════════════════════════════════════════════╝\x1b[0m`);

@@ -30,10 +30,10 @@ fn matmul(@builtin(global_invocation_id) gid: vec3u,
   let local_idx = lid.x * TILE + lid.y;
 
   var sum: f32 = 0.0;
+  var comp: f32 = 0.0;
   let num_tiles = (params.K + TILE - 1u) / TILE;
 
   for (var t: u32 = 0u; t < num_tiles; t++) {
-    // Load tile of A into shared memory
     let a_col = t * TILE + lid.y;
     if (row < params.M && a_col < params.K) {
       tile_a[local_idx] = A[row * params.K + a_col];
@@ -41,7 +41,6 @@ fn matmul(@builtin(global_invocation_id) gid: vec3u,
       tile_a[local_idx] = 0.0;
     }
 
-    // Load tile of B into shared memory
     let b_row = t * TILE + lid.x;
     if (b_row < params.K && col < params.N) {
       tile_b[local_idx] = B[b_row * params.N + col];
@@ -51,15 +50,17 @@ fn matmul(@builtin(global_invocation_id) gid: vec3u,
 
     workgroupBarrier();
 
-    // Compute partial dot product for this tile
     for (var k: u32 = 0u; k < TILE; k++) {
-      sum += tile_a[lid.x * TILE + k] * tile_b[k * TILE + lid.y];
+      let product = tile_a[lid.x * TILE + k] * tile_b[k * TILE + lid.y];
+      let y = product - comp;
+      let t_val = sum + y;
+      comp = (t_val - sum) - y;
+      sum = t_val;
     }
 
     workgroupBarrier();
   }
 
-  // Write result
   if (row < params.M && col < params.N) {
     C[row * params.N + col] = sum;
   }
@@ -80,6 +81,7 @@ fn matmul_bt(@builtin(global_invocation_id) gid: vec3u,
   let local_idx = lid.x * TILE + lid.y;
 
   var sum: f32 = 0.0;
+  var comp: f32 = 0.0;
   let num_tiles = (params.K + TILE - 1u) / TILE;
 
   for (var t: u32 = 0u; t < num_tiles; t++) {
@@ -90,7 +92,6 @@ fn matmul_bt(@builtin(global_invocation_id) gid: vec3u,
       tile_a[local_idx] = 0.0;
     }
 
-    // B^T[k, n] = B[n, k] = B[n * K + k]  (B stored as [N, K])
     let b_k = t * TILE + lid.x;
     if (b_k < params.K && col < params.N) {
       tile_b[local_idx] = B[col * params.K + b_k];
@@ -101,7 +102,11 @@ fn matmul_bt(@builtin(global_invocation_id) gid: vec3u,
     workgroupBarrier();
 
     for (var k: u32 = 0u; k < TILE; k++) {
-      sum += tile_a[lid.x * TILE + k] * tile_b[k * TILE + lid.y];
+      let product = tile_a[lid.x * TILE + k] * tile_b[k * TILE + lid.y];
+      let y = product - comp;
+      let t_val = sum + y;
+      comp = (t_val - sum) - y;
+      sum = t_val;
     }
 
     workgroupBarrier();
@@ -134,6 +139,7 @@ fn matmul_bt_bf16(@builtin(global_invocation_id) gid: vec3u,
   let local_idx = lid.x * TILE + lid.y;
 
   var sum: f32 = 0.0;
+  var comp: f32 = 0.0;
   let num_tiles = (params.K + TILE - 1u) / TILE;
 
   for (var t: u32 = 0u; t < num_tiles; t++) {
@@ -144,12 +150,10 @@ fn matmul_bt_bf16(@builtin(global_invocation_id) gid: vec3u,
       tile_a[local_idx] = 0.0;
     }
 
-    // B is BF16: B_bf16[col * (K/2) + k/2], extract low or high u16
     let b_k = t * TILE + lid.x;
     if (b_k < params.K && col < params.N) {
       let packed_idx = col * (params.K / 2u) + b_k / 2u;
       let packed = B_bf16[packed_idx];
-      // Even k → low 16 bits, odd k → high 16 bits
       let bf16_val = select(packed >> 16u, packed & 0xFFFFu, (b_k % 2u) == 0u);
       tile_b[local_idx] = bf16_to_f32(bf16_val);
     } else {
@@ -159,7 +163,11 @@ fn matmul_bt_bf16(@builtin(global_invocation_id) gid: vec3u,
     workgroupBarrier();
 
     for (var k: u32 = 0u; k < TILE; k++) {
-      sum += tile_a[lid.x * TILE + k] * tile_b[k * TILE + lid.y];
+      let product = tile_a[lid.x * TILE + k] * tile_b[k * TILE + lid.y];
+      let y = product - comp;
+      let t_val = sum + y;
+      comp = (t_val - sum) - y;
+      sum = t_val;
     }
 
     workgroupBarrier();
