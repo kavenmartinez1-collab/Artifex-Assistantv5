@@ -70,6 +70,12 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     target: 'esnext',
+    rollupOptions: {
+      input: {
+        main: 'index.html',
+        worker: 'worker.html',
+      },
+    },
   },
   plugins: [debugApiPlugin()],
   server: {
@@ -84,6 +90,12 @@ export default defineConfig({
       '/api/hf-cache': 'http://127.0.0.1:3001',
       // Proxy Artifex API calls
       '/v1': 'http://127.0.0.1:8000',
+      // WebSocket proxy to orchestration hub
+      '/ws': {
+        target: 'http://127.0.0.1:3001',
+        ws: true,
+        changeOrigin: true,
+      },
     },
   },
 });

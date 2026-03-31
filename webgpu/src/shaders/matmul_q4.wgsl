@@ -43,25 +43,29 @@ fn extract_q4(packed: i32, nibble_idx: u32) -> u32 {
 }
 
 // Read f16 value from packed u32 array (2 f16 per u32)
+// Uses exact bitwise conversion — no pow() approximation.
 fn read_f16_scale(idx: u32) -> f32 {
   let word = scales_raw[idx / 2u];
   let half_bits = select(word & 0xFFFFu, word >> 16u, (idx & 1u) == 1u);
-  // Decode IEEE 754 half-precision (f16) to f32
   let sign = (half_bits >> 15u) & 1u;
   let exp = (half_bits >> 10u) & 0x1Fu;
   let frac = half_bits & 0x3FFu;
   if (exp == 0u) {
-    // Subnormal or zero
+    // Subnormal or zero — rare for scales, but handle correctly
     if (frac == 0u) { return select(0.0, -0.0, sign == 1u); }
-    let f = f32(frac) / 1024.0 * pow(2.0, -14.0);
+    // Subnormal f16: value = (-1)^sign * frac/1024 * 2^-14
+    // Construct via f32 multiplication: 2^-14 / 1024 = 2^-24 = 0x33800000
+    let f = f32(frac) * bitcast<f32>(0x33800000u);
     return select(f, -f, sign == 1u);
   }
   if (exp == 31u) {
-    // Inf/NaN
+    // Inf/NaN — should not appear in valid scales
     return select(1e30, -1e30, sign == 1u);
   }
-  let f = (1.0 + f32(frac) / 1024.0) * pow(2.0, f32(exp) - 15.0);
-  return select(f, -f, sign == 1u);
+  // Normal f16 -> f32: exact bitwise construction
+  // f16 bias=15, f32 bias=127, delta=112. Mantissa: 10-bit -> 23-bit (shift left 13)
+  let f32_bits = (sign << 31u) | ((exp + 112u) << 23u) | (frac << 13u);
+  return bitcast<f32>(f32_bits);
 }
 
 // Dequantize a single INT4 weight value
@@ -86,6 +90,7 @@ fn matmul_bt_q4(@builtin(global_invocation_id) gid: vec3u,
   let num_groups = (K + gs - 1u) / gs;
 
   var sum: f32 = 0.0;
+  var comp: f32 = 0.0;  // Kahan compensation — prevents rounding loss in K=3584+ reductions
   let num_tiles = (K + TILE - 1u) / TILE;
 
   for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
@@ -124,9 +129,13 @@ fn matmul_bt_q4(@builtin(global_invocation_id) gid: vec3u,
 
     workgroupBarrier();
 
-    // Standard tiled dot product
+    // Kahan-compensated tiled dot product
     for (var k: u32 = 0u; k < TILE; k = k + 1u) {
-      sum += tile_a[lid.x * TILE + k] * tile_b[k * TILE + lid.y];
+      let product = tile_a[lid.x * TILE + k] * tile_b[k * TILE + lid.y];
+      let y = product - comp;
+      let t_val = sum + y;
+      comp = (t_val - sum) - y;
+      sum = t_val;
     }
 
     workgroupBarrier();

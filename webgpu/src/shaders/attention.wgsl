@@ -63,12 +63,18 @@ fn attention(@builtin(local_invocation_id) lid: vec3u,
 
   // ── Step 1: Compute attention scores ────────────────────────────────
   // score[j] = sum_k(Q[q_pos, head, k] * K[j, kv_head, k]) * scale
+  // Uses Kahan summation for d=256+ head dimensions
   var j = tid;
   while (j < cache_len) {
     let k_offset = (j * num_kv + kv_head) * d;
     var dot: f32 = 0.0;
+    var dot_comp: f32 = 0.0;
     for (var k = 0u; k < d; k = k + 1u) {
-      dot += q[q_offset + k] * k_cache[k_offset + k];
+      let product = q[q_offset + k] * k_cache[k_offset + k];
+      let y = product - dot_comp;
+      let t_val = dot + y;
+      dot_comp = (t_val - dot) - y;
+      dot = t_val;
     }
     scores[j] = dot * scale;
 
@@ -156,12 +162,18 @@ fn attention(@builtin(local_invocation_id) lid: vec3u,
 
   // ── Step 3: Weighted sum of values ──────────────────────────────────
   // output[q_pos, head, k] = sum_j(scores[j] * V[j, kv_head, k])
+  // Kahan summation for cache_len elements
   var k = tid;
   while (k < d) {
     var weighted_sum: f32 = 0.0;
+    var ws_comp: f32 = 0.0;
     for (var jj = 0u; jj < cache_len; jj = jj + 1u) {
       let v_offset = (jj * num_kv + kv_head) * d;
-      weighted_sum += scores[jj] * v_cache[v_offset + k];
+      let product = scores[jj] * v_cache[v_offset + k];
+      let y = product - ws_comp;
+      let t_val = weighted_sum + y;
+      ws_comp = (t_val - weighted_sum) - y;
+      weighted_sum = t_val;
     }
     output[out_offset + k] = weighted_sum;
     k = k + 256u;

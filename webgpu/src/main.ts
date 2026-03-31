@@ -6,7 +6,7 @@
  * Phase 2: SafeTensors weight loading from HuggingFace.
  */
 
-import { initWebGPU, type GPUContext } from './engine/gpu-device';
+import { initWebGPU, discoverAdapters, type GPUContext, type DiscoveredAdapter } from './engine/gpu-device';
 import { reportMetric, reportError, timed } from './utils/metrics';
 import { runKernelTests } from './engine/kernel-tests';
 import { loadModel, unloadModel, previewModel, formatBytes, getCacheStats, clearCache, type LoadedModel } from './model';
@@ -24,6 +24,7 @@ let session: InferenceSession | null = null;
 
 const $ = (id: string) => document.getElementById(id)!;
 const gpuBadge = $('gpu-badge');
+const gpuSelect = $('gpu-select') as HTMLSelectElement;
 const statusEl = $('status');
 const messagesEl = $('messages');
 const promptEl = $('prompt') as HTMLTextAreaElement;
@@ -41,6 +42,60 @@ const toppVal = $('topp-val');
 const browseBtn = $('browse-btn') as HTMLButtonElement;
 const modelBrowser = $('model-browser');
 const modelList = $('model-list');
+const clusterStatusEl = $('cluster-status');
+
+// ─── Orchestration Hub Connection ────────────────────────────────────────────
+
+function connectOrchestrator(): void {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${protocol}//${location.host}/ws`;
+
+  const ws = new WebSocket(wsUrl);
+  ws.onopen = () => {
+    ws.send(JSON.stringify({
+      type: 'orchestrator:connect',
+      id: `orch-${Date.now()}`,
+      timestamp: Date.now(),
+      source: 'orchestrator',
+      payload: {},
+    }));
+    console.log('[Orchestrator] Connected to hub');
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'cluster:status') {
+        const { workers, tasks } = msg.payload;
+        if (workers.length === 0) {
+          clusterStatusEl.textContent = 'No workers connected';
+        } else {
+          const lines = workers.map((w: any) =>
+            `${w.id}: ${w.gpu.device} [${w.status}]${w.model ? ` — ${w.model.repo}` : ''}`
+          );
+          clusterStatusEl.textContent = `${workers.length} worker(s)\n${lines.join('\n')}`;
+        }
+      } else if (msg.type === 'task:token') {
+        // Future: display streaming agent output
+      } else if (msg.type === 'task:complete') {
+        console.log('[Orchestrator] Task complete:', msg.payload.taskId);
+      }
+    } catch {}
+  };
+
+  ws.onclose = () => {
+    console.log('[Orchestrator] Hub disconnected, reconnecting in 5s...');
+    clusterStatusEl.textContent = 'Hub disconnected — reconnecting...';
+    setTimeout(connectOrchestrator, 5000);
+  };
+
+  ws.onerror = () => {
+    // Silently retry — hub might not be running
+  };
+}
+
+// Connect to hub (non-blocking — doesn't prevent app from working without hub)
+setTimeout(connectOrchestrator, 1000);
 
 // ─── Browse Local Models ─────────────────────────────────────────────────────
 
@@ -154,37 +209,88 @@ promptEl.addEventListener('keydown', (e) => {
 
 // ─── WebGPU Initialization ───────────────────────────────────────────────────
 
+// Track discovered adapters for GPU switching
+let discoveredAdapters: DiscoveredAdapter[] = [];
+
+async function initGPU(adapter?: GPUAdapter) {
+  gpu = await timed('perf', 'webgpu-init', () => initWebGPU(adapter));
+  const info = gpu.adapterInfo;
+  const label = info.device || info.description || info.architecture || 'Unknown GPU';
+  const maxMB = Math.round(gpu.maxBufferSize / (1024 * 1024));
+
+  gpuBadge.textContent = `${label} (${maxMB} MB max buffer)`;
+  gpuBadge.classList.remove('error');
+  updateFooter({ gpu: label, vram: `${maxMB} MB max` });
+
+  addMessage('system',
+    `GPU: ${label}\n` +
+    `Vendor: ${info.vendor || 'unknown'} | Arch: ${info.architecture || 'unknown'}\n` +
+    `Max buffer: ${maxMB} MB | Max storage bindings: ${gpu.limits.maxStorageBuffersPerShaderStage}\n` +
+    `Max workgroup: ${gpu.limits.maxComputeWorkgroupSizeX}x${gpu.limits.maxComputeWorkgroupSizeY}x${gpu.limits.maxComputeWorkgroupSizeZ}`
+  );
+}
+
 async function init() {
-  setStatus('Detecting WebGPU...');
+  setStatus('Detecting GPUs...');
 
   try {
-    gpu = await timed('perf', 'webgpu-init', () => initWebGPU());
+    // Discover all available GPU adapters
+    discoveredAdapters = await discoverAdapters();
+    console.log(`[Init] Discovered ${discoveredAdapters.length} GPU adapter(s)`);
 
-    const info = gpu.adapterInfo;
-    const label = info.device || info.description || info.architecture || 'Unknown GPU';
-    const maxMB = Math.round(gpu.maxBufferSize / (1024 * 1024));
+    // Always show GPU selector dropdown (even with 1 GPU, for visibility)
+    gpuSelect.innerHTML = '';
+    if (discoveredAdapters.length > 0) {
+      for (let i = 0; i < discoveredAdapters.length; i++) {
+        const da = discoveredAdapters[i];
+        const opt = document.createElement('option');
+        opt.value = String(i);
+        opt.textContent = `${da.label} (${da.maxBufferMB} MB)`;
+        gpuSelect.appendChild(opt);
+      }
+      gpuSelect.style.display = 'inline-block';
+      gpuBadge.style.display = 'none';
 
-    gpuBadge.textContent = `${label} (${maxMB} MB max buffer)`;
-    gpuBadge.classList.remove('error');
+      // Initialize with first (high-performance) adapter
+      await initGPU(discoveredAdapters[0].adapter);
 
-    updateFooter({
-      gpu: label,
-      vram: `${maxMB} MB max`,
-    });
+      if (discoveredAdapters.length > 1) {
+        setStatus(`WebGPU ready — ${discoveredAdapters.length} GPUs detected. Select GPU and load a model.`);
+      } else {
+        setStatus('WebGPU ready — load a model or run kernel tests');
+      }
 
-    setStatus('WebGPU ready — load a model or run kernel tests');
-
-    addMessage('system',
-      `GPU: ${label}\n` +
-      `Vendor: ${info.vendor || 'unknown'} | Arch: ${info.architecture || 'unknown'}\n` +
-      `Max buffer: ${maxMB} MB | Max storage bindings: ${gpu.limits.maxStorageBuffersPerShaderStage}\n` +
-      `Max workgroup: ${gpu.limits.maxComputeWorkgroupSizeX}x${gpu.limits.maxComputeWorkgroupSizeY}x${gpu.limits.maxComputeWorkgroupSizeZ}`
-    );
+      // Handle GPU switch
+      gpuSelect.addEventListener('change', async () => {
+        const idx = parseInt(gpuSelect.value);
+        const da = discoveredAdapters[idx];
+        if (currentModel) {
+          addMessage('system', 'Unload the current model before switching GPUs.');
+          return;
+        }
+        setStatus(`Switching to ${da.label}...`);
+        try {
+          await initGPU(da.adapter);
+          setStatus(`Switched to ${da.label} — ready to load a model.`);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          addMessage('system', `Failed to switch GPU: ${msg}`);
+        }
+      });
+    } else {
+      // No adapters found via discovery — fall back to direct init
+      gpuSelect.style.display = 'none';
+      gpuBadge.style.display = 'inline-block';
+      await initGPU();
+      setStatus('WebGPU ready — load a model or run kernel tests');
+    }
 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     gpuBadge.textContent = 'No WebGPU';
     gpuBadge.classList.add('error');
+    gpuSelect.style.display = 'none';
+    gpuBadge.style.display = 'inline-block';
     setStatus(`WebGPU Error: ${msg}`);
     addMessage('system', `WebGPU initialization failed: ${msg}`);
     reportError('init', err);
@@ -411,23 +517,36 @@ loadBtn.addEventListener('click', async () => {
     if (isQuantized) {
       const previewConfig = parseModelConfig(preview.config);
       if (previewConfig.isHybrid && previewConfig.layerTypes) {
-        // Add both possible prefixes (multimodal uses model.language_model.*, text-only uses model.*)
-        const projSuffixes = [
-          'linear_attn.in_proj_qkv', 'linear_attn.in_proj_a',
-          'linear_attn.in_proj_b', 'linear_attn.in_proj_z', 'linear_attn.out_proj',
-        ];
-        const prefixes = ['model.language_model.layers', 'model.layers'];
-        for (let l = 0; l < previewConfig.numLayers; l++) {
-          if (previewConfig.layerTypes[l] === 'linear_attention') {
-            for (const prefix of prefixes) {
-              for (const suffix of projSuffixes) {
-                dequantToBF16.add(`${prefix}.${l}.${suffix}`);
+        // Estimate VRAM overhead from SSM dequant (INT4→BF16 expansion ~3.5x per weight)
+        // Each SSM layer has ~5 projections; biggest is in_proj_qkv at hidden*2*head_dim*heads
+        const ssmLayerCount = previewConfig.layerTypes.filter((t: string) => t === 'linear_attention').length;
+        const hiddenSize = previewConfig.hiddenSize ?? 4096;
+        // Rough estimate: each SSM layer's dequanted projections add ~hidden^2 * 6 bytes net (BF16 - INT4)
+        const dequantOverheadBytes = ssmLayerCount * hiddenSize * hiddenSize * 6;
+        const estimatedTotalVRAM = preview.totalBytes + dequantOverheadBytes;
+        const GPU_VRAM_BUDGET = 7.5 * 1024 * 1024 * 1024; // conservative 7.5 GB for 8 GB cards
+
+        if (estimatedTotalVRAM > GPU_VRAM_BUDGET) {
+          console.warn(`[Engine] SSM dequant would need ~${formatBytes(estimatedTotalVRAM)} VRAM (budget: ${formatBytes(GPU_VRAM_BUDGET)}) — skipping, relying on GPTQ calibration for SSM layers`);
+        } else {
+          // Add both possible prefixes (multimodal uses model.language_model.*, text-only uses model.*)
+          const projSuffixes = [
+            'linear_attn.in_proj_qkv', 'linear_attn.in_proj_a',
+            'linear_attn.in_proj_b', 'linear_attn.in_proj_z', 'linear_attn.out_proj',
+          ];
+          const prefixes = ['model.language_model.layers', 'model.layers'];
+          for (let l = 0; l < previewConfig.numLayers; l++) {
+            if (previewConfig.layerTypes[l] === 'linear_attention') {
+              for (const prefix of prefixes) {
+                for (const suffix of projSuffixes) {
+                  dequantToBF16.add(`${prefix}.${l}.${suffix}`);
+                }
               }
             }
           }
-        }
-        if (dequantToBF16.size > 0) {
-          console.log(`[Engine] Mixed-precision GPTQ: ${dequantToBF16.size / 2} linear_attn projections → BF16 (${dequantToBF16.size} name variants)`);
+          if (dequantToBF16.size > 0) {
+            console.log(`[Engine] Mixed-precision GPTQ: ${dequantToBF16.size / 2} linear_attn projections → BF16 (${dequantToBF16.size} name variants)`);
+          }
         }
       }
     }

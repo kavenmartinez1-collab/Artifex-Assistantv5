@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Artifex GPU Worker</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --text: #e6edf3;
+      --dim: #7d8590;
+      --accent: #58a6ff;
+      --success: #3fb950;
+      --error: #f85149;
+      --mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      padding: 20px;
+    }
+    h1 { font-size: 16px; color: var(--accent); margin-bottom: 16px; }
+    .panel {
+      background: var(--surface);
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 16px;
+      margin-bottom: 12px;
+    }
+    .label { color: var(--dim); font-size: 11px; margin-bottom: 4px; }
+    .value { font-size: 14px; margin-bottom: 12px; }
+    .status-idle { color: var(--success); }
+    .status-generating { color: var(--accent); }
+    .status-loading { color: #d29922; }
+    .status-error { color: var(--error); }
+    #log {
+      background: var(--bg);
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 8px;
+      max-height: 400px;
+      overflow-y: auto;
+      font-size: 11px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+    .log-entry { margin-bottom: 2px; }
+    .log-time { color: var(--dim); }
+  </style>
+</head>
+<body>
+  <h1>ARTIFEX <span style="color:var(--text)">GPU Worker</span></h1>
+
+  <div class="panel">
+    <div class="label">Worker ID</div>
+    <div class="value" id="worker-id">—</div>
+    <div class="label">GPU</div>
+    <div class="value" id="gpu-info">Detecting...</div>
+    <div class="label">Status</div>
+    <div class="value" id="status">Initializing</div>
+    <div class="label">Hub Connection</div>
+    <div class="value" id="hub-status">Disconnected</div>
+  </div>
+
+  <div class="panel">
+    <div class="label">Model</div>
+    <div class="value" id="model-info">None</div>
+    <div class="label">Current Task</div>
+    <div class="value" id="task-info">None</div>
+    <div class="label">Stats</div>
+    <div class="value" id="stats">0 tasks | 0 tokens</div>
+  </div>
+
+  <div class="panel">
+    <div class="label">Log</div>
+    <div id="log"></div>
+  </div>
+
+  <script type="module" src="/src/worker-main.ts"></script>
+</body>
+</html>
