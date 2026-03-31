@@ -1,6 +1,6 @@
 // Rotary Position Embeddings (RoPE)
 // Applies rotary embeddings to Q and K tensors for positional encoding.
-// Qwen3.5 uses RoPE with theta = 10000 (or extended theta for long context)
+// Qwen3.5 uses RoPE with theta = 10,000,000 and partial_rotary_factor = 0.25
 //
 // For each pair of dimensions (2i, 2i+1):
 //   q_rot[2i]   = q[2i] * cos(theta) - q[2i+1] * sin(theta)

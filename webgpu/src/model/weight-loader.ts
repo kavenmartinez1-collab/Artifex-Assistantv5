@@ -253,11 +253,7 @@ export async function loadModel(
 
     let tensorIdx = 0;
     for (const [name, tensorInfo] of header.tensors) {
-      // Skip g_idx tensors — unused by our matmul_q4 shader
-      if (name.endsWith('.g_idx')) {
-        tensorIdx++;
-        continue;
-      }
+      // g_idx tensors are now loaded for actorder GPTQ support
       // Get raw tensor bytes — either from full shard or via chunked range requests
       let rawData: ArrayBuffer;
       if (shardData) {

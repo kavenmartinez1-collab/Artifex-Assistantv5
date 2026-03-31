@@ -33,6 +33,10 @@ struct Params {
 @group(0) @binding(4) var<storage, read> scales_raw: array<u32>;
 // Zeros: per-group zero points [num_groups, N/8] as packed INT4 in i32
 @group(0) @binding(5) var<storage, read> qzeros: array<i32>;
+// g_idx: per-column group mapping [K] as u32 (for actorder support)
+// Without actorder: g_idx[k] = k / group_size (trivial)
+// With actorder: g_idx[k] = reordered group assignment
+@group(0) @binding(6) var<storage, read> g_idx: array<u32>;
 
 var<workgroup> tile_a: array<f32, 256>; // TILE * TILE
 var<workgroup> tile_b: array<f32, 256>;
@@ -113,8 +117,8 @@ fn matmul_bt_q4(@builtin(global_invocation_id) gid: vec3u,
       let nibble = b_k % 8u;
       let q4_val = extract_q4(B_packed[packed_idx], nibble);
 
-      // Get group scale and zero point
-      let group_id = b_k / gs;
+      // Get group scale and zero point (actorder-aware via g_idx lookup)
+      let group_id = g_idx[b_k];
       let scale = read_f16_scale(group_id * N + col);
 
       // Get zero point (also packed INT4: qzeros[group_id, col/8], nibble col%8)

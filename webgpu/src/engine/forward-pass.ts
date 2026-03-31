@@ -74,25 +74,25 @@ export interface LayerWeights {
   downProj: GPUBuffer;     // [hidden_size, intermediate_size]
 
   // GPTQ quantized weight buffers (optional, only for INT4 models)
-  qProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
-  kProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
-  vProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
-  oProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
-  gateProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
-  upProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
-  downProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  qProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  kProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  vProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  oProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  gateProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  upProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  downProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
 
   // Linear attention (Gated DeltaNet) weights — only for hybrid models
   linearInProjQKV?: GPUBuffer;
-  linearInProjQKV_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  linearInProjQKV_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
   linearInProjA?: GPUBuffer;
-  linearInProjA_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  linearInProjA_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
   linearInProjB?: GPUBuffer;
-  linearInProjB_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  linearInProjB_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
   linearInProjZ?: GPUBuffer;
-  linearInProjZ_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  linearInProjZ_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
   linearOutProj?: GPUBuffer;
-  linearOutProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };
+  linearOutProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
   // Full attention Q/K norm weights (Qwen3.5 only)
   qNorm?: GPUBuffer;              // [head_dim] per-head RMSNorm weight for Q
   kNorm?: GPUBuffer;              // [head_dim] per-head RMSNorm weight for K
@@ -107,11 +107,11 @@ export interface LayerWeights {
 export interface GlobalWeights {
   embedTokens: GPUBuffer;  // [vocab_size, hidden_size] (f32, f16 packed, or dummy if Q4)
   embedIsF16?: boolean;    // true if embedding stored as F16/BF16 (large vocab models)
-  embedQ4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };  // GPTQ INT4 embedding
+  embedQ4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };  // GPTQ INT4 embedding
   finalNorm: GPUBuffer;    // [hidden_size]
   lmHead: GPUBuffer;       // [vocab_size, hidden_size] or same as embedTokens
   lmHeadIsBF16?: boolean;  // true if lm_head stored as BF16 (large vocab models)
-  lmHeadQ4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer };  // GPTQ INT4 lm_head
+  lmHeadQ4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };  // GPTQ INT4 lm_head
 }
 
 /** All model weights on the GPU. */
@@ -332,11 +332,18 @@ export function createForwardPassEngine(
   /** C[M,N] = A[M,K] @ dequant(q4_packed, scales, zeros)^T — GPTQ INT4 */
   function dispatchMatmulQ4(
     aBuf: GPUBuffer,
-    q4: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer },
+    q4: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer },
     cBuf: GPUBuffer,
     M: number, N: number, K: number, label: string,
   ) {
     if (!matmulQ4Pipeline) throw new Error('INT4 matmul not compiled (model is not quantized)');
+    if (!q4.qweight || !q4.scales || !q4.qzeros || !q4.g_idx) {
+      const missing = [
+        !q4.qweight && 'qweight', !q4.scales && 'scales',
+        !q4.qzeros && 'qzeros', !q4.g_idx && 'g_idx',
+      ].filter(Boolean).join(', ');
+      throw new Error(`matmul_q4 "${label}": missing buffers: ${missing}`);
+    }
     const params = createUniformBuffer(device,
       new Uint32Array([M, N, K, config.quantGroupSize]), `${label}-p`);
     const bg = createBindGroup(device, matmulQ4Pipeline, 0, [
@@ -346,6 +353,7 @@ export function createForwardPassEngine(
       { binding: 3, resource: { buffer: params } },
       { binding: 4, resource: { buffer: q4.scales } },
       { binding: 5, resource: { buffer: q4.qzeros } },
+      { binding: 6, resource: { buffer: q4.g_idx } },
     ], label);
     bd(matmulQ4Pipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
     deferDestroy(params);
@@ -360,7 +368,7 @@ export function createForwardPassEngine(
     outputBuf: GPUBuffer, M: number, N: number, K: number, label: string,
   ) {
     const q4key = `${proj}_q4` as keyof LayerWeights;
-    const q4 = lw[q4key] as { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer } | undefined;
+    const q4 = lw[q4key] as { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer } | undefined;
     if (q4) {
       dispatchMatmulQ4(inputBuf, q4, outputBuf, M, N, K, label);
     } else {
@@ -734,6 +742,20 @@ export function createForwardPassEngine(
       deferDestroy(embedParams);
     }
 
+    // Debug: dump embed output on first call (uncomment to diagnose INT4 embed issues)
+    // if (debugCallCount <= 1) {
+    //   flushBatch();
+    //   await device.queue.onSubmittedWorkDone();
+    //   const raw = new Float32Array(await readBuffer(device, hiddenBuf, 16 * 4));
+    //   const isQ4 = !!(weights.global.embedQ4 && embedQ4Pipeline);
+    //   console.log(`[EMBED ${isQ4 ? 'Q4' : 'BF16'}] first 16: [${Array.from(raw).map(v => v.toFixed(6)).join(', ')}]`);
+    //   const allZero = raw.every(v => v === 0);
+    //   const hasNaN = raw.some(v => isNaN(v));
+    //   const hasInf = raw.some(v => !isFinite(v));
+    //   if (allZero) console.error('[EMBED] WARNING: all zeros — embed dispatch likely failed');
+    //   if (hasNaN) console.error('[EMBED] WARNING: NaN detected — dequant bug');
+    //   if (hasInf) console.error('[EMBED] WARNING: Inf detected — overflow');
+    // }
     if (isDebug) {
       flushBatch();
       await debugRead(hiddenBuf, 'embed-out', 8);
@@ -1203,9 +1225,10 @@ export function createForwardPassEngine(
       lmInputBuf = lastHiddenBuf;
     }
     // LM head — select kernel based on weight format (BF16, INT4 GPTQ, or f32)
-    if (weights.global.lmHeadQ4 && matmulQ4Pipeline) {
+    const lmIsQ4 = !!(weights.global.lmHeadQ4 && matmulQ4Pipeline);
+    if (lmIsQ4) {
       // GPTQ INT4 lm_head (saves ~1.4 GB vs BF16)
-      dispatchMatmulQ4(lmInputBuf, weights.global.lmHeadQ4, logitsBuf, 1, V, H, 'lm-head');
+      dispatchMatmulQ4(lmInputBuf, weights.global.lmHeadQ4!, logitsBuf, 1, V, H, 'lm-head');
     } else if (weights.global.lmHeadIsBF16) {
       const params = createUniformBuffer(device, new Uint32Array([1, V, H, 0]), 'lm-head-p');
       const bg = createBindGroup(device, matmulBTBF16Pipeline, 0, [
@@ -1227,6 +1250,28 @@ export function createForwardPassEngine(
       deferredDestroys = [];
       currentBatch = null;
     }
+
+    // Debug: dump logits with global argmax (uncomment to diagnose lm_head issues)
+    // if (debugCallCount <= 3) {
+    //   await device.queue.onSubmittedWorkDone();
+    //   const allLogits = new Float32Array(await readBuffer(device, logitsBuf, V * 4));
+    //   let globalMax = -Infinity, globalArgmax = 0;
+    //   let nanCount = 0, infCount = 0;
+    //   for (let i = 0; i < V; i++) {
+    //     if (isNaN(allLogits[i])) nanCount++;
+    //     else if (!isFinite(allLogits[i])) infCount++;
+    //     else if (allLogits[i] > globalMax) { globalMax = allLogits[i]; globalArgmax = i; }
+    //   }
+    //   const indices = Array.from({length: V}, (_, i) => i);
+    //   indices.sort((a, b) => allLogits[b] - allLogits[a]);
+    //   const top5 = indices.slice(0, 5).map(i => `${i}:${allLogits[i].toFixed(2)}`);
+    //   const highSamples = [100000, 150000, 200000, 248000, 248044, 248319].map(
+    //     i => `[${i}]=${allLogits[Math.min(i, V-1)].toFixed(2)}`
+    //   );
+    //   console.log(`[FWD #${debugCallCount} pos=${kvCache.position}] argmax=${globalArgmax} max=${globalMax.toFixed(2)} NaN=${nanCount} Inf=${infCount}`);
+    //   console.log(`  top5: ${top5.join(', ')}`);
+    //   console.log(`  high-idx: ${highSamples.join(', ')}`);
+    // }
 
     // Update cache position
     kvCache.position += seqLen;
