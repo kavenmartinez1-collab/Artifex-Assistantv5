@@ -310,7 +310,59 @@ export async function loadModel(
         || name.endsWith('.e8_indices') || name.endsWith('.e8_scales')
         || name.endsWith('.e8_offsets');
 
-      // Mixed-precision: intercept GPTQ triplets that should be dequanted to BF16
+      // INT8→F32 CPU dequant: intercept Q8 triplets and convert to regular f32 weights
+      // Disabled by default: f32 expansion doubles VRAM. Enable for debugging Q8 shader.
+      if (false && isGPTQ) {
+        const q8Suffix = name.endsWith('.qweight_q8') ? '.qweight_q8'
+          : name.endsWith('.scales_q8') ? '.scales_q8'
+          : name.endsWith('.qzeros_q8') ? '.qzeros_q8'
+          : name.endsWith('.g_idx_q8') ? '.g_idx_q8' : '';
+        if (q8Suffix) {
+          const base = name.slice(0, -q8Suffix.length);
+          const entry = (dequantAccum as any).__q8__ ?? new Map();
+          (dequantAccum as any).__q8__ = entry;
+          const parts = entry.get(base) ?? {};
+          const part = q8Suffix.slice(1);
+          parts[part] = { data: rawData.slice(0), shape: tensorInfo.shape };
+          entry.set(base, parts);
+
+          // Check if Q8 triplet is complete (qweight + scales + qzeros; g_idx optional)
+          if (parts.qweight_q8 && parts.scales_q8 && parts.qzeros_q8) {
+            const qw = new Int32Array(parts.qweight_q8.data);
+            const sc = new Uint16Array(parts.scales_q8.data);
+            const qz = new Int32Array(parts.qzeros_q8.data);
+            const gi = parts.g_idx_q8 ? new Uint32Array(parts.g_idx_q8.data) : null;
+            const N_q8 = parts.qweight_q8.shape[1];
+            const K_q8 = parts.qweight_q8.shape[0] * 4;
+            const gs_q8 = config.quantization_config?.group_size ?? 128;
+
+            const f32Data = dequantQ8toF32(qw, sc, qz, gi, K_q8, N_q8, gs_q8);
+
+            const gpuBuffer = device.createBuffer({
+              size: f32Data.byteLength,
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+              label: `${base}.weight`,
+              mappedAtCreation: true,
+            });
+            new Uint8Array(gpuBuffer.getMappedRange()).set(
+              new Uint8Array(f32Data.buffer, f32Data.byteOffset, f32Data.byteLength)
+            );
+            gpuBuffer.unmap();
+
+            allTensors.set(`${base}.weight`, {
+              name: `${base}.weight`, buffer: gpuBuffer, shape: [N_q8, K_q8],
+              dtype: 'F32', byteLength: f32Data.byteLength,
+              elementCount: N_q8 * K_q8, isQuantized: false,
+            });
+            totalGPUBytes += f32Data.byteLength;
+            tensorsProcessed++;
+            entry.delete(base);
+          }
+          continue; // Skip normal GPU upload for Q8 tensors
+        }
+      }
+
+      // Mixed-precision: intercept GPTQ INT4 triplets that should be dequanted to BF16
       if (isGPTQ && dequantSet.size > 0) {
         const suffix = name.endsWith('.qweight') ? '.qweight'
           : name.endsWith('.scales') ? '.scales'
@@ -547,6 +599,50 @@ export function dequantGPTQ(
   }
 
   console.log(`[Dequant] GPTQ → f32: [${N}, ${K}] (${(result.byteLength / 1024 / 1024).toFixed(1)} MB)`);
+  return result;
+}
+
+/**
+ * CPU-side INT8 dequantization — converts INT8 packed weights to f32.
+ * Layout: qweight_q8 is [K/4, N] (4 INT8 per i32), scales_q8 is [numGroups, N] F16,
+ *         qzeros_q8 is [numGroups, N/4] (4 INT8 per i32), g_idx_q8 is [K] u32.
+ * @returns Float32Array of shape [N, K] (HF weight format: [out_features, in_features])
+ */
+export function dequantQ8toF32(
+  qweight: Int32Array,
+  scales: Uint16Array,
+  qzeros: Int32Array,
+  gIdx: Uint32Array | null,
+  K: number,
+  N: number,
+  groupSize: number,
+): Float32Array {
+  const result = new Float32Array(N * K);
+  const zerosStride = Math.ceil(N / 4);
+
+  for (let k = 0; k < K; k++) {
+    const groupId = gIdx ? gIdx[k] : Math.floor(k / groupSize);
+    const packedRow = Math.floor(k / 4);
+    const byteInPacked = k % 4;
+
+    for (let n = 0; n < N; n++) {
+      // Extract 8-bit weight
+      const packed = qweight[packedRow * N + n];
+      const q8 = (packed >> (byteInPacked * 8)) & 0xFF;
+
+      // Get scale (F16 stored as u16)
+      const scale = f16ToF32(scales[groupId * N + n]);
+
+      // Get zero point (packed INT8)
+      const zeroPacked = qzeros[groupId * zerosStride + Math.floor(n / 4)];
+      const zeroByte = n % 4;
+      const zero = (zeroPacked >> (zeroByte * 8)) & 0xFF;
+
+      result[n * K + k] = (q8 - zero) * scale;
+    }
+  }
+
+  console.log(`[Dequant] Q8 → f32: [${N}, ${K}] (${(result.byteLength / 1024 / 1024).toFixed(1)} MB)`);
   return result;
 }
 
