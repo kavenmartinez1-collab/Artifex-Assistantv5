@@ -672,6 +672,32 @@ loadBtn.addEventListener('click', async () => {
         return undefined;
       };
 
+      // Helper to load INT8 quad (qweight_q8 + scales_q8 + qzeros_q8 + g_idx_q8)
+      const tryGetQ8 = (weightName: string) => {
+        const base = weightName.replace('.weight', '');
+        const qw = tryGetTensor(`${base}.qweight_q8`);
+        const sc = tryGetTensor(`${base}.scales_q8`);
+        const qz = tryGetTensor(`${base}.qzeros_q8`);
+        if (qw && sc && qz) {
+          let gIdx = tryGetTensor(`${base}.g_idx_q8`);
+          if (!gIdx) {
+            // INT8 packs 4 per i32, so K = shape[0] * 4
+            const qwTensor = currentModel!.tensors.get(`${base}.qweight_q8`);
+            const K = qwTensor ? qwTensor.shape[0] * 4 : 0;
+            if (K > 0) {
+              console.log(`[Q8] ${base}: no g_idx_q8, generating trivial (K=${K})`);
+              gIdx = getOrCreateTrivialGIdx(K);
+            }
+          }
+          if (!gIdx) return undefined;
+          if (currentModel!.tensors.get(`${base}.qweight_q8`)) {
+            console.log(`[Q8] ${base}: INT8 loaded`);
+          }
+          return { qweight: qw, scales: sc, qzeros: qz, g_idx: gIdx };
+        }
+        return undefined;
+      };
+
       // Check if embedding is GPTQ INT4 (saves ~1.4 GB VRAM)
       const embedQ4 = tryGetQ4(nameMap.embedTokens);
       if (embedQ4) {
@@ -772,16 +798,22 @@ loadBtn.addEventListener('click', async () => {
           lw.linearDtBias = tryGetTensor(resolveLayerWeightName(lin.dtBias, l));
           lw.linearNormWeight = tryGetTensor(resolveLayerWeightName(lin.normWeight, l));
 
-          // GPTQ for linear attention projections
+          // GPTQ INT4 / INT8 for linear attention projections
           if (config.isQuantized) {
             const linQ4Keys = ['linearInProjQKV', 'linearInProjA', 'linearInProjB', 'linearInProjZ', 'linearOutProj'] as const;
             const linNameKeys = ['inProjQKV', 'inProjA', 'inProjB', 'inProjZ', 'outProj'] as const;
             for (let k = 0; k < linQ4Keys.length; k++) {
               const weightName = resolveLayerWeightName(lin[linNameKeys[k]], l);
-              const q4 = tryGetQ4(weightName);
-              if (q4) {
-                lw[`${linQ4Keys[k]}_q4`] = q4;
-                if (l === 0) console.log(`[Q4] L0 ${linQ4Keys[k]}: GPTQ loaded`);
+              // Try INT8 first, then INT4
+              const q8 = tryGetQ8(weightName);
+              if (q8) {
+                (lw as any)[`${linQ4Keys[k]}_q8`] = q8;
+              } else {
+                const q4 = tryGetQ4(weightName);
+                if (q4) {
+                  lw[`${linQ4Keys[k]}_q4`] = q4;
+                  if (l === 0) console.log(`[Q4] L0 ${linQ4Keys[k]}: GPTQ loaded`);
+                }
               }
             }
           }
@@ -808,15 +840,20 @@ loadBtn.addEventListener('click', async () => {
           trackBF16(vName, lw.vProj);
           trackBF16(oName, lw.oProj);
 
-          // GPTQ for standard attention projections
+          // GPTQ INT4 / INT8 for standard attention projections
           if (config.isQuantized) {
             const nameKeys = ['qProj', 'kProj', 'vProj', 'oProj'] as const;
             for (const key of nameKeys) {
               const weightName = resolveLayerWeightName(nameMap.layer[key], l);
-              const q4 = tryGetQ4(weightName);
-              if (q4) {
-                lw[`${key}_q4`] = q4;
-                if (l === 3) console.log(`[Q4] L3 ${key}: GPTQ loaded`); // L3 is first full_attn
+              const q8 = tryGetQ8(weightName);
+              if (q8) {
+                (lw as any)[`${key}_q8`] = q8;
+              } else {
+                const q4 = tryGetQ4(weightName);
+                if (q4) {
+                  lw[`${key}_q4`] = q4;
+                  if (l === 3) console.log(`[Q4] L3 ${key}: GPTQ loaded`);
+                }
               }
             }
           }
@@ -837,14 +874,19 @@ loadBtn.addEventListener('click', async () => {
           }
         }
 
-        // FFN GPTQ (shared for both layer types)
+        // FFN GPTQ INT4 / INT8 (shared for both layer types)
         if (config.isQuantized) {
           for (const key of ['gateProj', 'upProj', 'downProj'] as const) {
             const weightName = resolveLayerWeightName(nameMap.layer[key], l);
-            const q4 = tryGetQ4(weightName);
-            if (q4) {
-              lw[`${key}_q4`] = q4;
-              if (l === 0) console.log(`[Q4] L0 ${key}: GPTQ loaded`);
+            const q8 = tryGetQ8(weightName);
+            if (q8) {
+              (lw as any)[`${key}_q8`] = q8;
+            } else {
+              const q4 = tryGetQ4(weightName);
+              if (q4) {
+                lw[`${key}_q4`] = q4;
+                if (l === 0) console.log(`[Q4] L0 ${key}: GPTQ loaded`);
+              }
             }
           }
         }

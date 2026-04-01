@@ -1,0 +1,21 @@
+{
+  "name": "artifex-control-center",
+  "version": "0.1.0",
+  "description": "Unified management dashboard for Artifex services, models, and quantization",
+  "main": "dist/main/main.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && electron dist/main/main.js",
+    "dev": "tsc && electron dist/main/main.js",
+    "package": "npm run build && electron-builder"
+  },
+  "dependencies": {
+    "ws": "8.20.0"
+  },
+  "devDependencies": {
+    "electron": "34.2.0",
+    "electron-builder": "25.1.8",
+    "@types/ws": "8.18.1",
+    "typescript": "5.7.0"
+  }
+}

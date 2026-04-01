@@ -58,6 +58,14 @@ export interface ModelConfig {
   quantBits: number;
   /** Quantization group size (typically 128) */
   quantGroupSize: number;
+  /** Whether Hadamard rotation was applied during quantization (QuIP#-style) */
+  quantHadamard?: boolean;
+  /** Whether KLT rotation was fused offline (MambaQuant-style, zero runtime cost) */
+  quantKLT?: boolean;
+  /** Whether model contains E8 lattice 2-bit quantized layers */
+  hasE8?: boolean;
+  /** Whether model contains INT8 quantized layers */
+  hasQ8?: boolean;
 
   // ── Hybrid (Mamba-2 / Gated DeltaNet) ──────────────────────────────
   /** Per-layer type: 'full_attention' or 'linear_attention'. Undefined for pure transformers. */
@@ -357,6 +365,10 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
     quantMethod,
     quantBits,
     quantGroupSize,
+    quantHadamard: quantConfig?.hadamard ?? false,
+    quantKLT: quantConfig?.klt ?? false,
+    hasE8: quantConfig?.has_e8 ?? false,
+    hasQ8: quantConfig?.has_q8 ?? false,
     numQPerKV,
     isGQA: numKVHeads !== numAttentionHeads,
     isQuantized: quantMethod !== 'none',

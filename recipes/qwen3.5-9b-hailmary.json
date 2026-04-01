@@ -1,0 +1,13 @@
+{
+  "global": {
+    "bits": 4,
+    "group_size": 128,
+    "rotation": "klt"
+  },
+  "embed_tokens": { "bits": 16 },
+  "lm_head": { "bits": 16 },
+  "layer_defaults": {
+    "linear_attn.in_proj_a": { "bits": 8, "method": "rtn" },
+    "linear_attn.out_proj":  { "bits": 8, "method": "rtn" }
+  }
+}

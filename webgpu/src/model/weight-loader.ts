@@ -302,9 +302,13 @@ export async function loadModel(
         tensorIdx++;
       }
 
-      // GPTQ tensors stay in native format for GPU-side dequantization
+      // GPTQ/INT8/E8 tensors stay in native format for GPU-side dequantization
       const isGPTQ = name.endsWith('.qweight') || name.endsWith('.qzeros')
-        || name.endsWith('.scales') || name.endsWith('.g_idx');
+        || name.endsWith('.scales') || name.endsWith('.g_idx')
+        || name.endsWith('.qweight_q8') || name.endsWith('.qzeros_q8')
+        || name.endsWith('.scales_q8') || name.endsWith('.g_idx_q8')
+        || name.endsWith('.e8_indices') || name.endsWith('.e8_scales')
+        || name.endsWith('.e8_offsets');
 
       // Mixed-precision: intercept GPTQ triplets that should be dequanted to BF16
       if (isGPTQ && dequantSet.size > 0) {

@@ -47,6 +47,8 @@ import elementwiseWGSL from '../shaders/elementwise.wgsl?raw';
 import embedWGSL from '../shaders/embed.wgsl?raw';
 import attentionWGSL from '../shaders/attention.wgsl?raw';
 import matmulQ4WGSL from '../shaders/matmul_q4.wgsl?raw';
+import matmulE8WGSL from '../shaders/matmul_e8.wgsl?raw';
+import matmulQ8WGSL from '../shaders/matmul_q8.wgsl?raw';
 import tqEncodeWGSL from '../shaders/turboquant_encode.wgsl?raw';
 import tqDecodeWGSL from '../shaders/turboquant_decode.wgsl?raw';
 import attentionTqWGSL from '../shaders/attention_tq.wgsl?raw';
@@ -54,6 +56,7 @@ import conv1dWGSL from '../shaders/conv1d.wgsl?raw';
 import groupNormWGSL from '../shaders/group_norm.wgsl?raw';
 import ssmStepWGSL from '../shaders/ssm_step.wgsl?raw';
 import l2normWGSL from '../shaders/l2norm.wgsl?raw';
+import hadamardWGSL from '../shaders/hadamard.wgsl?raw';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -82,6 +85,24 @@ export interface LayerWeights {
   upProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
   downProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
 
+  // E8 lattice 2-bit quantized weight buffers (optional, per-layer via recipe)
+  qProj_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
+  kProj_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
+  vProj_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
+  oProj_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
+  gateProj_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
+  upProj_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
+  downProj_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
+
+  // INT8 quantized weight buffers (optional, per-layer via recipe)
+  qProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  kProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  vProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  oProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  gateProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  upProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  downProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+
   // Linear attention (Gated DeltaNet) weights — only for hybrid models
   linearInProjQKV?: GPUBuffer;
   linearInProjQKV_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
@@ -93,6 +114,16 @@ export interface LayerWeights {
   linearInProjZ_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
   linearOutProj?: GPUBuffer;
   linearOutProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  linearInProjQKV_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
+  linearInProjA_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
+  linearInProjB_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
+  linearInProjZ_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
+  linearOutProj_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
+  linearInProjQKV_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  linearInProjA_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  linearInProjB_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  linearInProjZ_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  linearOutProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
   // Full attention Q/K norm weights (Qwen3.5 only)
   qNorm?: GPUBuffer;              // [head_dim] per-head RMSNorm weight for Q
   kNorm?: GPUBuffer;              // [head_dim] per-head RMSNorm weight for K
@@ -108,6 +139,8 @@ export interface GlobalWeights {
   embedTokens: GPUBuffer;  // [vocab_size, hidden_size] (f32, f16 packed, or dummy if Q4)
   embedIsF16?: boolean;    // true if embedding stored as F16/BF16 (large vocab models)
   embedQ4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };  // GPTQ INT4 embedding
+  /** E8 codebook buffer, shared across all layers [256*8] f32 */
+  e8Codebook?: GPUBuffer;
   finalNorm: GPUBuffer;    // [hidden_size]
   lmHead: GPUBuffer;       // [vocab_size, hidden_size] or same as embedTokens
   lmHeadIsBF16?: boolean;  // true if lm_head stored as BF16 (large vocab models)
@@ -226,6 +259,19 @@ export function createForwardPassEngine(
   const matmulQ4Pipeline = config.isQuantized
     ? createComputePipeline(device, matmulQ4WGSL, 'matmul_bt_q4', 'matmul-q4')
     : null;
+  // E8 lattice 2-bit dequantizing matmul (weights packed as codebook indices)
+  const matmulE8Pipeline = config.isQuantized
+    ? createComputePipeline(device, matmulE8WGSL, 'matmul_e8', 'matmul-e8')
+    : null;
+  // INT8 dequantizing matmul (weights packed as 8-bit)
+  const matmulQ8Pipeline = config.isQuantized
+    ? createComputePipeline(device, matmulQ8WGSL, 'matmul_bt_q8', 'matmul-q8')
+    : null;
+  // Hadamard transform for QuIP#/QuaRot incoherence processing
+  const hadamardPipeline = config.isQuantized
+    ? createComputePipeline(device, hadamardWGSL, 'hadamard', 'hadamard')
+    : null;
+
   const ropePipeline = createComputePipeline(device, ropeWGSL, 'rope', 'rope');
   const attentionPipeline = createComputePipeline(device, attentionWGSL, 'attention', 'attention');
   const attentionTqPipeline = createComputePipeline(device, attentionTqWGSL, 'attention_tq', 'attention-tq');
@@ -359,14 +405,95 @@ export function createForwardPassEngine(
     deferDestroy(params);
   }
 
+  /** C[M,N] = A[M,K] @ dequant_e8(indices, scales, offsets, codebook)^T — E8 2-bit */
+  function dispatchMatmulE8(
+    aBuf: GPUBuffer,
+    e8: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer },
+    cBuf: GPUBuffer,
+    M: number, N: number, K: number, label: string,
+  ) {
+    if (!matmulE8Pipeline) throw new Error('E8 matmul not compiled (model is not quantized)');
+    const codebookBuf = weights.global.e8Codebook;
+    if (!codebookBuf) throw new Error(`matmul_e8 "${label}": no E8 codebook loaded`);
+    if (!e8.indices || !e8.scales || !e8.offsets) {
+      const missing = [
+        !e8.indices && 'indices', !e8.scales && 'scales', !e8.offsets && 'offsets',
+      ].filter(Boolean).join(', ');
+      throw new Error(`matmul_e8 "${label}": missing buffers: ${missing}`);
+    }
+    const params = createUniformBuffer(device,
+      new Uint32Array([M, N, K, config.quantGroupSize]), `${label}-p`);
+    const bg = createBindGroup(device, matmulE8Pipeline, 0, [
+      { binding: 0, resource: { buffer: aBuf } },
+      { binding: 1, resource: { buffer: e8.indices } },
+      { binding: 2, resource: { buffer: cBuf } },
+      { binding: 3, resource: { buffer: params } },
+      { binding: 4, resource: { buffer: e8.scales } },
+      { binding: 5, resource: { buffer: e8.offsets } },
+      { binding: 6, resource: { buffer: codebookBuf } },
+    ], label);
+    bd(matmulE8Pipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
+    deferDestroy(params);
+  }
+
+  /** C[M,N] = A[M,K] @ dequant_q8(packed, scales, zeros)^T — INT8 */
+  let q8DispatchCount = 0;
+  function dispatchMatmulQ8(
+    aBuf: GPUBuffer,
+    q8: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer },
+    cBuf: GPUBuffer,
+    M: number, N: number, K: number, label: string,
+  ) {
+    if (!matmulQ8Pipeline) throw new Error('INT8 matmul not compiled (model is not quantized)');
+    if (q8DispatchCount < 1) {
+      console.log(`[Q8] First dispatch ${label}: M=${M} N=${N} K=${K}`);
+    }
+    q8DispatchCount++;
+    if (!q8.qweight || !q8.scales || !q8.qzeros || !q8.g_idx) {
+      const missing = [
+        !q8.qweight && 'qweight', !q8.scales && 'scales',
+        !q8.qzeros && 'qzeros', !q8.g_idx && 'g_idx',
+      ].filter(Boolean).join(', ');
+      throw new Error(`matmul_q8 "${label}": missing buffers: ${missing}`);
+    }
+    const params = createUniformBuffer(device,
+      new Uint32Array([M, N, K, config.quantGroupSize]), `${label}-p`);
+    const bg = createBindGroup(device, matmulQ8Pipeline, 0, [
+      { binding: 0, resource: { buffer: aBuf } },
+      { binding: 1, resource: { buffer: q8.qweight } },
+      { binding: 2, resource: { buffer: cBuf } },
+      { binding: 3, resource: { buffer: params } },
+      { binding: 4, resource: { buffer: q8.scales } },
+      { binding: 5, resource: { buffer: q8.qzeros } },
+      { binding: 6, resource: { buffer: q8.g_idx } },
+    ], label);
+    bd(matmulQ8Pipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
+    deferDestroy(params);
+  }
+
   // Set of GPU buffers stored as BF16 (need matmul_bt_bf16 kernel)
   const bf16Set = weights.bf16Buffers ?? new Set<GPUBuffer>();
 
-  /** Dispatch f32 matmul_bt, BF16 matmul_bt_bf16, or INT4 matmul_q4 depending on weight type */
+  /** Dispatch f32/BF16/INT4/E8/INT8 matmul depending on weight type */
   function dispatchProjection(
     inputBuf: GPUBuffer, lw: LayerWeights, proj: string,
     outputBuf: GPUBuffer, M: number, N: number, K: number, label: string,
   ) {
+    // Priority: E8 2-bit > INT8 > INT4 GPTQ > BF16 > f32
+    const e8key = `${proj}_e8` as keyof LayerWeights;
+    const e8 = lw[e8key] as { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer } | undefined;
+    if (e8) {
+      dispatchMatmulE8(inputBuf, e8, outputBuf, M, N, K, label);
+      return;
+    }
+
+    const q8key = `${proj}_q8` as keyof LayerWeights;
+    const q8 = lw[q8key] as { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer } | undefined;
+    if (q8) {
+      dispatchMatmulQ8(inputBuf, q8, outputBuf, M, N, K, label);
+      return;
+    }
+
     const q4key = `${proj}_q4` as keyof LayerWeights;
     const q4 = lw[q4key] as { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer } | undefined;
     if (q4) {
@@ -496,6 +623,27 @@ export function createForwardPassEngine(
 
   // Qwen3_5 uses (1+weight) in RMSNorm — detect from model type
   const useResidualWeight = config.modelType === 'qwen3_5_text' ? 1 : 0;
+
+  // Hadamard rotation flag — set when model was quantized with --hadamard (online rotation)
+  // KLT models use offline fusion — no runtime rotation needed, so disable Hadamard
+  const useHadamard = !!(config.quantHadamard && !config.quantKLT && hadamardPipeline);
+
+  /** Apply Fast Walsh-Hadamard Transform to buffer (in-place via copy). */
+  function dispatchHadamard(
+    inputBuf: GPUBuffer, outputBuf: GPUBuffer,
+    rows: number, cols: number, signSeed: number, label: string,
+  ) {
+    if (!hadamardPipeline) return;
+    const params = createUniformBuffer(device,
+      new Uint32Array([cols, rows, signSeed]), `${label}-p`);
+    const bg = createBindGroup(device, hadamardPipeline, 0, [
+      { binding: 0, resource: { buffer: inputBuf } },
+      { binding: 1, resource: { buffer: outputBuf } },
+      { binding: 2, resource: { buffer: params } },
+    ], label);
+    bd(hadamardPipeline, [bg], [rows], label);
+    deferDestroy(params);
+  }
 
   function dispatchRMSNorm(
     inputBuf: GPUBuffer, outputBuf: GPUBuffer,
@@ -772,6 +920,13 @@ export function createForwardPassEngine(
       // Pre-attention RMSNorm
       dispatchRMSNorm(hiddenBuf, normedBuf, lw.inputNorm, seqLen, `L${l}-norm1`);
 
+      // QuIP#/QuaRot: Hadamard rotation after norm, before attention projections
+      // Only for full attention layers — linear attention weights are BF16 (not rotated)
+      if (useHadamard && !isLinearLayer) {
+        batchCopy(normedBuf, 0, ffnTempBuf, 0, seqLen * H * 4);
+        dispatchHadamard(ffnTempBuf, normedBuf, seqLen, H, 0, `L${l}-had1`);
+      }
+
       if (isLinearLayer && kvCache.ssmState) {
         // ── GATED DELTANET LINEAR ATTENTION ──────────────────────────
         const ssmIdx = kvCache.ssmState.layerToSSMIndex[l];
@@ -1017,6 +1172,14 @@ export function createForwardPassEngine(
         const outDim = linNKH * linGroupedVD;
         dispatchProjection(linOutBuf!, lw, 'linearOutProj', attnProjBuf, 1, H, outDim, `L${l}-lin-out`);
 
+        // Q8 out_proj debug readback (guarded behind debug flag)
+        if (isDebug && l === 0) {
+          flushBatch();
+          await device.queue.onSubmittedWorkDone();
+          const outData = new Float32Array(await readBuffer(device, attnProjBuf, 8 * 4));
+          console.log(`[Q8 DEBUG] L0 out_proj output[0:8]: [${Array.from(outData).map(v => v.toFixed(6)).join(', ')}]`);
+        }
+
       } else {
         // ── STANDARD SOFTMAX ATTENTION ────────────────────────────────
 
@@ -1160,6 +1323,15 @@ export function createForwardPassEngine(
           dispatchElementwise(mulPipeline, ffnTempBuf, attnOutBuf, gateDim, `L${l}-attn-gate`, normedBuf);
         }
 
+        // QuIP#/QuaRot: Hadamard rotation before o_proj (its weights were also rotated)
+        if (useHadamard) {
+          const oDim = nHeads * dHead;
+          if ((oDim & (oDim - 1)) === 0) {
+            batchCopy(attnOutBuf, 0, ffnTempBuf, 0, seqLen * oDim * 4);
+            dispatchHadamard(ffnTempBuf, attnOutBuf, seqLen, oDim, 0, `L${l}-had-o`);
+          }
+        }
+
         // Output projection: [seq, nHeads*dHead] → [seq, H]
         dispatchProjection(attnOutBuf, lw, 'oProj', attnProjBuf, seqLen, H, nHeads * dHead, `L${l}-o`);
 
@@ -1184,6 +1356,12 @@ export function createForwardPassEngine(
 
       // Post-attention RMSNorm
       dispatchRMSNorm(hiddenBuf, normedBuf, lw.postAttnNorm, seqLen, `L${l}-norm2`);
+
+      // QuIP#/QuaRot: Hadamard rotation after norm, before FFN projections
+      if (useHadamard) {
+        batchCopy(normedBuf, 0, ffnTempBuf, 0, seqLen * H * 4);
+        dispatchHadamard(ffnTempBuf, normedBuf, seqLen, H, 0, `L${l}-had2`);
+      }
 
       // ── FFN (SwiGLU) ───────────────────────────────────────────────
       // MODEL-SPECIFIC: Phi fuses gate+up into one projection.
