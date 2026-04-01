@@ -375,6 +375,22 @@ export function createForwardPassEngine(
   const linDecayBuf = isHybrid ? createStorageBuffer(device, null, linNVH * 4, 'lin-decay', true) : null;
   const linDtBuf = isHybrid ? createStorageBuffer(device, null, Math.max(linNVH, linNKH) * 4, 'lin-dt', true) : null;
 
+  // ── Uniform Buffer Cache ──────────────────────────────────────────────
+  // During M=1 generation, dispatch parameters are identical every token.
+  // Cache uniform buffers to avoid ~25 GPU allocations per forward pass.
+  const uniformCache = new Map<string, GPUBuffer>();
+  function getCachedUniform(data: Uint32Array | Uint8Array, label: string): GPUBuffer {
+    // Build cache key from raw bytes
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    const key = `${bytes.length}:${Array.from(bytes).join(',')}`;
+    let buf = uniformCache.get(key);
+    if (!buf) {
+      buf = createUniformBuffer(device, data, label);
+      uniformCache.set(key, buf);
+    }
+    return buf;
+  }
+
   /** C[M,N] = A[M,K] @ dequant(q4_packed, scales, zeros)^T — GPTQ INT4 */
   function dispatchMatmulQ4(
     aBuf: GPUBuffer,
@@ -390,7 +406,7 @@ export function createForwardPassEngine(
       ].filter(Boolean).join(', ');
       throw new Error(`matmul_q4 "${label}": missing buffers: ${missing}`);
     }
-    const params = createUniformBuffer(device,
+    const params = getCachedUniform(
       new Uint32Array([M, N, K, config.quantGroupSize]), `${label}-p`);
     const bg = createBindGroup(device, matmulQ4Pipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
@@ -402,7 +418,6 @@ export function createForwardPassEngine(
       { binding: 6, resource: { buffer: q4.g_idx } },
     ], label);
     bd(matmulQ4Pipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
-    deferDestroy(params);
   }
 
   /** C[M,N] = A[M,K] @ dequant_e8(indices, scales, offsets, codebook)^T — E8 2-bit */
@@ -421,7 +436,7 @@ export function createForwardPassEngine(
       ].filter(Boolean).join(', ');
       throw new Error(`matmul_e8 "${label}": missing buffers: ${missing}`);
     }
-    const params = createUniformBuffer(device,
+    const params = getCachedUniform(
       new Uint32Array([M, N, K, config.quantGroupSize]), `${label}-p`);
     const bg = createBindGroup(device, matmulE8Pipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
@@ -433,7 +448,6 @@ export function createForwardPassEngine(
       { binding: 6, resource: { buffer: codebookBuf } },
     ], label);
     bd(matmulE8Pipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
-    deferDestroy(params);
   }
 
   /** C[M,N] = A[M,K] @ dequant_q8(packed, scales, zeros)^T — INT8 */
@@ -456,7 +470,7 @@ export function createForwardPassEngine(
       ].filter(Boolean).join(', ');
       throw new Error(`matmul_q8 "${label}": missing buffers: ${missing}`);
     }
-    const params = createUniformBuffer(device,
+    const params = getCachedUniform(
       new Uint32Array([M, N, K, config.quantGroupSize]), `${label}-p`);
     const bg = createBindGroup(device, matmulQ8Pipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
@@ -468,7 +482,6 @@ export function createForwardPassEngine(
       { binding: 6, resource: { buffer: q8.g_idx } },
     ], label);
     bd(matmulQ8Pipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
-    deferDestroy(params);
 
   }
 
@@ -579,7 +592,7 @@ export function createForwardPassEngine(
     aBuf: GPUBuffer, bBuf: GPUBuffer, cBuf: GPUBuffer,
     M: number, N: number, K: number, label: string,
   ) {
-    const params = createUniformBuffer(device, new Uint32Array([M, N, K, 0]), `${label}-p`);
+    const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);
     const bg = createBindGroup(device, matmulPipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
       { binding: 1, resource: { buffer: bBuf } },
@@ -587,7 +600,6 @@ export function createForwardPassEngine(
       { binding: 3, resource: { buffer: params } },
     ], label);
     bd(matmulPipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
-    deferDestroy(params);
   }
 
   /** C[M,N] = A[M,K] @ B^T[K,N] where B is stored as [N,K] (HF weight format) */
@@ -595,7 +607,7 @@ export function createForwardPassEngine(
     aBuf: GPUBuffer, bBuf: GPUBuffer, cBuf: GPUBuffer,
     M: number, N: number, K: number, label: string,
   ) {
-    const params = createUniformBuffer(device, new Uint32Array([M, N, K, 0]), `${label}-p`);
+    const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);
     const bg = createBindGroup(device, matmulBTPipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
       { binding: 1, resource: { buffer: bBuf } },
@@ -603,7 +615,6 @@ export function createForwardPassEngine(
       { binding: 3, resource: { buffer: params } },
     ], label);
     bd(matmulBTPipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
-    deferDestroy(params);
   }
 
   /** C[M,N] = A[M,K] @ B_bf16^T[K,N] where B is stored as BF16 packed [N,K/2] u32 */
@@ -611,7 +622,7 @@ export function createForwardPassEngine(
     aBuf: GPUBuffer, bBuf: GPUBuffer, cBuf: GPUBuffer,
     M: number, N: number, K: number, label: string,
   ) {
-    const params = createUniformBuffer(device, new Uint32Array([M, N, K, 0]), `${label}-p`);
+    const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);
     const bg = createBindGroup(device, matmulBTBF16Pipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
       { binding: 2, resource: { buffer: cBuf } },
@@ -619,7 +630,6 @@ export function createForwardPassEngine(
       { binding: 5, resource: { buffer: bBuf } },
     ], label);
     bd(matmulBTBF16Pipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
-    deferDestroy(params);
   }
 
   // Qwen3_5 uses (1+weight) in RMSNorm — detect from model type
@@ -635,7 +645,7 @@ export function createForwardPassEngine(
     rows: number, cols: number, signSeed: number, label: string,
   ) {
     if (!hadamardPipeline) return;
-    const params = createUniformBuffer(device,
+    const params = getCachedUniform(
       new Uint32Array([cols, rows, signSeed]), `${label}-p`);
     const bg = createBindGroup(device, hadamardPipeline, 0, [
       { binding: 0, resource: { buffer: inputBuf } },
@@ -643,7 +653,6 @@ export function createForwardPassEngine(
       { binding: 2, resource: { buffer: params } },
     ], label);
     bd(hadamardPipeline, [bg], [rows], label);
-    deferDestroy(params);
   }
 
   function dispatchRMSNorm(
@@ -654,7 +663,7 @@ export function createForwardPassEngine(
     new Uint32Array(paramData, 0, 1)[0] = H;
     new Float32Array(paramData, 4, 1)[0] = eps;
     new Uint32Array(paramData, 8, 1)[0] = useResidualWeight;
-    const paramBuf = createUniformBuffer(device, new Uint8Array(paramData), `${label}-p`);
+    const paramBuf = getCachedUniform(new Uint8Array(paramData), `${label}-p`);
     const bg = createBindGroup(device, rmsnormPipeline, 0, [
       { binding: 0, resource: { buffer: inputBuf } },
       { binding: 1, resource: { buffer: outputBuf } },
@@ -662,7 +671,6 @@ export function createForwardPassEngine(
       { binding: 3, resource: { buffer: paramBuf } },
     ], label);
     bd(rmsnormPipeline, [bg], [rows], label);
-    deferDestroy(paramBuf);
   }
 
   function dispatchElementwise(
@@ -671,7 +679,7 @@ export function createForwardPassEngine(
     size: number, label: string, secondBuf?: GPUBuffer,
     broadcastB?: number,
   ) {
-    const params = createUniformBuffer(device, new Uint32Array([size, broadcastB ?? 0]), `${label}-p`);
+    const params = getCachedUniform(new Uint32Array([size, broadcastB ?? 0]), `${label}-p`);
     const entries: Array<{ binding: number; resource: GPUBindingResource }> = [
       { binding: 0, resource: { buffer: inputBuf } },
       { binding: 1, resource: { buffer: outputBuf } },
@@ -680,7 +688,6 @@ export function createForwardPassEngine(
     if (secondBuf) entries.push({ binding: 3, resource: { buffer: secondBuf } });
     const bg = createBindGroup(device, pipeline, 0, entries, label);
     bd(pipeline, [bg], [workgroupCount(size, 256)], label);
-    deferDestroy(params);
   }
 
   function dispatchRoPE(
@@ -700,7 +707,7 @@ export function createForwardPassEngine(
     u32View[3] = posOffset;
     f32View[4] = ropeTheta;
     u32View[5] = rd;
-    const paramBuf = createUniformBuffer(device, new Uint8Array(paramData), `${label}-p`);
+    const paramBuf = getCachedUniform(new Uint8Array(paramData), `${label}-p`);
 
     const bg = createBindGroup(device, ropePipeline, 0, [
       { binding: 0, resource: { buffer: qkBuf } },
@@ -711,7 +718,6 @@ export function createForwardPassEngine(
     const halfDim = rotDim / 2;
     const totalPairs = seqLen * numHeads * halfDim;
     bd(ropePipeline, [bg], [workgroupCount(totalPairs, 256)], label);
-    deferDestroy(paramBuf);
   }
 
   function dispatchAttention(
@@ -730,7 +736,7 @@ export function createForwardPassEngine(
     f32View[5] = 1.0 / Math.sqrt(dHead);
     u32View[6] = isCausal ? 1 : 0;
     u32View[7] = posOffset;
-    const paramBuf = createUniformBuffer(device, new Uint8Array(paramData), `${label}-p`);
+    const paramBuf = getCachedUniform(new Uint8Array(paramData), `${label}-p`);
 
     const bg = createBindGroup(device, attentionPipeline, 0, [
       { binding: 0, resource: { buffer: qBuf } },
@@ -741,7 +747,6 @@ export function createForwardPassEngine(
     ], label);
 
     bd(attentionPipeline, [bg], [newSeqLen, nHeads], label);
-    deferDestroy(paramBuf);
   }
 
   function dispatchAttentionTQ(
@@ -765,7 +770,7 @@ export function createForwardPassEngine(
     u32View[7] = posOffset;
     f32View[8] = Math.sqrt(Math.PI / 2) / Math.sqrt(dHead); // qjl_constant
     u32View[9] = tqSignWords; // sign_words_per_vec
-    const paramBuf = createUniformBuffer(device, new Uint8Array(paramData), `${label}-p`);
+    const paramBuf = getCachedUniform(new Uint8Array(paramData), `${label}-p`);
 
     const bg0 = createBindGroup(device, attentionTqPipeline, 0, [
       { binding: 0, resource: { buffer: qBuf } },
@@ -783,7 +788,6 @@ export function createForwardPassEngine(
     ], `${label}-g1`);
 
     bd(attentionTqPipeline, [bg0, bg1], [newSeqLen, nHeads], label);
-    deferDestroy(paramBuf);
   }
 
   function copyToKVCache(
@@ -803,7 +807,7 @@ export function createForwardPassEngine(
     outResidualNormsBuf: GPUBuffer,
     numVecs: number, outVecOffset: number, label: string,
   ) {
-    const params = createUniformBuffer(device,
+    const params = getCachedUniform(
       new Uint32Array([dHead, TQ_BITS, tqCodebook.centroids.length,
         tqCodebook.thresholds.length, outVecOffset]),
       `${label}-p`);
@@ -818,14 +822,13 @@ export function createForwardPassEngine(
       { binding: 0, resource: { buffer: params } },
     ], `${label}-g2`);
     bd(tqEncodePipeline, [bg0, tqEncodeMatBG, bg2], [numVecs], label);
-    deferDestroy(params);
   }
 
   function dispatchTQDecode(
     inQuantBuf: GPUBuffer, inSignBuf: GPUBuffer, inNormsBuf: GPUBuffer,
     outputBuf: GPUBuffer, numVecs: number, label: string,
   ) {
-    const params = createUniformBuffer(device,
+    const params = getCachedUniform(
       new Uint32Array([dHead, TQ_BITS, tqCodebook.centroids.length,
         tqCodebook.thresholds.length]),
       `${label}-p`);
@@ -839,7 +842,6 @@ export function createForwardPassEngine(
       { binding: 0, resource: { buffer: params } },
     ], `${label}-g2`);
     bd(tqDecodePipeline, [bg0, tqDecodeMatBG, bg2], [numVecs], label);
-    deferDestroy(params);
   }
 
   // ── Forward Pass ───────────────────────────────────────────────────
@@ -865,7 +867,7 @@ export function createForwardPassEngine(
     if (weights.global.embedQ4 && embedQ4Pipeline) {
       // GPTQ INT4 embedding — dequant on the fly per token
       const eq4 = weights.global.embedQ4;
-      const embedParams = createUniformBuffer(device,
+      const embedParams = getCachedUniform(
         new Uint32Array([H, seqLen, config.quantGroupSize || 128, V]), 'embed-q4-p');
       const embedBG = createBindGroup(device, embedQ4Pipeline, 0, [
         { binding: 0, resource: { buffer: tokenIdBuf } },
@@ -876,11 +878,10 @@ export function createForwardPassEngine(
         { binding: 5, resource: { buffer: eq4.qzeros } },
       ], 'embed-q4');
       bd(embedQ4Pipeline, [embedBG], [seqLen], 'embed-q4');
-      deferDestroy(embedParams);
     } else {
       const useF16Embed = weights.global.embedIsF16 === true;
       const embedPipe = useF16Embed ? embedF16Pipeline : embedPipeline;
-      const embedParams = createUniformBuffer(device, new Uint32Array([H, seqLen]), 'embed-p');
+      const embedParams = getCachedUniform(new Uint32Array([H, seqLen]), 'embed-p');
       const embedBG = createBindGroup(device, embedPipe, 0, [
         { binding: 0, resource: { buffer: tokenIdBuf } },
         { binding: 1, resource: { buffer: hiddenBuf } },
@@ -888,7 +889,6 @@ export function createForwardPassEngine(
         { binding: 3, resource: { buffer: embedParams } },
       ], 'embed');
       bd(embedPipe, [embedBG], [seqLen], 'embed');
-      deferDestroy(embedParams);
     }
 
     // Debug: dump embed output on first call (uncomment to diagnose INT4 embed issues)
@@ -961,7 +961,7 @@ export function createForwardPassEngine(
         // 2. Conv1d on ENTIRE QKV (8192 channels) BEFORE split
         // Conv1d weight is [8192, 1, 4] — all channels go through causal conv
         if (conv1dPipeline && conv1dUpdatePipeline) {
-          const convParams = createUniformBuffer(device,
+          const convParams = getCachedUniform(
             new Uint32Array([linQKVDim, linConvK]), `L${l}-conv-p`);
           const convBG = createBindGroup(device, conv1dPipeline, 0, [
             { binding: 0, resource: { buffer: linQKVBuf! } },
@@ -981,7 +981,6 @@ export function createForwardPassEngine(
           ], `L${l}-conv-upd`);
           bd(conv1dUpdatePipeline, [updateBG],
             [workgroupCount(linQKVDim, 256)], `L${l}-conv1d-update`);
-          deferDestroy(convParams);
 
           // SiLU on entire conv output (all 8192 channels)
           dispatchElementwise(siluPipeline, linConvOutBuf!, linQKVBuf!, linQKVDim, `L${l}-conv-silu`);
@@ -1043,24 +1042,22 @@ export function createForwardPassEngine(
           const qDim = linNKH * linKD;
           const kDim = linNKH * linKD;
 
-          const l2pQ = createUniformBuffer(device, new Uint32Array([qDim, linKD]), `L${l}-l2q-p`);
+          const l2pQ = getCachedUniform(new Uint32Array([qDim, linKD]), `L${l}-l2q-p`);
           const l2bgQ = createBindGroup(device, l2NormPipeline, 0, [
             { binding: 0, resource: { buffer: linQBuf! } },
             { binding: 1, resource: { buffer: linConvOutBuf! } },
             { binding: 2, resource: { buffer: l2pQ } },
           ], `L${l}-l2norm-q`);
           bd(l2NormPipeline, [l2bgQ], [workgroupCount(qDim, 256)], `L${l}-l2norm-q`);
-          deferDestroy(l2pQ);
           batchCopy(linConvOutBuf!, 0, linQBuf!, 0, qDim * 4);
 
-          const l2pK = createUniformBuffer(device, new Uint32Array([kDim, linKD]), `L${l}-l2k-p`);
+          const l2pK = getCachedUniform(new Uint32Array([kDim, linKD]), `L${l}-l2k-p`);
           const l2bgK = createBindGroup(device, l2NormPipeline, 0, [
             { binding: 0, resource: { buffer: linKBuf! } },
             { binding: 1, resource: { buffer: linConvOutBuf! } },
             { binding: 2, resource: { buffer: l2pK } },
           ], `L${l}-l2norm-k`);
           bd(l2NormPipeline, [l2bgK], [workgroupCount(kDim, 256)], `L${l}-l2norm-k`);
-          deferDestroy(l2pK);
 
           // Debug: verify L2 norm actually wrote to output
           if (isDebug && l === 0) {
@@ -1112,7 +1109,7 @@ export function createForwardPassEngine(
         // 7. SSM step: update hidden state, readout via Q
         // Decay is per value head [32], not per key dim
         if (ssmStepPipeline) {
-          const ssmParams = createUniformBuffer(device,
+          const ssmParams = getCachedUniform(
             new Uint32Array([linNKH, linNVH, linKD, linGroupedVD]), `L${l}-ssm-p`);
           const ssmBG0 = createBindGroup(device, ssmStepPipeline, 0, [
             { binding: 0, resource: { buffer: linQBuf! } },
@@ -1130,7 +1127,6 @@ export function createForwardPassEngine(
           ], `L${l}-ssm-g2`);
           bd(ssmStepPipeline, [ssmBG0, ssmBG1, ssmBG2],
             [linNKH], `L${l}-ssm-step`);
-          deferDestroy(ssmParams);
         }
 
         // Debug SSM output (layer 0, first pass)
@@ -1151,7 +1147,7 @@ export function createForwardPassEngine(
           new Uint32Array(gnParamData, 0, 1)[0] = linVD; // hidden_size = 128 (per head)
           new Float32Array(gnParamData, 4, 1)[0] = eps;
           new Uint32Array(gnParamData, 8, 1)[0] = 0; // use_residual_weight = 0 (weight directly)
-          const gnParams = createUniformBuffer(device, new Uint8Array(gnParamData), `L${l}-gn-p`);
+          const gnParams = getCachedUniform(new Uint8Array(gnParamData), `L${l}-gn-p`);
           const gnBG = createBindGroup(device, rmsnormPipeline, 0, [
             { binding: 0, resource: { buffer: linOutBuf! } },
             { binding: 1, resource: { buffer: attnProjBuf } },
@@ -1160,7 +1156,6 @@ export function createForwardPassEngine(
           ], `L${l}-rms-gated`);
           // Dispatch 32 workgroups — one per value head (each normalizes 128 elements)
           bd(rmsnormPipeline, [gnBG], [linNVH], `L${l}-rms-gated`);
-          deferDestroy(gnParams);
 
           // Multiply by silu(Z): output = normed * silu(z)
           if (gateSiluPipeline) {
@@ -1214,7 +1209,7 @@ export function createForwardPassEngine(
           new Uint32Array(qNormParams, 0, 1)[0] = dHead;
           new Float32Array(qNormParams, 4, 1)[0] = eps;
           new Uint32Array(qNormParams, 8, 1)[0] = useResidualWeight;
-          const qnp = createUniformBuffer(device, new Uint8Array(qNormParams), `L${l}-qn-p`);
+          const qnp = getCachedUniform(new Uint8Array(qNormParams), `L${l}-qn-p`);
           const qnBG = createBindGroup(device, rmsnormPipeline, 0, [
             { binding: 0, resource: { buffer: qBuf } },
             { binding: 1, resource: { buffer: attnOutBuf } },
@@ -1222,11 +1217,10 @@ export function createForwardPassEngine(
             { binding: 3, resource: { buffer: qnp } },
           ], `L${l}-qnorm`);
           bd(rmsnormPipeline, [qnBG], [seqLen * nHeads], `L${l}-qnorm`);
-          deferDestroy(qnp);
           batchCopy(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHead * 4);
 
           // K norm
-          const knp = createUniformBuffer(device, new Uint8Array(qNormParams), `L${l}-kn-p`);
+          const knp = getCachedUniform(new Uint8Array(qNormParams), `L${l}-kn-p`);
           new Uint32Array(qNormParams, 0, 1)[0] = dHead; // same params
           const knBG = createBindGroup(device, rmsnormPipeline, 0, [
             { binding: 0, resource: { buffer: kBuf } },
@@ -1235,7 +1229,6 @@ export function createForwardPassEngine(
             { binding: 3, resource: { buffer: knp } },
           ], `L${l}-knorm`);
           bd(rmsnormPipeline, [knBG], [seqLen * nKVHeads], `L${l}-knorm`);
-          deferDestroy(knp);
           batchCopy(ffnTempBuf, 0, kBuf, 0, seqLen * kvDim * 4);
         }
 
@@ -1409,7 +1402,7 @@ export function createForwardPassEngine(
       // GPTQ INT4 lm_head (saves ~1.4 GB vs BF16)
       dispatchMatmulQ4(lmInputBuf, weights.global.lmHeadQ4!, logitsBuf, 1, V, H, 'lm-head');
     } else if (weights.global.lmHeadIsBF16) {
-      const params = createUniformBuffer(device, new Uint32Array([1, V, H, 0]), 'lm-head-p');
+      const params = getCachedUniform(new Uint32Array([1, V, H, 0]), 'lm-head-p');
       const bg = createBindGroup(device, matmulBTBF16Pipeline, 0, [
         { binding: 0, resource: { buffer: lmInputBuf } },
         { binding: 2, resource: { buffer: logitsBuf } },
@@ -1417,7 +1410,6 @@ export function createForwardPassEngine(
         { binding: 5, resource: { buffer: lmHeadBuf } },
       ], 'lm-head');
       bd(matmulBTBF16Pipeline, [bg], [Math.ceil(1 / 16), Math.ceil(V / 16)], 'lm-head');
-      deferDestroy(params);
     } else {
       dispatchMatmulBT(lmInputBuf, lmHeadBuf, logitsBuf, 1, V, H, 'lm-head');
     }
