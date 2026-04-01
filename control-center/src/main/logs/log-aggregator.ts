@@ -13,6 +13,11 @@ export class LogAggregator {
     this.logStore = logStore;
   }
 
+  /** Add a manual log entry (not from a child process). */
+  addEntry(source: string, severity: 'info' | 'warn' | 'error', text: string): void {
+    this.logStore.push({ timestamp: Date.now(), source, severity, text });
+  }
+
   /**
    * Attach to a child process's stdout and stderr.
    * Each line is parsed into a LogEntry and pushed to the store.

@@ -46,6 +46,26 @@ export class ServiceManager {
         errorMessage: null,
       });
     }
+
+    // Auto-detect already-running services by scanning their ports
+    this.detectRunningServices();
+  }
+
+  /** Scan ports to detect services that are already running externally. */
+  async detectRunningServices(): Promise<void> {
+    for (const [id, mp] of this.processes) {
+      if (mp.definition.port > 0) {
+        const busy = await isPortInUse(mp.definition.port);
+        if (busy) {
+          mp.status = 'running';
+          mp.startTime = Date.now();
+          mp.errorMessage = null;
+          this.emitStatus(id);
+          this.logAggregator.addEntry(id, 'info',
+            `Detected running on port ${mp.definition.port}`);
+        }
+      }
+    }
   }
 
   private emitStatus(id: string): void {
@@ -82,17 +102,45 @@ export class ServiceManager {
 
     const def = mp.definition;
 
-    // Check if port is already in use
-    const portBusy = await isPortInUse(def.port);
-    if (portBusy) {
-      this.setStatus(id, 'error', `Port ${def.port} is already in use`);
-      return;
+    // Check if port is already in use — adopt the existing service
+    if (def.port > 0) {
+      const portBusy = await isPortInUse(def.port);
+      if (portBusy) {
+        mp.status = 'running';
+        mp.startTime = Date.now();
+        mp.errorMessage = null;
+        mp.process = null;
+        mp.pid = null; // Unknown PID for adopted process
+        this.emitStatus(id);
+        this.logAggregator.addEntry(def.id, 'info',
+          `Adopted existing service on port ${def.port} (already running)`);
+        return;
+      }
     }
 
     this.setStatus(id, 'starting');
     mp.errorMessage = null;
 
     try {
+      // Interactive apps (CLI) get their own terminal window
+      if (def.openTerminal) {
+        const fullCmd = `"${def.command}" ${def.args.join(' ')}`;
+        const child = spawn('cmd.exe', ['/c', 'start', 'cmd.exe', '/k', fullCmd], {
+          cwd: def.cwd,
+          shell: false,
+          env: { ...process.env },
+          stdio: 'ignore',
+          detached: true,
+        });
+        child.unref();
+        mp.process = null;
+        mp.pid = child.pid ?? null;
+        mp.startTime = Date.now();
+        mp.status = 'running';
+        this.emitStatus(id);
+        return;
+      }
+
       const child = spawn(def.command, def.args, {
         cwd: def.cwd,
         shell: true,
@@ -184,7 +232,7 @@ export class ServiceManager {
       }
     });
 
-    if (mp.status === 'stopping') {
+    if ((mp.status as string) === 'stopping') {
       this.setStatus(id, 'stopped');
     }
   }
