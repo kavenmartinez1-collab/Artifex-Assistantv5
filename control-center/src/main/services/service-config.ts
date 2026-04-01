@@ -11,6 +11,8 @@ export interface ServiceDefinition {
   healthCheck?: string;
   gracefulTimeout: number;
   group: string;
+  /** Launch in a visible terminal window (for interactive CLIs) */
+  openTerminal?: boolean;
 }
 
 /**
@@ -39,6 +41,7 @@ function findProjectRoot(): string {
 const PROJECT_ROOT = findProjectRoot();
 
 export const SERVICE_DEFINITIONS: ServiceDefinition[] = [
+  // ── Frontend ──
   {
     id: 'vite',
     name: 'Vite Dev Server',
@@ -61,6 +64,7 @@ export const SERVICE_DEFINITIONS: ServiceDefinition[] = [
     gracefulTimeout: 5000,
     group: 'frontend',
   },
+  // ── Backend ──
   {
     id: 'api-server',
     name: 'Python API Server',
@@ -71,5 +75,50 @@ export const SERVICE_DEFINITIONS: ServiceDefinition[] = [
     healthCheck: 'http://127.0.0.1:8000/health',
     gracefulTimeout: 10000,
     group: 'backend',
+  },
+  {
+    id: 'web-gateway',
+    name: 'Web Gateway',
+    command: path.join(PROJECT_ROOT, 'venv', 'Scripts', 'python.exe'),
+    args: [path.join('web-gateway', 'main.py')],
+    cwd: PROJECT_ROOT,
+    port: 8080,
+    healthCheck: 'http://127.0.0.1:8080/health',
+    gracefulTimeout: 5000,
+    group: 'backend',
+  },
+  // ── AI Services ──
+  {
+    id: 'ollama',
+    name: 'Ollama LLM Server',
+    command: 'ollama',
+    args: ['serve'],
+    cwd: PROJECT_ROOT,
+    port: 11434,
+    healthCheck: 'http://127.0.0.1:11434/',
+    gracefulTimeout: 10000,
+    group: 'ai',
+  },
+  // ── Applications ──
+  {
+    id: 'artifex-cli',
+    name: 'Artifex CLI',
+    command: path.join(PROJECT_ROOT, 'venv', 'Scripts', 'python.exe'),
+    args: ['main.py'],
+    cwd: PROJECT_ROOT,
+    port: 0,
+    gracefulTimeout: 5000,
+    group: 'apps',
+    openTerminal: true,
+  },
+  {
+    id: 'artifex-gui',
+    name: 'Artifex GUI',
+    command: path.join(PROJECT_ROOT, 'venv', 'Scripts', 'python.exe'),
+    args: ['main_gui.py'],
+    cwd: PROJECT_ROOT,
+    port: 0,
+    gracefulTimeout: 5000,
+    group: 'apps',
   },
 ];

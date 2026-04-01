@@ -15,6 +15,8 @@ export interface AppConfig {
   autoRestoreServices: boolean;
   logBufferSize: number;
   activePanel: string;
+  clusterHubUrl?: string;
+  [key: string]: unknown;
 }
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -50,7 +52,7 @@ export function loadConfig(): AppConfig {
   } catch {
     cachedConfig = { ...DEFAULT_CONFIG };
   }
-  return cachedConfig;
+  return cachedConfig!;
 }
 
 /**
