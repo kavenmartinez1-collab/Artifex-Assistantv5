@@ -893,6 +893,50 @@ All 15 WGSL compute kernels have been verified against PyTorch reference impleme
 
 ---
 
+## Control Center (Electron)
+
+Desktop dashboard for managing all Artifex services from one place. No terminal commands needed.
+
+### Quick Start
+
+```bash
+cd control-center
+npm install
+npm run dev
+```
+
+### 6 Panels
+
+| Panel | What it does |
+|-------|-------------|
+| **Services** | Start/stop/restart all 7 services (Vite, dev-server, API, Web Gateway, Ollama, CLI, GUI). Auto-detects already-running services by scanning ports. Port-based kill for orphaned processes. |
+| **Logs** | Unified chronological log stream from all services. Color-coded by source, filterable by service/severity, text search, export to file. |
+| **Quantize** | 6-step wizard: select model, profile SSM, edit recipe, review config, run with progress bar, done. HailMary (5.7 GB) and Conservative (9.4 GB) presets. Documents BF16 SSM requirement in the UI. |
+| **Models** | Browse models/ directory. Cards show name, size, quantization config, shard count. Delete with confirmation. |
+| **Docker** | Manage Docker containers from docker-compose.yml. Compose Up/Down, per-container Start/Stop, view logs. Graceful "Docker not installed" fallback. |
+| **Cluster** | GPU cluster monitor. Connects to WebSocket hub, shows worker cards with GPU/VRAM/status, task queue, tok/s sparklines. |
+
+### Architecture
+
+- **Electron** — vanilla TypeScript, no React/Vue/axios
+- **Dependencies**: electron 34.2.0, ws 8.20.0, typescript 5.6.3 (pinned, no auto-updates)
+- **Security**: `nodeIntegration: false`, `contextIsolation: true`, all IPC through `contextBridge`
+- **Service management**: `child_process.spawn()` with shell mode, PowerShell `Stop-Process` for port-based kill
+- **Auto-detect**: scans service ports on startup, adopts externally-running processes
+- **Interactive apps**: CLI launches in its own cmd.exe terminal window via PowerShell `Start-Process`
+
+### Diagnostic & Research Tools
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/diagnose_quant_quality.py` | Progressive layer-by-layer quantization diagnostic. Compares Original vs KLT GPTQ quality side-by-side. |
+| `scripts/validate_klt.py` | Side-by-side KLT rotation fidelity check through all 32 layers. |
+| `scripts/test_ppl.py` | Quick perplexity + generation quality test for quantized models. |
+| `scripts/quantize_gptq.py --profile-ssm` | SSM activation profiler with per-channel variance analysis. |
+| `scripts/e8_codebook.py` | E8 lattice 2-bit codebook generator for future compression. |
+
+---
+
 ## Project Structure
 
 ```
@@ -984,16 +1028,49 @@ Artifex-Assistant-V5/
         hf-hub.ts          # HuggingFace Hub API client
         cache.ts           # Browser IndexedDB cache for model weights
         turboquant.ts      # TurboQuant math (rotation matrix, codebook, CPU reference)
-      shaders/             # WGSL compute kernels (11 kernels, incl. matmul_q4.wgsl)
+      shaders/             # WGSL compute kernels (15 kernels)
+        matmul.wgsl        # f32/BF16 tiled matmul with Kahan summation
+        matmul_q4.wgsl     # INT4 GPTQ dequant matmul (per-weight g_idx actorder)
+        matmul_q8.wgsl     # INT8 dequant matmul (verified correct)
+        matmul_e8.wgsl     # E8 2-bit codebook matmul (untested)
+        hadamard.wgsl      # Fast Walsh-Hadamard transform
+        rmsnorm.wgsl       # RMSNorm with (1+w) support, f32 accumulators
+        attention.wgsl     # Fused QKV attention with stable softmax
+        ssm_step.wgsl      # Gated DeltaNet recurrence kernel
+        # + rope, embed, elementwise, conv1d, group_norm, l2norm, turboquant
       utils/               # Metrics reporting
     server/
-      dev-server.ts        # Express metrics collection server
-  tests/                   # Pytest test suite (12 modules, 110 tests)
-  knowledge/               # RAG knowledge bases (reference + workspaces)
-  models/                  # Local model cache (auto-discovered)
-  sessions/                # Saved conversations
-  output/                  # Generated outputs (images, audio, 3D, video)
-  logs/                    # Application logs
+      dev-server.ts        # Express metrics + WebSocket hub
+  control-center/            # Electron desktop dashboard (6 panels)
+    src/
+      main/
+        main.ts            # Electron window, tray, IPC registration
+        preload.ts         # contextBridge typed API for renderer
+        ipc-handlers.ts    # Central IPC router for all panels
+        services/          # Service manager (spawn, kill, port-based adopt)
+        logs/              # Log aggregator + ring buffer (10K lines)
+        quantization/      # Quantize runner (drives quantize_gptq.py)
+        models/            # Model scanner (reads models/ directory)
+        docker/            # Docker CLI wrapper (no npm deps)
+        cluster/           # WebSocket client + time-series state
+        state/             # JSON persistence in userData
+      renderer/
+        panels/            # 6 panel UIs (services, logs, quantize, models, docker, cluster)
+        components/        # Shared UI (modal, toast, progress bar, mini graph, wizard steps)
+        styles/            # Dark theme (--bg: #0f111a, --accent: #00f0ff)
+  scripts/                   # Quantization & diagnostic tools
+    quantize_gptq.py       # GPTQ v2 quantizer (INT4/INT8/E8, KLT, recipes)
+    diagnose_quant_quality.py  # Layer-by-layer quantization diagnostic
+    validate_klt.py        # KLT rotation fidelity validator
+    test_ppl.py            # Perplexity tester
+    e8_codebook.py         # E8 lattice codebook generator
+  recipes/                   # Quantization recipes (per-layer precision)
+  tests/                     # Pytest test suite (12 modules, 110 tests)
+  knowledge/                 # RAG knowledge bases (reference + workspaces)
+  models/                    # Local model cache (auto-discovered)
+  sessions/                  # Saved conversations
+  output/                    # Generated outputs (images, audio, 3D, video)
+  logs/                      # Application logs
 ```
 
 ---
