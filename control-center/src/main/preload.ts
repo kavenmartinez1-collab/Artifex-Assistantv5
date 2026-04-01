@@ -125,6 +125,50 @@ contextBridge.exposeInMainWorld('artifex', {
     }
   },
 
+  // ── Model Management ──
+  scanModels: (): Promise<unknown[]> => {
+    return ipcRenderer.invoke('models:scan');
+  },
+
+  deleteModel: (modelPath: string): Promise<void> => {
+    return ipcRenderer.invoke('models:delete', modelPath);
+  },
+
+  // ── Docker Management ──
+  docker: {
+    isDockerInstalled: (): Promise<boolean> => {
+      return ipcRenderer.invoke('docker:is-installed');
+    },
+
+    listContainers: (): Promise<unknown[]> => {
+      return ipcRenderer.invoke('docker:list-containers');
+    },
+
+    startContainer: (nameOrId: string): Promise<void> => {
+      return ipcRenderer.invoke('docker:start-container', nameOrId);
+    },
+
+    stopContainer: (nameOrId: string): Promise<void> => {
+      return ipcRenderer.invoke('docker:stop-container', nameOrId);
+    },
+
+    composeUp: (composePath: string): Promise<void> => {
+      return ipcRenderer.invoke('docker:compose-up', composePath);
+    },
+
+    composeDown: (composePath: string): Promise<void> => {
+      return ipcRenderer.invoke('docker:compose-down', composePath);
+    },
+
+    parseComposeFile: (composePath: string): Promise<unknown[]> => {
+      return ipcRenderer.invoke('docker:parse-compose', composePath);
+    },
+
+    getContainerLogs: (nameOrId: string, tail?: number): Promise<string> => {
+      return ipcRenderer.invoke('docker:container-logs', nameOrId, tail);
+    },
+  },
+
   // ── Config / State ──
   getConfig: (): Promise<unknown> => {
     return ipcRenderer.invoke('config:get');

@@ -1,13 +1,29 @@
 import { ipcMain, BrowserWindow, dialog } from 'electron';
+import * as path from 'path';
 import { ServiceManager } from './services/service-manager';
 import { LogStore } from './logs/log-store';
 import { loadConfig, updateConfig } from './state/persistence';
+import { scanModels, deleteModel } from './models/model-scanner';
+import {
+  isDockerInstalled,
+  listContainers,
+  startContainer,
+  stopContainer,
+  composeUp,
+  composeDown,
+  parseComposeFile,
+  getContainerLogs,
+} from './docker/docker-cli';
+import { QuantRunner, QuantConfig } from './quantization/quant-runner';
 
 export function registerAllHandlers(
   _mainWindow: BrowserWindow,
   serviceManager: ServiceManager,
   logStore: LogStore
 ): void {
+  const projectRoot = path.resolve(__dirname, '..', '..');
+  const quantRunner = new QuantRunner(projectRoot);
+  quantRunner.setWindow(_mainWindow);
   // ── Service Handlers ──
 
   ipcMain.handle('services:list', async () => {
@@ -59,6 +75,76 @@ export function registerAllHandlers(
 
   ipcMain.handle('logs:clear', async () => {
     logStore.clear();
+  });
+
+  // ── Model Handlers ──
+
+  ipcMain.handle('models:scan', async () => {
+    return scanModels(projectRoot);
+  });
+
+  ipcMain.handle('models:delete', async (_event, modelPath: string) => {
+    return deleteModel(modelPath);
+  });
+
+  // ── Docker Handlers ──
+
+  ipcMain.handle('docker:is-installed', async () => {
+    return isDockerInstalled();
+  });
+
+  ipcMain.handle('docker:list-containers', async () => {
+    return listContainers();
+  });
+
+  ipcMain.handle('docker:start-container', async (_event, nameOrId: string) => {
+    await startContainer(nameOrId);
+  });
+
+  ipcMain.handle('docker:stop-container', async (_event, nameOrId: string) => {
+    await stopContainer(nameOrId);
+  });
+
+  ipcMain.handle('docker:compose-up', async (_event, composePath: string) => {
+    await composeUp(composePath);
+  });
+
+  ipcMain.handle('docker:compose-down', async (_event, composePath: string) => {
+    await composeDown(composePath);
+  });
+
+  ipcMain.handle('docker:parse-compose', async (_event, composePath: string) => {
+    return parseComposeFile(composePath);
+  });
+
+  ipcMain.handle('docker:container-logs', async (_event, nameOrId: string, tail?: number) => {
+    return getContainerLogs(nameOrId, tail);
+  });
+
+  // ── Quantization Handlers ──
+
+  ipcMain.handle('quant:list-models', async () => {
+    return quantRunner.listModels();
+  });
+
+  ipcMain.handle('quant:list-recipes', async () => {
+    return quantRunner.listRecipes();
+  });
+
+  ipcMain.handle('quant:run', async (_event, config: QuantConfig) => {
+    return quantRunner.quantize(config);
+  });
+
+  ipcMain.handle('quant:profile', async (_event, modelPath: string, numSamples?: number) => {
+    return quantRunner.profile(modelPath, numSamples);
+  });
+
+  ipcMain.handle('quant:cancel', async () => {
+    quantRunner.cancel();
+  });
+
+  ipcMain.handle('quant:is-running', async () => {
+    return quantRunner.isRunning();
   });
 
   // ── Config Handlers ──

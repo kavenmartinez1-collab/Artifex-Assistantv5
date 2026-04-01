@@ -5,12 +5,16 @@ import { ServiceManager } from './services/service-manager';
 import { LogAggregator } from './logs/log-aggregator';
 import { LogStore } from './logs/log-store';
 import { loadConfig, saveConfig, updateConfig } from './state/persistence';
+import { ClusterClient, WorkerInfo } from './cluster/ws-client';
+import { ClusterTimeSeries } from './cluster/cluster-state';
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let serviceManager: ServiceManager;
 let logAggregator: LogAggregator;
 let logStore: LogStore;
+let clusterClient: ClusterClient;
+let clusterTimeSeries: ClusterTimeSeries;
 
 function createWindow(): void {
   const config = loadConfig();
@@ -140,8 +144,37 @@ function initServices(): void {
   };
 }
 
+function initCluster(): void {
+  const config = loadConfig();
+  const hubUrl = (config.clusterHubUrl as string) || 'ws://127.0.0.1:3001/ws';
+
+  clusterTimeSeries = new ClusterTimeSeries(60);
+  clusterClient = new ClusterClient(hubUrl);
+
+  clusterClient.onUpdate((workers: WorkerInfo[]) => {
+    // Record time-series data for sparklines
+    for (const w of workers) {
+      clusterTimeSeries.addPoint(w.id, 'tokPerSec', w.tokPerSec || 0);
+      clusterTimeSeries.addPoint(w.id, 'vramUsed', w.vramUsed || 0);
+    }
+
+    // Push combined state to renderer
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('cluster-status', {
+        connected: clusterClient.isConnected(),
+        workers: clusterClient.getWorkers(),
+        tasks: clusterClient.getTasks(),
+        timeSeries: clusterTimeSeries.getSnapshot(),
+      });
+    }
+  });
+
+  clusterClient.connect();
+}
+
 app.whenReady().then(() => {
   initServices();
+  initCluster();
   createWindow();
   createTray();
 
@@ -155,5 +188,6 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', async () => {
+  clusterClient?.disconnect();
   await serviceManager?.stopAll();
 });
