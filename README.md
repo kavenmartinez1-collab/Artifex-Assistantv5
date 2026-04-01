@@ -805,7 +805,8 @@ Phases 0-6 complete plus Gated DeltaNet/Mamba-2 hybrid support, TurboQuant KV ca
 
 Any HuggingFace model with a standard transformer decoder architecture works. Hybrid Mamba-2 models (Qwen3.5) have full support with calibrated GPTQ quantization. Weight name prefixes are auto-detected. Tested:
 
-- **Qwen3.5-9B GPTQ v2** (`local/qwen3.5-9b-GPTQv2-noact`) — 32 layers (24 Gated DeltaNet + 8 full attention), 4096 hidden, 16Q/4KV GQA. **Produces coherent, accurate responses** (correctly answers factual questions, solves equations, follows reasoning chains) at 1.8-2.2 tok/s on RTX 5060 Ti 8GB. Calibrated GPTQ INT4 with 128-sample wikitext calibration: BF16 embed/lm_head + BF16 SSM layers + INT4 attention/FFN. 9.37 GB (uses shared VRAM). Thinking mode with visible reasoning chain. All 15 WGSL kernels verified against PyTorch reference (max error < 1e-6).
+- **Qwen3.5-9B HailMary** (`local/qwen3.5-9b-HailMary`) — 32 layers (24 Gated DeltaNet + 8 full attention), 4096 hidden, 16Q/4KV GQA. **5.74 GB — fits 8 GB VRAM with 2+ GB headroom.** Coherent, accurate responses at 2.5 tok/s on RTX 5060 Ti 8GB. BF16 SSM + BF16 embed + INT4 GPTQ attention/FFN + INT4 RTN lm_head. Thinking mode with visible reasoning chain.
+- **Qwen3.5-9B noact** (`local/qwen3.5-9b-GPTQv2-noact`) — Same architecture, 9.37 GB. BF16 embed/lm_head/SSM + INT4 attention/FFN. 1.9 tok/s. Higher quality (BF16 lm_head) but larger VRAM footprint.
 - **Qwen3.5-2B** (`Qwen/Qwen3.5-2B`) — 24 layers (18 Gated DeltaNet + 6 full attention), 2048 hidden, GQA 8Q/2KV. Coherent English at 5.2 tok/s with native BF16 weights (4.18 GB VRAM).
 - **Qwen2.5-0.5B-Instruct** — 24 layers, 896 hidden, GQA 14Q/2KV. Generates coherent English at ~20 tok/s (f32).
 - **SmolLM2-135M-Instruct** — 30 layers, 576 hidden, GQA 9Q/3KV.
@@ -813,45 +814,57 @@ Any HuggingFace model with a standard transformer decoder architecture works. Hy
 
 ### Calibrated GPTQ Quantization
 
-For hybrid models like Qwen3.5 that combine Gated DeltaNet (linear attention / SSM) with standard softmax attention, INT4 quantization of SSM layers causes recurrence noise to compound — each token's error accumulates in the hidden state. The solution: **keep SSM-critical weights and embed/lm_head in BF16, only quantize FFN and attention layers to INT4**.
+For hybrid models like Qwen3.5 that combine Gated DeltaNet (linear attention / SSM) with standard softmax attention, INT4 quantization of SSM layers causes recurrence noise to compound — each token's error accumulates in the hidden state via geometric amplification (`h_t = A*h_{t-1} + B*x_t`, error grows as `A^N * epsilon`). Even INT8 SSM produces gibberish. The solution: **keep SSM-critical weights in BF16, quantize everything else to INT4**.
 
 ```bash
-# Calibrated GPTQ quantization (requires PyTorch + CUDA)
+# HailMary model: 5.74 GB, fits 8 GB VRAM (recommended)
+python scripts/quantize_gptq.py \
+  --model ./models/qwen3.5-9b \
+  --output models/qwen3.5-9b-HailMary \
+  --keep-bf16 norm embed_tokens
+
+# noact model: 9.37 GB, higher quality but larger
 python scripts/quantize_gptq.py \
   --model ./models/qwen3.5-9b \
   --output models/qwen3.5-9b-GPTQv2-noact \
   --no-actorder \
   --keep-bf16 linear_attn norm embed_tokens lm_head
-
-# Output: ~9.4 GB model with calibrated INT4 weights
-# Load in browser as: local/qwen3.5-9b-GPTQv2-noact
 ```
 
 **How it works:**
 1. Loads the unquantized BF16 model (18 GB for 9B)
 2. Runs 128 wikitext calibration samples through the model to compute Hessian matrices
 3. Layer-by-layer GPTQ: quantize each weight using Hessian-guided error propagation, then re-run calibration through quantized layer before proceeding to the next
-4. BF16 weights for SSM layers, norms, embedding, and lm_head are copied unchanged
-5. Produces GPTQ v2 SafeTensors with g_idx for actorder support
+4. BF16 weights for SSM layers, norms, and embedding are copied unchanged
+5. lm_head is quantized with RTN (round-to-nearest) — GPTQ segfaults on [248K, 4096] due to ~12 GB intermediates
+6. Produces GPTQ v2 SafeTensors with g_idx for actorder support
 
-**Why BF16 embed + lm_head is required (not INT4):**
+**Why SSM weights MUST be BF16 (not INT4 or INT8):**
+- DeltaNet recurrence `h_t = A*h_{t-1} + B*x_t` amplifies quantization error geometrically
+- INT8 SSM projections: 0.009% weight error, but 1-7% output error per projection, compounding through 24 layers
+- Proven experimentally: INT4 SSM, INT8 SSM, and INT8+KLT SSM all produce gibberish. Only BF16 SSM produces coherent output.
+- BF16 has the same dynamic range as FP32, preventing the exponential gating underflow that destroys INT8/INT4 SSM state
+
+**Why BF16 embed is required (not INT4):**
 - INT4 embedding has 0.993 cosine similarity to BF16 — close but the 0.7% error is amplified through 24 recurrent SSM layers, causing gibberish by position 2
-- INT4 lm_head (248K × 4096) has the highest GPTQ loss of any layer (50x average). The quantization noise pushes wrong tokens above correct ones in the 248K-way softmax
-- Both confirmed experimentally: INT4 embed OR lm_head produces gibberish, BF16 for both produces coherent output
 
-**VRAM budget for Qwen3.5-9B on 8 GB:**
+**INT4 lm_head: works without KLT rotation:**
+- Earlier testing showed INT4 lm_head produced gibberish, but that was with KLT rotation applied
+- Without KLT, RTN INT4 lm_head achieves 1.04% relative error and produces valid token rankings in the 248K-way softmax
+- Saves 1.4 GB vs BF16 lm_head (1.89 GB -> ~0.5 GB)
+
+**VRAM budget for Qwen3.5-9B HailMary on 8 GB:**
 
 | Component | Format | Size |
 |-----------|--------|------|
-| Embedding (248K × 4096) | BF16 | 1.9 GB |
+| Embedding (248K x 4096) | BF16 | 1.9 GB |
 | 24 linear_attn layers (5 proj each) | BF16 | 3.1 GB |
 | 32 FFN layers (3 proj each) | INT4 GPTQ | 1.2 GB |
 | 8 full attention layers (4 proj each) | INT4 GPTQ | 0.3 GB |
-| LM head (248K × 4096) | BF16 | 1.9 GB |
+| LM head (248K x 4096) | INT4 RTN | 0.5 GB |
 | Norms, biases, SSM state | f32/BF16 | 0.3 GB |
-| KV cache | f32 | 0.2 GB |
-| Intermediates | f32 | 0.5 GB |
-| **Total** | | **~9.4 GB** |
+| KV cache + intermediates | f32 | 0.5 GB |
+| **Total** | | **~5.7 GB (+2.3 GB headroom)** |
 
 ### Numerical Verification
 

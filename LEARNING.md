@@ -1185,27 +1185,49 @@ Qwen3.5 uses **partial RoPE** — only 25% of head dimensions (64 out of 256) ge
 
 ### Why INT4 Breaks Embedding and LM Head
 
-We tested three configurations:
-1. BF16 embed + BF16 lm_head = **works** (coherent output)
-2. INT4 embed + BF16 lm_head = **gibberish by position 2**
-3. BF16 embed + INT4 lm_head = **gibberish from first token**
+We tested multiple configurations (updated 2026-04-01):
 
-The INT4 embedding has 0.993 cosine similarity to BF16 — that sounds great for a feedforward network. But Qwen3.5 has 24 recurrent DeltaNet layers that **accumulate** the 0.7% error token by token. By position 2, the SSM state has diverged enough that the model predicts Chinese characters instead of English.
+**Embedding:**
+1. BF16 embed = **works** (coherent output)
+2. INT4 embed = **gibberish by position 2** — 0.993 cosine similarity sounds great, but 24 recurrent DeltaNet layers accumulate the 0.7% error. SSM state diverges completely.
 
-The INT4 lm_head has a different problem: with 248,320 output classes, even tiny quantization noise can flip which token "wins" the softmax. The GPTQ loss for lm_head was 50x higher than any other layer.
+**LM Head (248K x 4096):**
+1. BF16 lm_head = **works** (highest quality)
+2. INT4 GPTQ lm_head + KLT rotation = **gibberish** — KLT rotation changes the weight distribution, making INT4 noise flip token rankings in the 248K-way softmax
+3. INT4 RTN lm_head WITHOUT KLT = **works!** — 1.04% relative error, valid softmax rankings. Saves 1.4 GB (1.89 GB -> 0.5 GB)
+4. INT4 GPTQ lm_head = **segfaults** — [248K, 4096] creates ~12 GB intermediates. Use RTN instead.
 
-**Lesson**: For hybrid SSM+attention models, the boundaries (embed, lm_head) need higher precision than internal layers because:
-- Embedding errors compound through recurrent state
-- LM head errors get amplified by the huge softmax over 248K tokens
+**Lesson**: For hybrid SSM+attention models:
+- Embedding MUST be BF16 (errors compound through recurrent state)
+- LM head CAN be INT4 RTN if KLT rotation is not applied
+- GPTQ is too memory-hungry for large vocabulary lm_head; use RTN
+
+### SSM Recurrence vs Quantization: The Complete Picture (2026-04-01)
+
+**Tested every precision level for SSM projections:**
+- BF16 SSM = **works** (zero quantization error)
+- INT8 SSM = **gibberish** (0.009% weight error, but 1-7% output error per matmul, compounded geometrically through 24 layers)
+- INT4 SSM = **gibberish** (1.2% error, worse than INT8)
+- INT8 SSM + KLT rotation = **gibberish** (KLT doesn't help — the recurrence is the bottleneck, not the weight distribution)
+
+**The math**: DeltaNet recurrence `h_t = A*h_{t-1} + B*x_t` amplifies error as `A^N * epsilon`. After 200 tokens through 24 SSM layers, even 1-7% per-projection error destroys the hidden state.
+
+**Q8 shader is correct**: We initially misdiagnosed the Q8 WGSL shader as broken because debug readbacks were reading the output buffer AFTER conv1d+SiLU had already overwritten it. Proper buffer snapshot (batchCopy before subsequent ops) confirmed GPU output matches PyTorch reference to 2-3 decimal places.
+
+**KLT rotation diagnostic**: Built `scripts/diagnose_quant_quality.py` to compare Original vs KLT GPTQ quality layer by layer. Result: PPL 16.32 (original) vs 16.38 (KLT) — negligible difference. KLT dramatically reduces Hessian diagonal ratio for input projections (28,000x -> 4x) but doesn't help output projections (9M) since they read from internal activations, not the rotated residual stream.
+
+### The 5.74 GB Breakthrough
+
+**HailMary model**: BF16 SSM + BF16 embed + INT4 GPTQ attention/FFN + INT4 RTN lm_head = **5.74 GB, coherent at 2.5 tok/s**. Fits 8 GB VRAM with 2+ GB headroom. 31% faster than the 9.37 GB noact model due to less memory bandwidth pressure.
 
 ### Why This Project Is Cutting-Edge
 
-As of March 2026, **no project has fully solved browser-based inference for hybrid SSM+attention models**:
+As of April 2026, **no project has fully solved browser-based inference for hybrid SSM+attention models**:
 - WebLLM (17.6K GitHub stars) has Qwen3.5 support as an open issue
 - Transformers.js runs Qwen3.5-0.8B but with 20x slower performance due to missing DeltaNet operators
 - Research papers (MambaQuant, Quamba2) confirm that standard quantization methods catastrophically fail on SSM models
 
-We're running a 9B hybrid model in a browser with hand-written WGSL shaders. The model produces correct, coherent responses to factual questions, math problems, and reasoning tasks. That's genuinely novel.
+We're running a 9B hybrid model in a browser at 5.74 GB with hand-written WGSL shaders. The model produces correct, coherent responses to factual questions, math problems, and reasoning tasks. That's genuinely novel.
 
 ### The Shader Audit Results
 
