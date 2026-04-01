@@ -89,3 +89,4 @@ scripts/reference_output.txt
 *.pid
 *.sock
 research/
+control-center/node_modules/
