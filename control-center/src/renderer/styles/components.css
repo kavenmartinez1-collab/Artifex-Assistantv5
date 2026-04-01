@@ -131,16 +131,124 @@
   font-weight: 600;
 }
 
-/* Progress bar */
+/* Accent button */
+.btn-accent { border-color: var(--accent); color: var(--accent); }
+.btn-accent:hover { background: var(--accent); color: var(--bg); }
+.btn-accent:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-dim { border-color: var(--dim); color: var(--dim); }
+.btn-error { border-color: var(--error); color: var(--error); }
+.btn-error:hover { background: var(--error); color: var(--bg); }
+
+/* ── Wizard styles ── */
+.quant-wizard { padding: 16px; }
+.quant-header { margin-bottom: 16px; }
+.quant-header h2 { margin: 0; font-size: 18px; color: var(--text); }
+.quant-subtitle { color: var(--dim); font-size: 13px; margin-top: 4px; }
+
+.wizard-steps {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px 0 24px;
+  gap: 0;
+}
+.wiz-step { display: flex; flex-direction: column; align-items: center; gap: 6px; min-width: 60px; }
+.wiz-circle {
+  width: 32px; height: 32px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; font-weight: 600;
+  border: 2px solid var(--border); color: var(--dim); background: var(--bg);
+}
+.wiz-step.active .wiz-circle { border-color: var(--accent); color: var(--accent); background: rgba(0,240,255,0.1); }
+.wiz-step.complete .wiz-circle { border-color: var(--success); color: var(--success); background: rgba(76,175,80,0.1); }
+.wiz-label { font-size: 10px; color: var(--dim); text-align: center; }
+.wiz-step.active .wiz-label { color: var(--accent); }
+.wiz-line { flex: 1; height: 2px; background: var(--border); margin: 0 4px; margin-bottom: 18px; }
+
+.wizard-content { min-height: 300px; }
+.wizard-content h3 { margin: 0 0 8px; font-size: 15px; color: var(--text); }
+.wizard-content .hint { color: var(--dim); font-size: 13px; margin-bottom: 16px; }
+.wizard-nav { display: flex; justify-content: space-between; padding-top: 16px; border-top: 1px solid var(--border); }
+
+/* Model selection grid */
+.model-select-grid { display: flex; flex-wrap: wrap; gap: 10px; }
+.model-select-card {
+  background: var(--surface); border: 2px solid var(--border); border-radius: 8px;
+  padding: 12px 16px; cursor: pointer; min-width: 200px; transition: all 0.15s;
+}
+.model-select-card:hover { border-color: var(--accent); }
+.model-select-card.selected { border-color: var(--accent); background: rgba(0,240,255,0.05); }
+.model-select-card.quantized { opacity: 0.6; }
+.model-name { font-weight: 600; font-size: 14px; color: var(--text); }
+.model-meta { font-size: 12px; color: var(--dim); margin-top: 4px; }
+
+/* Recipe section */
+.recipe-section { margin-bottom: 16px; }
+.recipe-section h4 { margin: 0 0 8px; font-size: 13px; color: var(--accent); }
+.preset-btns { display: flex; gap: 8px; }
+.bf16-checks { display: flex; flex-direction: column; gap: 6px; }
+.bf16-checks label { font-size: 13px; color: var(--text); display: flex; align-items: center; gap: 6px; }
+.field-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.field-row label { font-size: 13px; color: var(--dim); min-width: 140px; }
+.field-input {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  padding: 6px 10px; border-radius: 4px; font-size: 13px; font-family: var(--mono);
+  flex: 1; max-width: 300px;
+}
+.field-input:focus { border-color: var(--accent); outline: none; }
+
+/* Info card */
+.info-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 16px; margin-top: 12px;
+}
+.info-title { font-weight: 600; font-size: 13px; color: var(--accent); margin-bottom: 8px; }
+.info-card ul { margin: 0; padding-left: 20px; }
+.info-card li { font-size: 12px; color: var(--text); margin-bottom: 4px; }
+.info-highlight { margin-top: 12px; font-size: 13px; color: var(--accent); font-weight: 600; }
+
+/* Review card */
+.review-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 16px; margin-bottom: 16px;
+}
+.review-row { display: flex; padding: 6px 0; border-bottom: 1px solid rgba(42,45,62,0.5); font-size: 13px; }
+.review-label { color: var(--dim); min-width: 160px; }
+.review-row span:last-child { color: var(--text); }
+.review-warning {
+  background: rgba(255,152,0,0.1); border: 1px solid var(--warning); border-radius: 6px;
+  padding: 12px; font-size: 12px; color: var(--warning);
+}
+.accent { color: var(--accent); }
+
+/* Progress */
+.progress-bar-container {
+  height: 8px; background: var(--bg); border-radius: 4px; overflow: hidden; margin: 12px 0;
+}
 .progress-bar {
-  height: 6px;
-  background: var(--bg);
-  border-radius: 3px;
-  overflow: hidden;
+  height: 100%; background: var(--accent); border-radius: 4px;
+  transition: width 0.5s ease;
 }
-.progress-bar .fill {
-  height: 100%;
-  background: linear-gradient(90deg, var(--accent), var(--accent2));
-  border-radius: 3px;
-  transition: width 0.3s ease;
+.progress-meta { display: flex; justify-content: space-between; font-size: 12px; color: var(--dim); }
+.quant-status { font-size: 14px; color: var(--text); margin-bottom: 8px; }
+.quant-sublayer { font-size: 12px; color: var(--dim); font-family: var(--mono); }
+
+/* Error box */
+.error-box {
+  background: rgba(244,67,54,0.1); border: 1px solid var(--error); border-radius: 6px;
+  padding: 16px; margin-bottom: 16px;
 }
+.error-title { font-weight: 600; color: var(--error); margin-bottom: 4px; }
+.error-msg { font-size: 13px; color: var(--text); font-family: var(--mono); }
+
+/* Done card */
+.done-card {
+  background: var(--surface); border: 2px solid var(--success); border-radius: 8px;
+  padding: 24px; text-align: center; margin-bottom: 16px;
+}
+.done-icon { font-size: 48px; color: var(--success); margin-bottom: 8px; }
+.done-msg { font-size: 15px; color: var(--text); }
+.done-hint { font-size: 12px; color: var(--dim); margin-top: 8px; }
+
+/* Loading state */
+.loading { text-align: center; padding: 40px; color: var(--dim); }

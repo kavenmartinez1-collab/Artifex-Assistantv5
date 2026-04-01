@@ -4,10 +4,10 @@
 const panels = {
   services: { init: initServicesPanel, label: 'Services' },
   logs: { init: initLogsPanel, label: 'Logs' },
-  quantize: { init: null, label: 'Quantize' },
-  cluster: { init: null, label: 'Cluster' },
-  models: { init: null, label: 'Models' },
-  docker: { init: null, label: 'Docker' },
+  quantize: { init: initQuantPanel, label: 'Quantize' },
+  cluster: { init: initClusterPanel, label: 'Cluster' },
+  models: { init: initModelsPanel, label: 'Models' },
+  docker: { init: initDockerPanel, label: 'Docker' },
 };
 
 let activePanel = 'services';
