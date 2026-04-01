@@ -1,5 +1,16 @@
 # Artifex Assistant V5
 
+```
+  ▄▀▀▀▀▀▀▀▀▀▄
+  █ ·  ▲  · █
+  █ ·╱ ◈ ╲· █
+  █ ╱─────╲ █
+  █ ╲ ╱·╲ ╱ █
+  █ ·╲╱ ╲╱· █
+  ▀▄▄▄▄▄▄▄▄▄▀
+ Artifex-Assistant-v5
+```
+
 > *"Unless the LORD builds the house, the builders labor in vain."*
 > — Psalm 127:1 (NIV)
 

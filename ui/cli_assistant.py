@@ -328,7 +328,16 @@ def _handle_kb_command(args, km):
 
 def run_assistant():
     """Main ASSISTANT agent CLI loop."""
-    print(f"{Fore.CYAN}  Artifex Assistant V5 — AI Assistant{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}")
+    print(f"  ▄▀▀▀▀▀▀▀▀▀▄")
+    print(f"  █ ·  ▲  · █")
+    print(f"  █ ·╱ ◈ ╲· █")
+    print(f"  █ ╱─────╲ █")
+    print(f"  █ ╲ ╱·╲ ╱ █")
+    print(f"  █ ·╲╱ ╲╱· █")
+    print(f"  ▀▄▄▄▄▄▄▄▄▄▀")
+    print(f" Artifex-Assistant-v5{Style.RESET_ALL}")
+    print()
     print(f"{Fore.WHITE}  Type your questions. The AI can run shell commands, Python, and web searches.")
     print(f"  Commands: /workspace <path>, /kb search|add|list|show|remove, /refresh, /clear")
     print(f"  Session:  /save [name], /load [name|#], /sessions, /export [path]")
