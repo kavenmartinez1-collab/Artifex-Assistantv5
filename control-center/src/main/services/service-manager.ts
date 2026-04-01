@@ -122,17 +122,18 @@ export class ServiceManager {
     mp.errorMessage = null;
 
     try {
-      // Interactive apps (CLI) get their own terminal window
+      // Interactive apps (CLI) get their own visible terminal window
       if (def.openTerminal) {
         const fullCmd = `"${def.command}" ${def.args.join(' ')}`;
-        const child = spawn('cmd.exe', ['/c', 'start', 'cmd.exe', '/k', fullCmd], {
+        const child = spawn('powershell.exe', [
+          '-NoProfile', '-Command',
+          `Start-Process -FilePath cmd.exe -ArgumentList '/k cd /d "${def.cwd}" && ${fullCmd}' -WindowStyle Normal`,
+        ], {
           cwd: def.cwd,
           shell: false,
           env: { ...process.env },
           stdio: 'ignore',
-          detached: true,
         });
-        child.unref();
         mp.process = null;
         mp.pid = child.pid ?? null;
         mp.startTime = Date.now();
@@ -194,22 +195,54 @@ export class ServiceManager {
     }
   }
 
+  /** Find and kill a process by the port it's listening on (Windows). */
+  private async killByPort(port: number): Promise<boolean> {
+    if (port <= 0) return false;
+    try {
+      const result = execSync(
+        `powershell.exe -NoProfile -Command "(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue).OwningProcess"`,
+        { encoding: 'utf-8', timeout: 5000 }
+      ).trim();
+      const pids = result.split('\n').map(s => parseInt(s.trim())).filter(n => n > 0);
+      for (const pid of pids) {
+        try {
+          execSync(`taskkill /PID ${pid} /T /F`, { timeout: 5000 });
+        } catch { /* process may already be dead */ }
+      }
+      return pids.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
   async stop(id: string): Promise<void> {
     const mp = this.processes.get(id);
     if (!mp) throw new Error(`Unknown service: ${id}`);
     if (mp.status === 'stopped' || mp.status === 'stopping') return;
-    if (!mp.process || !mp.pid) {
+
+    const def = mp.definition;
+
+    // Adopted service (no process handle) — kill by port
+    if (!mp.process && !mp.pid) {
+      if (def.port > 0) {
+        this.setStatus(id, 'stopping');
+        const killed = await this.killByPort(def.port);
+        if (killed) {
+          this.logAggregator.addEntry(id, 'info',
+            `Killed adopted process on port ${def.port}`);
+        }
+      }
       this.setStatus(id, 'stopped');
       return;
     }
 
     this.setStatus(id, 'stopping');
-    const pid = mp.pid;
+    const pid = mp.pid!;
     const timeout = mp.definition.gracefulTimeout;
 
     // Try graceful kill first
     try {
-      mp.process.kill('SIGTERM');
+      mp.process!.kill('SIGTERM');
     } catch {
       // Process may already be dead
     }
