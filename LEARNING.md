@@ -922,20 +922,53 @@ Where:
 ✅ Qwen3.5-9B running in browser at 2.9 tok/s, 7.22 GB VRAM (8 GB card)
    Mixed-precision: BF16 SSM + INT4 FFN + INT4 embed/lm_head
    Correctly answers "What is the capital of France?" → "Paris!"
+
+✅ Calibrated GPTQ v2 quantizer (scripts/quantize_gptq.py)
+   Pure PyTorch — no CUDA compilation needed. 128-sample wikitext calibration.
+   Layer-by-layer: calibrate → quantize → propagate. Actorder + percentile clipping.
+   ~28 min on 8 GB GPU for 9B model.
+✅ SSM activation profiler (--profile-ssm) — per-channel variance analysis
+✅ Recipe system — per-layer/per-projection bits, rotation method, group size
+✅ KLT rotation fusion — absorb norm scales + global eigenvector rotation
+   (proven equivalent to original GPTQ quality: PPL 16.32 vs 16.38)
+✅ INT8 RTN quantizer + matmul_q8.wgsl shader (verified: GPU matches PyTorch)
+✅ E8 2-bit lattice quantizer + matmul_e8.wgsl shader (built, untested)
+✅ Progressive quantization diagnostic (scripts/diagnose_quant_quality.py)
+✅ KLT rotation validator (scripts/validate_klt.py) — all 32 layers pass
+✅ Uniform buffer cache — eliminates 25 GPU alloc/destroy cycles per token
+
+✅ HailMary model: 5.74 GB, coherent output, 3.1 tok/s on RTX 5060 Ti 8GB
+   BF16 SSM + BF16 embed + INT4 GPTQ attention/FFN + INT4 RTN lm_head
+   2+ GB VRAM headroom. TurboQuant KV compression active (86% savings).
+   Correctly explains Newton's law, Coulomb's law with proper formulas.
+
+✅ Electron Control Center — 6-panel desktop dashboard
+   Services (7 services, auto-detect, port-based kill), Logs (ring buffer,
+   filters, export), Quantize (6-step wizard with presets), Models (scanner,
+   delete), Docker (compose up/down, container cards), Cluster (WebSocket,
+   worker cards, tok/s sparklines). Vanilla TypeScript, no React/Vue/axios.
 ```
 
 ### What's remaining
 
-**Qwen3.5-9B mixed-precision running!** — Answers factual questions correctly ("Paris!") at 2.9 tok/s with 7.22 GB VRAM on 8 GB card. Thinking mode shows coherent reasoning chain. Drifts on long responses due to RTN quantization noise in FFN layers.
+**HailMary model working at 5.74 GB!** — Coherent multi-paragraph responses at 3.1 tok/s with TurboQuant KV compression on 8 GB card. Some Chinese character bleed in thinking section (~300+ tokens), researched mitigations documented below.
 
-**Quality improvement needed:**
-- RTN (round-to-nearest) quantization introduces more error than calibrated GPTQ. Long responses drift after ~50 tokens.
-- Fix path: get `gptqmodel` or `auto-gptq` CUDA build working on Windows, or use a pre-made mixed-precision AWQ model like `cyankiwi/Qwen3.5-9B-AWQ-BF16-INT4` (needs AWQ dequant kernel).
-- Alternative: implement calibrated RTN (clip outliers before quantizing, use per-channel statistics).
+**Accuracy improvements (researched, not yet implemented):**
+1. Re-normalize k vectors in DeltaNet recurrence (prevents exponential state growth)
+2. Language-aware logit bias (suppress CJK tokens when prompt is English)
+3. Periodic SSM state RMS normalization (correct drift every 64 tokens)
+4. Attention sink FP16 anchoring (first 4 KV entries at full precision)
+5. Script-switch repetition penalty (detect pathological Latin↔CJK switching)
 
 **Speed optimization:**
-- Prefill is 3 tok/s (token-by-token for hybrid models). Could batch through full attention layers and only go sequential for SSM layers.
-- Decode is 2.9 tok/s — reasonable for 9B on 8 GB. Kernel optimization (larger tile sizes, memory coalescing) could help.
+- Current: 3.1 tok/s decode, ~3 tok/s prefill (token-by-token for hybrid SSM)
+- Target: 5-8 tok/s via M=1 vectorized matmul (biggest win — current 16x16 tiles waste 15/16 rows)
+- Fused RMSNorm+projection kernels, flash attention for prefill
+- Theoretical bandwidth limit: ~50 tok/s (5.74 GB / 288 GB/s)
+
+**Future VRAM optimization:**
+- E8 2-bit for FFN layers (pipeline built, shader untested) — saves ~0.75 GB
+- BF16 matmul for SSM weights on GPU (avoid f32 expansion during loading)
 
 **Key bugs found during Qwen3.5 debugging (all fixed):**
 1. BF16 embedding decoded as F16 (100x wrong)
