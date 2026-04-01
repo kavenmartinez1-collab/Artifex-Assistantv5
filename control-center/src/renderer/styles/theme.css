@@ -1,0 +1,56 @@
+:root {
+  --bg: #0f111a;
+  --bg2: #161a2b;
+  --surface: #161b22;
+  --text: #c7d0ff;
+  --dim: #666688;
+  --accent: #00f0ff;
+  --accent2: #b060ff;
+  --success: #44ff88;
+  --error: #ff4444;
+  --warn: #ffcc00;
+  --border: #222244;
+  --mono: 'Consolas', 'Cascadia Code', 'Fira Code', monospace;
+  --sans: 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: var(--sans);
+  font-size: 14px;
+  color: var(--text);
+  background: var(--bg);
+  line-height: 1.5;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--dim);
+}
+
+/* Selection */
+::selection {
+  background: rgba(0, 240, 255, 0.2);
+  color: var(--text);
+}

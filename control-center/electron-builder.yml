@@ -1,0 +1,17 @@
+appId: com.artifex.control-center
+productName: Artifex Control Center
+directories:
+  output: release
+win:
+  target: portable
+  icon: assets/icon.ico
+files:
+  - dist/**/*
+  - src/renderer/**/*
+  - node_modules/**/*
+extraFiles:
+  - from: ../webgpu
+    to: webgpu
+    filter:
+      - "!node_modules"
+      - "!dist"

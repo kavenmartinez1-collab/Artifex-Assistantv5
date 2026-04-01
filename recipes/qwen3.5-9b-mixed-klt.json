@@ -1,0 +1,18 @@
+{
+  "description": "Qwen3.5-9B mixed-precision: INT4+KLT for most layers, INT8 for SSM out_proj (high variance ratio), BF16 for embed/lm_head",
+  "global": {
+    "bits": 4,
+    "group_size": 128,
+    "rotation": "klt"
+  },
+  "embed_tokens": { "bits": 16 },
+  "lm_head": { "bits": 16 },
+  "layer_defaults": {
+    "linear_attn.in_proj_qkv": { "bits": 4, "rotation": "klt" },
+    "linear_attn.in_proj_a": { "bits": 4, "rotation": "klt" },
+    "linear_attn.in_proj_b": { "bits": 4, "rotation": "klt" },
+    "linear_attn.in_proj_z": { "bits": 4, "rotation": "klt" },
+    "linear_attn.out_proj": { "bits": 8, "rotation": "klt" },
+    "mlp.down_proj": { "bits": 4, "rotation": "klt+snc" }
+  }
+}
