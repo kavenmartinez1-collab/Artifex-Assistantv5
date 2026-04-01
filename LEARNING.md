@@ -1302,4 +1302,75 @@ All 15 WGSL kernels verified correct against PyTorch (`scripts/audit_kernels.py`
 
 ---
 
+### Future Work: Accuracy Improvements for Long-Sequence Generation (Research Notes)
+
+The 5.74 GB HailMary model produces coherent output for ~200-300 tokens, then exhibits SSM state drift (Chinese character bleed, repetitive spiraling, emoji/symbol degeneration). Root cause: two compounding problems — (1) SSM hidden state magnitude drift from BF16 arithmetic accumulation, and (2) INT4 lm_head systematic bias favoring Chinese tokens in the 248K vocabulary.
+
+**Priority 1: Re-normalize k vectors in DeltaNet recurrence (LOW effort, HIGH impact)**
+
+The DeltaNet gate `(I - beta*k*kT)` has spectral norm <= 1 only when k is unit-normalized. In BF16/f32, k may not be exactly normalized after projection, causing the state matrix to grow exponentially. Fix: add one cheap normalization per head per token in the SSM step shader:
+
+```wgsl
+// In ssm_step.wgsl, before using k in the recurrence:
+var k_sq_sum: f32 = 0.0;
+for (var i = 0u; i < HEAD_DIM; i++) {
+    k_sq_sum += k[i] * k[i];
+}
+let k_inv_norm = inverseSqrt(k_sq_sum + 1e-8);
+for (var i = 0u; i < HEAD_DIM; i++) {
+    k[i] = k[i] * k_inv_norm;
+}
+```
+
+This directly addresses the root cause of exponential state growth. Negligible compute cost.
+
+**Priority 2: Language-aware logit bias (LOW effort, HIGH impact)**
+
+Pre-classify vocabulary tokens by script at model load time. Apply a negative logit penalty to CJK tokens when the prompt is detected as English:
+
+```typescript
+// At startup — classify tokens:
+const tokenBias = new Float32Array(vocabSize);
+for (let i = 0; i < vocabSize; i++) {
+    const decoded = tokenizer.decode([i]);
+    if (/[\u4e00-\u9fff\u3400-\u4dbf]/.test(decoded)) {
+        tokenBias[i] = -3.0;  // suppress CJK in English mode
+    }
+}
+
+// Apply after lm_head projection, before sampling:
+for (let i = 0; i < vocabSize; i++) {
+    logits[i] += tokenBias[i];
+}
+```
+
+This is how OpenAI's `logit_bias` API parameter works. At temperature 0, even -0.5 would fix most argmax ranking flips. The -3.0 penalty means a Chinese token needs to be exp(3) = 20x more confident to win.
+
+**Priority 3: Periodic SSM state RMS normalization (MEDIUM effort, HIGH impact)**
+
+Every N tokens (start with N=64), normalize the hidden state matrix to a calibrated target RMS:
+
+```
+rms = sqrt(mean(S^2) + eps)
+S_normalized = S * (target_rms / rms)
+```
+
+The `target_rms` should be calibrated per layer by running a short BF16 reference pass and recording typical state magnitudes. Use soft blending: `S = lerp(S, S_normalized, 0.9)`.
+
+MambaQuant (Pierro et al., 2024) found SSM quantization error grows O(sqrt(L)) to O(L) with sequence length. Re-normalizing every 64 tokens gives 4-5 correction points within the 300-token degradation window.
+
+**Priority 4: Attention sink FP16 anchoring (LOW effort, MEDIUM impact)**
+
+Keep first 4 KV cache entries at FP16 instead of TurboQuant compressed. These "attention sinks" (Xiao et al., 2023) accumulate disproportionate attention weight. Quantization noise here feeds into SSM layers through the residual stream. Cost: ~460 KB.
+
+**Priority 5: Script-switch repetition penalty (LOW effort, MEDIUM impact)**
+
+Track script category of recent tokens. Apply escalating penalty when rapid Latin-to-CJK switching is detected (pathological bleed pattern). Normal code-switching (quotes, technical terms) stays unpenalized.
+
+**Key insight from research**: Fix the SSM drift first (#1 + #3), and the lm_head quantization error becomes tolerable because hidden states stay in the calibrated distribution. Fix the logits (#2), and remaining drift doesn't surface as Chinese tokens. Both root causes must be addressed for stable 500+ token generation.
+
+**References**: MambaQuant (Pierro et al., 2024), Quamba2 (2024), StreamingLLM / Attention Sinks (Xiao et al., 2023), DeltaNet (Yang et al., 2024).
+
+---
+
 *"Unless the LORD builds the house, the builders labor in vain." — Psalm 127:1*
