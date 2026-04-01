@@ -199,6 +199,7 @@ export class ServiceManager {
   private async killByPort(port: number): Promise<boolean> {
     if (port <= 0) return false;
     try {
+      // Get PIDs listening on this port
       const result = execSync(
         `powershell.exe -NoProfile -Command "(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue).OwningProcess"`,
         { encoding: 'utf-8', timeout: 5000 }
@@ -206,7 +207,11 @@ export class ServiceManager {
       const pids = result.split('\n').map(s => parseInt(s.trim())).filter(n => n > 0);
       for (const pid of pids) {
         try {
-          execSync(`taskkill /PID ${pid} /T /F`, { timeout: 5000 });
+          // Use PowerShell Stop-Process (taskkill doesn't work in PS)
+          execSync(
+            `powershell.exe -NoProfile -Command "Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue"`,
+            { timeout: 5000 }
+          );
         } catch { /* process may already be dead */ }
       }
       return pids.length > 0;
