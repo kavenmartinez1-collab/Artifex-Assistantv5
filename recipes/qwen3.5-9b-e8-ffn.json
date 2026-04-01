@@ -1,0 +1,17 @@
+{
+  "description": "E8 2-bit for FFN+attention, BF16 for SSM/embed/lm_head. Target: ~8 GB on 8 GB card.",
+  "global": {
+    "bits": 2,
+    "group_size": 128,
+    "method": "e8"
+  },
+  "embed_tokens": { "bits": 16 },
+  "lm_head": { "bits": 16 },
+  "layer_defaults": {
+    "linear_attn.in_proj_qkv": { "bits": 16 },
+    "linear_attn.in_proj_a":   { "bits": 16 },
+    "linear_attn.in_proj_b":   { "bits": 16 },
+    "linear_attn.in_proj_z":   { "bits": 16 },
+    "linear_attn.out_proj":    { "bits": 16 }
+  }
+}

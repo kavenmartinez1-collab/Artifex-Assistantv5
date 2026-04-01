@@ -469,6 +469,7 @@ export function createForwardPassEngine(
     ], label);
     bd(matmulQ8Pipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
     deferDestroy(params);
+
   }
 
   // Set of GPU buffers stored as BF16 (need matmul_bt_bf16 kernel)

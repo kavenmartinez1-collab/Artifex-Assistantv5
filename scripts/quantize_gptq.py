@@ -1638,80 +1638,48 @@ def quantize_layer_by_layer(
             lm_head_module = module
             lm_head_name = name
 
-    # Quantize lm_head with GPTQ on CPU (too large for GPU — [248K, 4096]
-    # creates ~3.7 GB intermediates during error propagation, but GPTQ's
-    # within-matrix error compensation still improves quality over RTN)
+    # Quantize lm_head with RTN (round-to-nearest) — GPTQ is too memory-hungry
+    # for [248K, 4096] (creates ~12 GB intermediates). RTN uses no Hessian,
+    # and for the final projection before softmax, the quality difference is minimal.
     if lm_head_module is not None and not keep_lmhead_bf16:
-        log("  Quantizing lm_head with GPTQ (on CPU, large vocab)...")
-        # Build Hessian from final hidden states (after norm)
-        final_norm = getattr(inner_model, 'norm', None)
-        if final_norm is not None:
-            final_norm.to(gpu)
-            normed_inputs = []
-            with torch.no_grad():
-                for inp in layer_inputs:
-                    normed = final_norm(inp.to(gpu))
-                    normed_inputs.append(normed.to(torch.bfloat16).cpu())
-            final_norm.to('cpu')
-            if use_gpu:
-                torch.cuda.empty_cache()
-        else:
-            normed_inputs = layer_inputs
-
-        # Accumulate Hessian on CPU
-        K = lm_head_module.in_features
-        H = torch.zeros((K, K), dtype=torch.float32)
-        n_samples = 0
-        for act in normed_inputs:
-            x = act.float()
-            if len(x.shape) == 3:
-                x = x.reshape(-1, x.shape[-1])
-            H += x.t() @ x
-            n_samples += 1
-        H = (2.0 / n_samples) * H
-        del normed_inputs
-
-        # Run GPTQ on CPU (avoids OOM from large vocab intermediates)
+        log("  Quantizing lm_head with RTN (large vocab, memory-safe)...")
         W = lm_head_module.weight.data.float()  # already on CPU
-        N = W.shape[0]
+        N, K = W.shape
 
         gs = quantizer_config.get('group_size', 128)
         if K % gs != 0:
-            local_cfg = quantizer_config.copy()
             for alt_gs in [64, 32, K]:
                 if K % alt_gs == 0:
-                    local_cfg['group_size'] = alt_gs
+                    gs = alt_gs
                     break
-            local_gptq = GPTQQuantizer(**local_cfg)
-        else:
-            local_gptq = gptq
-
-        # Optional Hadamard rotation for lm_head
-        if use_hadamard and (K & (K - 1)) == 0:
-            W, H = apply_hadamard_to_weight(W, H)
 
         t_lm = time.time()
-        Q_int, scales, zeros, g_idx, Q_deq, loss = \
-            local_gptq.quantize_weight(W, H)
+        result = rtn_quantize(W, 'lm_head', gs)
         dt_lm = time.time() - t_lm
 
-        quant_count += 1
-        total_params += N * K
-        total_loss += loss
-        if report_mse:
-            mse = ((W - Q_deq) ** 2).mean().item()
-            rel = mse / ((W ** 2).mean().item() + 1e-10)
-            log(f"    [{quant_count}] lm_head [{N}x{K}] "
-                f"MSE={mse:.8f} Rel={rel:.4%} ({dt_lm:.1f}s, CPU)")
-        else:
-            log(f"    [{quant_count}] lm_head [{N}x{K}] "
-                f"loss={loss:.4f} ({dt_lm:.1f}s, CPU)")
+        if result is not None:
+            Q_int, rtn_scales, rtn_zeros, g_idx = result
+            quant_count += 1
+            total_params += N * K
 
-        output_tensors[f"{lm_head_name}.qweight"] = pack_qweight(Q_int)
-        output_tensors[f"{lm_head_name}.scales"] = pack_scales(scales)
-        output_tensors[f"{lm_head_name}.qzeros"] = pack_qzeros(zeros)
-        output_tensors[f"{lm_head_name}.g_idx"] = g_idx
-        del W, H, Q_int, scales, zeros, g_idx, Q_deq
+            if report_mse:
+                Q_deq = rtn_scales[:, g_idx.long()] * (Q_int.float() - rtn_zeros.float()[:, g_idx.long()])
+                mse = ((W - Q_deq) ** 2).mean().item()
+                rel = mse / ((W ** 2).mean().item() + 1e-10)
+                log(f"    [{quant_count}] lm_head [{N}x{K}] RTN "
+                    f"MSE={mse:.8f} Rel={rel:.4%} ({dt_lm:.1f}s)")
+                del Q_deq
+            else:
+                log(f"    [{quant_count}] lm_head [{N}x{K}] RTN ({dt_lm:.1f}s)")
+
+            output_tensors[f"{lm_head_name}.qweight"] = pack_qweight(Q_int)
+            output_tensors[f"{lm_head_name}.scales"] = pack_scales(rtn_scales)
+            output_tensors[f"{lm_head_name}.qzeros"] = pack_qzeros(rtn_zeros)
+            output_tensors[f"{lm_head_name}.g_idx"] = g_idx
+            del W, Q_int, rtn_scales, rtn_zeros, g_idx
+        else:
+            log(f"    lm_head: RTN failed (dim issue), keeping BF16")
+            output_tensors[f"{lm_head_name}.weight"] = W.to(torch.bfloat16)
 
     # Quantize embed_tokens with RTN (lookup table — no Hessian)
     if not keep_embed_bf16:

@@ -673,6 +673,7 @@ loadBtn.addEventListener('click', async () => {
       };
 
       // Helper to load INT8 quad (qweight_q8 + scales_q8 + qzeros_q8 + g_idx_q8)
+      // Helper to load INT8 quad (qweight_q8 + scales_q8 + qzeros_q8 + g_idx_q8)
       const tryGetQ8 = (weightName: string) => {
         const base = weightName.replace('.weight', '');
         const qw = tryGetTensor(`${base}.qweight_q8`);
@@ -681,18 +682,11 @@ loadBtn.addEventListener('click', async () => {
         if (qw && sc && qz) {
           let gIdx = tryGetTensor(`${base}.g_idx_q8`);
           if (!gIdx) {
-            // INT8 packs 4 per i32, so K = shape[0] * 4
             const qwTensor = currentModel!.tensors.get(`${base}.qweight_q8`);
             const K = qwTensor ? qwTensor.shape[0] * 4 : 0;
-            if (K > 0) {
-              console.log(`[Q8] ${base}: no g_idx_q8, generating trivial (K=${K})`);
-              gIdx = getOrCreateTrivialGIdx(K);
-            }
+            if (K > 0) gIdx = getOrCreateTrivialGIdx(K);
           }
           if (!gIdx) return undefined;
-          if (currentModel!.tensors.get(`${base}.qweight_q8`)) {
-            console.log(`[Q8] ${base}: INT8 loaded`);
-          }
           return { qweight: qw, scales: sc, qzeros: qz, g_idx: gIdx };
         }
         return undefined;
