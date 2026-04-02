@@ -104,9 +104,11 @@ Universal Local AI Hosting Platform. Run any AI model locally — text generatio
 
 | Tier | VRAM | Examples | Quantization |
 |------|------|----------|-------------|
-| TIGHT | <= 12 GB | RTX 3060 12GB, RTX 5060 Ti 8GB | NF4 double-quant, aggressive budgets |
-| COMFORTABLE | 13-20 GB | RTX 4070 Ti 16GB | NF4 with relaxed budgets |
-| ABUNDANT | > 20 GB | RTX 4090 24GB, RTX 5090 32GB | FP16/BF16 or light quant |
+| TIGHT | <= 12 GB | RTX 3060 12GB, RTX 5060 Ti 8GB | NF4 all layers (dynamic VRAM planner auto-selects) |
+| COMFORTABLE | 13-20 GB | RTX 4070 Ti 16GB | NF4 + BF16 SSM/lm_head (quality preserved) |
+| ABUNDANT | > 20 GB | RTX 4090 24GB, RTX 5090 32GB | NF4 + BF16 SSM/lm_head/embeddings |
+
+The transformers engine includes a **dynamic VRAM budget planner** that analyzes each model's weight map at load time and automatically selects which layer groups (SSM, lm_head, embeddings) can stay at BF16 vs must be NF4 to fit on your GPU. No manual configuration needed.
 
 ---
 
@@ -252,6 +254,8 @@ Interactive terminal assistant with streaming responses, thinking blocks, and ag
 | `/workspace <path>` | Set working directory for knowledge base |
 | `/workspace scan` | Re-scan current workspace |
 | `/health` | Full system diagnostics (GPU, VRAM, models, Ollama, disk) |
+| `/compile on\|off` | Toggle torch.compile JIT (20-40% faster, slow first gen) |
+| `/turboquant on\|off` | Toggle TurboQuant+ KV cache compression (longer context) |
 | `/save <name>` | Save current conversation |
 | `/load <name\|#index>` | Load a saved conversation |
 | `/sessions` | List all saved sessions |
@@ -802,9 +806,9 @@ Phases 0-6 complete plus Gated DeltaNet/Mamba-2 hybrid support, TurboQuant KV ca
 
 - **Standard transformer inference** — full forward pass with GQA, RoPE, KV cache, autoregressive generation
 - **Gated DeltaNet (Mamba-2) hybrid** — Qwen3.5's 24 linear attention layers + 8 full attention layers. New WGSL kernels: conv1d, SSM delta rule recurrence, L2 norm, per-head RMSNormGated. Fixed-size SSM state (~50 MB) instead of growing KV cache. Token-by-token prefill for correct SSM recurrence.
-- **TurboQuant KV cache with asymmetric attention** — 3-bit (d≥128) or 4-bit (d≤64) compressed KV cache saving ~80% memory. Uses the QJL unbiased inner product estimator to correct attention scores directly from compressed data, avoiding the 23-44% per-vector reconstruction error of naive decode-then-attend. Current token K/V is always exact; only cached tokens get QJL correction. Validated against tonbistudio's real-model MSE numbers.
+- **TurboQuant+ KV cache with asymmetric attention** — Asymmetric K3/V2 compressed KV cache (keys 3-bit, values 2-bit) with boundary layer protection (first/last 2 layers at full precision). Walsh-Hadamard rotation replaces random orthogonal matrix. Uses the QJL unbiased inner product estimator for keys to correct attention scores directly from compressed data. Current token K/V is always exact; only cached tokens get compressed. Also available as a PyTorch cache wrapper for the transformers engine (`core/turboquant_cache.py`).
 - **Batch prefill** — 512-token chunks for standard transformers, token-by-token for hybrid models (SSM recurrence requires sequential processing)
-- **Mixed-precision quantization** — custom quantization pipeline (`scripts/quantize_mixed_precision.py`) that keeps SSM-critical linear_attn layers in original BF16 precision while quantizing FFN and attention to INT4. `dispatchProjection` auto-selects f32/BF16/INT4 kernel per weight buffer. See [Mixed-Precision Quantization](#mixed-precision-quantization) below.
+- **Mixed-precision quantization** — custom quantization pipeline (`scripts/quantize_mixed_precision.py`) that keeps SSM-critical linear_attn layers in original BF16 precision while quantizing FFN and attention to INT4. `dispatchProjection` auto-selects f32/BF16/INT4 kernel per weight buffer.
 - **GPTQ INT4** — weight loader and fused `matmul_bt_q4` kernel for quantized models. INT4 embedding lookup (`embed_q4`) and INT4 LM head matmul.
 - **BF16 native weights** — `keepBF16` auto-detection keeps large BF16 tensors in native format on GPU, halving VRAM usage. Works for both unquantized models and mixed-precision GPTQ. BF16 embedding lookup and BF16 LM head matmul (including tied-embedding models).
 - **Local model loading** — dev server serves SafeTensors from local HF cache and project `models/` directory. Local-first with automatic CDN fallback. 50-100x faster than CDN downloads.
