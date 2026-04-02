@@ -227,53 +227,37 @@ export class ServiceManager {
     if (mp.status === 'stopped' || mp.status === 'stopping') return;
 
     const def = mp.definition;
-
-    // Adopted service (no process handle) — kill by port
-    if (!mp.process && !mp.pid) {
-      if (def.port > 0) {
-        this.setStatus(id, 'stopping');
-        const killed = await this.killByPort(def.port);
-        if (killed) {
-          this.logAggregator.addEntry(id, 'info',
-            `Killed adopted process on port ${def.port}`);
-        }
-      }
-      this.setStatus(id, 'stopped');
-      return;
-    }
-
     this.setStatus(id, 'stopping');
-    const pid = mp.pid!;
-    const timeout = mp.definition.gracefulTimeout;
 
-    // Try graceful kill first
-    try {
-      mp.process!.kill('SIGTERM');
-    } catch {
-      // Process may already be dead
+    // Strategy: tree-kill by PID first, then kill by port as safety net.
+    // On Windows, SIGTERM only kills the parent — taskkill /T /F kills
+    // the entire process tree including child workers.
+
+    // Step 1: Tree-kill by PID (if we have one)
+    if (mp.pid) {
+      this.treeKill(mp.pid);
+    } else if (mp.process) {
+      try { mp.process.kill(); } catch { /* already dead */ }
     }
 
-    // Wait for exit or force-kill after timeout
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        this.treeKill(pid);
-        resolve();
-      }, timeout);
+    // Step 2: Wait briefly for exit
+    if (mp.process) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 2000);
+        mp.process!.once('exit', () => { clearTimeout(timer); resolve(); });
+      });
+    }
 
-      if (mp.process) {
-        mp.process.once('exit', () => {
-          clearTimeout(timer);
-          resolve();
-        });
-      } else {
-        clearTimeout(timer);
-        resolve();
+    // Step 3: Kill by port as safety net (catches orphaned workers)
+    if (def.port > 0) {
+      const killed = await this.killByPort(def.port);
+      if (killed) {
+        this.logAggregator.addEntry(id, 'info',
+          `Cleaned up process on port ${def.port}`);
       }
-    });
-
-    if ((mp.status as string) === 'stopping') {
-      this.setStatus(id, 'stopped');
     }
+
+    this.setStatus(id, 'stopped');
   }
 
   async restart(id: string): Promise<void> {
@@ -289,8 +273,19 @@ export class ServiceManager {
   }
 
   async stopAll(): Promise<void> {
-    const promises = SERVICE_DEFINITIONS.map((def) => this.stop(def.id));
-    await Promise.allSettled(promises);
+    // Stop all services with a hard timeout to prevent hanging on exit
+    const stopPromise = Promise.allSettled(
+      SERVICE_DEFINITIONS.map((def) => this.stop(def.id))
+    );
+    const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, 10000));
+    await Promise.race([stopPromise, timeoutPromise]);
+
+    // Final safety net: kill anything still on our known ports
+    for (const def of SERVICE_DEFINITIONS) {
+      if (def.port > 0) {
+        await this.killByPort(def.port).catch(() => {});
+      }
+    }
   }
 
   getStatus(): ServiceStatusInfo[] {

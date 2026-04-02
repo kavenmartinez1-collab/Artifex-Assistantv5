@@ -53,8 +53,12 @@ function createWindow(): void {
   mainWindow.on('resize', saveBounds);
   mainWindow.on('move', saveBounds);
 
+  let isClosing = false;
   mainWindow.on('close', async (e) => {
+    if (isClosing) return; // prevent double-stop
+    isClosing = true;
     e.preventDefault();
+
     // Save which services were running
     const statuses = serviceManager.getStatus();
     const activeIds = statuses
@@ -62,7 +66,7 @@ function createWindow(): void {
       .map((s) => s.id);
     updateConfig({ activeServicesOnClose: activeIds });
 
-    // Stop all services gracefully
+    // Stop all services — stopAll() has its own 10s timeout + port cleanup
     await serviceManager.stopAll();
     saveConfig(loadConfig());
 
