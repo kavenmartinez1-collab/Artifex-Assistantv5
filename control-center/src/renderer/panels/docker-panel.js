@@ -5,6 +5,7 @@ let dockerContainerCards = {};
 let dockerIsInstalled = false;
 let dockerComposePathInput = null;
 let dockerLogsOverlay = null;
+let dockerRefreshInProgress = false;
 
 async function initDockerPanel(container) {
   // Clean up previous timer if re-initializing
@@ -166,6 +167,12 @@ async function initDockerPanel(container) {
 
 /** Refresh the entire Docker panel state */
 async function refreshDockerPanel() {
+  if (dockerRefreshInProgress) return;
+  dockerRefreshInProgress = true;
+  try { await _refreshDockerPanelInner(); } finally { dockerRefreshInProgress = false; }
+}
+
+async function _refreshDockerPanelInner() {
   const statusDot = document.getElementById('docker-status-dot');
   const statusText = document.getElementById('docker-status-text');
   const notInstalled = document.getElementById('docker-not-installed');
@@ -231,8 +238,9 @@ async function refreshDockerPanel() {
     }
   }
 
-  // Show empty state
+  // Show empty state (clear stale card references)
   if (containers.length === 0 && grid.children.length === 0) {
+    dockerContainerCards = {};
     grid.innerHTML = `
       <div style="padding:32px;text-align:center;color:#888;width:100%">
         No containers found. Start a container or use Compose Up.
