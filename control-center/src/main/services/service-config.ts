@@ -1,6 +1,16 @@
 import * as path from 'path';
 import * as fs from 'fs';
 
+/** Describes a configurable option shown in the UI before starting a service */
+export interface ServiceOption {
+  key: string;        // CLI flag name (e.g. '--backend')
+  label: string;      // UI label
+  type: 'select' | 'text' | 'number';
+  default: string;
+  choices?: string[]; // for 'select' type
+  envVar?: string;    // if set, also passed as environment variable
+}
+
 export interface ServiceDefinition {
   id: string;
   name: string;
@@ -13,6 +23,8 @@ export interface ServiceDefinition {
   group: string;
   /** Launch in a visible terminal window (for interactive CLIs) */
   openTerminal?: boolean;
+  /** Configurable options shown in the UI */
+  options?: ServiceOption[];
 }
 
 /**
@@ -79,6 +91,14 @@ export const SERVICE_DEFINITIONS: ServiceDefinition[] = [
     healthCheck: 'http://127.0.0.1:8000/health',
     gracefulTimeout: 10000,
     group: 'backend',
+    options: [
+      { key: '--port', label: 'Port', type: 'number', default: '8000' },
+      { key: '--backend', label: 'Backend', type: 'select', default: 'transformers',
+        choices: ['transformers', 'ollama'], envVar: 'ARTIFEX_BACKEND' },
+      { key: '--model', label: 'Model', type: 'text', default: '',
+        envVar: 'ARTIFEX_MODEL' },
+      { key: '--gateway', label: 'Gateway URL', type: 'text', default: 'http://localhost:8080' },
+    ],
   },
   {
     id: 'web-gateway',
@@ -90,6 +110,9 @@ export const SERVICE_DEFINITIONS: ServiceDefinition[] = [
     healthCheck: 'http://127.0.0.1:8080/health',
     gracefulTimeout: 5000,
     group: 'backend',
+    options: [
+      { key: '--port', label: 'Port', type: 'number', default: '8080' },
+    ],
   },
   // ── AI Services ──
   {
