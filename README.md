@@ -48,6 +48,9 @@ Universal Local AI Hosting Platform. Run any AI model locally — text generatio
   - [Network Isolation](#network-isolation-full-profile)
 - [Multi-Modal Pipelines](#multi-modal-pipelines)
 - [Agent Tools](#agent-tools)
+- [Starting Services](#starting-services)
+  - [Control Center (Recommended)](#option-a-control-center-recommended)
+  - [Manual Terminal Commands](#option-b-manual-terminal-commands)
 - [WebGPU Engine](#webgpu-engine)
 - [Project Structure](#project-structure)
 - [Configuration](#configuration)
@@ -58,7 +61,6 @@ Universal Local AI Hosting Platform. Run any AI model locally — text generatio
 - [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
 - [Requirements](#requirements)
-- [Acknowledgments](#acknowledgments)
 - [Acknowledgements](#acknowledgements)
 - [License](#license)
 
@@ -901,35 +903,89 @@ All 15 WGSL compute kernels have been verified against PyTorch reference impleme
 
 ---
 
-## Control Center (Electron)
+## Starting Services
 
-Desktop dashboard for managing all Artifex services from one place. No terminal commands needed.
+There are two ways to run Artifex — the **Control Center** (desktop app, manages everything) or **manual terminal commands** (run each service individually).
 
-### Quick Start
+### Option A: Control Center (Recommended)
+
+Desktop dashboard that manages all services from one place. No terminal commands needed.
 
 ```bash
 cd control-center
-npm install
-npm run dev
+npm install       # first time only
+npm run dev       # or: npm start
 ```
 
-### 6 Panels
+The Services panel shows each service with start/stop/restart buttons and **configurable options**:
+
+| Service | Configurable Options |
+|---------|---------------------|
+| **Python API Server** | Port, Backend (transformers/ollama), Model name, Gateway URL |
+| **Web Gateway** | Port |
+| **Vite / Dev Server** | Start/stop only |
+| **Ollama** | Start/stop only |
+| **Artifex CLI / GUI** | Start/stop only |
+
+When a service is stopped, its config row shows input fields. Set your backend to `ollama`, pick a model name, then click Start — the options are passed as CLI arguments automatically.
+
+**Process cleanup**: When you stop a service or close the Control Center, it:
+1. Tree-kills the process and all child workers (`taskkill /T /F`)
+2. Kills anything still on the service's port (safety net)
+3. For Ollama: hunts and kills orphaned runner subprocesses that hold VRAM
+
+### Option B: Manual Terminal Commands
+
+Run each service in its own terminal:
+
+```bash
+# Activate the venv first
+venv\Scripts\activate        # Windows
+source venv/bin/activate     # Linux/macOS
+
+# ── Core services ──
+python main.py                           # CLI assistant
+python main_gui.py                       # GUI (cyberpunk desktop)
+python main_api.py                       # API server (port 8000)
+python main_api.py --backend ollama      # API with Ollama backend
+python main_api.py --backend ollama --model qwen3.5-27b-iq2xxs --port 8000
+
+# ── Web gateway (separate terminal) ──
+python web-gateway/main.py               # Web search proxy (port 8080)
+
+# ── Ollama (if not already running) ──
+ollama serve                             # Starts on port 11434
+
+# ── WebGPU frontend (separate terminal) ──
+cd webgpu
+npx vite --host 127.0.0.1               # Vite dev server (port 5173)
+npx tsx server/dev-server.ts             # Dev server (port 3001)
+```
+
+**Environment variables** (alternative to CLI flags):
+```bash
+set ARTIFEX_BACKEND=ollama              # Windows
+set ARTIFEX_MODEL=qwen3.5-27b-iq2xxs
+python main_api.py
+```
+
+### 6 Control Center Panels
 
 | Panel | What it does |
 |-------|-------------|
-| **Services** | Start/stop/restart all 7 services (Vite, dev-server, API, Web Gateway, Ollama, CLI, GUI). Auto-detects already-running services by scanning ports. Port-based kill for orphaned processes. |
+| **Services** | Start/stop/restart all 7 services with configurable options. Auto-detects already-running services by scanning ports. |
 | **Logs** | Unified chronological log stream from all services. Color-coded by source, filterable by service/severity, text search, export to file. |
-| **Quantize** | 6-step wizard: select model, profile SSM, edit recipe, review config, run with progress bar, done. HailMary (5.7 GB) and Conservative (9.4 GB) presets. Documents BF16 SSM requirement in the UI. |
+| **Quantize** | 6-step wizard: select model, profile SSM, edit recipe, review config, run with progress bar, done. HailMary (5.7 GB) and Conservative (9.4 GB) presets. |
 | **Models** | Browse models/ directory. Cards show name, size, quantization config, shard count. Delete with confirmation. |
 | **Docker** | Manage Docker containers from docker-compose.yml. Compose Up/Down, per-container Start/Stop, view logs. Graceful "Docker not installed" fallback. |
 | **Cluster** | GPU cluster monitor. Connects to WebSocket hub, shows worker cards with GPU/VRAM/status, task queue, tok/s sparklines. |
 
-### Architecture
+### Control Center Architecture
 
 - **Electron** — vanilla TypeScript, no React/Vue/axios
 - **Dependencies**: electron 34.2.0, ws 8.20.0, typescript 5.6.3 (pinned, no auto-updates)
 - **Security**: `nodeIntegration: false`, `contextIsolation: true`, all IPC through `contextBridge`
-- **Service management**: `child_process.spawn()` with shell mode, PowerShell `Stop-Process` for port-based kill
+- **Service management**: `child_process.spawn()` with `shell: false` (handles paths with spaces), tree-kill + port-kill cleanup
 - **Auto-detect**: scans service ports on startup, adopts externally-running processes
 - **Interactive apps**: CLI launches in its own cmd.exe terminal window via PowerShell `Start-Process`
 
