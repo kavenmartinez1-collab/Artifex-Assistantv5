@@ -95,43 +95,21 @@ fn encode(@builtin(local_invocation_id) lid: vec3u,
     output_norms[out_idx] = norm;
   }
 
-  // ── Stage 1a: Walsh-Hadamard rotation (O(d log d)) ─────────────────
-  // WHT decorrelates coordinates the same as random orthogonal rotation
-  // but computes in-place with butterfly pattern instead of O(d²) matmul.
+  // ── Stage 1a: Hadamard rotation ────────────────────────────────────
+  // The rotation_matrix buffer holds the normalized Hadamard matrix H.
+  // H·x produces the same result as in-place WHT but via standard matmul,
+  // which is proven reliable on all GPU drivers. For d=128, the O(d²) vs
+  // O(d log d) difference is negligible on GPU hardware.
   let sqrt_d = sqrt(f32(d));
   let inv_sqrt_d = 1.0 / sqrt_d;
 
-  // Load normalized input into shared memory
   i = tid;
   while (i < d) {
-    rotated[i] = input[vec_idx * d + i] * inv_norm;
-    i = i + 256u;
-  }
-  workgroupBarrier();
-
-  // In-place WHT butterfly
-  var h = 1u;
-  while (h < d) {
-    i = tid;
-    while (i < d / 2u) {
-      let block = i / h;
-      let offset = i % h;
-      let i1 = block * 2u * h + offset;
-      let i2 = i1 + h;
-      let a = rotated[i1];
-      let b = rotated[i2];
-      rotated[i1] = a + b;
-      rotated[i2] = a - b;
-      i = i + 256u;
+    var sum: f32 = 0.0;
+    for (var j = 0u; j < d; j = j + 1u) {
+      sum += rotation_matrix[i * d + j] * input[vec_idx * d + j] * inv_norm;
     }
-    workgroupBarrier();
-    h = h * 2u;
-  }
-
-  // Normalize WHT output
-  i = tid;
-  while (i < d) {
-    rotated[i] = rotated[i] * inv_sqrt_d;
+    rotated[i] = sum;
     i = i + 256u;
   }
   workgroupBarrier();
