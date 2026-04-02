@@ -2,7 +2,14 @@
 TurboQuant+ KV Cache — PyTorch implementation.
 
 Ports the TurboQuant algorithm (Google, ICLR 2026) with improvements from
-TurboQuant+ (TheTom) to a transformers-compatible Cache class.
+TurboQuant+ (TheTom) to a transformers-compatible Cache wrapper.
+
+Architecture:
+  TurboQuantCache wraps the model's native cache (DynamicCache, Qwen3.5
+  hybrid cache, etc.) and intercepts update() to compress old tokens.
+  All other attributes and methods proxy transparently to the inner cache,
+  so SSM state (conv_states, recurrent_states, has_previous_state) and
+  any model-specific cache features work unchanged.
 
 Algorithm:
   Stage 1 (PolarQuant): normalize → WHT rotate → Lloyd-Max scalar quantize
@@ -18,13 +25,13 @@ Acknowledgement:
 
 Usage:
     from core.turboquant_cache import TurboQuantCache
-    cache = TurboQuantCache(key_bits=3, value_bits=2, residual_length=64)
+    cache = TurboQuantCache(inner_cache, key_bits=3, value_bits=2)
     # Pass as past_key_values to model.generate()
 """
 
 import math
 import torch
-from transformers.cache_utils import DynamicCache
+from transformers.cache_utils import Cache
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -52,15 +59,14 @@ CODEBOOK = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# FAST WALSH-HADAMARD TRANSFORM  (replaces random orthogonal rotation)
+# FAST WALSH-HADAMARD TRANSFORM
 # ═══════════════════════════════════════════════════════════════════════════
 
 def fast_wht(x):
     """Vectorized Fast Walsh-Hadamard Transform on the last dimension.
 
     O(n log n) — replaces the O(n²) random orthogonal matrix multiply.
-    WHT is its own inverse (self-adjoint and unitary when normalized),
-    so the same function is used for both encode and decode.
+    WHT is self-inverse when normalized: WHT(WHT(x)) = x.
 
     Args:
         x: (..., d) tensor where d is a power of 2
@@ -71,7 +77,6 @@ def fast_wht(x):
     result = x.clone()
     h = 1
     while h < d:
-        # Butterfly: reshape last dim into pairs of size h
         r = result.reshape(*result.shape[:-1], -1, 2 * h)
         a = r[..., :h].clone()
         b = r[..., h:].clone()
@@ -89,14 +94,11 @@ def _generate_jl_matrix(d, seed=137, device="cpu"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TURBOQUANT+ CODEC  (vectorized PyTorch)
+# TURBOQUANT+ CODEC
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TurboQuantCodec:
-    """Encoder/decoder for TurboQuant+ KV compression.
-
-    Supports asymmetric bit widths — create separate codecs for K and V.
-    """
+    """Encoder/decoder for TurboQuant+ KV compression."""
 
     def __init__(self, head_dim, bits=3, device="cpu", dtype=torch.float16):
         self.head_dim = head_dim
@@ -110,11 +112,9 @@ class TurboQuantCodec:
         self.num_centroids = len(cb["centroids"])
         self.sqrt_d = math.sqrt(head_dim)
 
-        # JL matrix for QJL correction (only needed for keys)
         self.jl_matrix = _generate_jl_matrix(head_dim, seed=137, device=device)
 
     def to(self, device):
-        """Move codec buffers to a new device."""
         self.device = device
         self.centroids = self.centroids.to(device)
         self.thresholds = self.thresholds.to(device)
@@ -122,27 +122,15 @@ class TurboQuantCodec:
         return self
 
     def encode(self, vectors, compute_qjl=True):
-        """Encode vectors to compressed representation.
-
-        Args:
-            vectors: (N, d) float tensor
-            compute_qjl: If True, compute QJL sign bits (needed for keys,
-                         skipped for values since V compression uses no correction)
-
-        Returns:
-            dict with keys: indices, norms, and optionally sign_packed, residual_norms
-        """
+        """Encode vectors to compressed representation."""
         d = self.head_dim
-        flat = vectors.reshape(-1, d).float()  # (N, d)
+        flat = vectors.reshape(-1, d).float()
 
-        # Step 1: L2 normalize
         norms = torch.linalg.norm(flat, dim=-1, keepdim=True).clamp(min=1e-8)
         normalized = flat / norms
 
-        # Step 2: Walsh-Hadamard rotation (O(n log n))
         rotated = fast_wht(normalized)
 
-        # Step 3: Lloyd-Max scalar quantize
         scaled = rotated * self.sqrt_d
         abs_val = scaled.abs()
         sign = scaled.sign()
@@ -153,11 +141,9 @@ class TurboQuantCodec:
             bins = torch.zeros_like(abs_val, dtype=torch.long)
         bins = bins.long()
 
-        # Dequantize for residual
         dequant_abs = self.centroids[bins] / self.sqrt_d
         dequantized = sign * dequant_abs
 
-        # Encode index: negative values offset by num_centroids
         indices = torch.where(sign >= 0, bins, bins + self.num_centroids)
 
         result = {
@@ -165,7 +151,6 @@ class TurboQuantCodec:
             "norms": norms.squeeze(-1).to(self.dtype),
         }
 
-        # Step 4: QJL correction (only for keys — "V compression is free")
         if compute_qjl:
             residual = rotated - dequantized
             residual_norms = torch.linalg.norm(residual, dim=-1, keepdim=True).clamp(min=1e-8)
@@ -173,7 +158,6 @@ class TurboQuantCodec:
             jl_projected = residual @ self.jl_matrix.T
             sign_raw = (jl_projected >= 0).to(torch.uint8)
 
-            # Pack 8 sign bits per byte
             sign_grouped = sign_raw.reshape(-1, d // 8, 8)
             bit_weights = (2 ** torch.arange(8, device=flat.device)).to(torch.uint8)
             sign_packed = (sign_grouped * bit_weights).sum(dim=-1).to(torch.uint8)
@@ -184,7 +168,6 @@ class TurboQuantCodec:
         return result
 
     def _unpack_sign_bits(self, sign_packed):
-        """Unpack sign bits from packed uint8 -> (N, d) float {-1, +1}."""
         d = self.head_dim
         bit_weights = (2 ** torch.arange(8, device=sign_packed.device)).to(torch.uint8)
         unpacked = ((sign_packed.unsqueeze(-1) & bit_weights) > 0).float()
@@ -202,76 +185,87 @@ class TurboQuantCodec:
         dequant_abs = self.centroids[bins] / self.sqrt_d
         dequantized_rotated = sign * dequant_abs
 
-        # Inverse WHT (same as forward — WHT is self-inverse when normalized)
         reconstructed = fast_wht(dequantized_rotated)
         return (norms.unsqueeze(-1) * reconstructed).to(self.dtype)
 
-    def qjl_correction(self, query, encoded):
-        """Compute QJL attention correction for compressed K vectors."""
-        d = self.head_dim
-        norms = encoded["norms"].float()
-        res_norms = encoded["residual_norms"].float()
-
-        sign_pm = self._unpack_sign_bits(encoded["sign_packed"])
-
-        # S·WHT(q) — WHT replaces rotation matrix
-        q_flat = query.reshape(-1, d).float()
-        q_rotated = fast_wht(q_flat)
-        sq = q_rotated @ self.jl_matrix.T  # (Q, d)
-
-        qjl_scale = math.sqrt(math.pi / 2.0) / math.sqrt(d)
-        dot = sq @ sign_pm.T
-        correction = qjl_scale * (norms * res_norms).unsqueeze(0) * dot
-
-        return correction
-
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TRANSFORMERS-COMPATIBLE CACHE CLASS
+# TRANSPARENT CACHE WRAPPER
 # ═══════════════════════════════════════════════════════════════════════════
 
-class TurboQuantCache(DynamicCache):
-    """KV cache with TurboQuant+ compression for past tokens.
+class TurboQuantCache(Cache):
+    """Transparent wrapper that adds TurboQuant+ compression to any cache.
 
-    TurboQuant+ improvements:
-      - Asymmetric K/V: keys at key_bits, values at value_bits (default 3/2)
-      - Boundary layer protection: first/last N layers stay full precision
-      - WHT rotation: O(n log n) encode/decode
+    Wraps the model's native cache object and intercepts update() to
+    compress old KV tokens. All other attribute access (conv_states,
+    recurrent_states, has_previous_state, key_cache, value_cache, etc.)
+    proxies transparently to the inner cache.
+
+    This design works with any model's cache:
+      - DynamicCache (standard transformers)
+      - Qwen3.5 hybrid cache (with SSM conv/recurrent states)
+      - Jamba, Zamba, or any future hybrid architecture
 
     Args:
+        inner: The model's native cache instance (created by the model).
         key_bits: Quantization bits for keys (1-4). Default 3.
         value_bits: Quantization bits for values (1-4). Default 2.
-            "V compression is free" — 2-bit values have zero measurable
-            quality impact when key precision is maintained.
         residual_length: Recent tokens kept at full precision.
-        boundary_layers: Number of first/last layers to protect (full precision).
-            Default 2 — recovers 37-91% of quality gap per TurboQuant+ findings.
-        num_layers: Total model layers (needed for boundary detection). Auto-detected
-            if not provided.
+        boundary_layers: First/last N layers stay at full precision.
+        num_layers: Total model layers (for last-N boundary detection).
     """
 
-    def __init__(self, key_bits=3, value_bits=2, residual_length=128,
-                 boundary_layers=2, num_layers=None, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, inner, key_bits=3, value_bits=2, residual_length=128,
+                 boundary_layers=2, num_layers=None):
+        # Don't call super().__init__() — we proxy everything to inner
+        self._inner = inner
         self.key_bits = key_bits
         self.value_bits = value_bits
         self.residual_length = residual_length
         self.boundary_layers = boundary_layers
         self.num_layers = num_layers
-        self._k_codecs = {}      # head_dim -> TurboQuantCodec
-        self._v_codecs = {}      # head_dim -> TurboQuantCodec
-        self._compressed = {}    # layer_idx -> {"keys": encoded, "values": encoded}
+        self._k_codecs = {}
+        self._v_codecs = {}
+        self._compressed = {}
         self._compressed_len = {}
         self._max_layer_seen = 0
 
+    # ── Transparent proxy ─────────────────────────────────────────────────
+    # Any attribute not on TurboQuantCache falls through to the inner cache.
+    # This is what makes conv_states, recurrent_states, has_previous_state,
+    # key_cache, value_cache, layers, etc. all work without patching.
+
+    def __getattr__(self, name):
+        # __getattr__ is only called when normal lookup fails,
+        # so our own attributes (key_bits, _inner, etc.) resolve normally.
+        return getattr(self._inner, name)
+
+    def __setattr__(self, name, value):
+        # Our own attributes go on self, everything else on inner
+        if name.startswith('_') or name in (
+            'key_bits', 'value_bits', 'residual_length',
+            'boundary_layers', 'num_layers',
+        ):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._inner, name, value)
+
+    def __len__(self):
+        return len(self._inner)
+
+    def __bool__(self):
+        return bool(self._inner)
+
+    def __iter__(self):
+        return iter(self._inner)
+
+    # ── Cache interface ───────────────────────────────────────────────────
+
     def _is_boundary_layer(self, layer_idx):
-        """Check if this layer should be protected (no compression)."""
         if self.boundary_layers <= 0:
             return False
-        # First N layers
         if layer_idx < self.boundary_layers:
             return True
-        # Last N layers — use num_layers if known, else track max seen
         self._max_layer_seen = max(self._max_layer_seen, layer_idx)
         total = self.num_layers or (self._max_layer_seen + 1)
         if layer_idx >= total - self.boundary_layers:
@@ -279,7 +273,6 @@ class TurboQuantCache(DynamicCache):
         return False
 
     def _get_k_codec(self, head_dim, device):
-        """Lazy-init key codec."""
         if head_dim not in self._k_codecs:
             self._k_codecs[head_dim] = TurboQuantCodec(
                 head_dim=head_dim, bits=self.key_bits, device=device
@@ -290,7 +283,6 @@ class TurboQuantCache(DynamicCache):
         return codec
 
     def _get_v_codec(self, head_dim, device):
-        """Lazy-init value codec (may have different bit width)."""
         if head_dim not in self._v_codecs:
             self._v_codecs[head_dim] = TurboQuantCodec(
                 head_dim=head_dim, bits=self.value_bits, device=device
@@ -301,7 +293,6 @@ class TurboQuantCache(DynamicCache):
         return codec
 
     def _compress_overflow(self, layer_idx, key_states, value_states):
-        """Compress tokens beyond residual_length using asymmetric K/V."""
         seq_len = key_states.shape[2]
         if seq_len <= self.residual_length:
             return key_states, value_states
@@ -318,11 +309,9 @@ class TurboQuantCache(DynamicCache):
         k_flat = k_old.reshape(-1, head_dim)
         v_flat = v_old.reshape(-1, head_dim)
 
-        # Asymmetric: keys get QJL correction, values don't need it
         k_enc = k_codec.encode(k_flat, compute_qjl=True)
         v_enc = v_codec.encode(v_flat, compute_qjl=False)
 
-        # Merge with previously compressed tokens
         prev = self._compressed.get(layer_idx)
         if prev is not None:
             for key in k_enc:
@@ -342,7 +331,6 @@ class TurboQuantCache(DynamicCache):
         return k_recent, v_recent
 
     def _reconstruct_full(self, layer_idx, key_states, value_states):
-        """Reconstruct full K/V by prepending decoded compressed tokens."""
         compressed = self._compressed.get(layer_idx)
         if compressed is None:
             return key_states, value_states
@@ -361,37 +349,63 @@ class TurboQuantCache(DynamicCache):
         return full_k, full_v
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
-        """Update cache: append new tokens, compress overflow, return full K/V."""
-        keys, values = super().update(key_states, value_states, layer_idx, cache_kwargs)
+        """Intercept update: delegate to inner cache, then compress overflow."""
+        # Let the inner cache do its native update (handles SSM state etc.)
+        keys, values = self._inner.update(key_states, value_states, layer_idx, cache_kwargs)
 
-        # Boundary layers: no compression (full precision for quality)
+        # Boundary layers: no compression
         if self._is_boundary_layer(layer_idx):
+            return keys, values
+
+        # Only compress attention layers (skip SSM layers that don't return 4D tensors)
+        if keys.ndim != 4:
             return keys, values
 
         # Compress tokens beyond residual_length
         k_recent, v_recent = self._compress_overflow(layer_idx, keys, values)
 
-        # Store only the recent (uncompressed) tokens in parent's layer storage
-        if hasattr(self, 'layers') and layer_idx < len(self.layers):
-            self.layers[layer_idx].key_cache = k_recent
-            self.layers[layer_idx].value_cache = v_recent
-        elif hasattr(self, 'key_cache') and layer_idx < len(self.key_cache):
-            self.key_cache[layer_idx] = k_recent
-            self.value_cache[layer_idx] = v_recent
+        # Update inner cache to only hold recent tokens
+        if hasattr(self._inner, 'key_cache') and self._inner.key_cache is not None:
+            if isinstance(self._inner.key_cache, list) and layer_idx < len(self._inner.key_cache):
+                self._inner.key_cache[layer_idx] = k_recent
+                self._inner.value_cache[layer_idx] = v_recent
 
-        # Reconstruct full K/V for attention computation
+        # Reconstruct full K/V for this attention computation
         full_k, full_v = self._reconstruct_full(layer_idx, k_recent, v_recent)
 
         return full_k, full_v
 
     def get_seq_length(self, layer_idx=0):
-        """Total sequence length including compressed tokens."""
-        base_len = super().get_seq_length(layer_idx)
+        base_len = self._inner.get_seq_length(layer_idx)
         compressed_len = self._compressed_len.get(layer_idx, 0)
         return base_len + compressed_len
 
     def reset(self):
-        """Clear all cached state."""
-        super().reset()
+        self._inner.reset()
         self._compressed.clear()
         self._compressed_len.clear()
+
+    # Forward remaining Cache interface methods to inner
+    def reorder_cache(self, beam_idx):
+        return self._inner.reorder_cache(beam_idx)
+
+    def get_max_cache_shape(self, layer_idx=0):
+        return self._inner.get_max_cache_shape(layer_idx)
+
+
+def wrap_cache_with_turboquant(cache, num_layers=None, key_bits=3, value_bits=2,
+                                residual_length=128, boundary_layers=2):
+    """Convenience: wrap any cache instance with TurboQuant+ compression.
+
+    Usage in generate():
+        # After model creates its cache, wrap it:
+        cache = wrap_cache_with_turboquant(model_cache, num_layers=32)
+    """
+    return TurboQuantCache(
+        inner=cache,
+        key_bits=key_bits,
+        value_bits=value_bits,
+        residual_length=residual_length,
+        boundary_layers=boundary_layers,
+        num_layers=num_layers,
+    )
