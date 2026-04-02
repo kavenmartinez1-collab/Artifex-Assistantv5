@@ -190,7 +190,7 @@ async function _refreshDockerPanelInner() {
 
   if (!dockerIsInstalled) {
     statusDot.style.background = '#f44336';
-    statusText.textContent = 'Not detected';
+    statusText.textContent = 'Not detected — start Docker Desktop, then switch back to this panel';
     statusText.style.color = '#f44336';
     notInstalled.style.display = 'block';
     grid.style.display = 'none';
