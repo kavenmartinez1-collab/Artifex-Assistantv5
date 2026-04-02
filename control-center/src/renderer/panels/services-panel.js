@@ -38,7 +38,8 @@ async function initServicesPanel(container) {
   `;
   container.appendChild(consoleSection);
 
-  // Load services
+  // Load service options (port, backend, model configs) then services
+  await loadServiceOptions();
   const services = await window.artifex.listServices();
   serviceCards = {};
   for (const svc of services) {

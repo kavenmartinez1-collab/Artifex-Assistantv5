@@ -34,8 +34,12 @@ contextBridge.exposeInMainWorld('artifex', {
     return ipcRenderer.invoke('services:list');
   },
 
-  startService: (id: string): Promise<void> => {
-    return ipcRenderer.invoke('services:start', id);
+  startService: (id: string, configOverrides?: Record<string, string>): Promise<void> => {
+    return ipcRenderer.invoke('services:start', id, configOverrides);
+  },
+
+  getServiceOptions: (): Promise<Array<{ id: string; options: unknown[] }>> => {
+    return ipcRenderer.invoke('services:get-options');
   },
 
   stopService: (id: string): Promise<void> => {

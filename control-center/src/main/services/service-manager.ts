@@ -95,25 +95,57 @@ export class ServiceManager {
     this.emitStatus(id);
   }
 
-  async start(id: string): Promise<void> {
+  /**
+   * Start a service, optionally with config overrides from the UI.
+   * @param id - Service ID
+   * @param configOverrides - Map of option key to value (e.g. {'--port': '9000', '--backend': 'ollama'})
+   */
+  async start(id: string, configOverrides?: Record<string, string>): Promise<void> {
     const mp = this.processes.get(id);
     if (!mp) throw new Error(`Unknown service: ${id}`);
     if (mp.status === 'running' || mp.status === 'starting') return;
 
     const def = mp.definition;
 
+    // Build args: base args + config overrides
+    let args = [...def.args];
+    const extraEnv: Record<string, string> = {};
+    if (configOverrides && def.options) {
+      for (const opt of def.options) {
+        const val = configOverrides[opt.key];
+        if (val !== undefined && val !== '' && val !== opt.default) {
+          // Special case: --port also updates the adoption check
+          if (opt.key === '--port') {
+            args.push(opt.key, val);
+          } else {
+            args.push(opt.key, val);
+          }
+          // Set env var if configured
+          if (opt.envVar) {
+            extraEnv[opt.envVar] = val;
+          }
+        }
+      }
+    }
+
+    // Determine effective port (may be overridden)
+    let effectivePort = def.port;
+    if (configOverrides?.['--port']) {
+      effectivePort = parseInt(configOverrides['--port']) || def.port;
+    }
+
     // Check if port is already in use — adopt the existing service
-    if (def.port > 0) {
-      const portBusy = await isPortInUse(def.port);
+    if (effectivePort > 0) {
+      const portBusy = await isPortInUse(effectivePort);
       if (portBusy) {
         mp.status = 'running';
         mp.startTime = Date.now();
         mp.errorMessage = null;
         mp.process = null;
-        mp.pid = null; // Unknown PID for adopted process
+        mp.pid = null;
         this.emitStatus(id);
         this.logAggregator.addEntry(def.id, 'info',
-          `Adopted existing service on port ${def.port} (already running)`);
+          `Adopted existing service on port ${effectivePort} (already running)`);
         return;
       }
     }
@@ -121,17 +153,19 @@ export class ServiceManager {
     this.setStatus(id, 'starting');
     mp.errorMessage = null;
 
+    const spawnEnv = { ...process.env, ...extraEnv };
+
     try {
       // Interactive apps (CLI) get their own visible terminal window
       if (def.openTerminal) {
-        const fullCmd = `"${def.command}" ${def.args.join(' ')}`;
+        const fullCmd = `"${def.command}" ${args.join(' ')}`;
         const child = spawn('powershell.exe', [
           '-NoProfile', '-Command',
           `Start-Process -FilePath cmd.exe -ArgumentList '/k cd /d "${def.cwd}" && ${fullCmd}' -WindowStyle Normal`,
         ], {
           cwd: def.cwd,
           shell: false,
-          env: { ...process.env },
+          env: spawnEnv,
           stdio: 'ignore',
         });
         mp.process = null;
@@ -142,10 +176,10 @@ export class ServiceManager {
         return;
       }
 
-      const child = spawn(def.command, def.args, {
+      const child = spawn(def.command, args, {
         cwd: def.cwd,
         shell: false,
-        env: { ...process.env },
+        env: spawnEnv,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       });

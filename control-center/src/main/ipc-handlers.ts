@@ -45,8 +45,8 @@ export function registerAllHandlers(
     return serviceManager.getStatus();
   });
 
-  ipcMain.handle('services:start', async (_event, id: string) => {
-    await serviceManager.start(id);
+  ipcMain.handle('services:start', async (_event, id: string, configOverrides?: Record<string, string>) => {
+    await serviceManager.start(id, configOverrides);
   });
 
   ipcMain.handle('services:stop', async (_event, id: string) => {
@@ -55,6 +55,15 @@ export function registerAllHandlers(
 
   ipcMain.handle('services:restart', async (_event, id: string) => {
     await serviceManager.restart(id);
+  });
+
+  ipcMain.handle('services:get-options', async () => {
+    // Return service option definitions for the UI
+    const { SERVICE_DEFINITIONS } = require('./services/service-config');
+    return SERVICE_DEFINITIONS.map((def: any) => ({
+      id: def.id,
+      options: def.options || [],
+    }));
   });
 
   ipcMain.handle('services:start-all', async () => {
