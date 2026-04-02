@@ -40,12 +40,16 @@ function findProjectRoot(): string {
 
 const PROJECT_ROOT = findProjectRoot();
 
+// On Windows, npx/npm are .cmd batch files — shell:false won't find them.
+// Resolve to the actual .cmd path so spawn works without shell:true.
+const NPX = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+
 export const SERVICE_DEFINITIONS: ServiceDefinition[] = [
   // ── Frontend ──
   {
     id: 'vite',
     name: 'Vite Dev Server',
-    command: 'npx',
+    command: NPX,
     args: ['vite', '--host', '127.0.0.1'],
     cwd: path.join(PROJECT_ROOT, 'webgpu'),
     port: 5173,
@@ -56,7 +60,7 @@ export const SERVICE_DEFINITIONS: ServiceDefinition[] = [
   {
     id: 'dev-server',
     name: 'WebGPU Dev Server',
-    command: 'npx',
+    command: NPX,
     args: ['tsx', 'server/dev-server.ts'],
     cwd: path.join(PROJECT_ROOT, 'webgpu'),
     port: 3001,

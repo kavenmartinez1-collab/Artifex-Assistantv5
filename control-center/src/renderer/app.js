@@ -18,15 +18,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   const sidebar = document.getElementById('sidebar');
   const statusbar = document.getElementById('statusbar');
 
-  // Create sidebar buttons
-  for (const [id, panel] of Object.entries(panels)) {
-    const btn = document.createElement('button');
-    btn.className = 'sidebar-btn' + (id === activePanel ? ' active' : '');
-    btn.textContent = panel.label;
-    btn.dataset.panel = id;
-    btn.onclick = () => switchPanel(id);
-    sidebar.appendChild(btn);
-  }
+  // Wire up sidebar buttons (defined in index.html with icons)
+  sidebar.querySelectorAll('.sidebar-btn[data-panel]').forEach(btn => {
+    btn.onclick = () => switchPanel(btn.dataset.panel);
+  });
 
   // Global IPC listeners
   if (window.artifex) {

@@ -169,6 +169,31 @@ contextBridge.exposeInMainWorld('artifex', {
     },
   },
 
+  // ── Quantization ──
+  listQuantModels: (): Promise<unknown[]> => {
+    return ipcRenderer.invoke('quant:list-models');
+  },
+
+  listQuantRecipes: (): Promise<unknown[]> => {
+    return ipcRenderer.invoke('quant:list-recipes');
+  },
+
+  runQuantization: (config: unknown): Promise<void> => {
+    return ipcRenderer.invoke('quant:run', config);
+  },
+
+  cancelQuantization: (): Promise<void> => {
+    return ipcRenderer.invoke('quant:cancel');
+  },
+
+  isQuantRunning: (): Promise<boolean> => {
+    return ipcRenderer.invoke('quant:is-running');
+  },
+
+  profileModel: (modelPath: string, numSamples?: number): Promise<unknown> => {
+    return ipcRenderer.invoke('quant:profile', modelPath, numSamples);
+  },
+
   // ── Config / State ──
   getConfig: (): Promise<unknown> => {
     return ipcRenderer.invoke('config:get');

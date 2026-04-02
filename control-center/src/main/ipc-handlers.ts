@@ -21,7 +21,22 @@ export function registerAllHandlers(
   serviceManager: ServiceManager,
   logStore: LogStore
 ): void {
-  const projectRoot = path.resolve(__dirname, '..', '..');
+  // Use the same project root detection as service-config.ts
+  // __dirname is dist/main/ → need to walk up to find the actual project root
+  // (the directory containing webgpu/ and scripts/)
+  let projectRoot = path.resolve(__dirname, '..', '..');
+  // Walk up to find the real project root (above control-center/)
+  let dir = __dirname;
+  for (let i = 0; i < 10; i++) {
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+    const fs = require('fs');
+    if (fs.existsSync(path.join(dir, 'webgpu')) && fs.existsSync(path.join(dir, 'scripts'))) {
+      projectRoot = dir;
+      break;
+    }
+  }
   const quantRunner = new QuantRunner(projectRoot);
   quantRunner.setWindow(_mainWindow);
   // ── Service Handlers ──
