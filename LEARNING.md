@@ -791,27 +791,35 @@ This is a 2D rotation matrix applied to each pair. The frequency decreases for h
 
 ### Kernel 6: TurboQuant Encode/Decode (`turboquant_encode.wgsl` / `turboquant_decode.wgsl`)
 
-**What it does**: Compresses KV cache vectors from 32-bit floats to 3-4 bits per coordinate using Google's TurboQuant algorithm (ICLR 2026).
+**What it does**: Compresses KV cache vectors from 32-bit floats to 2-3 bits per coordinate using Google's TurboQuant algorithm (ICLR 2026), enhanced with TurboQuant+ findings.
 
 **The two-stage algorithm**:
 
 1. **PolarQuant** (Stage 1):
    - Compute the vector's L2 norm (parallel reduction), normalize to unit length
-   - Multiply by a random orthogonal matrix Π (makes coordinates ~independent N(0, 1/d))
+   - Apply Walsh-Hadamard Transform (makes coordinates ~independent N(0, 1/d)) — O(n log n) vs O(n²) for random orthogonal matrix (TurboQuant+ improvement)
    - Scalar quantize each coordinate using Lloyd-Max optimal centroids for N(0,1)
    - Pack quantized indices into u32 words (3 bits = 10 indices per u32)
 
-2. **QJL** (Stage 2):
+2. **QJL** (Stage 2) — keys only:
    - Compute the quantization residual: `r = rotated - dequantized`
    - Compute residual L2 norm (stored for asymmetric attention correction)
    - Project residual through JL matrix S: `sign(S · r)` → 1 bit per coordinate
    - Store these sign bits alongside the packed indices
 
-**Decode** only reverses Stage 1 (unpack → centroid lookup → inverse rotation → rescale by norm). Stage 2's sign bits are NOT applied during reconstruction — they're used in the attention kernel instead.
+**TurboQuant+ improvements** (from [TheTom/turboquant_plus](https://github.com/TheTom/turboquant_plus)):
 
-**Why this works**: Random rotation makes coordinates near-independent. The Lloyd-Max quantizer is optimal for the resulting Gaussian distribution. No per-block scales or zero-points needed — the rotation IS the normalization.
+- **Asymmetric K/V**: Keys at 3-bit, values at 2-bit. "V compression is free" — zero measurable attention quality impact when key precision is maintained. QJL correction is only computed for keys; values skip Stage 2 entirely (saves compute + storage).
+- **Boundary layer protection**: First/last 2 layers stay at full precision. These layers are disproportionately sensitive — protecting them recovers 37-91% of the quality gap with minimal VRAM cost.
+- **Walsh-Hadamard rotation**: Replaces the random orthogonal matrix with a deterministic WHT. Same decorrelation properties, O(n log n) instead of O(n²), no matrix storage needed (WHT is computed in-place).
 
-**Memory savings**: 3-bit = 10.67x compression. For Qwen3.5-9B's 8 full attention layers with 256-dim heads: KV cache drops from ~400 MB to ~38 MB at 2K context.
+**Decode** only reverses Stage 1 (unpack → centroid lookup → inverse WHT → rescale by norm). Stage 2's sign bits are NOT applied during reconstruction — they're used in the attention kernel instead.
+
+**Why this works**: WHT rotation makes coordinates near-independent. The Lloyd-Max quantizer is optimal for the resulting Gaussian distribution. No per-block scales or zero-points needed — the rotation IS the normalization.
+
+**Memory savings**: Asymmetric K3/V2 with boundary protection gives ~1.7x overall compression across all layers. For Qwen3.5-9B at 4K context: KV cache drops from ~256 MB to ~154 MB. Per-token per-head: 512 bytes (FP16) → 278 bytes (TurboQuant+).
+
+**PyTorch implementation**: `core/turboquant_cache.py` — A `TurboQuantCache` class compatible with transformers' `generate()` pipeline. Same algorithm as the WGSL shaders, running on CUDA via PyTorch. Toggleable via GUI checkbox or `/turboquant on` in CLI.
 
 ### Kernel 7: Asymmetric Attention (`attention_tq.wgsl`)
 
