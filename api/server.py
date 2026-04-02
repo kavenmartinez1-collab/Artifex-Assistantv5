@@ -28,6 +28,7 @@ from core.config import (
 )
 from core.engine_factory import create_engine
 from core.inference import strip_think_blocks, ThinkFilter
+from core.model_queue import get_model_queue
 from core.health import run_health_check, format_health_report
 from core.logging_config import get_logger
 from api.web_tools import (
@@ -536,6 +537,13 @@ def create_app():
         report["backend"] = get_active_backend()
         return report
 
+    @app.get("/v1/queue")
+    async def queue_status(request: Request):
+        """Model queue status — shows current model, pending requests, switch count."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        return get_model_queue().stats
+
     # ─── Models ───────────────────────────────────────────────────────────
 
     @app.get("/v1/models")
@@ -574,31 +582,51 @@ def create_app():
 
         # ── Streaming path (both backends) ────────────────────────────
         if stream:
-            # Concurrency gate
-            if _inference_busy.is_set():
+            # For Ollama: use model queue to serialize and handle model switching.
+            # For transformers: use simple concurrency gate (single model).
+            if backend != "ollama" and _inference_busy.is_set():
                 return JSONResponse(
                     status_code=503,
                     content={"error": "GPU busy — retry later"},
                     headers={"Retry-After": "30"},
                 )
 
-            _inference_busy.set()
+            if backend != "ollama":
+                _inference_busy.set()
 
             async def guarded_stream():
-                """Wrap streaming generator with inference lock."""
+                """Wrap streaming generator with inference lock / model queue."""
                 try:
                     if backend == "ollama":
-                        _get_engine()  # Verify Ollama is reachable
-                    async for chunk in _stream_with_tools(
-                        messages, model, max_tokens or 4096, temperature,
-                        body.options, use_web_tools, backend,
-                    ):
-                        yield chunk
+                        # Model queue handles serialization + model switching
+                        mq = get_model_queue()
+                        async with mq._lock:
+                            # Switch model if needed
+                            if mq._current_model and model != mq._current_model:
+                                _log.info("Queue: switching %s → %s", mq._current_model, model)
+                                await mq._unload_model(mq._current_model)
+                                mq._stats["model_switches"] += 1
+                            mq._current_model = model
+                            mq._stats["total_requests"] += 1
+
+                            _get_engine()  # Verify Ollama is reachable
+                            async for chunk in _stream_with_tools(
+                                messages, model, max_tokens or 4096, temperature,
+                                body.options, use_web_tools, backend,
+                            ):
+                                yield chunk
+                    else:
+                        async for chunk in _stream_with_tools(
+                            messages, model, max_tokens or 4096, temperature,
+                            body.options, use_web_tools, backend,
+                        ):
+                            yield chunk
                 except Exception as e:
                     _log.error("Streaming error: %s", e)
                     yield f"data: {json.dumps({'error': str(e)})}\n\n"
                 finally:
-                    _inference_busy.clear()
+                    if backend != "ollama":
+                        _inference_busy.clear()
 
             return StreamingResponse(
                 guarded_stream(),
