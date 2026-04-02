@@ -98,31 +98,17 @@ fn decode(@builtin(local_invocation_id) lid: vec3u,
   }
   workgroupBarrier();
 
-  // ── Step 3: Inverse WHT + rescale by norm ───────────────────────────
-  // WHT is self-inverse (unitary): WHT(WHT(x)) = x when normalized.
-  // In-place butterfly on reconstructed[], then rescale by norm.
-  var h = 1u;
-  while (h < d) {
-    i = tid;
-    while (i < d / 2u) {
-      let block = i / h;
-      let offset = i % h;
-      let i1 = block * 2u * h + offset;
-      let i2 = i1 + h;
-      let a = reconstructed[i1];
-      let b = reconstructed[i2];
-      reconstructed[i1] = a + b;
-      reconstructed[i2] = a - b;
-      i = i + 256u;
-    }
-    workgroupBarrier();
-    h = h * 2u;
-  }
-
-  // Normalize and rescale by original vector norm
+  // ── Step 3: Inverse Hadamard rotation + rescale by norm ─────────────
+  // H is symmetric and unitary: H^T = H, so inverse rotation = same matmul.
+  // output = norm * H · reconstructed
   i = tid;
   while (i < d) {
-    output[vec_idx * d + i] = reconstructed[i] * inv_sqrt_d * norm;
+    var sum: f32 = 0.0;
+    for (var j = 0u; j < d; j = j + 1u) {
+      sum += rotation_matrix[j * d + i] * reconstructed[j];
+    }
+    output[vec_idx * d + i] = sum * norm;
+
     i = i + 256u;
   }
 }
