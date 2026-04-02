@@ -815,24 +815,58 @@ class TransformersEngine(BaseEngine):
             if isinstance(pad_id, list):
                 pad_id = pad_id[0]
 
-        # KV cache strategy: TurboQuant > quanto > none
+        # KV cache strategy: TurboQuant+ wraps native > quanto > none
         past_kv = None
         gpu = self._detect_gpu_tier()
-        if get_turboquant_kv():
+        _use_turboquant = get_turboquant_kv()
+        if _use_turboquant:
             try:
-                from core.turboquant_cache import TurboQuantCache
+                from core.turboquant_cache import wrap_cache_with_turboquant
+                # Create the model's native cache first (handles SSM state etc.)
+                native_cache = None
+                cache_cls = getattr(model, '_get_cache', None)
+                if cache_cls:
+                    native_cache = cache_cls()
+                if native_cache is None:
+                    # Let the model create it via its forward() default
+                    for cls_name in dir(type(model)):
+                        obj = getattr(type(model), cls_name, None)
+                        if isinstance(obj, type) and 'Cache' in cls_name:
+                            try:
+                                native_cache = obj(config=model.config)
+                                break
+                            except Exception:
+                                continue
+                if native_cache is None:
+                    # Fallback: look in the model's module for its DynamicCache variant
+                    model_module = type(model).__module__
+                    import importlib
+                    mod = importlib.import_module(model_module)
+                    for name in dir(mod):
+                        if 'DynamicCache' in name and name != 'DynamicCache':
+                            cls = getattr(mod, name)
+                            if isinstance(cls, type):
+                                try:
+                                    native_cache = cls(config=model.config)
+                                    break
+                                except Exception:
+                                    continue
+                if native_cache is None:
+                    from transformers.cache_utils import DynamicCache
+                    native_cache = DynamicCache()
+
                 num_layers = getattr(model.config, "num_hidden_layers", None)
-                past_kv = TurboQuantCache(
-                    key_bits=3, value_bits=2, residual_length=128,
-                    boundary_layers=2, num_layers=num_layers,
+                past_kv = wrap_cache_with_turboquant(
+                    native_cache, num_layers=num_layers,
+                    key_bits=3, value_bits=2, residual_length=128, boundary_layers=2,
                 )
                 logging.getLogger(__name__).info(
-                    "Using TurboQuant+ KV cache (K=3-bit, V=2-bit, boundary=2, ~2.3x compression)"
+                    "Using TurboQuant+ KV cache wrapping %s (K=3-bit, V=2-bit, boundary=2)",
+                    type(native_cache).__name__,
                 )
             except Exception as e:
                 logging.getLogger(__name__).warning("TurboQuant KV cache failed: %s", e)
         if past_kv is None and gpu["tier"] == "TIGHT":
-            # Fallback: quanto cache on constrained cards
             try:
                 from transformers.cache_utils import QuantizedCache
                 past_kv = QuantizedCache(
