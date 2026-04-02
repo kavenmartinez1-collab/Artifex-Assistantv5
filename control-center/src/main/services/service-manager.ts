@@ -144,9 +144,10 @@ export class ServiceManager {
 
       const child = spawn(def.command, def.args, {
         cwd: def.cwd,
-        shell: true,
+        shell: false,
         env: { ...process.env },
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       });
 
       mp.process = child;
