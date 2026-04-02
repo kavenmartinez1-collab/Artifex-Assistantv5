@@ -12,22 +12,26 @@
 #
 # ─────────────────────────────────────────────────────────────────────
 
-# ── Model loading / quantization ────────────────────────────────────
-# transformers 5.2.0: first stable release with full Qwen3.5 support
-#   (architecture merged 2026-02-09 in PR #43830)
-# bitsandbytes 0.49.1: NF4 + double-quant, CUDA 11.8-13.0 compat
-# accelerate 1.12.0: device_map placement, memory budgeting
+# ── Model loading / quantization (GPU-specific pins) ──────────────────
 transformers==5.2.0
 bitsandbytes==0.49.1
 accelerate==1.12.0
-numpy>=1.26.0,<3.0.0
-huggingface-hub>=1.3.0,<2.0.0
+numpy==2.3.5
+huggingface-hub==1.7.2
+tiktoken==0.12.0
+safetensors==0.7.0
 
-# ── Application dependencies ────────────────────────────────────────
+# ── Application ──────────────────────────────────────────────────────
 colorama==0.4.6
-duckduckgo-search>=7.0.0,<9.0.0
-pypdf>=4.0.0,<6.0.0
-lxml>=5.2.1,<6.0.0
-psutil>=5.9.0,<7.0.0
-FreeSimpleGUI>=5.0.0,<6.0.0
-pyperclip>=1.9.0,<2.0.0
+duckduckgo-search==8.1.1
+pypdf==6.9.1
+lxml==6.0.2
+psutil==7.2.2
+FreeSimpleGUI==5.2.0.post1
+pyperclip==1.11.0
+
+# ── API server / Web gateway ─────────────────────────────────────────
+fastapi==0.135.1
+uvicorn==0.42.0
+httpx==0.28.1
+slowapi==0.1.9

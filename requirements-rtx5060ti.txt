@@ -1,33 +1,37 @@
 # ─────────────────────────────────────────────────────────────────────
-#  Artifex Assistant V5 — Dependencies for RTX 5060 Ti (8 GB VRAM)
+#  Artifex Assistant V5 — Pinned deps for RTX 5060 Ti (8 GB VRAM)
 # ─────────────────────────────────────────────────────────────────────
 #
 #  GPU:   NVIDIA RTX 5060 Ti 8 GB (Blackwell, sm_120)
-#  CUDA:  12.8+ (bundled with PyTorch — no separate CUDA toolkit needed)
+#  CUDA:  12.8+ (bundled with PyTorch)
 #  Python: 3.11+
 #
-#  IMPORTANT: Install torch from the CUDA 12.8 index FIRST:
+#  Install torch from CUDA 12.8 index FIRST:
 #    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-#  Then install the rest:
+#  Then:
 #    pip install -r requirements-rtx5060ti.txt
-#
-#  Note: 8 GB VRAM requires aggressive quantization and VRAM-aware layer control.
 # ─────────────────────────────────────────────────────────────────────
 
-torch>=2.10.0
-torchvision>=0.25.0
-torchaudio>=2.10.0
-transformers>=5.2.0
-bitsandbytes>=0.49.0
-accelerate>=1.6.0,<1.7.0
-numpy>=1.26.0
-tiktoken>=0.12.0
-protobuf>=7.0.0
-colorama>=0.4.6
-FreeSimpleGUI>=5.0.0
-huggingface-hub>=0.20.0
-duckduckgo-search>=7.0.0
-pypdf>=4.0.0
-lxml>=5.2.1
-pyperclip>=1.8.0
-psutil>=6.1.0
+# ── Core AI (pinned — no auto-updates) ────────────────────────────────
+transformers==5.3.0
+bitsandbytes==0.49.2
+accelerate==1.6.0
+numpy==2.3.5
+safetensors==0.7.0
+huggingface-hub==1.7.2
+tiktoken==0.12.0
+
+# ── Application ──────────────────────────────────────────────────────
+colorama==0.4.6
+FreeSimpleGUI==5.2.0.post1
+pyperclip==1.11.0
+psutil==7.2.2
+duckduckgo-search==8.1.1
+pypdf==6.9.1
+lxml==6.0.2
+
+# ── API server / Web gateway ─────────────────────────────────────────
+fastapi==0.135.1
+uvicorn==0.42.0
+httpx==0.28.1
+slowapi==0.1.9
