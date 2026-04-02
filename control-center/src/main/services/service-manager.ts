@@ -107,20 +107,17 @@ export class ServiceManager {
 
     const def = mp.definition;
 
-    // Build args: base args + config overrides
+    // Build args: base args + all configured options (defaults included).
+    // Options are always passed so the service gets the full config —
+    // not just overrides. Empty strings are skipped.
     let args = [...def.args];
     const extraEnv: Record<string, string> = {};
-    if (configOverrides && def.options) {
+    if (def.options) {
       for (const opt of def.options) {
-        const val = configOverrides[opt.key];
-        if (val !== undefined && val !== '' && val !== opt.default) {
-          // Special case: --port also updates the adoption check
-          if (opt.key === '--port') {
-            args.push(opt.key, val);
-          } else {
-            args.push(opt.key, val);
-          }
-          // Set env var if configured
+        // Use override if provided, otherwise use default
+        const val = configOverrides?.[opt.key] ?? opt.default;
+        if (val !== undefined && val !== '') {
+          args.push(opt.key, val);
           if (opt.envVar) {
             extraEnv[opt.envVar] = val;
           }
