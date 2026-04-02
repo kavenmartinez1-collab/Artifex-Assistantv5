@@ -28,9 +28,10 @@ MAX_TOOL_ROUNDS = 10
 
 # ── Tool-call regex patterns ─────────────────────────────────────────────────
 
-# Match @search("query") with regular or smart quotes
+# Match @search("query") with regular, smart, or NO quotes
+# Models sometimes omit quotes: @search(some query here)
 _SEARCH_PATTERN = re.compile(
-    r'@search\(\s*["\u201c\u201d]([^"\u201c\u201d]+)["\u201c\u201d]\s*\)'
+    r'@search\(\s*["\u201c\u201d]?([^"\u201c\u201d)]+?)["\u201c\u201d]?\s*\)'
 )
 # Match @web_read(N) or @web_read("url") with regular or smart quotes
 _WEB_READ_PATTERN = re.compile(
