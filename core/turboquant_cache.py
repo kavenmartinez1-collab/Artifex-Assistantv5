@@ -352,8 +352,10 @@ class TurboQuantCache(Cache):
         k_codec = self._get_k_codec(head_dim, device)
         v_codec = self._get_v_codec(head_dim, device)
 
-        k_decoded = k_codec.decode(compressed["keys"]).reshape(batch, heads, comp_len, head_dim)
-        v_decoded = v_codec.decode(compressed["values"]).reshape(batch, heads, comp_len, head_dim)
+        # Decode and cast to match the model's compute dtype (e.g. BF16)
+        target_dtype = key_states.dtype
+        k_decoded = k_codec.decode(compressed["keys"]).reshape(batch, heads, comp_len, head_dim).to(target_dtype)
+        v_decoded = v_codec.decode(compressed["values"]).reshape(batch, heads, comp_len, head_dim).to(target_dtype)
 
         full_k = torch.cat([k_decoded, key_states], dim=2)
         full_v = torch.cat([v_decoded, value_states], dim=2)
