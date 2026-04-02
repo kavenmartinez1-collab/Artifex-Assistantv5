@@ -527,6 +527,36 @@ python main_api.py --backend ollama --gateway http://localhost:8080
 
 Now when the model uses `@search("query")` or `@web_read(url)`, requests are routed through the gateway. If Docker isn't running, the CLI falls back to direct DuckDuckGo search automatically. The API server requires the gateway for web tools (`web_tools: true` in requests).
 
+### Important: Docker vs Local Gateway (Port 8080 Conflict)
+
+There are **two** web gateways — a Docker container and a local Python script. **Do not run both.** They compete for port 8080 and the local one can't reach Docker's SearXNG.
+
+| Mode | How to start | SearXNG access | Notes |
+|------|-------------|----------------|-------|
+| **Docker (recommended)** | `docker compose up` | Works (Docker internal network) | Gateway + SearXNG both in containers |
+| **Local (no Docker)** | Control Center → start "Web Gateway" | Needs `SEARXNG_URL` configured | Only for setups without Docker |
+
+**Order of operations:**
+
+```
+Docker mode:
+  1. docker compose up          ← starts SearXNG + web gateway on port 8080
+  2. Start API server           ← with --gateway http://localhost:8080
+  3. Do NOT start "Web Gateway (local)" from the Control Center
+
+Local mode (no Docker):
+  1. Start SearXNG separately   ← or skip (no web search)
+  2. Start "Web Gateway (local)" from Control Center
+  3. Start API server           ← with --gateway http://localhost:8080
+```
+
+**Diagnosis if search tools fail:**
+```bash
+curl http://localhost:8080/health
+# If "searxng": "unreachable" → the local gateway is running instead of Docker's
+# Fix: stop the local gateway, ensure docker compose is running
+```
+
 ### Safety Features
 
 | Feature | Description |

@@ -102,7 +102,7 @@ export const SERVICE_DEFINITIONS: ServiceDefinition[] = [
   },
   {
     id: 'web-gateway',
-    name: 'Web Gateway',
+    name: 'Web Gateway (local)',
     command: path.join(PROJECT_ROOT, 'venv', 'Scripts', 'python.exe'),
     args: [path.join('web-gateway', 'main.py')],
     cwd: PROJECT_ROOT,
@@ -113,6 +113,15 @@ export const SERVICE_DEFINITIONS: ServiceDefinition[] = [
     options: [
       { key: '--port', label: 'Port', type: 'number', default: '8080' },
     ],
+    // NOTE: Do NOT start this if Docker is running the web-gateway container.
+    // Docker's web-gateway has access to SearXNG on the internal network.
+    // The local gateway cannot reach Docker's SearXNG (http://searxng:8080
+    // is a Docker-internal hostname). If both compete for port 8080, the
+    // local gateway wins but search tools fail.
+    //
+    // Order of operations:
+    //   Docker mode:  docker compose up → port 8080 handled → don't start local
+    //   Local mode:   start local gateway → needs SEARXNG_URL configured
   },
   // ── AI Services ──
   {
