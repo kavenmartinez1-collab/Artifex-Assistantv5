@@ -1,12 +1,15 @@
-// TurboQuant Encode — KV Cache Compression (Google, ICLR 2026)
+// TurboQuant+ Encode — KV Cache Compression
 //
-// Takes f32 KV vectors, compresses to (bits-1) + 1 bits per coordinate:
+// Based on Google's TurboQuant (ICLR 2026) with TurboQuant+ improvements:
+//   - Walsh-Hadamard Transform replaces random orthogonal rotation (O(d log d) vs O(d²))
+//   - Asymmetric K/V support (caller controls bit width per dispatch)
+//
+// Pipeline:
 //   Stage 0: Compute L2 norm, normalize to unit vector
-//   Stage 1 (PolarQuant): rotate → scalar quantize → pack indices
+//   Stage 1 (PolarQuant): WHT rotate → scalar quantize → pack indices
 //   Stage 2 (QJL):        compute residual → JL project → sign bits
 //
-// One workgroup processes one vector (one row of the KV cache).
-// Workgroup size = 256 threads, each thread handles ceil(d/256) coordinates.
+// One workgroup processes one vector. Workgroup size = 256 threads.
 
 struct Params {
   head_dim: u32,      // d (typically 64 or 128)
@@ -92,18 +95,43 @@ fn encode(@builtin(local_invocation_id) lid: vec3u,
     output_norms[out_idx] = norm;
   }
 
-  // ── Stage 1a: Rotate normalized vector ──────────────────────────────
-  // rotated[i] = sum_j(Pi[i,j] * (input[j] / norm))
+  // ── Stage 1a: Walsh-Hadamard rotation (O(d log d)) ─────────────────
+  // WHT decorrelates coordinates the same as random orthogonal rotation
+  // but computes in-place with butterfly pattern instead of O(d²) matmul.
   let sqrt_d = sqrt(f32(d));
   let inv_sqrt_d = 1.0 / sqrt_d;
 
+  // Load normalized input into shared memory
   i = tid;
   while (i < d) {
-    var sum: f32 = 0.0;
-    for (var j = 0u; j < d; j = j + 1u) {
-      sum += rotation_matrix[i * d + j] * input[vec_idx * d + j] * inv_norm;
+    rotated[i] = input[vec_idx * d + i] * inv_norm;
+    i = i + 256u;
+  }
+  workgroupBarrier();
+
+  // In-place WHT butterfly
+  var h = 1u;
+  while (h < d) {
+    i = tid;
+    while (i < d / 2u) {
+      let block = i / h;
+      let offset = i % h;
+      let i1 = block * 2u * h + offset;
+      let i2 = i1 + h;
+      let a = rotated[i1];
+      let b = rotated[i2];
+      rotated[i1] = a + b;
+      rotated[i2] = a - b;
+      i = i + 256u;
     }
-    rotated[i] = sum;
+    workgroupBarrier();
+    h = h * 2u;
+  }
+
+  // Normalize WHT output
+  i = tid;
+  while (i < d) {
+    rotated[i] = rotated[i] * inv_sqrt_d;
     i = i + 256u;
   }
   workgroupBarrier();

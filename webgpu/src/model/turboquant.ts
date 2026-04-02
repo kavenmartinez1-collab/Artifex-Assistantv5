@@ -1,17 +1,19 @@
 /**
- * TurboQuant — KV Cache Compression for WebGPU Inference
+ * TurboQuant+ — KV Cache Compression for WebGPU Inference
  *
- * Implements Google's TurboQuant (ICLR 2026, arXiv:2504.19874) for
- * compressing attention Key/Value cache vectors at 3-4 bits per channel
- * with near-zero quality loss.
+ * Implements Google's TurboQuant (ICLR 2026, arXiv:2504.19874) with
+ * improvements from TurboQuant+ (TheTom/turboquant_plus):
  *
  * Two-stage algorithm:
- *   Stage 1 (PolarQuant): Random rotation → optimal scalar quantization
+ *   Stage 1 (PolarQuant): WHT rotation → optimal scalar quantization
  *   Stage 2 (QJL):        1-bit residual correction for unbiased inner products
  *
- * All heavy computation runs on the GPU via WGSL kernels.
- * This module handles the one-time setup: rotation matrix, codebook,
- * JL sign matrix, and GPU buffer uploads.
+ * TurboQuant+ improvements:
+ *   - Walsh-Hadamard rotation: O(d log d) vs O(d²), deterministic, no matrix storage
+ *   - Asymmetric K/V: keys at kBits, values at vBits ("V compression is free")
+ *   - Boundary layer protection: first/last N layers stay full precision
+ *
+ * Acknowledgement: TurboQuant+ findings from github.com/TheTom/turboquant_plus
  */
 
 // ── Lloyd-Max Optimal Codebook ─────────────────────────────────────────────
@@ -167,23 +169,80 @@ function qrOrthogonal(A: Float32Array, d: number): Float32Array {
 }
 
 /**
- * Generate a d×d random orthogonal matrix (the rotation matrix Pi).
- * Uses QR decomposition of a Gaussian random matrix.
- *
- * @param d   - Head dimension (e.g., 64 or 128)
- * @param seed - Deterministic seed (must match between encode and decode)
- * @returns Column-major d×d Float32Array
+ * Generate a d×d random orthogonal matrix (legacy — replaced by Hadamard).
+ * Kept for backwards compatibility and testing.
  */
 export function generateRotationMatrix(d: number, seed = 42): Float32Array {
   const rng = createRNG(seed);
   const A = new Float32Array(d * d);
-
-  // Fill with iid N(0,1) entries
   for (let i = 0; i < d * d; i++) {
     A[i] = gaussianRandom(rng);
   }
-
   return qrOrthogonal(A, d);
+}
+
+/**
+ * Generate the d×d normalized Hadamard matrix (column-major).
+ * Replaces random orthogonal rotation — same decorrelation properties,
+ * O(d log d) when applied as WHT, deterministic, no seed needed.
+ *
+ * H_1 = [1], H_2n = [[H_n, H_n], [H_n, -H_n]] (recursive construction)
+ * Normalized by 1/sqrt(d) so H·H^T = I.
+ */
+export function generateHadamardMatrix(d: number): Float32Array {
+  // d must be power of 2
+  const H = new Float32Array(d * d);
+  H[0] = 1.0;
+
+  let size = 1;
+  while (size < d) {
+    // Double the matrix: [[H, H], [H, -H]]
+    for (let i = size - 1; i >= 0; i--) {
+      for (let j = size - 1; j >= 0; j--) {
+        const val = H[i * size + j];
+        // Top-left
+        H[i * (2 * size) + j] = val;
+        // Top-right
+        H[i * (2 * size) + (j + size)] = val;
+        // Bottom-left
+        H[(i + size) * (2 * size) + j] = val;
+        // Bottom-right
+        H[(i + size) * (2 * size) + (j + size)] = -val;
+      }
+    }
+    size *= 2;
+  }
+
+  // Normalize
+  const scale = 1.0 / Math.sqrt(d);
+  for (let i = 0; i < d * d; i++) {
+    H[i] *= scale;
+  }
+
+  return H;
+}
+
+/**
+ * CPU-side Fast Walsh-Hadamard Transform (in-place, O(d log d)).
+ * WHT is self-inverse when normalized: WHT(WHT(x)) = x.
+ */
+export function cpuWHT(x: Float32Array, d: number): Float32Array {
+  const out = new Float32Array(x);
+  let h = 1;
+  while (h < d) {
+    for (let i = 0; i < d; i += 2 * h) {
+      for (let j = i; j < i + h; j++) {
+        const a = out[j];
+        const b = out[j + h];
+        out[j] = a + b;
+        out[j + h] = a - b;
+      }
+    }
+    h *= 2;
+  }
+  const scale = 1.0 / Math.sqrt(d);
+  for (let i = 0; i < d; i++) out[i] *= scale;
+  return out;
 }
 
 
@@ -215,15 +274,15 @@ export function generateJLMatrix(d: number, seed = 137): Float32Array {
 }
 
 
-// ── Precomputed S·Π Matrix ─────────────────────────────────────────────────
+// ── Precomputed S·H Matrix ─────────────────────────────────────────────────
 //
-// For the asymmetric attention kernel, we need S·Π·q for each query vector.
-// Precomputing M = S·Π once at initialization saves a d×d matmul per query.
-// Both S and Π are stored row-major, so M[i][j] = Σ_k S[i][k] * Π[k][j].
+// For the asymmetric attention kernel, we need S·WHT(q) for each query.
+// Precomputing M = S·H once saves a d×d matmul per query.
+// H is the normalized Hadamard matrix (replaces random orthogonal Π).
 
 /**
- * Compute M = S · Π (row-major d×d).
- * Used in the asymmetric attention kernel: sq = M · q = S · Π · q
+ * Compute M = S · H (row-major d×d).
+ * Used in the asymmetric attention kernel: sq = M · q = S · H · q
  */
 export function generateSPiMatrix(
   jlMatrix: Float32Array,
@@ -260,19 +319,36 @@ export interface TurboQuantBuffers {
   params: GPUBuffer;
   /** Head dimension */
   headDim: number;
-  /** Bits per coordinate */
-  bits: number;
+  /** Bits per coordinate for keys */
+  kBits: number;
+  /** Bits per coordinate for values */
+  vBits: number;
+  /** Key codebook buffers (centroids + thresholds at kBits) */
+  kCentroids: GPUBuffer;
+  kThresholds: GPUBuffer;
+  /** Value codebook buffers (centroids + thresholds at vBits) */
+  vCentroids: GPUBuffer;
+  vThresholds: GPUBuffer;
+  /** Boundary layer protection config */
+  boundaryLayers: number;
+  numLayers: number;
 }
 
 export interface TurboQuantConfig {
   /** Attention head dimension (typically 64 or 128) */
   headDim: number;
-  /** Bits per coordinate for PolarQuant stage (1-4, recommend 3) */
-  bits: number;
-  /** Seed for rotation matrix */
-  rotationSeed?: number;
+  /** Bits per coordinate for keys (1-4, default 3) */
+  kBits?: number;
+  /** Bits per coordinate for values (1-4, default 2 — "V compression is free") */
+  vBits?: number;
+  /** Legacy single bits field (used if kBits/vBits not set) */
+  bits?: number;
   /** Seed for JL matrix */
   jlSeed?: number;
+  /** Number of first/last layers to protect at full precision (default 2) */
+  boundaryLayers?: number;
+  /** Total model layers (needed for last-N boundary detection) */
+  numLayers?: number;
 }
 
 /**
@@ -284,78 +360,59 @@ export function initTurboQuant(
   device: GPUDevice,
   config: TurboQuantConfig,
 ): TurboQuantBuffers {
-  const { headDim: d, bits, rotationSeed = 42, jlSeed = 137 } = config;
+  const d = config.headDim;
+  const kBits = config.kBits ?? config.bits ?? 3;
+  const vBits = config.vBits ?? config.bits ?? 2;
+  const jlSeed = config.jlSeed ?? 137;
+  const boundaryLayers = config.boundaryLayers ?? 2;
+  const numLayers = config.numLayers ?? 32;
 
-  // Generate CPU-side data
-  const rotMatrix = generateRotationMatrix(d, rotationSeed);
+  // Generate CPU-side data — Hadamard replaces random orthogonal
+  const hadamardMatrix = generateHadamardMatrix(d);
   const jlMatrix = generateJLMatrix(d, jlSeed);
-  const spiMatrix = generateSPiMatrix(jlMatrix, rotMatrix, d);
-  const codebook = buildCodebook(bits);
+  const spiMatrix = generateSPiMatrix(jlMatrix, hadamardMatrix, d);
+  const kCodebook = buildCodebook(kBits);
+  const vCodebook = buildCodebook(vBits);
 
-  // Upload rotation matrix (d×d × 4 bytes)
-  const rotBuf = device.createBuffer({
-    size: d * d * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    label: 'turboquant-rotation',
-    mappedAtCreation: true,
-  });
-  new Float32Array(rotBuf.getMappedRange()).set(rotMatrix);
-  rotBuf.unmap();
-
-  // Upload JL matrix
-  const jlBuf = device.createBuffer({
-    size: d * d * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    label: 'turboquant-jl',
-    mappedAtCreation: true,
-  });
-  new Float32Array(jlBuf.getMappedRange()).set(jlMatrix);
-  jlBuf.unmap();
-
-  // Upload S·Π matrix (for asymmetric attention kernel)
-  const spiBuf = device.createBuffer({
-    size: d * d * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    label: 'turboquant-spi',
-    mappedAtCreation: true,
-  });
-  new Float32Array(spiBuf.getMappedRange()).set(spiMatrix);
-  spiBuf.unmap();
-
-  // Upload centroids — pad to minimum 16 bytes for WebGPU alignment
-  const centroidData = codebook.centroids;
-  const centBuf = device.createBuffer({
-    size: Math.max(centroidData.byteLength, 16),
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    label: 'turboquant-centroids',
-    mappedAtCreation: true,
-  });
-  new Float32Array(centBuf.getMappedRange(0, centroidData.byteLength)).set(centroidData);
-  centBuf.unmap();
-
-  // Upload thresholds — pad to minimum 16 bytes
-  // For b=1, thresholds is empty — still need a valid buffer
-  const threshData = codebook.thresholds;
-  const threshSize = Math.max(threshData.byteLength, 16);
-  const threshBuf = device.createBuffer({
-    size: threshSize,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    label: 'turboquant-thresholds',
-    mappedAtCreation: true,
-  });
-  if (threshData.byteLength > 0) {
-    new Float32Array(threshBuf.getMappedRange(0, threshData.byteLength)).set(threshData);
+  // Helper: create and upload a GPU storage buffer
+  function uploadStorage(data: Float32Array | Uint32Array, label: string): GPUBuffer {
+    const size = Math.max(data.byteLength, 16);
+    const buf = device.createBuffer({
+      size,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      label,
+      mappedAtCreation: true,
+    });
+    if (data.byteLength > 0) {
+      if (data instanceof Float32Array) {
+        new Float32Array(buf.getMappedRange(0, data.byteLength)).set(data);
+      } else {
+        new Uint32Array(buf.getMappedRange(0, data.byteLength)).set(data);
+      }
+    }
+    buf.unmap();
+    return buf;
   }
-  threshBuf.unmap();
 
-  // Params uniform: [headDim, bits, numCentroids, numThresholds, out_vec_offset]
-  // 5 fields to match the encode shader's Params struct (out_vec_offset defaults to 0)
+  // Upload Hadamard matrix as "rotation" buffer (still needed for bind group layout;
+  // encode/decode shaders use in-place WHT but attention kernel uses S·H via spiMatrix)
+  const rotBuf = uploadStorage(hadamardMatrix, 'turboquant-hadamard');
+  const jlBuf = uploadStorage(jlMatrix, 'turboquant-jl');
+  const spiBuf = uploadStorage(spiMatrix, 'turboquant-spi');
+
+  // Asymmetric codebook buffers — separate for K and V
+  const kCentBuf = uploadStorage(kCodebook.centroids, 'turboquant-k-centroids');
+  const kThreshBuf = uploadStorage(kCodebook.thresholds, 'turboquant-k-thresholds');
+  const vCentBuf = uploadStorage(vCodebook.centroids, 'turboquant-v-centroids');
+  const vThreshBuf = uploadStorage(vCodebook.thresholds, 'turboquant-v-thresholds');
+
+  // Default params uses key bits (overridden per-dispatch for K vs V)
   const paramsData = new Uint32Array([
     d,
-    bits,
-    centroidData.length,
-    threshData.length,
-    0, // out_vec_offset — default 0, overridden per-dispatch in forward pass
+    kBits,
+    kCodebook.centroids.length,
+    kCodebook.thresholds.length,
+    0, // out_vec_offset
   ]);
   const paramsBuf = device.createBuffer({
     size: Math.max(paramsData.byteLength, 16),
@@ -370,11 +427,18 @@ export function initTurboQuant(
     rotationMatrix: rotBuf,
     jlMatrix: jlBuf,
     spiMatrix: spiBuf,
-    centroids: centBuf,
-    thresholds: threshBuf,
+    centroids: kCentBuf,    // default to key codebook for legacy compat
+    thresholds: kThreshBuf,
     params: paramsBuf,
     headDim: d,
-    bits,
+    kBits,
+    vBits,
+    kCentroids: kCentBuf,
+    kThresholds: kThreshBuf,
+    vCentroids: vCentBuf,
+    vThresholds: vThreshBuf,
+    boundaryLayers,
+    numLayers,
   };
 }
 
@@ -387,7 +451,7 @@ export function initTurboQuant(
  */
 export function cpuEncode(
   vector: Float32Array,
-  rotMatrix: Float32Array,
+  rotMatrix: Float32Array,   // unused with WHT — kept for API compat
   jlMatrix: Float32Array,
   codebook: TurboQuantCodebook,
   d: number,
@@ -401,15 +465,10 @@ export function cpuEncode(
   const norm = Math.sqrt(normSq);
   const invNorm = norm > 1e-8 ? 1.0 / norm : 0;
 
-  // Stage 1a: Rotate normalized vector — y = Pi · (x / ||x||)
-  const rotated = new Float32Array(d);
-  for (let i = 0; i < d; i++) {
-    let sum = 0;
-    for (let j = 0; j < d; j++) {
-      sum += rotMatrix[i * d + j] * vector[j] * invNorm;
-    }
-    rotated[i] = sum;
-  }
+  // Stage 1a: WHT rotation (replaces random orthogonal matrix multiply)
+  const normalized = new Float32Array(d);
+  for (let i = 0; i < d; i++) normalized[i] = vector[i] * invNorm;
+  const rotated = cpuWHT(normalized, d);
 
   // Stage 1b: Scalar quantize each coordinate
   // Normalize to unit-normal scale for codebook lookup
@@ -532,14 +591,11 @@ export function cpuDecode(
     reconstructedRotated[i] = dequantized[i] + correction[i];
   }
 
-  // Inverse rotation: x_hat = Pi^T · y, then rescale by norm
+  // Inverse WHT (self-inverse) + rescale by norm
+  const invRotated = cpuWHT(reconstructedRotated, d);
   const output = new Float32Array(d);
   for (let i = 0; i < d; i++) {
-    let sum = 0;
-    for (let j = 0; j < d; j++) {
-      sum += rotMatrix[j * d + i] * reconstructedRotated[j];
-    }
-    output[i] = sum * norm;
+    output[i] = invRotated[i] * norm;
   }
 
   return output;
@@ -580,7 +636,7 @@ export function computeRelativeMSE(original: Float32Array, reconstructed: Float3
  * @param signBits    - QJL sign bits from cpuEncode
  * @param norm        - Original key vector norm (from cpuEncode)
  * @param residualNorm - Quantization residual norm (from cpuEncode)
- * @param spiMatrix   - Precomputed S·Π matrix (from generateSPiMatrix)
+ * @param spiMatrix   - Precomputed S·H matrix (from generateSPiMatrix)
  * @param d           - Head dimension
  * @returns Estimated <q, k> inner product
  */

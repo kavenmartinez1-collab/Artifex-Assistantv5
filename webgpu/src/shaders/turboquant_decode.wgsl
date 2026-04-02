@@ -1,11 +1,10 @@
-// TurboQuant Decode — KV Cache Decompression (Google, ICLR 2026)
+// TurboQuant+ Decode — KV Cache Decompression
 //
-// Reverses the TurboQuant encode:
+// Reverses the TurboQuant+ encode:
 //   1. Unpack quantized indices → look up centroids → dequantized vector
-//   2. Unpack sign bits → inverse JL transform → correction vector
-//   3. Add: reconstructed_rotated = dequantized + correction
-//   4. Inverse rotation: x_hat = Pi^T · reconstructed_rotated
-//   5. Rescale by stored norm
+//   2. (QJL correction skipped for reconstruction — applied in attention)
+//   3. Inverse WHT: x_hat = WHT(dequantized) (WHT is self-inverse)
+//   4. Rescale by stored norm
 //
 // One workgroup processes one vector. Workgroup size = 256.
 
@@ -99,16 +98,31 @@ fn decode(@builtin(local_invocation_id) lid: vec3u,
   }
   workgroupBarrier();
 
-  // ── Step 3: Inverse rotation + rescale by norm ──────────────────────
-  // output = norm * Pi^T · reconstructed
+  // ── Step 3: Inverse WHT + rescale by norm ───────────────────────────
+  // WHT is self-inverse (unitary): WHT(WHT(x)) = x when normalized.
+  // In-place butterfly on reconstructed[], then rescale by norm.
+  var h = 1u;
+  while (h < d) {
+    i = tid;
+    while (i < d / 2u) {
+      let block = i / h;
+      let offset = i % h;
+      let i1 = block * 2u * h + offset;
+      let i2 = i1 + h;
+      let a = reconstructed[i1];
+      let b = reconstructed[i2];
+      reconstructed[i1] = a + b;
+      reconstructed[i2] = a - b;
+      i = i + 256u;
+    }
+    workgroupBarrier();
+    h = h * 2u;
+  }
+
+  // Normalize and rescale by original vector norm
   i = tid;
   while (i < d) {
-    var sum: f32 = 0.0;
-    for (var j = 0u; j < d; j = j + 1u) {
-      sum += rotation_matrix[j * d + i] * reconstructed[j];
-    }
-    output[vec_idx * d + i] = sum * norm;
-
+    output[vec_idx * d + i] = reconstructed[i] * inv_sqrt_d * norm;
     i = i + 256u;
   }
 }
