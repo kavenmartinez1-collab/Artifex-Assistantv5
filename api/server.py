@@ -581,41 +581,22 @@ def create_app():
             raise HTTPException(status_code=400, detail="messages is required")
 
         # ── Streaming path (both backends) ────────────────────────────
+        # Model queue serializes requests and handles model/backend switching
+        # for both Ollama and Transformers. No more 503 rejections — requests
+        # queue and wait their turn.
         if stream:
-            # For Ollama: use model queue to serialize and handle model switching.
-            # For transformers: use simple concurrency gate (single model).
-            if backend != "ollama" and _inference_busy.is_set():
-                return JSONResponse(
-                    status_code=503,
-                    content={"error": "GPU busy — retry later"},
-                    headers={"Retry-After": "30"},
-                )
-
-            if backend != "ollama":
-                _inference_busy.set()
-
             async def guarded_stream():
-                """Wrap streaming generator with inference lock / model queue."""
+                """Wrap streaming with model queue lock (both backends)."""
+                mq = get_model_queue()
                 try:
-                    if backend == "ollama":
-                        # Model queue handles serialization + model switching
-                        mq = get_model_queue()
-                        async with mq._lock:
-                            # Switch model if needed
-                            if mq._current_model and model != mq._current_model:
-                                _log.info("Queue: switching %s → %s", mq._current_model, model)
-                                await mq._unload_model(mq._current_model)
-                                mq._stats["model_switches"] += 1
-                            mq._current_model = model
-                            mq._stats["total_requests"] += 1
+                    async with mq._lock:
+                        await mq.switch_if_needed(model, backend)
 
+                        if backend == "ollama":
                             _get_engine()  # Verify Ollama is reachable
-                            async for chunk in _stream_with_tools(
-                                messages, model, max_tokens or 4096, temperature,
-                                body.options, use_web_tools, backend,
-                            ):
-                                yield chunk
-                    else:
+                        else:
+                            _get_engine()  # Load/reload transformers model
+
                         async for chunk in _stream_with_tools(
                             messages, model, max_tokens or 4096, temperature,
                             body.options, use_web_tools, backend,
@@ -624,9 +605,6 @@ def create_app():
                 except Exception as e:
                     _log.error("Streaming error: %s", e)
                     yield f"data: {json.dumps({'error': str(e)})}\n\n"
-                finally:
-                    if backend != "ollama":
-                        _inference_busy.clear()
 
             return StreamingResponse(
                 guarded_stream(),
@@ -637,73 +615,67 @@ def create_app():
                 },
             )
 
-        # ── Non-streaming path ────────────────────────────────────────
-        if backend == "ollama":
-            if _inference_busy.is_set():
-                return JSONResponse(
-                    status_code=503,
-                    content={"error": "GPU busy — retry later"},
-                    headers={"Retry-After": "30"},
-                )
+        # ── Non-streaming path (both backends via model queue) ────────
+        mq = get_model_queue()
+        async with mq._lock:
+            await mq.switch_if_needed(model, backend)
 
-            _inference_busy.set()
-            try:
-                _get_engine()
-                has_images = _messages_have_images(messages)
-                timeout = 600 if has_images else 300
-                ollama_msgs = _convert_messages_for_ollama(messages)
+            if backend == "ollama":
+                try:
+                    _get_engine()
+                    has_images = _messages_have_images(messages)
+                    timeout = 600 if has_images else 300
+                    ollama_msgs = _convert_messages_for_ollama(messages)
 
-                _log.info(
-                    "Ollama proxy: model=%s images=%s msgs=%d",
-                    model, has_images, len(messages),
-                )
+                    _log.info(
+                        "Ollama proxy: model=%s images=%s msgs=%d",
+                        model, has_images, len(messages),
+                    )
 
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    None,
-                    lambda: _proxy_ollama_chat(
-                        ollama_msgs, model, temperature,
-                        max_tokens, body.options, timeout,
-                    ),
-                )
-                return result
-            except (RuntimeError, ConnectionError) as e:
-                _log.error("Ollama proxy error: %s", e)
-                raise HTTPException(status_code=502, detail=str(e))
-            finally:
-                _inference_busy.clear()
+                    loop = asyncio.get_event_loop()
+                    result = await loop.run_in_executor(
+                        None,
+                        lambda: _proxy_ollama_chat(
+                            ollama_msgs, model, temperature,
+                            max_tokens, body.options, timeout,
+                        ),
+                    )
+                    return result
+                except (RuntimeError, ConnectionError) as e:
+                    _log.error("Ollama proxy error: %s", e)
+                    raise HTTPException(status_code=502, detail=str(e))
 
-        # Transformers non-streaming
-        engine = _get_engine()
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: engine.generate_streaming(
-                messages, max_tokens=max_tokens or 4096,
-                temperature=temperature,
-            ),
-        )
-        response = strip_think_blocks(response) if response else ""
+            # Transformers non-streaming
+            engine = _get_engine()
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: engine.generate_streaming(
+                    messages, max_tokens=max_tokens or 4096,
+                    temperature=temperature,
+                ),
+            )
+            response = strip_think_blocks(response) if response else ""
 
-        return {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": response},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": sum(len(m.get("content", "")) // 4 for m in messages),
-                "completion_tokens": len(response) // 4,
-                "total_tokens": (sum(len(m.get("content", "")) // 4 for m in messages)
-                                + len(response) // 4),
-            },
-        }
+            return {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": response},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": sum(len(m.get("content", "")) // 4 for m in messages),
+                    "completion_tokens": len(response) // 4,
+                    "total_tokens": (sum(len(m.get("content", "")) // 4 for m in messages)
+                                    + len(response) // 4),
+                },
+            }
 
     # ─── Image Generation ────────────────────────────────────────────────
 
