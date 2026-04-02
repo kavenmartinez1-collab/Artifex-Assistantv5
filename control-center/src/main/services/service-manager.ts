@@ -257,6 +257,14 @@ export class ServiceManager {
       }
     }
 
+    // Step 4: Ollama-specific — kill orphaned runner subprocesses.
+    // Ollama spawns "ollama.exe runner --ollama-engine --model <blob>"
+    // processes that hold GPU VRAM. These can become zombies when the
+    // Ollama server loses track of them. kill them all on stop.
+    if (def.id === 'ollama') {
+      await this.killOllamaRunners();
+    }
+
     this.setStatus(id, 'stopped');
   }
 
@@ -286,6 +294,9 @@ export class ServiceManager {
         await this.killByPort(def.port).catch(() => {});
       }
     }
+
+    // Kill any orphaned Ollama runners holding VRAM
+    await this.killOllamaRunners().catch(() => {});
   }
 
   getStatus(): ServiceStatusInfo[] {
@@ -301,6 +312,39 @@ export class ServiceManager {
         errorMessage: mp.errorMessage,
       };
     });
+  }
+
+  /**
+   * Kill orphaned Ollama runner processes that hold GPU VRAM.
+   * These are subprocesses ("ollama.exe runner --ollama-engine --model ...")
+   * that can survive after the Ollama server stops or loses track of them.
+   */
+  private async killOllamaRunners(): Promise<void> {
+    if (process.platform !== 'win32') return;
+    try {
+      // Find all Ollama processes with "runner" in the command line
+      const result = execSync(
+        `powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name='ollama.exe'\\" | Where-Object { $_.CommandLine -match 'runner' } | Select-Object -ExpandProperty ProcessId"`,
+        { encoding: 'utf-8', timeout: 10000 }
+      ).trim();
+      const pids = result.split('\n').map(s => parseInt(s.trim())).filter(n => n > 0);
+      for (const pid of pids) {
+        try {
+          execSync(
+            `powershell.exe -NoProfile -Command "Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue"`,
+            { timeout: 5000 }
+          );
+          this.logAggregator.addEntry('ollama', 'info',
+            `Killed orphaned Ollama runner (PID ${pid})`);
+        } catch { /* already dead */ }
+      }
+      if (pids.length > 0) {
+        this.logAggregator.addEntry('ollama', 'info',
+          `Cleaned up ${pids.length} Ollama runner process(es) — VRAM freed`);
+      }
+    } catch {
+      // PowerShell query failed — non-fatal
+    }
   }
 
   /**
