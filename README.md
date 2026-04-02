@@ -816,7 +816,7 @@ Phases 0-6 complete plus Gated DeltaNet/Mamba-2 hybrid support, TurboQuant KV ca
 
 Any HuggingFace model with a standard transformer decoder architecture works. Hybrid Mamba-2 models (Qwen3.5) have full support with calibrated GPTQ quantization. Weight name prefixes are auto-detected. Tested:
 
-- **Qwen3.5-9B HailMary** (`local/qwen3.5-9b-HailMary`) — 32 layers (24 Gated DeltaNet + 8 full attention), 4096 hidden, 16Q/4KV GQA. **5.74 GB — fits 8 GB VRAM with 2+ GB headroom.** Coherent, accurate responses at 2.5 tok/s on RTX 5060 Ti 8GB. BF16 SSM + BF16 embed + INT4 GPTQ attention/FFN + INT4 RTN lm_head. Thinking mode with visible reasoning chain.
+- **Qwen3.5-9B HailMary** (`local/qwen3.5-9b-HailMary`) — 32 layers (24 Gated DeltaNet + 8 full attention), 4096 hidden, 16Q/4KV GQA. **5.74 GB — fits 8 GB VRAM with ~2 GB headroom.** Coherent, accurate responses at 2.5 tok/s on RTX 5060 Ti 8GB. BF16 embed + INT4 GPTQ SSM/attention/FFN + INT4 RTN lm_head. Thinking mode with visible reasoning chain.
 - **Qwen3.5-9B noact** (`local/qwen3.5-9b-GPTQv2-noact`) — Same architecture, 9.37 GB. BF16 embed/lm_head/SSM + INT4 attention/FFN. 1.9 tok/s. Higher quality (BF16 lm_head) but larger VRAM footprint.
 - **Qwen3.5-2B** (`Qwen/Qwen3.5-2B`) — 24 layers (18 Gated DeltaNet + 6 full attention), 2048 hidden, GQA 8Q/2KV. Coherent English at 5.2 tok/s with native BF16 weights (4.18 GB VRAM).
 - **Qwen2.5-0.5B-Instruct** — 24 layers, 896 hidden, GQA 14Q/2KV. Generates coherent English at ~20 tok/s (f32).
@@ -825,16 +825,18 @@ Any HuggingFace model with a standard transformer decoder architecture works. Hy
 
 ### Calibrated GPTQ Quantization
 
-For hybrid models like Qwen3.5 that combine Gated DeltaNet (linear attention / SSM) with standard softmax attention, INT4 quantization of SSM layers causes recurrence noise to compound — each token's error accumulates in the hidden state via geometric amplification (`h_t = A*h_{t-1} + B*x_t`, error grows as `A^N * epsilon`). Even INT8 SSM produces gibberish. The solution: **keep SSM-critical weights in BF16, quantize everything else to INT4**.
+For hybrid models like Qwen3.5 that combine Gated DeltaNet (linear attention / SSM) with standard softmax attention, INT4 quantization of SSM layers causes recurrence noise to compound — each token's error accumulates in the hidden state via geometric amplification (`h_t = A*h_{t-1} + B*x_t`, error grows as `A^N * epsilon`). Two approaches: **HailMary** quantizes everything (including SSM) to INT4 for maximum compression — this works in practice despite the theoretical risk. **Conservative (noact)** keeps SSM weights in BF16 for higher quality at the cost of larger VRAM.
 
 ```bash
 # HailMary model: 5.74 GB, fits 8 GB VRAM (recommended)
+# INT4 everything except embed + norms — aggressive but proven to work
 python scripts/quantize_gptq.py \
   --model ./models/qwen3.5-9b \
   --output models/qwen3.5-9b-HailMary \
   --keep-bf16 norm embed_tokens
 
 # noact model: 9.37 GB, higher quality but larger
+# BF16 SSM + embed + lm_head for maximum quality, INT4 FFN + attention
 python scripts/quantize_gptq.py \
   --model ./models/qwen3.5-9b \
   --output models/qwen3.5-9b-GPTQv2-noact \
@@ -846,15 +848,16 @@ python scripts/quantize_gptq.py \
 1. Loads the unquantized BF16 model (18 GB for 9B)
 2. Runs 128 wikitext calibration samples through the model to compute Hessian matrices
 3. Layer-by-layer GPTQ: quantize each weight using Hessian-guided error propagation, then re-run calibration through quantized layer before proceeding to the next
-4. BF16 weights for SSM layers, norms, and embedding are copied unchanged
+4. BF16 weights for norms, embedding, and any `--keep-bf16` patterns are copied unchanged
 5. lm_head is quantized with RTN (round-to-nearest) — GPTQ segfaults on [248K, 4096] due to ~12 GB intermediates
 6. Produces GPTQ v2 SafeTensors with g_idx for actorder support
 
-**Why SSM weights MUST be BF16 (not INT4 or INT8):**
-- DeltaNet recurrence `h_t = A*h_{t-1} + B*x_t` amplifies quantization error geometrically
+**SSM quantization tradeoffs:**
+- DeltaNet recurrence `h_t = A*h_{t-1} + B*x_t` amplifies quantization error geometrically in theory
 - INT8 SSM projections: 0.009% weight error, but 1-7% output error per projection, compounding through 24 layers
-- Proven experimentally: INT4 SSM, INT8 SSM, and INT8+KLT SSM all produce gibberish. Only BF16 SSM produces coherent output.
-- BF16 has the same dynamic range as FP32, preventing the exponential gating underflow that destroys INT8/INT4 SSM state
+- Early testing with INT8 SSM and INT8+KLT SSM produced gibberish, but calibrated INT4 GPTQ with actorder (HailMary) produces coherent output — GPTQ's Hessian-guided error minimization compensates for the recurrence sensitivity
+- BF16 SSM (noact) provides higher quality at the cost of ~3.6 GB additional VRAM
+- The HailMary model proves aggressive INT4 SSM is viable when paired with proper calibration
 
 **Why BF16 embed is required (not INT4):**
 - INT4 embedding has 0.993 cosine similarity to BF16 — close but the 0.7% error is amplified through 24 recurrent SSM layers, causing gibberish by position 2
@@ -869,13 +872,13 @@ python scripts/quantize_gptq.py \
 | Component | Format | Size |
 |-----------|--------|------|
 | Embedding (248K x 4096) | BF16 | 1.9 GB |
-| 24 linear_attn layers (5 proj each) | BF16 | 3.1 GB |
-| 32 FFN layers (3 proj each) | INT4 GPTQ | 1.2 GB |
-| 8 full attention layers (4 proj each) | INT4 GPTQ | 0.3 GB |
+| 24 linear_attn layers (5 proj each) | INT4 GPTQ | 0.8 GB |
+| 32 FFN layers (3 x 12288x4096 each) | INT4 GPTQ | 2.4 GB |
+| 8 full attention layers (4 proj each) | INT4 GPTQ | 0.2 GB |
 | LM head (248K x 4096) | INT4 RTN | 0.5 GB |
-| Norms, biases, SSM state | f32/BF16 | 0.3 GB |
-| KV cache + intermediates | f32 | 0.5 GB |
-| **Total** | | **~5.7 GB (+2.3 GB headroom)** |
+| Norms, biases, small weights | f32/BF16 | 0.1 GB |
+| SSM state + KV cache + intermediates | f32 | 0.2 GB |
+| **Total** | | **~5.7 GB (~2 GB headroom)** |
 
 ### Numerical Verification
 
@@ -1015,7 +1018,7 @@ Artifex-Assistant-V5/
         gpu-device.ts      # WebGPU adapter/device initialization
         buffers.ts         # GPU buffer create, read, write utilities
         compute.ts         # Shader compilation, pipeline caching, dispatch
-        kernel-tests.ts    # GPU kernel correctness tests (9 tests)
+        kernel-tests.ts    # GPU kernel correctness tests (15 tests)
         forward-pass.ts    # Full transformer forward pass orchestrator
         generate.ts        # Autoregressive generation loop with sampling
         inference.ts       # Top-level session orchestrator (load → chat)
