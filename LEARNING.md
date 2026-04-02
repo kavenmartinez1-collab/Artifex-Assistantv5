@@ -904,12 +904,13 @@ Where:
    dispatchProjection auto-selects f32/BF16/INT4 kernel per weight.
 ✅ Qwen3.5-2B coherent output at 5.2 tok/s with 4.18 GB VRAM (BF16)
 
-✅ TurboQuant KV cache integration — 3-bit (d≥128) or 4-bit (d≤64)
-   compressed KV cache. ~80% memory savings. Current token exact,
-   only cached tokens decoded from compressed storage.
+✅ TurboQuant+ KV cache integration — asymmetric K3/V2 with boundary
+   layer protection. Walsh-Hadamard rotation replaces random orthogonal.
+   Current token exact, only cached tokens compressed. Also ported to
+   PyTorch as TurboQuantCache wrapper for transformers engine.
 ✅ Asymmetric attention kernel (attention_tq.wgsl) — QJL inner
-   product correction applied during Q·K^T scoring, not reconstruction.
-   Precomputes S·Π·q once per workgroup, adds correction to compressed
+   product correction applied during Q·K^T scoring (keys only, not values).
+   Precomputes S·H·q once per workgroup, adds correction to compressed
    positions only. Validated against tonbistudio MSE benchmarks.
 ✅ Batch prefill — 512-token chunks for standard transformers,
    token-by-token for hybrid models (SSM needs sequential processing)
