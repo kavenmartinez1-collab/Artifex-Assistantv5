@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import os
 
 from core.logging_config import setup_logging
 
@@ -18,10 +19,11 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000, help="Port (default: 8000)")
     parser.add_argument("--reload", action="store_true", help="Auto-reload on code changes")
-    parser.add_argument("--backend", default=None, choices=["transformers", "ollama"],
-                        help="Backend to use (default: auto-detect)")
-    parser.add_argument("--model", default=None,
-                        help="Model name (e.g. qwen3.5-27b-distilled for transformers, qwen3.5:27b for ollama)")
+    parser.add_argument("--backend", default=os.environ.get("ARTIFEX_BACKEND"),
+                        choices=["transformers", "ollama"],
+                        help="Backend to use (default: auto-detect, or set ARTIFEX_BACKEND env var)")
+    parser.add_argument("--model", default=os.environ.get("ARTIFEX_MODEL"),
+                        help="Model name (or set ARTIFEX_MODEL env var)")
     parser.add_argument("--gateway", default=None,
                         help="Web gateway URL for search tools (e.g. http://localhost:8080)")
     args = parser.parse_args()
