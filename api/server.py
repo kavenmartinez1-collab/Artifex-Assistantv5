@@ -437,7 +437,43 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
 
         round_count += 1
         if round_count > MAX_TOOL_ROUNDS:
-            _log.warning("Max tool rounds (%d) reached", MAX_TOOL_ROUNDS)
+            _log.warning("Max tool rounds (%d) reached — forcing answer", MAX_TOOL_ROUNDS)
+            # Force the model to synthesize an answer with what it has
+            current_messages.append({
+                "role": "system",
+                "content": (
+                    "You have used all available research rounds. STOP making tool calls. "
+                    "Answer the user's question NOW using the information you have already "
+                    "gathered. Do NOT output any @search() or @web_read() calls."
+                ),
+            })
+            # One final generation pass with tools disabled
+            q_final = queue.Queue(maxsize=256)
+            if backend == "ollama":
+                ollama_final = _convert_messages_for_ollama(current_messages)
+                t = threading.Thread(
+                    target=_stream_ollama_raw,
+                    args=(ollama_final, model, temperature, max_tokens, options, 300, q_final),
+                    daemon=True,
+                )
+            else:
+                engine = _get_engine()
+                t = threading.Thread(
+                    target=_stream_transformers_raw,
+                    args=(engine, current_messages, max_tokens, temperature, q_final),
+                    daemon=True,
+                )
+            t.start()
+            while True:
+                item = await loop.run_in_executor(None, q_final.get)
+                if item is _SENTINEL:
+                    break
+                kind, data = item
+                if kind == "thinking":
+                    yield _make_sse_chunk(chat_id, model, {"x_thinking": data})
+                elif kind == "content":
+                    yield _make_sse_chunk(chat_id, model, {"content": data})
+            t.join(timeout=10)
             break
 
         _log.info("Tool round %d: %d tools detected", round_count, len(tools))

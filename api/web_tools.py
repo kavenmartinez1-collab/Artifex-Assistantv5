@@ -24,7 +24,7 @@ _log = logging.getLogger("artifex.api.web_tools")
 WEB_GATEWAY_URL = os.getenv("WEB_GATEWAY_URL", "")
 GATEWAY_AUTH_TOKEN = os.getenv("GATEWAY_AUTH_TOKEN", "")
 
-MAX_TOOL_ROUNDS = 3
+MAX_TOOL_ROUNDS = 6
 
 # ── Tool-call regex patterns ─────────────────────────────────────────────────
 
