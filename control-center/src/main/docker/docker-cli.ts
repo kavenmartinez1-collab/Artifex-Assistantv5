@@ -27,17 +27,50 @@ export interface ComposeService {
 
 // ── Helpers ──
 
+/**
+ * Resolve the Docker CLI path. execFile without shell can't find docker
+ * if Docker Desktop was started after the Electron app (PATH not inherited).
+ * Try common install locations as fallback.
+ */
+let _resolvedDockerPath: string | null = null;
+function resolveDockerPath(): string {
+  if (_resolvedDockerPath) return _resolvedDockerPath;
+
+  // Check common Docker Desktop install paths on Windows
+  if (process.platform === 'win32') {
+    const candidates = [
+      'docker',  // try PATH first
+      path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Docker', 'Docker', 'resources', 'bin', 'docker.exe'),
+      path.join(process.env.LOCALAPPDATA || '', 'Docker', 'resources', 'bin', 'docker.exe'),
+      path.join('C:\\Program Files', 'Docker', 'Docker', 'resources', 'bin', 'docker.exe'),
+    ];
+    for (const p of candidates) {
+      if (p === 'docker' || fs.existsSync(p)) {
+        _resolvedDockerPath = p;
+        return p;
+      }
+    }
+  }
+
+  _resolvedDockerPath = 'docker';
+  return 'docker';
+}
+
 /** Run a command and return stdout. Rejects on non-zero exit or missing binary. */
 function run(cmd: string, args: string[], options?: { cwd?: string; timeout?: number }): Promise<string> {
+  // Auto-resolve docker path for Docker commands
+  const resolvedCmd = cmd === 'docker' ? resolveDockerPath() : cmd;
+
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, {
+    execFile(resolvedCmd, args, {
       timeout: options?.timeout ?? 30000,
       maxBuffer: 4 * 1024 * 1024,
       cwd: options?.cwd,
     }, (err, stdout, stderr) => {
       if (err) {
-        // ENOENT means the binary is missing
         if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          // Reset resolved path so it retries next time (Docker may start later)
+          _resolvedDockerPath = null;
           reject(new Error(`${cmd} is not installed or not in PATH`));
         } else {
           reject(new Error(stderr?.trim() || err.message));
