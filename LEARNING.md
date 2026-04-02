@@ -488,6 +488,18 @@ When Artifex wants to search the web or read a page:
 5. If Artifex wants to read a page, **the gateway** fetches it, extracts clean text via **trafilatura** (strips scripts, ads, tracking), and scans for prompt injection patterns
 6. If injection is detected, the content is wrapped in `[UNTRUSTED WEB CONTENT]` markers so the model knows not to trust it
 
+### Port 8080 Conflict — Docker vs Local Gateway
+
+A common pitfall: there are **two** web gateways in the codebase — a Docker container and a local Python script. Both bind to port 8080. If you run both, the local gateway wins the port race but **cannot reach SearXNG** (which lives on Docker's internal network at `http://searxng:8080`). The result: search tools fail silently and the health check shows `"searxng": "unreachable"`.
+
+**Rule: pick one.**
+- **Docker mode** (`docker compose up`): SearXNG + web gateway run together in containers. The Docker gateway can reach SearXNG. Don't start the local gateway from the Control Center.
+- **Local mode** (no Docker): Start the local web gateway from the Control Center. You'll need to configure `SEARXNG_URL` to point to a separately-running SearXNG instance, or accept that web search is unavailable.
+
+The Control Center shows a warning on the "Web Gateway (local)" card when Docker's web-gateway container is detected as running.
+
+**Lesson learned**: When two services compete for the same port, the one that binds first wins silently. The loser's process may not even start, or it starts on a different port, or it crashes — with no obvious error in the UI. Always check `curl http://localhost:PORT/health` to confirm which service is actually responding.
+
 ### SSRF protection
 
 **SSRF** (Server-Side Request Forgery) is when an attacker tricks a server into making requests to internal services. If someone told the AI "read the page at http://169.254.169.254/latest/meta-data/", the gateway would be fetching your cloud provider's metadata endpoint — which contains secrets.
