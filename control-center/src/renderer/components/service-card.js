@@ -41,9 +41,15 @@ function createServiceCard(service) {
     </div>
     <div class="meta pid-info"></div>
     <div class="meta uptime-info"></div>
+    <div class="service-warning" style="display:none"></div>
     <div class="service-config" style="display:none"></div>
     <div class="actions"></div>
   `;
+
+  // Web gateway: show Docker conflict warning
+  if (service.id === 'web-gateway') {
+    checkWebGatewayDockerConflict(card);
+  }
 
   updateCardActions(card, service);
   updateCardMeta(card, service);
@@ -178,6 +184,25 @@ function updateCardActions(card, service) {
     errEl.textContent = service.errorMessage;
     actions.appendChild(errEl);
   }
+}
+
+/** Check if Docker is running a web-gateway container and show warning */
+async function checkWebGatewayDockerConflict(card) {
+  const warningEl = card.querySelector('.service-warning');
+  if (!warningEl || !window.artifex?.docker) return;
+  try {
+    const isDocker = await window.artifex.docker.isDockerInstalled();
+    if (!isDocker) return;
+    const containers = await window.artifex.docker.listContainers();
+    const gwContainer = containers.find(c =>
+      c.name?.includes('web-gateway') || c.image?.includes('web-gateway')
+    );
+    if (gwContainer && gwContainer.status === 'running') {
+      warningEl.style.display = 'block';
+      warningEl.style.cssText = 'display:block;font-size:10px;color:#ff9800;background:#2a2200;border:1px solid #ff9800;border-radius:3px;padding:4px 6px;margin:4px 0;';
+      warningEl.innerHTML = '⚠ Docker web-gateway is running on port 8080. <b>Do not start this local gateway</b> — it will conflict. Use Docker\'s gateway instead.';
+    }
+  } catch { /* Docker not available — no conflict */ }
 }
 
 function updateCardMeta(card, service) {
