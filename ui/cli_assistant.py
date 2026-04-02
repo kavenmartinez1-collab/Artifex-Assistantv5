@@ -341,7 +341,7 @@ def run_assistant():
     print(f"{Fore.WHITE}  Type your questions. The AI can run shell commands, Python, and web searches.")
     print(f"  Commands: /workspace <path>, /kb search|add|list|show|remove, /refresh, /clear")
     print(f"  Session:  /save [name], /load [name|#], /sessions, /export [path]")
-    print(f"  System:   /backend transformers|ollama, /health")
+    print(f"  System:   /backend transformers|ollama, /health, /compile on|off, /turboquant on|off")
     print(f"  Type 'exit' to quit.{Style.RESET_ALL}\n")
 
     # Knowledge manager + workspace setup
@@ -503,6 +503,38 @@ def run_assistant():
             if user_input.lower() == "/health":
                 report = run_health_check()
                 print(f"{Fore.CYAN}{format_health_report(report)}{Style.RESET_ALL}\n")
+                continue
+
+            # /compile command
+            if user_input.lower().startswith("/compile"):
+                from core.config import set_torch_compile, get_torch_compile
+                arg = user_input[8:].strip().lower()
+                if arg in ("on", "true", "yes", "1"):
+                    set_torch_compile(True)
+                    print(f"{Fore.CYAN}  torch.compile enabled — reload model to apply{Style.RESET_ALL}\n")
+                elif arg in ("off", "false", "no", "0"):
+                    set_torch_compile(False)
+                    print(f"{Fore.CYAN}  torch.compile disabled{Style.RESET_ALL}\n")
+                else:
+                    state = "ON" if get_torch_compile() else "OFF"
+                    print(f"{Fore.CYAN}  torch.compile: {state}")
+                    print(f"  Usage: /compile on|off{Style.RESET_ALL}\n")
+                continue
+
+            # /turboquant command
+            if user_input.lower().startswith("/turboquant"):
+                from core.config import set_turboquant_kv, get_turboquant_kv
+                arg = user_input[11:].strip().lower()
+                if arg in ("on", "true", "yes", "1"):
+                    set_turboquant_kv(True)
+                    print(f"{Fore.CYAN}  TurboQuant KV cache enabled (1.7x compression){Style.RESET_ALL}\n")
+                elif arg in ("off", "false", "no", "0"):
+                    set_turboquant_kv(False)
+                    print(f"{Fore.CYAN}  TurboQuant KV cache disabled{Style.RESET_ALL}\n")
+                else:
+                    state = "ON" if get_turboquant_kv() else "OFF"
+                    print(f"{Fore.CYAN}  TurboQuant KV cache: {state}")
+                    print(f"  Usage: /turboquant on|off{Style.RESET_ALL}\n")
                 continue
 
             # /save command

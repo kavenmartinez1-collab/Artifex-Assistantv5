@@ -59,6 +59,7 @@ Universal Local AI Hosting Platform. Run any AI model locally — text generatio
 - [Troubleshooting](#troubleshooting)
 - [Requirements](#requirements)
 - [Acknowledgments](#acknowledgments)
+- [Acknowledgements](#acknowledgements)
 - [License](#license)
 
 ---
@@ -1311,6 +1312,13 @@ First and foremost, all praise and glory to **God** through **Jesus Christ**. Ev
 - **[Docker](https://www.docker.com/)** — Docker Inc. — containerization
 - **[NVIDIA Container Toolkit](https://github.com/NVIDIA/nvidia-container-toolkit)** — NVIDIA — GPU support in Docker
 - **[pytest](https://docs.pytest.org/)** — Holger Krekel and pytest contributors — testing framework
+
+---
+
+## Acknowledgements
+
+- **TurboQuant** (Google, ICLR 2026, arXiv:2504.19874) — PolarQuant + QJL KV cache compression algorithm. Our WebGPU and PyTorch implementations are based on the original paper.
+- **TurboQuant+** ([TheTom/turboquant_plus](https://github.com/TheTom/turboquant_plus)) — Key findings that improved our implementation: asymmetric K/V compression ("V compression is free"), boundary layer protection (first/last 2 layers at full precision), and Walsh-Hadamard rotation replacing random orthogonal matrices. These improvements are integrated into both the WebGPU WGSL shaders and the PyTorch `TurboQuantCache`.
 
 ---
 

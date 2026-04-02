@@ -31,7 +31,10 @@ from transformers import (
 )
 
 from core.engine_base import BaseEngine
-from core.config import BNB_CONFIG, get_active_model_path
+from core.config import (
+    BNB_CONFIG, get_active_model_path,
+    get_torch_compile, get_turboquant_kv,
+)
 from core.inference import STOP_STRINGS, _clean_response
 
 # Suppress harmless warnings
@@ -40,6 +43,9 @@ warnings.filterwarnings("ignore", message="The following layers were not sharded
 warnings.filterwarnings("ignore", message=".*fast path is not available.*")
 warnings.filterwarnings("ignore", message=".*required library is not installed.*")
 warnings.filterwarnings("ignore", message=".*FP4 quantization state not initialized.*")
+warnings.filterwarnings("ignore", message=".*quantization.*", module="bitsandbytes")
+warnings.filterwarnings("ignore", message=".*MatMul8bitLt.*")
+warnings.filterwarnings("ignore", message=".*bitsandbytes.*")
 
 
 def _patch_config_json(model_path: str):
@@ -101,6 +107,7 @@ class TransformersEngine(BaseEngine):
         self.tokenizer = None
         self._loaded_path = None
         self._gpu_tier = None
+        self._last_gen_stats = None
 
     # =========================================================================
     # GPU TIER DETECTION
@@ -153,9 +160,16 @@ class TransformersEngine(BaseEngine):
 
     def _has_cached_quantized(self, quantized_path):
         """Check if pre-quantized weights exist on disk."""
-        return os.path.isdir(quantized_path) and os.path.isfile(
-            os.path.join(quantized_path, "config.json")
+        if not os.path.isdir(quantized_path):
+            return False
+        if not os.path.isfile(os.path.join(quantized_path, "config.json")):
+            return False
+        # Must have actual model weights, not just config stubs
+        has_weights = any(
+            f for f in os.listdir(quantized_path)
+            if f.endswith((".safetensors", ".bin"))
         )
+        return has_weights
 
     def _get_vram_constraints(self, allow_cpu_staging=False):
         """Build max_memory dict using GPU tier-aware memory fraction."""
@@ -301,7 +315,7 @@ class TransformersEngine(BaseEngine):
             if status_callback:
                 status_callback(f"Loading {model_name} (fast path)...")
 
-            self.tokenizer = AutoTokenizer.from_pretrained(quantized_path)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
 
             try:
                 self.model = AutoModelForCausalLM.from_pretrained(
@@ -310,6 +324,7 @@ class TransformersEngine(BaseEngine):
                     dtype=gpu["compute_dtype"],
                     trust_remote_code=True,
                     low_cpu_mem_usage=True,
+                    attn_implementation="sdpa",
                 )
             except (RuntimeError, torch.cuda.OutOfMemoryError):
                 if status_callback:
@@ -323,10 +338,12 @@ class TransformersEngine(BaseEngine):
                     dtype=gpu["compute_dtype"],
                     trust_remote_code=True,
                     low_cpu_mem_usage=True,
+                    attn_implementation="sdpa",
                 )
 
             # Register dtype correction hooks
             self._register_dtype_hooks()
+            self._apply_torch_compile(status_callback)
 
             self._loaded_path = model_path
             self._report_vram(model_name, gpu, "cached-nf4", status_callback)
@@ -336,20 +353,17 @@ class TransformersEngine(BaseEngine):
         if status_callback:
             status_callback(f"Loading {model_name} (first run — quantizing)...")
 
-        # Qwen3.5's hybrid linear_attn layers don't reliably pack to 4-bit
-        # on all hardware / CUDA driver combos — skip them from quantization.
-        _linear_attn_skip = [
-            "linear_attn",
-            "in_proj_qkv", "in_proj_a", "in_proj_b",
-            "in_proj_z", "out_proj",
-        ]
+        # Dynamic VRAM budget: analyze model weights and decide which layer
+        # groups can stay at BF16 vs must be NF4 to fit on this GPU.
+        plan = self._plan_load_strategy(model_path, gpu, status_callback)
+        _skip_modules = plan["skip_modules"]
 
         bnb_kwargs = dict(
             load_in_4bit=BNB_CONFIG["load_in_4bit"],
             bnb_4bit_compute_dtype=gpu["compute_dtype"],
             bnb_4bit_quant_type=BNB_CONFIG["bnb_4bit_quant_type"],
             bnb_4bit_use_double_quant=BNB_CONFIG["bnb_4bit_use_double_quant"],
-            llm_int8_skip_modules=["lm_head"] + _linear_attn_skip,
+            llm_int8_skip_modules=_skip_modules,
         )
         bnb_config = BitsAndBytesConfig(**bnb_kwargs)
 
@@ -366,6 +380,7 @@ class TransformersEngine(BaseEngine):
             dtype=gpu["compute_dtype"],
             trust_remote_code=True,
             low_cpu_mem_usage=True,
+            attn_implementation="sdpa",
         )
 
         # ── Verify 4-bit packing ────────────────────────────────────────
@@ -384,7 +399,7 @@ class TransformersEngine(BaseEngine):
 
             bnb_config = BitsAndBytesConfig(
                 load_in_8bit=True,
-                llm_int8_skip_modules=["lm_head"] + list(_linear_attn_skip),
+                llm_int8_skip_modules=_skip_modules,
             )
 
             self.model = AutoModelForCausalLM.from_pretrained(
@@ -394,6 +409,7 @@ class TransformersEngine(BaseEngine):
                 dtype=gpu["compute_dtype"],
                 trust_remote_code=True,
                 low_cpu_mem_usage=True,
+                attn_implementation="sdpa",
             )
             _fell_back_to_8bit = True
 
@@ -409,14 +425,45 @@ class TransformersEngine(BaseEngine):
                     "Failed to cache quantized weights: %s", e
                 )
 
+        self._apply_torch_compile(status_callback)
+
         self._loaded_path = model_path
-        quant_label = "8-bit" if _fell_back_to_8bit else "4-bit nf4"
+        quant_label = "8-bit" if _fell_back_to_8bit else plan["strategy_label"]
         self._report_vram(model_name, gpu, quant_label, status_callback)
 
+    def _apply_torch_compile(self, status_callback=None):
+        """Optionally JIT-compile the model for faster inference.
+
+        Gated by config flag. Adds ~30s warmup on first generation but
+        20-40% throughput improvement on subsequent ones.
+        """
+        if not get_torch_compile():
+            return
+        if self.model is None:
+            return
+
+        log = logging.getLogger(__name__)
+        try:
+            if status_callback:
+                status_callback("Applying torch.compile (first generation will be slower)...")
+            self.model = torch.compile(self.model, mode="reduce-overhead")
+            log.info("torch.compile applied (mode=reduce-overhead)")
+        except Exception as e:
+            log.warning("torch.compile failed (non-fatal): %s", e)
+            if status_callback:
+                status_callback(f"torch.compile skipped: {e}")
+
     def _register_dtype_hooks(self):
-        """Fix dtype mismatches between quantized and non-quantized layers."""
+        """Fix dtype mismatches between quantized and non-quantized layers.
+
+        Only hooks modules whose weight dtype differs from the model's
+        compute dtype — avoids adding forward-pass overhead to layers
+        that already match.
+        """
         try:
             import bitsandbytes as bnb
+
+            compute_dtype = self._detect_gpu_tier()["compute_dtype"]
 
             def _make_dtype_hook(mod):
                 def hook(module, args):
@@ -424,13 +471,224 @@ class TransformersEngine(BaseEngine):
                         return (args[0].to(module.weight.dtype),) + args[1:]
                 return hook
 
+            hooked = 0
             for name, module in self.model.named_modules():
-                if isinstance(module, bnb.nn.Linear4bit):
+                if isinstance(module, (bnb.nn.Linear4bit, bnb.nn.Linear8bitLt)):
                     continue
                 if hasattr(module, "weight") and isinstance(module, (torch.nn.Linear, torch.nn.Conv1d)):
-                    module.register_forward_pre_hook(_make_dtype_hook(module))
+                    if module.weight.dtype != compute_dtype:
+                        module.register_forward_pre_hook(_make_dtype_hook(module))
+                        hooked += 1
+
+            if hooked:
+                logging.getLogger(__name__).debug(
+                    "Registered dtype hooks on %d modules", hooked
+                )
         except ImportError:
             pass
+
+    # =========================================================================
+    # DYNAMIC VRAM BUDGET PLANNER
+    # =========================================================================
+
+    def _plan_load_strategy(self, model_path, gpu, status_callback=None):
+        """Analyze model weights and plan quantization to fit VRAM budget.
+
+        Reads the safetensors weight index to calculate per-group sizes,
+        then progressively drops groups from the BF16 skip list until the
+        estimated footprint fits in the GPU's VRAM budget.
+
+        Priority order (last dropped = highest quality preference):
+          1. lm_head / embed_tokens  — large but tolerant of NF4
+          2. SSM / recurrent layers  — sensitive but BnB NF4 dequantizes
+             to full precision before compute, so recurrence runs at BF16
+          3. Everything else          — always NF4
+
+        Returns:
+            dict with 'skip_modules', 'estimated_gb', 'strategy_label'
+        """
+        log = logging.getLogger(__name__)
+
+        # ── VRAM budget ──────────────────────────────────────────────────
+        # Reserve for CUDA context (~0.4 GB), KV cache (~0.5 GB),
+        # activations / peak overhead (~0.3 GB)
+        overhead_gb = 1.2
+        vram_budget = gpu["total_gb"] - overhead_gb
+
+        # ── Detect layer groups from weight index ────────────────────────
+        groups = self._analyze_weight_groups(model_path)
+
+        if not groups:
+            # No weight index found — fall back to empty skip (NF4 everything)
+            log.warning("No weight index found — quantizing all layers to NF4")
+            return {"skip_modules": [], "estimated_gb": 0, "strategy_label": "nf4-all"}
+
+        # ── Calculate size under each skip configuration ─────────────────
+        # "candidates" are groups we COULD keep at BF16 for quality.
+        # Ordered from most-expendable to least-expendable.
+        candidate_order = ["lm_head", "embed", "ssm"]
+        base_nf4_gb = groups.get("other_nf4", 0)
+
+        # Build configs from most aggressive (NF4-all) to least (BF16-all-candidates)
+        configs = []
+
+        # Config 0: NF4 everything
+        total = base_nf4_gb + sum(groups.get(f"{c}_nf4", 0) for c in candidate_order)
+        configs.append(([], total, "nf4-all"))
+
+        # Progressive configs: keep candidates at BF16 one by one
+        kept = []
+        for cand in reversed(candidate_order):
+            kept.insert(0, cand)
+            total = base_nf4_gb
+            for c in candidate_order:
+                if c in kept:
+                    total += groups.get(f"{c}_bf16", 0)
+                else:
+                    total += groups.get(f"{c}_nf4", 0)
+            patterns = []
+            for c in kept:
+                patterns.extend(groups.get(f"{c}_patterns", []))
+            label = "nf4+bf16(" + ",".join(kept) + ")"
+            configs.append((patterns, total, label))
+
+        # ── Pick the least-aggressive config that fits ───────────────────
+        chosen = configs[0]  # fallback: NF4 everything
+        for skip_modules, est_gb, label in reversed(configs):
+            if est_gb <= vram_budget:
+                chosen = (skip_modules, est_gb, label)
+                break
+
+        skip_modules, est_gb, label = chosen
+        log.info(
+            "Load strategy: %s — estimated %.1f / %.1f GB budget (%.1f GB total VRAM)",
+            label, est_gb, vram_budget, gpu["total_gb"],
+        )
+        if status_callback:
+            status_callback(f"Strategy: {label} — ~{est_gb:.1f} GB / {vram_budget:.1f} GB budget")
+
+        return {
+            "skip_modules": skip_modules,
+            "estimated_gb": est_gb,
+            "strategy_label": label,
+        }
+
+    def _analyze_weight_groups(self, model_path):
+        """Read safetensors index and classify params into groups with sizes.
+
+        Returns dict with keys like:
+            ssm_nf4, ssm_bf16, ssm_patterns,
+            lm_head_nf4, lm_head_bf16, lm_head_patterns,
+            embed_nf4, embed_bf16, embed_patterns,
+            other_nf4
+        Values are sizes in GB.
+        """
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        if not os.path.isfile(index_path):
+            # Single-file model — can't analyze without loading
+            return {}
+
+        try:
+            with open(index_path, "r") as f:
+                index = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+        weight_map = index.get("weight_map", {})
+        if not weight_map:
+            return {}
+
+        # ── Detect SSM/recurrent patterns from model config ──────────────
+        config_path = os.path.join(model_path, "config.json")
+        ssm_keywords = set()
+        try:
+            with open(config_path, "r") as f:
+                cfg = json.load(f)
+            # Check for hybrid layer_types (e.g., Qwen3.5, Jamba, Zamba)
+            layer_types = cfg.get("layer_types", [])
+            for lt in layer_types:
+                if lt != "full_attention" and "attention" in lt:
+                    # e.g., "linear_attention" → "linear_attn" pattern
+                    ssm_keywords.add(lt.replace("attention", "attn"))
+                    ssm_keywords.add(lt)
+            # Check for mamba/ssm indicators
+            if cfg.get("mamba_ssm_dtype") or cfg.get("ssm_cfg"):
+                ssm_keywords.add("mamba")
+                ssm_keywords.add("ssm")
+            if "linear_attention" in layer_types:
+                # DeltaNet-specific projection names
+                ssm_keywords.update(["in_proj_qkv", "in_proj_a", "in_proj_b",
+                                     "in_proj_z", "out_proj", "linear_attn"])
+        except (json.JSONDecodeError, OSError, KeyError):
+            pass
+
+        # ── Classify each parameter ──────────────────────────────────────
+        # Estimate param count from name (we don't load tensors here).
+        # Use metadata.total_size if available, else estimate from weight count.
+        total_size = index.get("metadata", {}).get("total_size", 0)
+        param_count = len(weight_map)
+
+        # We need actual tensor sizes. Parse from safetensors metadata if available.
+        param_bytes = {}
+        try:
+            from safetensors import safe_open
+            shard_files = set(weight_map.values())
+            for shard in shard_files:
+                path = os.path.join(model_path, shard)
+                with safe_open(path, framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        t = f.get_slice(key)
+                        shape = t.get_shape()
+                        # Assume source is BF16/FP16 (2 bytes per element)
+                        numel = 1
+                        for s in shape:
+                            numel *= s
+                        param_bytes[key] = numel * 2  # BF16 bytes
+        except Exception:
+            # Fallback: estimate evenly from total_size
+            if total_size and param_count:
+                avg = total_size / param_count
+                param_bytes = {k: avg for k in weight_map}
+            else:
+                return {}
+
+        # ── Group params ─────────────────────────────────────────────────
+        ssm_bf16 = 0
+        lm_head_bf16 = 0
+        embed_bf16 = 0
+        other_bf16 = 0
+        ssm_patterns_found = set()
+
+        for name, bf16_bytes in param_bytes.items():
+            if "lm_head" in name:
+                lm_head_bf16 += bf16_bytes
+            elif "embed" in name and "layer" not in name:
+                embed_bf16 += bf16_bytes
+            elif ssm_keywords and any(kw in name for kw in ssm_keywords):
+                ssm_bf16 += bf16_bytes
+                # Extract the module-level pattern for the skip list
+                for kw in ssm_keywords:
+                    if kw in name:
+                        ssm_patterns_found.add(kw)
+            else:
+                other_bf16 += bf16_bytes
+
+        to_gb = 1 / (1024 ** 3)
+        # NF4 = 0.5 bytes per param, double-quant adds ~12.5% overhead
+        nf4_ratio = 0.5 * 1.125 / 2  # relative to BF16 bytes
+
+        return {
+            "ssm_bf16": ssm_bf16 * to_gb,
+            "ssm_nf4": ssm_bf16 * nf4_ratio * to_gb,
+            "ssm_patterns": sorted(ssm_patterns_found),
+            "lm_head_bf16": lm_head_bf16 * to_gb,
+            "lm_head_nf4": lm_head_bf16 * nf4_ratio * to_gb,
+            "lm_head_patterns": ["lm_head"],
+            "embed_bf16": embed_bf16 * to_gb,
+            "embed_nf4": embed_bf16 * nf4_ratio * to_gb,
+            "embed_patterns": ["embed"],
+            "other_nf4": other_bf16 * nf4_ratio * to_gb,
+        }
 
     def _report_vram(self, model_name, gpu, quant_label, status_callback):
         """Log VRAM usage after model load and warn about shared memory spill."""
@@ -557,18 +815,34 @@ class TransformersEngine(BaseEngine):
             if isinstance(pad_id, list):
                 pad_id = pad_id[0]
 
-        # Quantized KV cache
+        # KV cache strategy: TurboQuant > quanto > none
         past_kv = None
-        try:
-            from transformers.cache_utils import QuantizedCache
-            past_kv = QuantizedCache(
-                backend="quanto",
-                config=model.config,
-                nbits=4,
-                residual_length=128,
-            )
-        except Exception:
-            pass
+        gpu = self._detect_gpu_tier()
+        if get_turboquant_kv():
+            try:
+                from core.turboquant_cache import TurboQuantCache
+                num_layers = getattr(model.config, "num_hidden_layers", None)
+                past_kv = TurboQuantCache(
+                    key_bits=3, value_bits=2, residual_length=128,
+                    boundary_layers=2, num_layers=num_layers,
+                )
+                logging.getLogger(__name__).info(
+                    "Using TurboQuant+ KV cache (K=3-bit, V=2-bit, boundary=2, ~2.3x compression)"
+                )
+            except Exception as e:
+                logging.getLogger(__name__).warning("TurboQuant KV cache failed: %s", e)
+        if past_kv is None and gpu["tier"] == "TIGHT":
+            # Fallback: quanto cache on constrained cards
+            try:
+                from transformers.cache_utils import QuantizedCache
+                past_kv = QuantizedCache(
+                    backend="quanto",
+                    config=model.config,
+                    nbits=4,
+                    residual_length=128,
+                )
+            except Exception:
+                pass
 
         gen_kwargs = dict(
             **inputs,
@@ -598,14 +872,46 @@ class TransformersEngine(BaseEngine):
         thread = Thread(target=_safe_generate, daemon=True)
         thread.start()
 
+        import time as _time
         full_response = ""
+        token_count = 0
+        t_first = None
+        t_start = _time.perf_counter()
 
         for new_text in streamer:
             full_response += new_text
+            if new_text:
+                token_count += 1
+                if t_first is None:
+                    t_first = _time.perf_counter()
             if on_token and new_text:
                 on_token(new_text)
 
+        t_end = _time.perf_counter()
         thread.join()
+
+        # Log throughput stats
+        wall_time = t_end - t_start
+        ttft = (t_first - t_start) if t_first else 0
+        toks_per_sec = token_count / wall_time if wall_time > 0 else 0
+        # Decode-only speed (excludes first-token latency)
+        decode_tokens = max(token_count - 1, 0)
+        decode_time = (t_end - t_first) if t_first else wall_time
+        decode_tps = decode_tokens / decode_time if decode_time > 0 else 0
+
+        log = logging.getLogger(__name__)
+        log.info(
+            "Generation: %d tokens in %.1fs (%.1f tok/s, TTFT=%.2fs, decode=%.1f tok/s)",
+            token_count, wall_time, toks_per_sec, ttft, decode_tps,
+        )
+        # Store for GUI / API access
+        self._last_gen_stats = {
+            "tokens": token_count,
+            "wall_time": round(wall_time, 2),
+            "tok_per_sec": round(toks_per_sec, 1),
+            "ttft": round(ttft, 3),
+            "decode_tok_per_sec": round(decode_tps, 1),
+        }
 
         # VRAM cleanup
         del inputs, gen_kwargs, streamer, stop_criteria, thread

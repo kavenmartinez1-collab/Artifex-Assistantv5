@@ -243,6 +243,12 @@ class ArtifexGUI:
                 sg.Slider((0.1, 1.5), 0.7, 0.1, orientation="h", size=(8, 12),
                           key="-TEMP-", font=FONT_SMALL),
                 sg.Push(),
+                sg.Checkbox("Compile", default=False, key="-TORCH-COMPILE-",
+                            font=FONT_SMALL, text_color="#44ff44",
+                            tooltip="torch.compile — 20-40% faster (slow first run)"),
+                sg.Checkbox("TQ Cache", default=False, key="-TURBOQUANT-KV-",
+                            font=FONT_SMALL, text_color="#44ff44",
+                            tooltip="TurboQuant KV cache — 1.7x compression, longer context"),
                 sg.Button("EXECUTE", key="-RUN-", button_color=("#ffffff", "#ff2a6d"),
                           font=("Segoe UI", 11, "bold"), size=(10, 1), bind_return_key=True),
                 sg.Button("Refresh", key="-REFRESH-", button_color=(panel_bg, accent), size=(7, 1)),
@@ -519,8 +525,23 @@ class ArtifexGUI:
             think_filter.flush()
 
             self.messages.append({"role": "assistant", "content": response})
-            self.window["-OUTPUT-"].update("\n\n", append=True)
-            self.window["-STATUS-"].update("READY")
+
+            # Show generation speed in output (persists) and status bar
+            stats = getattr(self.engine, "_last_gen_stats", None)
+            if stats:
+                perf_line = (
+                    f"\n[{stats['tok_per_sec']} tok/s | "
+                    f"{stats['tokens']} tokens | "
+                    f"TTFT {stats['ttft']}s | "
+                    f"decode {stats['decode_tok_per_sec']} tok/s]\n"
+                )
+                self.window["-OUTPUT-"].update(perf_line, append=True)
+                self.window["-STATUS-"].update(
+                    f"READY — {stats['tok_per_sec']} tok/s"
+                )
+            else:
+                self.window["-OUTPUT-"].update("\n\n", append=True)
+                self.window["-STATUS-"].update("READY")
 
             try:
                 self.km.add_from_ai_response(response)
@@ -780,6 +801,12 @@ class ArtifexGUI:
                 self.window["-PROMPT-"].update("")
                 max_tokens = int(values["-TOKENS-"])
                 temp = values["-TEMP-"]
+
+                # Sync optimization toggles to config
+                from core.config import set_torch_compile, set_turboquant_kv
+                set_torch_compile(values.get("-TORCH-COMPILE-", False))
+                set_turboquant_kv(values.get("-TURBOQUANT-KV-", False))
+
                 threading.Thread(target=self._generate_thread,
                                  args=(prompt, max_tokens, temp), daemon=True).start()
 

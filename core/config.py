@@ -75,6 +75,35 @@ def set_active_backend(name):
     return False
 
 
+# ===== INFERENCE OPTIMIZATIONS =====
+_torch_compile_enabled = False
+_turboquant_kv_enabled = False
+
+
+def get_torch_compile():
+    """Whether torch.compile() is applied to the model for faster inference."""
+    return _torch_compile_enabled
+
+
+def set_torch_compile(enabled):
+    """Toggle torch.compile(). Requires model reload to take effect."""
+    global _torch_compile_enabled
+    _torch_compile_enabled = bool(enabled)
+    return True
+
+
+def get_turboquant_kv():
+    """Whether TurboQuant KV cache compression is active."""
+    return _turboquant_kv_enabled
+
+
+def set_turboquant_kv(enabled):
+    """Toggle TurboQuant KV cache. Takes effect on next generation."""
+    global _turboquant_kv_enabled
+    _turboquant_kv_enabled = bool(enabled)
+    return True
+
+
 # ===== OLLAMA CONFIGURATION =====
 OLLAMA_MODELS = {}  # auto-discovered from running Ollama server
 OLLAMA_NUM_GPU = "auto"  # "auto", 0, -1, or specific int
