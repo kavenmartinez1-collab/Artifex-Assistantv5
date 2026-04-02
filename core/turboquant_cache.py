@@ -230,6 +230,13 @@ class TurboQuantCache(Cache):
         self._compressed_len = {}
         self._max_layer_seen = 0
 
+        # Cache base class attributes that generate() may access.
+        # These live on the wrapper so __getattr__ doesn't need to
+        # proxy them to inner caches that may not have them.
+        self.layers = getattr(inner, 'layers', [])
+        self.layer_class_to_replicate = getattr(inner, 'layer_class_to_replicate', None)
+        self.offloading = getattr(inner, 'offloading', False)
+
     # ── Transparent proxy ─────────────────────────────────────────────────
     # Any attribute not on TurboQuantCache falls through to the inner cache.
     # This is what makes conv_states, recurrent_states, has_previous_state,
@@ -240,12 +247,17 @@ class TurboQuantCache(Cache):
         # so our own attributes (key_bits, _inner, etc.) resolve normally.
         return getattr(self._inner, name)
 
+    # Attributes that belong to the wrapper (not forwarded to inner cache)
+    _OWN_ATTRS = frozenset({
+        'key_bits', 'value_bits', 'residual_length',
+        'boundary_layers', 'num_layers',
+        # Cache base class attributes (inner cache may not have these)
+        'layers', 'layer_class_to_replicate', 'offloading', 'only_non_sliding',
+        'prefetch_stream',
+    })
+
     def __setattr__(self, name, value):
-        # Our own attributes go on self, everything else on inner
-        if name.startswith('_') or name in (
-            'key_bits', 'value_bits', 'residual_length',
-            'boundary_layers', 'num_layers',
-        ):
+        if name.startswith('_') or name in self._OWN_ATTRS:
             object.__setattr__(self, name, value)
         else:
             setattr(self._inner, name, value)
