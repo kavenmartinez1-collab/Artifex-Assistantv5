@@ -373,12 +373,22 @@ def run_assistant():
 
     def _build_system_prompt():
         profile = get_context_profile()
-        return build_assistant_prompt(
+        prompt = build_assistant_prompt(
             system_info, os.getcwd(),
             workspace_text=km.get_workspace_summary(max_tokens=profile.workspace_token_budget),
             knowledge_text=km.render_for_prompt(token_budget=profile.knowledge_token_budget),
             session_map_text=session_map.render(token_budget=profile.session_map_token_budget),
         )
+        # Ollama models need extra emphasis on tool marker format
+        if get_active_backend() == "ollama":
+            prompt += (
+                "\n\nIMPORTANT REMINDER — Tool markers go in PLAIN TEXT, never in code blocks:\n"
+                "CORRECT: @search(\"my query\")\n"
+                "WRONG:   ```bash\\n@search(\"my query\")\\n```\n"
+                "WRONG:   ```bash\\nsearch \"my query\"\\n```\n"
+                "Tool markers are NOT shell commands. Write them as plain text on their own line."
+            )
+        return prompt
 
     history = [{"role": "system", "content": _build_system_prompt()}]
     _first_message = True

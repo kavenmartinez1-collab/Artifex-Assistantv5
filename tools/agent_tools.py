@@ -260,6 +260,13 @@ def extract_agent_actions(response):
     """
     actions = []
 
+    # Tool marker pattern — lines that are @tool(...) calls, not shell commands.
+    # Some models (especially Ollama) mistakenly wrap these in code blocks.
+    _TOOL_MARKER_RE = re.compile(
+        r'^\s*@(?:search|read_file|read_function|find_symbol|find_references'
+        r'|grep|glob|web_read|download|trace_imports|architecture)\s*\(',
+    )
+
     # --- Shell code blocks (treat entire block as one command for powershell) ---
     shell_blocks = re.findall(
         r"```(?:bash|sh|shell|console|cmd|powershell|zsh)\s*\n(.*?)```",
@@ -271,6 +278,12 @@ def extract_agent_actions(response):
             continue
 
         lines = block.split("\n")
+
+        # Filter out lines that are tool markers (not shell commands)
+        lines = [l for l in lines if not _TOOL_MARKER_RE.match(l)]
+        if not lines:
+            continue
+
         # If it's a multi-line pipeline (PowerShell piped command), keep as one
         # Detect by checking if it's a single logical command with line continuations
         # or pipes, or if it has multiple independent commands

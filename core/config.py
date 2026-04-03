@@ -71,6 +71,8 @@ def set_active_backend(name):
     global _active_backend
     if name in ("transformers", "ollama"):
         _active_backend = name
+        if name == "ollama" and not OLLAMA_MODELS:
+            refresh_ollama_models()
         return True
     return False
 
@@ -200,7 +202,7 @@ def get_active_ollama_model():
     # Default: first discovered model, or generic
     if OLLAMA_MODELS:
         return next(iter(OLLAMA_MODELS.keys()))
-    return "qwen3.5:latest"
+    return "qwen3.5:9b"
 
 
 def get_model_names():

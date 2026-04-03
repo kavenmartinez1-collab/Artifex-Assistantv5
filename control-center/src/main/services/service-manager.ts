@@ -173,9 +173,14 @@ export class ServiceManager {
         return;
       }
 
+      // Node.js ≥20.12 blocks spawning .cmd/.bat files without shell:true
+      // (CVE-2024-27980). Enable shell for batch commands on Windows.
+      const needsShell = process.platform === 'win32' &&
+        /\.(cmd|bat)$/i.test(def.command);
+
       const child = spawn(def.command, args, {
         cwd: def.cwd,
-        shell: false,
+        shell: needsShell,
         env: spawnEnv,
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
