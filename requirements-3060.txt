@@ -42,6 +42,9 @@ FreeSimpleGUI==5.2.0.post1
 pyperclip==1.11.0
 sounddevice==0.5.1
 scipy==1.15.3
+soundfile==0.13.1
+librosa==0.11.0
+trimesh==4.11.5
 
 # ── API server / Web gateway ─────────────────────────────────────────
 fastapi==0.135.1
