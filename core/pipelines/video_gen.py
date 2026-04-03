@@ -44,6 +44,16 @@ class VideoGenerationPipeline(BasePipeline):
                 "Install with: pip install diffusers>=0.30.0"
             )
 
+        # Check video codec deps — without these, export_to_video segfaults
+        try:
+            import imageio_ffmpeg
+            imageio_ffmpeg.get_ffmpeg_exe()
+        except (ImportError, RuntimeError):
+            raise ImportError(
+                "imageio-ffmpeg is required for video export (MP4 encoding).\n"
+                "Install with: pip install imageio imageio-ffmpeg"
+            )
+
         # Check GPU tier
         gpu_gb = 0
         if torch.cuda.is_available():
