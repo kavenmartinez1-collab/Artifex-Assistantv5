@@ -98,6 +98,39 @@ class ImageGenerationRequest(BaseModel):
     height: Optional[int] = Field(512, ge=64, le=2048)
     steps: Optional[int] = Field(30, ge=1, le=100)
 
+class ImageEditRequest(BaseModel):
+    file_id: str = Field(..., example="a1b2c3d4e5f6")
+    prompt: str = Field(..., example="Make the sky more dramatic")
+    mode: Optional[str] = Field("img2img", example="img2img")
+    strength: Optional[float] = Field(0.75, ge=0.0, le=1.0)
+    num_steps: Optional[int] = Field(30, ge=1, le=100)
+
+class VisionAnalyzeRequest(BaseModel):
+    file_id: Optional[str] = None
+    image_base64: Optional[str] = None
+    prompt: str = Field("Describe this image in detail.", example="What is in this image?")
+    max_tokens: Optional[int] = Field(512, ge=1, le=4096)
+
+class AudioSpeechRequest(BaseModel):
+    text: str = Field(..., example="Hello, how are you?")
+    model: Optional[str] = None
+
+class AudioTranscriptionRequest(BaseModel):
+    file_id: str = Field(..., example="a1b2c3d4e5f6")
+
+class MusicGenerationRequest(BaseModel):
+    prompt: str = Field(..., example="An upbeat jazz piano melody")
+    duration_seconds: Optional[float] = Field(10.0, ge=1.0, le=30.0)
+
+class VideoGenerationRequest(BaseModel):
+    prompt: str = Field(..., example="A cat playing with a ball")
+    num_frames: Optional[int] = Field(16, ge=4, le=32)
+    fps: Optional[int] = Field(8, ge=1, le=30)
+
+class Shape3DGenerationRequest(BaseModel):
+    prompt: str = Field(..., example="A small red chair")
+    num_steps: Optional[int] = Field(64, ge=16, le=128)
+
 class EmbeddingRequest(BaseModel):
     input: List[str] = Field(..., example=["Hello world"])
 
@@ -531,24 +564,28 @@ def create_app():
         description="OpenAI-compatible local AI API with web search tools",
     )
 
-    # CORS: allow localhost origins for local development
+    # CORS: allow localhost and LAN origins for local dev + upstream-client Web Suite
+    cors_origins = os.environ.get("ARTIFEX_CORS_ORIGINS", "").split(",")
+    cors_origins = [o.strip() for o in cors_origins if o.strip()]
+    cors_origins += [
+        "http://localhost",
+        "http://localhost:5173",    # WebGPU dev server
+        "http://localhost:3001",    # Metrics server
+        "http://localhost:5000",    # Common dev server port
+        "http://localhost:8080",    # Common dev server port
+        "http://localhost:8114",    # upstream client suite
+        "http://127.0.0.1",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:3001",
+        "http://127.0.0.1:5000",
+        "http://127.0.0.1:8080",
+        "http://127.0.0.1:8114",
+    ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "http://localhost",
-            "http://localhost:5173",    # WebGPU dev server
-            "http://localhost:3001",    # Metrics server
-            "http://localhost:5000",    # Common dev server port
-            "http://localhost:8080",    # Common dev server port
-            "http://localhost:8114",    # upstream client suite
-            "http://127.0.0.1",
-            "http://127.0.0.1:5173",
-            "http://127.0.0.1:3001",
-            "http://127.0.0.1:5000",
-            "http://127.0.0.1:8080",
-            "http://127.0.0.1:8114",
-        ],
-        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_origins=cors_origins,
+        allow_origin_regex=r"http://192\.168\.\d+\.\d+:\d+",  # LAN access
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "X-API-Key"],
     )
 
@@ -720,25 +757,29 @@ def create_app():
         if not _check_auth(request):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
+        from core.services import get_service
+        svc = get_service()
+
         try:
-            from core.pipelines.registry import create_pipeline
-            pipe = create_pipeline("text-to-image")
-            if not pipe.is_loaded():
-                raise HTTPException(
-                    status_code=503,
-                    detail="Image generation model not loaded. Load a model first.",
-                )
-            result = pipe.run(
-                prompt=body.prompt[:2000],
-                negative_prompt=(body.negative_prompt or "")[:500],
-                width=body.width,
-                height=body.height,
-                num_steps=body.steps,
-            )
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+                "text-to-image",
+                kwargs={
+                    "prompt": body.prompt[:2000],
+                    "negative_prompt": (body.negative_prompt or "")[:500],
+                    "width": body.width,
+                    "height": body.height,
+                    "num_steps": body.steps,
+                },
+                store_output=True,
+            ))
             if result.success:
                 return {
                     "created": int(time.time()),
-                    "data": [{"url": f"file://{os.path.basename(result.content)}"}],
+                    "data": [{
+                        "file_id": result.metadata.get("file_id"),
+                        "url": f"/v1/files/{result.metadata.get('file_id', '')}",
+                    }],
                 }
             raise HTTPException(status_code=500, detail=result.error)
         except ValueError as e:
@@ -778,5 +819,348 @@ def create_app():
             raise HTTPException(status_code=500, detail=result.error)
         except (ValueError, ImportError) as e:
             raise HTTPException(status_code=503, detail=str(e))
+
+    # ─── File Management ────────────────────────────────────────────────
+
+    @app.post("/v1/files")
+    async def upload_file(request: Request):
+        """Upload a file (image, audio, video, document). Multipart form data."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        try:
+            from fastapi import UploadFile, File as FastAPIFile
+        except ImportError:
+            raise HTTPException(status_code=500, detail="FastAPI file support unavailable")
+
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None:
+            raise HTTPException(status_code=400, detail="No file provided. Use multipart form with 'file' field.")
+
+        purpose = form.get("purpose", "upload")
+        file_bytes = await upload.read()
+        filename = upload.filename or "unknown"
+
+        from core.services.file_manager import _detect_file_type
+        file_type = _detect_file_type(filename)
+        if file_type == "unknown":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {filename}. "
+                       "Accepted: images, audio, video, documents, meshes.",
+            )
+
+        from core.services import get_file_manager
+        fm = get_file_manager()
+        record = fm.store_upload(file_bytes, filename, upload.content_type)
+
+        return {
+            "id": record.file_id,
+            "object": "file",
+            "filename": record.original_name,
+            "purpose": purpose,
+            "bytes": record.size_bytes,
+            "file_type": record.file_type,
+            "created_at": int(record.created_at),
+        }
+
+    @app.get("/v1/files")
+    async def list_files(request: Request, purpose: Optional[str] = None,
+                         file_type: Optional[str] = None):
+        """List uploaded and generated files."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        from core.services import get_file_manager
+        fm = get_file_manager()
+        records = fm.list_files(file_type=file_type, purpose=purpose)
+
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": r.file_id,
+                    "object": "file",
+                    "filename": r.original_name,
+                    "purpose": r.purpose,
+                    "bytes": r.size_bytes,
+                    "file_type": r.file_type,
+                    "created_at": int(r.created_at),
+                }
+                for r in records
+            ],
+        }
+
+    @app.get("/v1/files/{file_id}")
+    async def download_file(request: Request, file_id: str):
+        """Download a file by its ID."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        from fastapi.responses import FileResponse
+        from core.services import get_file_manager
+        fm = get_file_manager()
+
+        record = fm.get_file(file_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        path = fm.get_file_path(file_id)
+        if path is None:
+            raise HTTPException(status_code=404, detail="File data missing from disk")
+
+        return FileResponse(
+            path=path,
+            media_type=record.content_type,
+            filename=record.original_name,
+        )
+
+    @app.delete("/v1/files/{file_id}")
+    async def delete_file(request: Request, file_id: str):
+        """Delete a file by its ID."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        from core.services import get_file_manager
+        fm = get_file_manager()
+
+        if not fm.delete_file(file_id):
+            raise HTTPException(status_code=404, detail="File not found")
+
+        return {"id": file_id, "object": "file", "deleted": True}
+
+    # ─── Vision (Image Understanding) ────────────────────────────────────
+
+    @app.post("/v1/vision/analyze")
+    async def vision_analyze(request: Request, body: VisionAnalyzeRequest):
+        """Analyze an image using a vision model."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        import tempfile
+        from core.services import get_service
+
+        svc = get_service()
+
+        # Resolve image to a file path
+        if body.file_id:
+            image_path = svc.file_manager.get_file_path(body.file_id)
+            if image_path is None:
+                raise HTTPException(status_code=404, detail="File not found")
+        elif body.image_base64:
+            import base64
+            img_bytes = base64.b64decode(body.image_base64)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+            tmp.write(img_bytes)
+            tmp.close()
+            image_path = tmp.name
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either file_id or image_base64",
+            )
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+            "image-text-to-text",
+            kwargs={
+                "image_path": image_path,
+                "prompt": body.prompt,
+                "max_tokens": body.max_tokens,
+            },
+            store_output=False,
+        ))
+
+        if not result.success:
+            raise HTTPException(status_code=500, detail=result.error)
+
+        return {
+            "object": "vision.analysis",
+            "analysis": result.content,
+            "model": result.metadata.get("model", "vision"),
+        }
+
+    # ─── Audio TTS ───────────────────────────────────────────────────────
+
+    @app.post("/v1/audio/speech")
+    async def audio_speech(request: Request, body: AudioSpeechRequest):
+        """Generate speech from text (TTS)."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        from core.services import get_service
+        svc = get_service()
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+            "text-to-audio",
+            model_path=body.model or "",
+            kwargs={"text": body.text[:5000]},
+            store_output=True,
+        ))
+
+        if not result.success:
+            raise HTTPException(status_code=500, detail=result.error)
+
+        file_id = result.metadata.get("file_id")
+        return {
+            "object": "audio.speech",
+            "file_id": file_id,
+            "content_type": "audio/wav",
+        }
+
+    # ─── Audio STT ───────────────────────────────────────────────────────
+
+    @app.post("/v1/audio/transcriptions")
+    async def audio_transcriptions(request: Request,
+                                   body: AudioTranscriptionRequest = None):
+        """Transcribe audio to text (STT). Accepts file_id."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        from core.services import get_service
+        svc = get_service()
+
+        audio_path = svc.file_manager.get_file_path(body.file_id)
+        if audio_path is None:
+            raise HTTPException(status_code=404, detail="Audio file not found")
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+            "automatic-speech-recognition",
+            kwargs={"audio_path": audio_path},
+            store_output=False,
+        ))
+
+        if not result.success:
+            raise HTTPException(status_code=500, detail=result.error)
+
+        return {"object": "transcription", "text": result.content}
+
+    # ─── Music Generation ────────────────────────────────────────────────
+
+    @app.post("/v1/audio/music")
+    async def music_generation(request: Request, body: MusicGenerationRequest):
+        """Generate music from a text description."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        from core.services import get_service
+        svc = get_service()
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+            "text-to-music",
+            kwargs={
+                "prompt": body.prompt[:1000],
+                "duration_seconds": body.duration_seconds,
+            },
+            store_output=True,
+        ))
+
+        if not result.success:
+            raise HTTPException(status_code=500, detail=result.error)
+
+        return {
+            "object": "audio.music",
+            "file_id": result.metadata.get("file_id"),
+            "duration_seconds": body.duration_seconds,
+        }
+
+    # ─── Image Editing ───────────────────────────────────────────────────
+
+    @app.post("/v1/images/edits")
+    async def image_edits(request: Request, body: ImageEditRequest):
+        """Edit an image (img2img, inpaint, upscale)."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        from core.services import get_service
+        svc = get_service()
+
+        image_path = svc.file_manager.get_file_path(body.file_id)
+        if image_path is None:
+            raise HTTPException(status_code=404, detail="Source image not found")
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+            "image-to-image",
+            kwargs={
+                "image_path": image_path,
+                "prompt": body.prompt[:2000],
+                "strength": body.strength,
+                "num_steps": body.num_steps,
+            },
+            store_output=True,
+        ))
+
+        if not result.success:
+            raise HTTPException(status_code=500, detail=result.error)
+
+        return {
+            "object": "image.edit",
+            "file_id": result.metadata.get("file_id"),
+        }
+
+    # ─── Video Generation ────────────────────────────────────────────────
+
+    @app.post("/v1/video/generations")
+    async def video_generations(request: Request, body: VideoGenerationRequest):
+        """Generate a video from a text prompt."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        from core.services import get_service
+        svc = get_service()
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+            "text-to-video",
+            kwargs={
+                "prompt": body.prompt[:2000],
+                "num_frames": body.num_frames,
+                "fps": body.fps,
+            },
+            store_output=True,
+        ))
+
+        if not result.success:
+            raise HTTPException(status_code=500, detail=result.error)
+
+        return {
+            "object": "video.generation",
+            "file_id": result.metadata.get("file_id"),
+        }
+
+    # ─── 3D Generation ───────────────────────────────────────────────────
+
+    @app.post("/v1/3d/generations")
+    async def shape_3d_generations(request: Request,
+                                   body: Shape3DGenerationRequest):
+        """Generate a 3D mesh from a text prompt."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        from core.services import get_service
+        svc = get_service()
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+            "shap-e",
+            kwargs={
+                "prompt": body.prompt[:1000],
+                "num_steps": body.num_steps,
+            },
+            store_output=True,
+        ))
+
+        if not result.success:
+            raise HTTPException(status_code=500, detail=result.error)
+
+        return {
+            "object": "3d.generation",
+            "file_id": result.metadata.get("file_id"),
+        }
 
     return app

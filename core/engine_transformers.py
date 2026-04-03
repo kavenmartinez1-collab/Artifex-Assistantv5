@@ -37,6 +37,43 @@ from core.config import (
 )
 from core.inference import STOP_STRINGS, _clean_response
 
+# Model types that require AutoModelForMultimodalLM instead of AutoModelForCausalLM
+_MULTIMODAL_MODEL_TYPES = {
+    "gemma3n", "gemma3n_text", "gemma3n_vision", "gemma3n_audio",
+}
+
+
+def _detect_model_type_from_config(model_path: str):
+    """Read model_type from config.json."""
+    config_path = os.path.join(model_path, "config.json")
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                return json.load(f).get("model_type")
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
+def _get_auto_model_class(model_path: str):
+    """Return the appropriate AutoModel class for a given model.
+
+    Gemma 4 (model_type gemma3n*) requires AutoModelForMultimodalLM.
+    All other models use AutoModelForCausalLM.
+    Requires transformers >= 5.5.0 for multimodal support.
+    """
+    model_type = _detect_model_type_from_config(model_path)
+    if model_type in _MULTIMODAL_MODEL_TYPES:
+        try:
+            from transformers import AutoModelForMultimodalLM
+            return AutoModelForMultimodalLM
+        except ImportError:
+            logging.getLogger(__name__).warning(
+                "AutoModelForMultimodalLM not available (needs transformers >= 5.5.0). "
+                "Falling back to AutoModelForCausalLM for %s.", model_type
+            )
+    return AutoModelForCausalLM
+
 # Suppress harmless warnings
 warnings.filterwarnings("ignore", message="expandable_segments not supported")
 warnings.filterwarnings("ignore", message="The following layers were not sharded")
@@ -105,9 +142,31 @@ class TransformersEngine(BaseEngine):
     def __init__(self):
         self.model = None
         self.tokenizer = None
+        self.processor = None  # For multimodal models (Gemma 4, etc.)
         self._loaded_path = None
         self._gpu_tier = None
         self._last_gen_stats = None
+
+    def _load_processor(self, model_path: str):
+        """Load AutoProcessor for multimodal models (Gemma 4, etc.).
+
+        Falls back silently for text-only models that don't ship a processor.
+        """
+        model_type = _detect_model_type_from_config(model_path)
+        if model_type not in _MULTIMODAL_MODEL_TYPES:
+            self.processor = None
+            return
+        try:
+            from transformers import AutoProcessor
+            self.processor = AutoProcessor.from_pretrained(
+                model_path, trust_remote_code=True
+            )
+            logging.getLogger(__name__).info("Loaded AutoProcessor for %s", model_type)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Could not load processor for %s: %s", model_type, e
+            )
+            self.processor = None
 
     # =========================================================================
     # GPU TIER DETECTION
@@ -316,9 +375,10 @@ class TransformersEngine(BaseEngine):
                 status_callback(f"Loading {model_name} (fast path)...")
 
             self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self._load_processor(model_path)
 
             try:
-                self.model = AutoModelForCausalLM.from_pretrained(
+                self.model = _get_auto_model_class(model_path).from_pretrained(
                     quantized_path,
                     device_map={"": 0},
                     dtype=gpu["compute_dtype"],
@@ -331,7 +391,7 @@ class TransformersEngine(BaseEngine):
                     status_callback("Direct GPU load failed — retrying with memory constraints...")
                 torch.cuda.empty_cache()
                 max_mem = self._get_vram_constraints(allow_cpu_staging=False)
-                self.model = AutoModelForCausalLM.from_pretrained(
+                self.model = _get_auto_model_class(model_path).from_pretrained(
                     quantized_path,
                     device_map="auto",
                     max_memory=max_mem,
@@ -371,9 +431,10 @@ class TransformersEngine(BaseEngine):
         _patch_config_json(model_path)
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self._load_processor(model_path)
 
         # GPU-only placement — no CPU offload / shared memory spillover
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model = _get_auto_model_class(model_path).from_pretrained(
             model_path,
             device_map={"": 0},
             quantization_config=bnb_config,
@@ -402,7 +463,7 @@ class TransformersEngine(BaseEngine):
                 llm_int8_skip_modules=_skip_modules,
             )
 
-            self.model = AutoModelForCausalLM.from_pretrained(
+            self.model = _get_auto_model_class(model_path).from_pretrained(
                 model_path,
                 device_map={"": 0},
                 quantization_config=bnb_config,
@@ -733,6 +794,10 @@ class TransformersEngine(BaseEngine):
             del self.tokenizer
             self.tokenizer = None
 
+        if self.processor is not None:
+            del self.processor
+            self.processor = None
+
         gc.collect()
 
         if torch.cuda.is_available():
@@ -783,7 +848,10 @@ class TransformersEngine(BaseEngine):
         if _inf._tokenizer is None:
             _inf._tokenizer = tokenizer
 
-        inputs = tokenizer.apply_chat_template(
+        # Use processor for multimodal models (Gemma 4), tokenizer otherwise
+        template_source = self.processor if self.processor is not None else tokenizer
+
+        inputs = template_source.apply_chat_template(
             messages,
             add_generation_prompt=True,
             enable_thinking=enable_thinking,
@@ -792,7 +860,8 @@ class TransformersEngine(BaseEngine):
         ).to(model.device)
 
         streamer = TextIteratorStreamer(
-            tokenizer, skip_prompt=True, skip_special_tokens=True
+            self.processor or tokenizer,
+            skip_prompt=True, skip_special_tokens=True,
         )
 
         stop_criteria = StopStringCriteria(tokenizer=tokenizer, stop_strings=STOP_STRINGS)

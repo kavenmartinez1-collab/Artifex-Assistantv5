@@ -17,6 +17,8 @@ STOP_STRINGS = [
     "\nUser:", "\nUSER:", "\nYOU:", "\nuser:", "\nHuman:",
     # ChatML format (Qwen) — role names without colons
     "\nuser\n", "\nUser\n", "\nassistant\n", "\nassistant ",
+    # Gemma turn markers
+    "\n<end_of_turn>", "<end_of_turn>",
     # Tool output markers
     "\n[TOOL OUTPUT", "\n[tool output",
 ]
@@ -50,17 +52,22 @@ class ThinkFilter:
     def _process(self):
         while True:
             if self.in_think:
+                # Check for end-of-thinking: </think> (Qwen) or <channel|> (Gemma 4)
                 idx = self.buffer.find("</think>")
+                end_len = 8
+                if idx == -1:
+                    idx = self.buffer.find("<channel|>")
+                    end_len = 10
                 if idx != -1:
                     if self.on_thinking and idx > 0:
                         self.on_thinking(self.buffer[:idx])
                     self.in_think = False
-                    self.buffer = self.buffer[idx + 8:]
+                    self.buffer = self.buffer[idx + end_len:]
                     continue
                 else:
-                    if self.on_thinking and len(self.buffer) > 8:
-                        self.on_thinking(self.buffer[:-8])
-                        self.buffer = self.buffer[-8:]
+                    if self.on_thinking and len(self.buffer) > 10:
+                        self.on_thinking(self.buffer[:-10])
+                        self.buffer = self.buffer[-10:]
                     break
             else:
                 idx = self.buffer.find("<think>")

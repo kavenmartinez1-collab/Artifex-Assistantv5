@@ -341,6 +341,7 @@ def run_assistant():
     print(f"{Fore.WHITE}  Type your questions. The AI can run shell commands, Python, and web searches.")
     print(f"  Commands: /workspace <path>, /kb search|add|list|show|remove, /refresh, /clear")
     print(f"  Session:  /save [name], /load [name|#], /sessions, /export [path]")
+    print(f"  Pipeline: /mode <mode>, /attach <file>, /output <dir>")
     print(f"  System:   /backend transformers|ollama, /health, /compile on|off, /turboquant on|off")
     print(f"  Type 'exit' to quit.{Style.RESET_ALL}\n")
 
@@ -367,6 +368,18 @@ def run_assistant():
     engine.load(status_callback=lambda msg: print(f"{Fore.CYAN}  {msg}{Style.RESET_ALL}"))
     mode_cfg = MODES["ASSISTANT"]
     session_map = SessionMap()
+
+    # Pipeline mode state
+    _cli_pipeline_mode = "chat"
+    _cli_attached_files = []
+    _cli_output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+    _CLI_MODE_MAP = {
+        "chat": None, "code": None,
+        "image_gen": "text-to-image", "image_edit": "image-to-image",
+        "vision": "image-text-to-text", "tts": "text-to-audio",
+        "stt": "automatic-speech-recognition", "music": "text-to-music",
+        "video": "text-to-video", "3d": "shap-e",
+    }
 
     # Build environment info once
     system_info = get_assistant_tools_prompt()
@@ -640,6 +653,123 @@ def run_assistant():
                     print(f"{Fore.YELLOW}  sentence-transformers not installed. Run: pip install sentence-transformers{Style.RESET_ALL}\n")
                 except Exception as e:
                     print(f"{Fore.RED}  Indexing failed: {e}{Style.RESET_ALL}\n")
+                continue
+
+            # /mode command — switch pipeline mode
+            if user_input.lower().startswith("/mode"):
+                arg = user_input[5:].strip().lower()
+                if not arg:
+                    modes = ", ".join(_CLI_MODE_MAP.keys())
+                    print(f"{Fore.CYAN}  Current mode: {_cli_pipeline_mode}")
+                    print(f"  Available: {modes}{Style.RESET_ALL}\n")
+                elif arg in _CLI_MODE_MAP:
+                    _cli_pipeline_mode = arg
+                    print(f"{Fore.CYAN}  Pipeline mode: {_cli_pipeline_mode}{Style.RESET_ALL}\n")
+                else:
+                    print(f"{Fore.YELLOW}  Unknown mode: {arg}. Available: {', '.join(_CLI_MODE_MAP.keys())}{Style.RESET_ALL}\n")
+                continue
+
+            # /attach command — attach file for pipeline input
+            if user_input.lower().startswith("/attach"):
+                path = user_input[7:].strip()
+                if not path:
+                    if _cli_attached_files:
+                        print(f"{Fore.CYAN}  Attached: {', '.join(os.path.basename(f) for f in _cli_attached_files)}{Style.RESET_ALL}\n")
+                    else:
+                        print(f"{Fore.YELLOW}  No files attached. Usage: /attach <path>{Style.RESET_ALL}\n")
+                elif os.path.isfile(path):
+                    _cli_attached_files.append(os.path.abspath(path))
+                    print(f"{Fore.CYAN}  Attached: {os.path.basename(path)}{Style.RESET_ALL}\n")
+                else:
+                    print(f"{Fore.YELLOW}  File not found: {path}{Style.RESET_ALL}\n")
+                continue
+
+            # /output command — set output directory
+            if user_input.lower().startswith("/output"):
+                path = user_input[7:].strip()
+                if not path:
+                    print(f"{Fore.CYAN}  Output dir: {_cli_output_dir}{Style.RESET_ALL}\n")
+                elif os.path.isdir(path):
+                    _cli_output_dir = os.path.abspath(path)
+                    print(f"{Fore.CYAN}  Output dir: {_cli_output_dir}{Style.RESET_ALL}\n")
+                else:
+                    print(f"{Fore.YELLOW}  Directory not found: {path}{Style.RESET_ALL}\n")
+                continue
+
+            # /open command — open a file with system viewer
+            if user_input.lower().startswith("/open"):
+                path = user_input[5:].strip()
+                if path and os.path.isfile(path):
+                    os.startfile(path)
+                    print(f"{Fore.CYAN}  Opened: {path}{Style.RESET_ALL}\n")
+                else:
+                    print(f"{Fore.YELLOW}  File not found: {path}{Style.RESET_ALL}\n")
+                continue
+
+            # Pipeline execution for non-chat modes
+            if _cli_pipeline_mode not in ("chat", "code") and _CLI_MODE_MAP.get(_cli_pipeline_mode):
+                pipeline_type = _CLI_MODE_MAP[_cli_pipeline_mode]
+                kwargs = {}
+
+                if _cli_pipeline_mode == "image_gen":
+                    kwargs = {"prompt": user_input, "width": 512, "height": 512, "num_steps": 30}
+                elif _cli_pipeline_mode == "image_edit":
+                    if not _cli_attached_files:
+                        print(f"{Fore.YELLOW}  Attach an image first: /attach <path>{Style.RESET_ALL}\n")
+                        continue
+                    kwargs = {"image_path": _cli_attached_files[0], "prompt": user_input, "strength": 0.75}
+                elif _cli_pipeline_mode == "vision":
+                    if not _cli_attached_files:
+                        print(f"{Fore.YELLOW}  Attach an image first: /attach <path>{Style.RESET_ALL}\n")
+                        continue
+                    kwargs = {"image_path": _cli_attached_files[0], "prompt": user_input or "Describe this image."}
+                elif _cli_pipeline_mode == "tts":
+                    kwargs = {"text": user_input}
+                elif _cli_pipeline_mode == "stt":
+                    if not _cli_attached_files:
+                        print(f"{Fore.YELLOW}  Attach an audio file first: /attach <path>{Style.RESET_ALL}\n")
+                        continue
+                    kwargs = {"audio_path": _cli_attached_files[0]}
+                elif _cli_pipeline_mode == "music":
+                    kwargs = {"prompt": user_input, "duration_seconds": 10}
+                elif _cli_pipeline_mode == "video":
+                    kwargs = {"prompt": user_input, "num_frames": 16, "fps": 8}
+                elif _cli_pipeline_mode == "3d":
+                    kwargs = {"prompt": user_input, "num_steps": 64}
+
+                # Run through service layer with progress
+                from core.services import get_service
+                svc = get_service()
+                print(f"{Fore.CYAN}  Running {_cli_pipeline_mode}...{Style.RESET_ALL}")
+
+                def _cli_progress(cur, tot, msg):
+                    print(f"{Fore.CYAN}  {msg}{Style.RESET_ALL}")
+
+                result = svc.run_pipeline(
+                    pipeline_type, kwargs=kwargs,
+                    progress_callback=_cli_progress, store_output=True,
+                )
+
+                if result.success:
+                    if result.output_type == "text":
+                        print(f"\n{Fore.WHITE}  {result.content}{Style.RESET_ALL}\n")
+                    else:
+                        path = result.metadata.get("stored_path") or result.metadata.get("saved_to", "")
+                        file_id = result.metadata.get("file_id", "")
+                        print(f"{Fore.GREEN}  Done! Output: {os.path.basename(path)}")
+                        if file_id:
+                            print(f"  File ID: {file_id}")
+                        print(f"  Full path: {path}{Style.RESET_ALL}\n")
+                        # Auto-open images
+                        if result.output_type == "image" and path and os.path.isfile(path):
+                            try:
+                                os.startfile(path)
+                            except Exception:
+                                pass
+                else:
+                    print(f"{Fore.RED}  Error: {result.error}{Style.RESET_ALL}\n")
+
+                _cli_attached_files.clear()
                 continue
 
             # /kb command

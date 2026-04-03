@@ -447,6 +447,32 @@ def extract_agent_actions(response):
         display = f'read_function: "{fname}" in {os.path.basename(fpath)}'
         actions.append(AgentAction("read_function", content, display))
 
+    # --- Gemma 4 tool call format: <|tool_call>call:func{k:v,...}<tool_call|> ---
+    gemma_tool_calls = re.findall(
+        r'<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>',
+        response, re.DOTALL,
+    )
+    for func_name, args_str in gemma_tool_calls:
+        # Parse Gemma 4 arguments: key:<|"|>value<|"|> or key:plain_value
+        args = {}
+        for key, quoted_val, plain_val in re.findall(
+            r'(\w+):(?:<\|"\|>(.*?)<\|"\|>|([^,}]*))', args_str
+        ):
+            args[key] = (quoted_val or plain_val).strip()
+
+        # Map to existing action types where possible
+        if func_name == "search" and "query" in args:
+            actions.append(AgentAction("search", args["query"],
+                                       f'search: "{args["query"]}"'))
+        elif func_name == "read_file" and "path" in args:
+            actions.append(AgentAction("read_file", args["path"],
+                                       f'read_file: "{args["path"]}"'))
+        else:
+            # Generic tool call — display as-is
+            display = f'{func_name}({", ".join(f"{k}={v}" for k, v in args.items())})'
+            actions.append(AgentAction("shell", f"# Gemma tool: {display}",
+                                       f"tool: {display}"))
+
     return actions
 
 

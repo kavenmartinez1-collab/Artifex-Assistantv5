@@ -35,6 +35,12 @@ _MODEL_TYPE_MAP = {
     "mistral": "text-generation",
     "gemma": "text-generation",
     "gemma2": "text-generation",
+    "gemma3": "text-generation",
+    # Gemma 4 — multimodal (uses AutoModelForMultimodalLM)
+    "gemma3n": "image-text-to-text",
+    "gemma3n_text": "image-text-to-text",
+    "gemma3n_vision": "image-text-to-text",
+    "gemma3n_audio": "image-text-to-text",
     "phi": "text-generation",
     "phi3": "text-generation",
     "starcoder2": "text-generation",
