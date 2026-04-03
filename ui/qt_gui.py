@@ -39,6 +39,9 @@ from core.config import (
 )
 from core.engine_factory import create_engine
 from core.services import get_service
+from core.knowledge import KnowledgeManager
+from tools.tool_cache import SessionMap, clear_cache, update_session_map, maybe_cache_output
+from tools.agent_tools import get_assistant_tools_prompt, get_tool_output_limit
 
 
 # Pipeline mode definitions
@@ -82,6 +85,12 @@ class ArtifexMainWindow(QMainWindow):
         self._current_worker = None
         self._pending_actions = []
         self._current_bubble = None
+        self._output_dir = os.path.join(BASE_DIR, "output")
+
+        # Knowledge & context (matches old GUI)
+        self.km = KnowledgeManager()
+        self.session_map = SessionMap()
+        self._system_info = get_assistant_tools_prompt()
 
         # Build UI
         self._build_ui()
@@ -384,6 +393,11 @@ class ArtifexMainWindow(QMainWindow):
         self._status_label.setProperty("class", "status")
         self._status_bar.addWidget(self._status_label, 1)
 
+        self._copy_btn = QPushButton("COPY")
+        self._copy_btn.setMaximumWidth(60)
+        self._copy_btn.setProperty("class", "secondary")
+        self._status_bar.addPermanentWidget(self._copy_btn)
+
         self._resource_label = QLabel("")
         self._resource_label.setProperty("class", "status")
         self._status_bar.addPermanentWidget(self._resource_label)
@@ -443,6 +457,15 @@ class ArtifexMainWindow(QMainWindow):
 
         # Workspace
         self._ws_set_btn.clicked.connect(self._on_ws_set)
+        self._ws_scan_btn.clicked.connect(self._on_ws_scan)
+
+        # Copy button
+        self._copy_btn.clicked.connect(self._on_copy)
+
+        # Enter key shortcut for execute (Ctrl+Enter to avoid conflict with multiline)
+        from PyQt6.QtGui import QShortcut, QKeySequence
+        self._enter_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        self._enter_shortcut.activated.connect(self._on_execute)
 
         # Token batchers for streaming output
         self._response_batcher = TokenBatcher(flush_interval_ms=50)
@@ -659,11 +682,18 @@ class ArtifexMainWindow(QMainWindow):
         self._thinking_output.ensureCursorVisible()
 
     def _on_generation_finished(self, response: str):
-        """Generation complete — store response, check for actions."""
+        """Generation complete — store response, extract knowledge, check for actions."""
         self._response_batcher.flush_now()
         self._thinking_batcher.flush_now()
 
         self.messages.append({"role": "assistant", "content": response})
+
+        # Extract knowledge from AI response (matches old GUI)
+        try:
+            self.km.add_from_ai_response(response)
+        except Exception:
+            pass
+
         self._finish_busy("Generation complete")
 
         # Check for agent actions
@@ -799,9 +829,55 @@ class ArtifexMainWindow(QMainWindow):
         worker.start()
 
     def _on_action_output(self, display, output):
+        """Display action output and feed it back to AI for analysis."""
         bubble = self._chat_view.add_bubble("assistant")
         bubble.add_text(f"[Action: {display}]\n{output}")
         self._chat_view.scroll_to_bottom()
+
+        # Process through knowledge manager
+        if self.km and output:
+            self.km.process_tool_result("shell", display, output)
+            update_session_map(self.session_map, "shell", display, output)
+
+        # Feed output back to AI for analysis (matches old GUI behavior)
+        if self.engine and output and self.engine.is_loaded():
+            truncated = output
+            limit = get_tool_output_limit()
+            if len(truncated) > limit:
+                truncated = truncated[:limit] + "\n[...truncated...]"
+
+            feedback_msg = (
+                "[TOOL OUTPUT — this is automated command output, not a human message]\n\n"
+                f"{truncated}\n\n"
+                "Analyze the output above and tell the user what you found."
+            )
+            self.messages.append({"role": "user", "content": feedback_msg})
+            self._update_system_prompt()
+
+            from core.inference import build_active_messages
+            mode_cfg = MODES["ASSISTANT"]
+            _, active_msgs = build_active_messages(
+                self.messages, mode_cfg.context_window
+            )
+
+            self._current_bubble = self._chat_view.add_bubble("assistant")
+            self._current_bubble.add_text("")
+
+            worker = GenerationWorker(
+                self.engine, active_msgs, mode_cfg.max_tokens,
+                mode_cfg.temperature,
+                enable_thinking=mode_cfg.enable_thinking,
+                cancel_event=self._cancel_event,
+            )
+            worker.response_received.connect(self._response_batcher.add)
+            worker.thinking_received.connect(self._thinking_batcher.add)
+            worker.status_changed.connect(self._set_status)
+            worker.finished.connect(self._on_generation_finished)
+            worker.error.connect(self._on_generation_error)
+            self._current_worker = worker
+            self._busy = True
+            self._execute_btn.setText("CANCEL")
+            worker.start()
 
     # ═══════════════════════════════════════════════════════════════════
     # UTILITY
@@ -836,6 +912,8 @@ class ArtifexMainWindow(QMainWindow):
         self._action_panel.setVisible(False)
         self._pending_actions.clear()
         self._drop_zone.clear()
+        self.session_map.clear()
+        clear_cache()
         self._set_status("STANDBY")
 
     def _on_vram_relief(self):
@@ -867,8 +945,14 @@ class ArtifexMainWindow(QMainWindow):
             "JSON Files (*.json)"
         )
         if ok and name:
+            metadata = {
+                "model": get_active_model_name(),
+                "backend": get_active_backend(),
+            }
+            smap_data = self.session_map.to_dict() if hasattr(
+                self.session_map, "to_dict") else {}
             save_session(os.path.basename(name).replace(".json", ""),
-                         self.messages)
+                         self.messages, smap_data, metadata)
             self._set_status("Session saved")
 
     def _on_load_session(self):
@@ -910,12 +994,46 @@ class ArtifexMainWindow(QMainWindow):
             if path:
                 self._ws_path.setText(path)
         if path and os.path.isdir(path):
-            self._set_status(f"Workspace: {path}")
+            if self.km.set_workspace(path):
+                self.km.bind_workspace_store(path)
+                summary = self.km.get_workspace_summary()
+                self._set_status(f"Workspace: {path}")
+                bubble = self._chat_view.add_bubble("assistant")
+                bubble.add_text(f"Workspace set: {path}\n{summary}")
+            else:
+                self._set_status(f"Invalid workspace: {path}")
+
+    def _on_ws_scan(self):
+        self.km.rescan_workspace()
+        summary = self.km.get_workspace_summary()
+        self._set_status("Workspace rescanned")
+        bubble = self._chat_view.add_bubble("assistant")
+        bubble.add_text(f"Workspace rescanned.\n{summary}")
+
+    def _on_copy(self):
+        """Copy last assistant response to clipboard."""
+        # Find last assistant message
+        for msg in reversed(self.messages):
+            if msg.get("role") == "assistant":
+                QApplication.clipboard().setText(msg.get("content", ""))
+                self._set_status("Copied to clipboard")
+                return
+        self._set_status("Nothing to copy")
 
     def _update_system_prompt(self, mode: str = "ASSISTANT"):
+        """Build system prompt with full context (workspace, knowledge, session map)."""
         try:
             from core.prompts import build_assistant_prompt
-            prompt = build_assistant_prompt()
+            profile = get_context_profile()
+            prompt = build_assistant_prompt(
+                self._system_info, os.getcwd(),
+                workspace_text=self.km.get_workspace_summary(
+                    max_tokens=profile.workspace_token_budget),
+                knowledge_text=self.km.render_for_prompt(
+                    token_budget=profile.knowledge_token_budget),
+                session_map_text=self.session_map.render(
+                    token_budget=profile.session_map_token_budget),
+            )
             self.messages[0]["content"] = prompt
         except Exception:
             pass
