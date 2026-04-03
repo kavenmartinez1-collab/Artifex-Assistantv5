@@ -24,7 +24,7 @@ Universal Local AI Hosting Platform. Run any AI model locally — text generatio
 
 ### GUI Demo
 
-<video src="docs/demos/gui-demo.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 
 ## Table of Contents
 
@@ -248,7 +248,7 @@ python -m pytest tests/ -v
 
 Interactive terminal assistant with streaming responses, thinking blocks, and agent tool execution.
 
-<video src="docs/demos/cli-demo.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/911f3f29-d70f-402c-960c-1c68f7d2de22
 
 ### Slash Commands
 
@@ -292,7 +292,7 @@ All tool execution requires your confirmation before running.
 
 ## Using the GUI (`python main_gui.py`)
 
-<video src="docs/demos/gui-demo.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 
 The cyberpunk GUI provides a visual interface with:
 
@@ -781,7 +781,7 @@ Dangerous commands (rm -rf /, format c:, etc.) are blocked by configurable safet
 
 Experimental browser-based GPU inference using WebGPU compute shaders. Runs directly on your GPU through Chrome/Edge without Python or CUDA. **All servers bind to 127.0.0.1 only.**
 
-<video src="docs/demos/webgpu-demo.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/3e60ed18-4351-42c6-a846-effe862f3f84
 
 ### Prerequisites
 
@@ -951,7 +951,7 @@ There are two ways to run Artifex — the **Control Center** (desktop app, manag
 
 Desktop dashboard that manages all services from one place. No terminal commands needed.
 
-<video src="docs/demos/control-center-demo.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/5b8aa53a-042e-4a1f-83b9-d030cb7964a7
 
 ```bash
 cd control-center
