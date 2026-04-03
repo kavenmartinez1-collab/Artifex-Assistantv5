@@ -34,7 +34,7 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 - [Prerequisites](#prerequisites)
 - [Setup Guide](#setup-guide)
 - [Using the CLI](#using-the-cli-python-mainpy)
-- [Using the GUI](#using-the-gui-python-main_guipy)
+- [Using the GUI](#using-the-gui-python-main_gui_qtpy)
 - [Using the API Server](#using-the-api-server-python-main_apipy)
   - [Starting the Server](#starting-the-server)
   - [CLI Flags](#cli-flags)
@@ -75,7 +75,7 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 - **Multi-modal inference** — 10 pipeline types: text, image, image editing, 3D mesh, vision, audio, speech recognition, music, video, embeddings
 - **Two backends** — HuggingFace Transformers (GPU-accelerated) and Ollama (pre-quantized models)
 - **Automatic VRAM management** — GPU tier detection, NF4/INT8 quantization, KV cache budgeting
-- **Three interfaces** — CLI with agent tools, cyberpunk GUI, OpenAI-compatible REST API
+- **Three interfaces** — CLI with agent tools and multimodal pipelines, PyQt6 GUI with inline media, OpenAI-compatible REST API with file management
 - **Agent tools** — shell execution, Python runner, web search, codebase analysis (grep, glob, architecture), file I/O, edit-in-place
 - **RAG knowledge base** — per-workspace knowledge entries with lifecycle classification, action keys, loop detection
 - **Session persistence** — save/load conversations with full metadata (model, backend, mode)
@@ -272,6 +272,10 @@ https://github.com/user-attachments/assets/911f3f29-d70f-402c-960c-1c68f7d2de22
 | `/kb search <query>` | Search knowledge base |
 | `/kb list` | List knowledge entries |
 | `/index` | Show/rebuild the knowledge index |
+| `/mode <name>` | Switch pipeline mode (chat, image_gen, vision, tts, stt, music, video, 3d) |
+| `/attach <path>` | Attach a file for the next pipeline operation |
+| `/output <dir>` | Set output directory for generated files |
+| `/open <path>` | Open a file with the system default viewer |
 | `/refresh` | Compress history and free VRAM |
 | `/clear` | Reset conversation (keeps knowledge) |
 | `/cleanup` | Deep clean — reset conversation + remove stale workspace data |
@@ -290,19 +294,29 @@ All tool execution requires your confirmation before running.
 
 ---
 
-## Using the GUI (`python main_gui.py`)
+## Using the GUI (`python main_gui_qt.py`)
 
 https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 
-The cyberpunk GUI provides a visual interface with:
+The PyQt6 GUI provides a production-grade desktop interface with full multimodal support:
 
 - **Model selector** — dropdown of all auto-discovered models
 - **Backend toggle** — switch between Transformers and Ollama
-- **Parameter controls** — temperature, max tokens sliders
-- **System prompt editor** — customize the model's behavior
-- **Chat window** — conversation with streaming responses
-- **Session management** — save/load conversations
-- **Output display** — renders images, audio, and 3D outputs inline
+- **Parameter controls** — temperature slider, max tokens, torch.compile, TurboQuant KV toggles
+- **10 pipeline modes** — Chat, Code, Image Gen, Image Edit, Vision, 3D, Audio TTS, Audio STT, Music Gen, Video Gen
+- **Drag-and-drop file input** — drop images, audio, video, documents onto the drop zone
+- **Microphone recording** — record audio directly for STT
+- **Rich chat view** — inline images, audio players, video players in chat bubbles
+- **Token batching** — 50ms batch interval prevents GUI freezing during fast streaming
+- **Cancel support** — interrupt generation mid-stream
+- **Progress bars** — visual progress for pipeline operations
+- **Knowledge base** — workspace-aware context with automatic knowledge extraction
+- **Session management** — save/load conversations with model/backend metadata
+- **5 themes** — Cyberpunk, Dark Blue, Blood Dragon, Forest, Light (instant hot-swap)
+- **Resource monitor** — real-time VRAM/RAM/CPU in status bar
+- **Keyboard shortcut** — Ctrl+Enter to execute
+
+> **Note:** The legacy FreeSimpleGUI GUI (`main_gui.py`) is still available but deprecated. The PyQt6 GUI is the recommended interface.
 
 ---
 
@@ -351,9 +365,22 @@ python main_api.py --backend transformers --model qwen3.5-27b-distilled --gatewa
 | GET | `/health` | System diagnostics (GPU, VRAM, models, backend, web gateway status) |
 | GET | `/v1/models` | List available models |
 | POST | `/v1/chat/completions` | Chat completion (streaming or non-streaming, with optional web tools) |
-| POST | `/v1/images/generations` | Image generation |
+| POST | `/v1/images/generations` | Image generation (returns file_id for download) |
+| POST | `/v1/images/edits` | Image editing — img2img, inpaint, upscale |
+| POST | `/v1/vision/analyze` | Image understanding (accepts file_id or base64) |
+| POST | `/v1/audio/speech` | Text-to-speech (TTS) |
+| POST | `/v1/audio/transcriptions` | Speech-to-text (STT) |
+| POST | `/v1/audio/music` | Music generation from text prompt |
+| POST | `/v1/video/generations` | Video generation from text prompt |
+| POST | `/v1/3d/generations` | 3D mesh generation (ShapE) |
 | POST | `/v1/embeddings` | Generate embeddings |
+| POST | `/v1/files` | Upload file (image, audio, video, document) |
+| GET | `/v1/files` | List uploaded and generated files |
+| GET | `/v1/files/{file_id}` | Download a file by ID |
+| DELETE | `/v1/files/{file_id}` | Delete a file |
 | GET | `/docs` | Interactive Swagger API documentation |
+
+**LAN access for KBot Web Suite:** Use `--host 0.0.0.0` to bind to all interfaces. CORS is configured to accept `192.168.x.x` origins. Set `ARTIFEX_CORS_ORIGINS` env var for additional origins.
 
 ### Example Requests
 
@@ -752,6 +779,36 @@ Models are auto-discovered from the `models/` directory. To add a new model:
 
 You can also manually place any HuggingFace model folder in `models/` — the registry detects its type from `config.json`.
 
+### Gemma 4 Support
+
+Google's Gemma 4 models are supported with automatic detection and multimodal capabilities:
+
+| Model | Params | Active | VRAM | Context | Multimodal |
+|-------|--------|--------|------|---------|------------|
+| gemma-4-E2B-it | 5.1B | 2.3B | ~7 GB | 128K | Text, Image, Video, Audio |
+| gemma-4-E4B-it | 8B | 4.5B | ~10 GB | 128K | Text, Image, Video, Audio |
+| gemma-4-26B-A4B-it | 25.2B | 3.8B (MoE) | ~18 GB | 256K | Text, Image, Video |
+| gemma-4-31B-it | 30.7B | 30.7B | ~20 GB | 256K | Text, Image, Video |
+
+**Setup:**
+1. Requires `transformers >= 5.5.0` (for `AutoModelForMultimodalLM`)
+2. Download: `huggingface-cli download google/gemma-4-E4B-it --local-dir models/gemma-4-e4b-it`
+3. Select the model in the GUI or CLI — multimodal loading is automatic
+
+The engine detects `model_type: gemma3n` in `config.json` and automatically uses `AutoModelForMultimodalLM` + `AutoProcessor`. Existing models (Qwen, Llama, Mistral) are unaffected — they continue using `AutoModelForCausalLM`.
+
+Gemma 4 also works via Ollama: `ollama pull gemma4:e4b`
+
+### Shared Service Layer
+
+All pipelines are accessed through a shared `MultimodalService` layer (`core/services/`) used by the GUI, CLI, and API. This provides:
+
+- **Pipeline caching** — loaded pipelines are reused across calls
+- **VRAM management** — auto-evicts least-recently-used pipelines when VRAM is tight
+- **File management** — uploads and generated files stored with persistent index (`output/file_index.json`)
+- **Cancellation** — operations can be interrupted mid-stream
+- **Progress reporting** — uniform callback interface for all pipeline types
+
 ---
 
 ## Agent Tools
@@ -987,7 +1044,8 @@ source venv/bin/activate     # Linux/macOS
 
 # ── Core services ──
 python main.py                           # CLI assistant
-python main_gui.py                       # GUI (cyberpunk desktop)
+python main_gui_qt.py                    # GUI (PyQt6 desktop — recommended)
+python main_gui.py                       # GUI (legacy FreeSimpleGUI)
 python main_api.py                       # API server (port 8000)
 python main_api.py --backend ollama      # API with Ollama backend
 python main_api.py --backend ollama --model qwen3.5-27b-iq2xxs --port 8000
@@ -1048,7 +1106,8 @@ python main_api.py
 ```
 Artifex-Assistant-V5/
   main.py                  # CLI entry point
-  main_gui.py              # GUI entry point
+  main_gui_qt.py           # PyQt6 GUI entry point (recommended)
+  main_gui.py              # Legacy FreeSimpleGUI entry point
   main_api.py              # API server entry point
   setup_wizard.py          # GPU detection and setup wizard
   setup_ollama.py          # Ollama setup helper (install, start, pull)
@@ -1081,6 +1140,10 @@ Artifex-Assistant-V5/
     progress.py            # Progress tracking
     tool_protocol.py       # Agent tool execution protocol
     logging_config.py      # Structured logging
+    services/              # Shared multimodal service layer
+      __init__.py          # Singleton get_service() accessor
+      multimodal_service.py # Pipeline caching, VRAM eviction, cancellation
+      file_manager.py      # File upload/download/generated content management
     pipelines/             # Multi-modal model pipelines (10 types)
       base.py              # Abstract pipeline interface
       registry.py          # Pipeline discovery and factory
@@ -1094,9 +1157,14 @@ Artifex-Assistant-V5/
       music.py             # Music generation (MusicGen)
       video_gen.py         # Video generation
   ui/
-    cli_assistant.py       # CLI assistant loop with tool execution
-    cyber_gui.py           # FreeSimpleGUI cyberpunk GUI
-    gui_theme.py           # GUI theming
+    cli_assistant.py       # CLI assistant loop with tool execution + multimodal pipelines
+    qt_gui.py              # PyQt6 main window (recommended GUI)
+    qt_theme.py            # PyQt6 theme system (5 themes, QSS stylesheets)
+    qt_workers.py          # QThread workers + TokenBatcher for smooth streaming
+    qt_widgets.py          # DropZone, ImageViewer, AudioPlayer, VideoPlayer, MicRecorder, ChatView
+    qt_launcher.py         # PyQt6 QApplication setup
+    cyber_gui.py           # Legacy FreeSimpleGUI GUI
+    gui_theme.py           # Legacy GUI theming
     terminal.py            # Terminal utilities
   api/
     server.py              # FastAPI OpenAI-compatible REST API (streaming for both backends, tool execution)

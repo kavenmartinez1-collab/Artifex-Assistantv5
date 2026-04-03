@@ -21,7 +21,9 @@
 12. [The Forward Pass — Step by Step](#12-the-forward-pass--step-by-step)
 13. [How All the Pieces Connect](#13-how-all-the-pieces-connect)
 14. [Lessons from the Numerical Audit](#14-lessons-from-the-numerical-audit-2026-03-31)
-15. [Glossary](#15-glossary)
+15. [The Multimodal Service Layer](#15-the-multimodal-service-layer)
+16. [Gemma 4 Integration — A Different Architecture](#16-gemma-4-integration--a-different-architecture)
+17. [Glossary](#17-glossary)
 
 ---
 
@@ -1295,7 +1297,101 @@ All 15 WGSL kernels verified correct against PyTorch (`scripts/audit_kernels.py`
 
 ---
 
-## 15. Glossary
+## 15. The Multimodal Service Layer
+
+### Why a service layer?
+
+Before the service layer, the GUI called `create_pipeline()` directly and managed its own loading, unloading, and VRAM tracking. The CLI had no pipeline support at all. The API had ad-hoc pipeline calls in each endpoint. This meant three copies of the same logic.
+
+The **MultimodalService** (`core/services/multimodal_service.py`) is a singleton that sits between all three interfaces and the backend pipelines. All three share the same pipeline instances, file storage, and VRAM management.
+
+### How pipeline caching works
+
+When you generate an image, the service loads the `text-to-image` pipeline and caches it. If you generate another image, it reuses the cached pipeline — no reload. If you then switch to audio TTS, the service checks VRAM: if there's room, both pipelines stay cached. If VRAM is tight, the **least-recently-used** pipeline is evicted first.
+
+```
+GUI: "generate an image"
+  → MultimodalService.run_pipeline("text-to-image", ...)
+    → Pipeline already cached? Reuse it.
+    → Not cached? Check VRAM → evict LRU if needed → load → cache → run
+```
+
+### File management
+
+The **FileManager** (`core/services/file_manager.py`) gives every uploaded or generated file a unique 12-character ID. The API uses these IDs instead of filesystem paths — so coworkers on the network never see your file paths.
+
+```
+output/
+  uploads/       # Files uploaded via API or GUI drag-drop
+  generated/     # Pipeline outputs (images, audio, video, meshes)
+  file_index.json  # Persistent index of all FileRecord entries
+```
+
+The index survives restarts. Generated files older than 24 hours are auto-cleaned.
+
+### The PyQt6 GUI architecture
+
+The new GUI uses **QThread workers** instead of Python daemon threads. The critical difference:
+
+- **Old GUI**: `threading.Thread(daemon=True)` — can't be cancelled, GUI update per token freezes Tkinter
+- **New GUI**: `QThread` + `pyqtSignal` — cancellable, token batching at 50ms intervals
+
+The **TokenBatcher** collects streaming tokens in a buffer and flushes them to the GUI widget at most every 50ms (20 FPS). This is the single change that prevents GUI freezing during fast generation — instead of 100+ widget updates per second, it does at most 20.
+
+---
+
+## 16. Gemma 4 Integration — A Different Architecture
+
+### Why Gemma 4 is different
+
+Most LLMs we run (Qwen, Llama, Mistral) are loaded with `AutoModelForCausalLM` — a standard text-only model class. Gemma 4 is **natively multimodal**: it can process images, audio, and video alongside text. This requires a different model class: `AutoModelForMultimodalLM`.
+
+It also uses `AutoProcessor` instead of `AutoTokenizer`. The processor handles converting images/audio into token embeddings before they reach the transformer layers.
+
+### How the engine handles it
+
+The engine detects the model type from `config.json`:
+
+```python
+def _get_auto_model_class(model_path):
+    model_type = read_config_json(model_path).get("model_type")
+    if model_type in {"gemma3n", "gemma3n_text", "gemma3n_vision", "gemma3n_audio"}:
+        return AutoModelForMultimodalLM  # Gemma 4
+    return AutoModelForCausalLM          # Everything else
+```
+
+This is checked at every `from_pretrained()` call. Existing models get `AutoModelForCausalLM` as always — zero impact on Qwen, Llama, etc.
+
+### Gemma 4's novel architecture
+
+Gemma 4 has four features not found in standard transformers:
+
+1. **Alternating attention** — layers alternate between local sliding-window attention and global full-context attention
+2. **Dual RoPE** — different positional encoding per layer type (standard RoPE for sliding-window, proportional RoPE for global)
+3. **Shared KV cache** — later layers reuse key/value tensors from earlier layers
+4. **Per-Layer Embeddings (PLE)** — a parallel conditioning pathway that modulates hidden states per layer
+
+For the Transformers backend, HuggingFace handles all of this internally — the model's config specifies the architecture, and `from_pretrained()` builds the correct layers. We don't need custom code for any of these.
+
+For the WebGPU engine (which runs custom WGSL kernels), these would each require new shader implementations — that's a future project.
+
+### Thinking mode differences
+
+Qwen uses `<think>...</think>` tags. Gemma 4 uses `<|channel>thought...<channel|>`. The `ThinkFilter` in `core/inference.py` detects both patterns so streaming works with either model family.
+
+### Tool calling format
+
+Gemma 4 uses a custom tool call syntax different from Qwen:
+```
+Qwen:   <tool_call>{"name": "search", "arguments": {"query": "test"}}</tool_call>
+Gemma:  <|tool_call>call:search{query:<|"|>test<|"|>}<tool_call|>
+```
+
+The `extract_agent_actions()` function in `tools/agent_tools.py` parses both formats and maps them to the same `AgentAction` types.
+
+---
+
+## 17. Glossary
 
 | Term | Definition |
 |------|-----------|

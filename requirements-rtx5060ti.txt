@@ -21,6 +21,11 @@ safetensors==0.7.0
 huggingface-hub==1.7.2
 tiktoken==0.12.0
 
+# ── GUI (PyQt6) ──────────────────────────────────────────────────────
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.0
+PyQt6-sip==13.11.1
+
 # ── Application ──────────────────────────────────────────────────────
 colorama==0.4.6
 FreeSimpleGUI==5.2.0.post1
@@ -29,6 +34,8 @@ psutil==7.2.2
 duckduckgo-search==8.1.1
 pypdf==6.9.1
 lxml==6.0.2
+sounddevice==0.5.1
+scipy==1.15.3
 
 # ── API server / Web gateway ─────────────────────────────────────────
 fastapi==0.135.1
