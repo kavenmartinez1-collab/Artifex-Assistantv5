@@ -151,7 +151,7 @@ export const SERVICE_DEFINITIONS: ServiceDefinition[] = [
     id: 'artifex-gui',
     name: 'Artifex GUI',
     command: path.join(PROJECT_ROOT, 'venv', 'Scripts', 'python.exe'),
-    args: ['main_gui.py'],
+    args: ['main_gui_qt.py'],
     cwd: PROJECT_ROOT,
     port: 0,
     gracefulTimeout: 5000,
