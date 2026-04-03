@@ -87,3 +87,21 @@ class TestExtractAgentActions:
         )
         actions = extract_agent_actions(response)
         assert len(actions) >= 3
+
+    def test_tool_marker_in_code_block_not_shell(self):
+        """Tool markers inside bash blocks should NOT become shell actions."""
+        response = '```bash\n@search("Artemis 2 launch")\n```\n'
+        actions = extract_agent_actions(response)
+        # Should have a search action but NOT a shell action
+        assert any(a.type == "search" for a in actions)
+        assert not any(a.type == "shell" for a in actions)
+
+    def test_tool_marker_in_code_block_mixed(self):
+        """Bash block with both real commands and tool markers: only commands become shell."""
+        response = '```bash\nls -la\n@read_file("test.py")\n```\n'
+        actions = extract_agent_actions(response)
+        shell_actions = [a for a in actions if a.type == "shell"]
+        read_actions = [a for a in actions if a.type == "read_file"]
+        assert len(shell_actions) == 1
+        assert shell_actions[0].content == "ls -la"
+        assert len(read_actions) == 1
