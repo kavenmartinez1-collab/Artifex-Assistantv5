@@ -51,9 +51,14 @@ duckduckgo-search==8.1.1
 pypdf==6.9.1
 lxml==6.0.2
 
-# ── Audio recording (optional — for microphone input) ────────────────
+# ── Audio I/O ────────────────────────────────────────────────────────
 sounddevice==0.5.1
 scipy==1.15.3
+soundfile==0.13.1
+librosa==0.11.0
+
+# ── 3D mesh export ───────────────────────────────────────────────────
+trimesh==4.11.5
 
 # ── API server ───────────────────────────────────────────────────────
 fastapi==0.135.1

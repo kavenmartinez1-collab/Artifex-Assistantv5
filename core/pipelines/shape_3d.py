@@ -37,6 +37,15 @@ class Shape3DPipeline(BasePipeline):
                 "Install with: pip install diffusers>=0.30.0"
             )
 
+        # Check mesh export deps — trimesh needed for PLY/OBJ export
+        try:
+            import trimesh  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "trimesh is required for 3D mesh export (PLY/OBJ).\n"
+                "Install with: pip install trimesh"
+            )
+
         if not model_path:
             model_path = "openai/shap-e"
 

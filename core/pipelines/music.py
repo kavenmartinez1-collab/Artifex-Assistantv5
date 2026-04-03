@@ -41,6 +41,15 @@ class MusicPipeline(BasePipeline):
         """
         from transformers import MusicgenForConditionalGeneration, AutoProcessor
 
+        # Check audio export dep
+        try:
+            import scipy.io.wavfile  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "scipy is required for music WAV export.\n"
+                "Install with: pip install scipy"
+            )
+
         if not model_path:
             model_path = self._auto_select_model()
 

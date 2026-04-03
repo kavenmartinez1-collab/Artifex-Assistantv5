@@ -39,6 +39,15 @@ class AudioPipeline(BasePipeline):
         """
         from transformers import pipeline as hf_pipeline
 
+        # Check audio dependencies early — missing these causes crashes
+        try:
+            import scipy.io.wavfile  # noqa: F401 — needed for TTS WAV export
+        except ImportError:
+            raise ImportError(
+                "scipy is required for audio WAV export.\n"
+                "Install with: pip install scipy"
+            )
+
         if status_callback:
             status_callback(f"Loading audio model: {os.path.basename(model_path)}...")
 
@@ -51,6 +60,14 @@ class AudioPipeline(BasePipeline):
         dtype = kwargs.get("dtype", torch.float16)
 
         if mode == "stt":
+            # STT needs librosa or soundfile for audio loading
+            try:
+                import soundfile  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "soundfile is required for audio file loading (STT).\n"
+                    "Install with: pip install soundfile librosa"
+                )
             self.pipe = hf_pipeline(
                 "automatic-speech-recognition",
                 model=model_path,
