@@ -22,6 +22,10 @@ Universal Local AI Hosting Platform. Run any AI model locally — text generatio
 
 **Everything runs locally. All servers bind to 127.0.0.1 only. Nothing is exposed to the network.**
 
+### GUI Demo
+
+<video src="docs/demos/gui-demo.mp4" controls width="100%"></video>
+
 ## Table of Contents
 
 - [Features](#features)
@@ -244,6 +248,8 @@ python -m pytest tests/ -v
 
 Interactive terminal assistant with streaming responses, thinking blocks, and agent tool execution.
 
+<video src="docs/demos/cli-demo.mp4" controls width="100%"></video>
+
 ### Slash Commands
 
 | Command | Description |
@@ -285,6 +291,8 @@ All tool execution requires your confirmation before running.
 ---
 
 ## Using the GUI (`python main_gui.py`)
+
+<video src="docs/demos/gui-demo.mp4" controls width="100%"></video>
 
 The cyberpunk GUI provides a visual interface with:
 
@@ -773,6 +781,8 @@ Dangerous commands (rm -rf /, format c:, etc.) are blocked by configurable safet
 
 Experimental browser-based GPU inference using WebGPU compute shaders. Runs directly on your GPU through Chrome/Edge without Python or CUDA. **All servers bind to 127.0.0.1 only.**
 
+<video src="docs/demos/webgpu-demo.mp4" controls width="100%"></video>
+
 ### Prerequisites
 
 - **Node.js 18+** — [nodejs.org](https://nodejs.org/)
@@ -940,6 +950,8 @@ There are two ways to run Artifex — the **Control Center** (desktop app, manag
 ### Option A: Control Center (Recommended)
 
 Desktop dashboard that manages all services from one place. No terminal commands needed.
+
+<video src="docs/demos/control-center-demo.mp4" controls width="100%"></video>
 
 ```bash
 cd control-center
