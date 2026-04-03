@@ -396,6 +396,14 @@ def get_context_profile_name():
     return _active_profile
 
 
+# ===== MODEL-SPECIFIC SAMPLING DEFAULTS =====
+# Google's recommended sampling for Gemma 4 models
+GEMMA4_SAMPLING = {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 64,
+}
+
 # ===== SAFETY =====
 DANGEROUS_PATTERNS = [
     "rm -rf /",
