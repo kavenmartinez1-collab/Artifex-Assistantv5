@@ -44,6 +44,11 @@ _engine_lock = threading.Lock()
 _api_key = os.environ.get("ARTIFEX_API_KEY", "")
 _inference_busy = threading.Event()  # set() = GPU busy, clear() = free
 
+# Rate limiting for failed auth attempts
+_auth_failures: dict[str, list[float]] = {}  # ip -> list of timestamps
+_AUTH_FAIL_WINDOW = 60.0    # seconds
+_AUTH_FAIL_MAX = 10         # max failures per window
+
 if not _api_key:
     _log.warning("ARTIFEX_API_KEY not set — API authentication is DISABLED")
 
@@ -62,16 +67,35 @@ def _get_engine():
 
 
 def _check_auth(request):
-    """Validate API key if configured. Uses constant-time comparison."""
+    """Validate API key if configured. Uses constant-time comparison with rate limiting."""
     if not _api_key:
         return True  # No auth required
+
+    # Rate limit check
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    fails = _auth_failures.get(client_ip, [])
+    # Prune old failures outside the window
+    fails = [t for t in fails if now - t < _AUTH_FAIL_WINDOW]
+    _auth_failures[client_ip] = fails
+
+    if len(fails) >= _AUTH_FAIL_MAX:
+        _log.warning("Rate limited auth from %s (%d failures)", client_ip, len(fails))
+        return False
+
     import hmac
     auth_header = request.headers.get("Authorization", "")
     key_header = request.headers.get("X-API-Key", "")
     token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else key_header
     if not token:
+        fails.append(now)
+        _auth_failures[client_ip] = fails
         return False
-    return hmac.compare_digest(token, _api_key)
+    if not hmac.compare_digest(token, _api_key):
+        fails.append(now)
+        _auth_failures[client_ip] = fails
+        return False
+    return True
 
 
 # ── Request models for Swagger docs ─────────────────────────────────────
@@ -961,25 +985,31 @@ def create_app():
                 detail="Provide either file_id or image_base64",
             )
 
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
-            "image-text-to-text",
-            kwargs={
-                "image_path": image_path,
-                "prompt": body.prompt,
-                "max_tokens": body.max_tokens,
-            },
-            store_output=False,
-        ))
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+                "image-text-to-text",
+                kwargs={
+                    "image_path": image_path,
+                    "prompt": body.prompt,
+                    "max_tokens": body.max_tokens,
+                },
+                store_output=False,
+            ))
 
-        if not result.success:
-            raise HTTPException(status_code=500, detail=result.error)
+            if not result.success:
+                raise HTTPException(status_code=500, detail=result.error)
 
-        return {
-            "object": "vision.analysis",
-            "analysis": result.content,
-            "model": result.metadata.get("model", "vision"),
-        }
+            return {
+                "object": "vision.analysis",
+                "analysis": result.content,
+                "model": result.metadata.get("model", "vision"),
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            _log.error("Vision pipeline error: %s", e)
+            raise HTTPException(status_code=500, detail=f"Vision pipeline failed: {e}")
 
     # ─── Audio TTS ───────────────────────────────────────────────────────
 
@@ -992,23 +1022,29 @@ def create_app():
         from core.services import get_service
         svc = get_service()
 
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
-            "text-to-audio",
-            model_path=body.model or "",
-            kwargs={"text": body.text[:5000]},
-            store_output=True,
-        ))
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+                "text-to-audio",
+                model_path=body.model or "",
+                kwargs={"text": body.text[:5000]},
+                store_output=True,
+            ))
 
-        if not result.success:
-            raise HTTPException(status_code=500, detail=result.error)
+            if not result.success:
+                raise HTTPException(status_code=500, detail=result.error)
 
-        file_id = result.metadata.get("file_id")
-        return {
-            "object": "audio.speech",
-            "file_id": file_id,
-            "content_type": "audio/wav",
-        }
+            file_id = result.metadata.get("file_id")
+            return {
+                "object": "audio.speech",
+                "file_id": file_id,
+                "content_type": "audio/wav",
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            _log.error("TTS pipeline error: %s", e)
+            raise HTTPException(status_code=500, detail=f"TTS pipeline failed: {e}")
 
     # ─── Audio STT ───────────────────────────────────────────────────────
 
@@ -1026,17 +1062,23 @@ def create_app():
         if audio_path is None:
             raise HTTPException(status_code=404, detail="Audio file not found")
 
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
-            "automatic-speech-recognition",
-            kwargs={"audio_path": audio_path},
-            store_output=False,
-        ))
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+                "automatic-speech-recognition",
+                kwargs={"audio_path": audio_path},
+                store_output=False,
+            ))
 
-        if not result.success:
-            raise HTTPException(status_code=500, detail=result.error)
+            if not result.success:
+                raise HTTPException(status_code=500, detail=result.error)
 
-        return {"object": "transcription", "text": result.content}
+            return {"object": "transcription", "text": result.content}
+        except HTTPException:
+            raise
+        except Exception as e:
+            _log.error("STT pipeline error: %s", e)
+            raise HTTPException(status_code=500, detail=f"STT pipeline failed: {e}")
 
     # ─── Music Generation ────────────────────────────────────────────────
 
@@ -1049,24 +1091,30 @@ def create_app():
         from core.services import get_service
         svc = get_service()
 
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
-            "text-to-music",
-            kwargs={
-                "prompt": body.prompt[:1000],
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+                "text-to-music",
+                kwargs={
+                    "prompt": body.prompt[:1000],
+                    "duration_seconds": body.duration_seconds,
+                },
+                store_output=True,
+            ))
+
+            if not result.success:
+                raise HTTPException(status_code=500, detail=result.error)
+
+            return {
+                "object": "audio.music",
+                "file_id": result.metadata.get("file_id"),
                 "duration_seconds": body.duration_seconds,
-            },
-            store_output=True,
-        ))
-
-        if not result.success:
-            raise HTTPException(status_code=500, detail=result.error)
-
-        return {
-            "object": "audio.music",
-            "file_id": result.metadata.get("file_id"),
-            "duration_seconds": body.duration_seconds,
-        }
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            _log.error("Music pipeline error: %s", e)
+            raise HTTPException(status_code=500, detail=f"Music pipeline failed: {e}")
 
     # ─── Image Editing ───────────────────────────────────────────────────
 
@@ -1083,25 +1131,31 @@ def create_app():
         if image_path is None:
             raise HTTPException(status_code=404, detail="Source image not found")
 
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
-            "image-to-image",
-            kwargs={
-                "image_path": image_path,
-                "prompt": body.prompt[:2000],
-                "strength": body.strength,
-                "num_steps": body.num_steps,
-            },
-            store_output=True,
-        ))
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+                "image-to-image",
+                kwargs={
+                    "image_path": image_path,
+                    "prompt": body.prompt[:2000],
+                    "strength": body.strength,
+                    "num_steps": body.num_steps,
+                },
+                store_output=True,
+            ))
 
-        if not result.success:
-            raise HTTPException(status_code=500, detail=result.error)
+            if not result.success:
+                raise HTTPException(status_code=500, detail=result.error)
 
-        return {
-            "object": "image.edit",
-            "file_id": result.metadata.get("file_id"),
-        }
+            return {
+                "object": "image.edit",
+                "file_id": result.metadata.get("file_id"),
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            _log.error("Image edit pipeline error: %s", e)
+            raise HTTPException(status_code=500, detail=f"Image edit pipeline failed: {e}")
 
     # ─── Video Generation ────────────────────────────────────────────────
 
@@ -1114,24 +1168,30 @@ def create_app():
         from core.services import get_service
         svc = get_service()
 
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
-            "text-to-video",
-            kwargs={
-                "prompt": body.prompt[:2000],
-                "num_frames": body.num_frames,
-                "fps": body.fps,
-            },
-            store_output=True,
-        ))
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+                "text-to-video",
+                kwargs={
+                    "prompt": body.prompt[:2000],
+                    "num_frames": body.num_frames,
+                    "fps": body.fps,
+                },
+                store_output=True,
+            ))
 
-        if not result.success:
-            raise HTTPException(status_code=500, detail=result.error)
+            if not result.success:
+                raise HTTPException(status_code=500, detail=result.error)
 
-        return {
-            "object": "video.generation",
-            "file_id": result.metadata.get("file_id"),
-        }
+            return {
+                "object": "video.generation",
+                "file_id": result.metadata.get("file_id"),
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            _log.error("Video pipeline error: %s", e)
+            raise HTTPException(status_code=500, detail=f"Video pipeline failed: {e}")
 
     # ─── 3D Generation ───────────────────────────────────────────────────
 
@@ -1145,22 +1205,28 @@ def create_app():
         from core.services import get_service
         svc = get_service()
 
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
-            "shap-e",
-            kwargs={
-                "prompt": body.prompt[:1000],
-                "num_steps": body.num_steps,
-            },
-            store_output=True,
-        ))
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+                "shap-e",
+                kwargs={
+                    "prompt": body.prompt[:1000],
+                    "num_steps": body.num_steps,
+                },
+                store_output=True,
+            ))
 
-        if not result.success:
-            raise HTTPException(status_code=500, detail=result.error)
+            if not result.success:
+                raise HTTPException(status_code=500, detail=result.error)
 
-        return {
-            "object": "3d.generation",
-            "file_id": result.metadata.get("file_id"),
-        }
+            return {
+                "object": "3d.generation",
+                "file_id": result.metadata.get("file_id"),
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            _log.error("3D pipeline error: %s", e)
+            raise HTTPException(status_code=500, detail=f"3D pipeline failed: {e}")
 
     return app

@@ -6,9 +6,12 @@ proper threading, token batching, and rich inline media display.
 """
 
 import gc
+import logging
 import os
 import sys
 import threading
+
+_log = logging.getLogger(__name__)
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QFont
@@ -616,6 +619,16 @@ class ArtifexMainWindow(QMainWindow):
         svc = get_service()
         kwargs = self._build_pipeline_kwargs(mode, prompt)
 
+        if not kwargs:
+            # File-dependent modes return empty kwargs if no files attached
+            if mode in _FILE_INPUT_MODES:
+                self._set_status(f"Attach a file first for {mode} mode")
+            else:
+                self._set_status(f"Cannot build parameters for {mode}")
+            self._busy = False
+            self._execute_btn.setText("EXECUTE")
+            return
+
         self._progress_bar.setVisible(True)
         self._progress_bar.setRange(0, 0)  # Indeterminate
 
@@ -691,8 +704,8 @@ class ArtifexMainWindow(QMainWindow):
         # Extract knowledge from AI response (matches old GUI)
         try:
             self.km.add_from_ai_response(response)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.warning("Knowledge extraction failed: %s", e)
 
         self._finish_busy("Generation complete")
 
@@ -707,8 +720,8 @@ class ArtifexMainWindow(QMainWindow):
                     display = getattr(a, "display", str(a))
                     self._action_list.addItem(display)
                 self._action_panel.setVisible(True)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.warning("Action extraction failed: %s", e)
 
     def _on_generation_error(self, error_msg: str):
         """Handle generation error."""
@@ -930,6 +943,8 @@ class ArtifexMainWindow(QMainWindow):
                 torch.cuda.ipc_collect()
         except ImportError:
             pass
+        except Exception as e:
+            _log.warning("VRAM cleanup error: %s", e)
         self._set_status("VRAM released")
 
     def _on_health(self):
@@ -940,20 +955,24 @@ class ArtifexMainWindow(QMainWindow):
 
     def _on_save_session(self):
         from core.session import save_session
-        name, ok = QFileDialog.getSaveFileName(
-            self, "Save Session", os.path.join(BASE_DIR, "sessions"),
+        sessions_dir = os.path.join(BASE_DIR, "sessions")
+        os.makedirs(sessions_dir, exist_ok=True)
+        path, ok = QFileDialog.getSaveFileName(
+            self, "Save Session", sessions_dir,
             "JSON Files (*.json)"
         )
-        if ok and name:
+        if ok and path:
             metadata = {
                 "model": get_active_model_name(),
                 "backend": get_active_backend(),
             }
             smap_data = self.session_map.to_dict() if hasattr(
                 self.session_map, "to_dict") else {}
-            save_session(os.path.basename(name).replace(".json", ""),
-                         self.messages, smap_data, metadata)
-            self._set_status("Session saved")
+            # Use the full chosen path's basename as session name,
+            # but save_session will store it in the sessions directory
+            session_name = os.path.splitext(os.path.basename(path))[0]
+            save_session(session_name, self.messages, smap_data, metadata)
+            self._set_status(f"Session saved: {session_name}")
 
     def _on_load_session(self):
         from core.session import list_sessions, load_session
@@ -961,19 +980,23 @@ class ArtifexMainWindow(QMainWindow):
         if not sessions:
             self._set_status("No saved sessions")
             return
-        name, ok = QFileDialog.getOpenFileName(
+        path, ok = QFileDialog.getOpenFileName(
             self, "Load Session", os.path.join(BASE_DIR, "sessions"),
             "JSON Files (*.json)"
         )
-        if ok and name:
-            data = load_session(os.path.basename(name).replace(".json", ""))
+        if ok and path:
+            session_name = os.path.splitext(os.path.basename(path))[0]
+            data = load_session(session_name)
             if data:
                 self.messages = data.get("messages", self.messages)
                 self._chat_view.clear_chat()
                 for msg in self.messages[1:]:
-                    bubble = self._chat_view.add_bubble(msg["role"])
+                    role = msg.get("role", "user")
+                    bubble = self._chat_view.add_bubble(role)
                     bubble.add_text(msg.get("content", ""))
-                self._set_status("Session loaded")
+                self._set_status(f"Session loaded: {session_name}")
+            else:
+                self._set_status(f"Failed to load session: {session_name}")
 
     def _on_export(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -983,7 +1006,8 @@ class ArtifexMainWindow(QMainWindow):
         if path:
             with open(path, "w", encoding="utf-8") as f:
                 for msg in self.messages[1:]:
-                    f.write(f"**{msg['role'].upper()}**\n\n")
+                    role = msg.get("role", "unknown").upper()
+                    f.write(f"**{role}**\n\n")
                     f.write(f"{msg.get('content', '')}\n\n---\n\n")
             self._set_status(f"Exported to {os.path.basename(path)}")
 
@@ -1035,8 +1059,8 @@ class ArtifexMainWindow(QMainWindow):
                     token_budget=profile.session_map_token_budget),
             )
             self.messages[0]["content"] = prompt
-        except Exception:
-            pass
+        except Exception as e:
+            _log.warning("System prompt update failed: %s", e)
 
     # ═══════════════════════════════════════════════════════════════════
     # RESOURCE MONITOR
@@ -1061,6 +1085,8 @@ class ArtifexMainWindow(QMainWindow):
                 self._resource_label.setStyleSheet(f"color: {color};")
         except ImportError:
             pass
+        except Exception as e:
+            _log.debug("VRAM monitor error: %s", e)
 
         try:
             import psutil
@@ -1072,5 +1098,7 @@ class ArtifexMainWindow(QMainWindow):
             parts.append(f"CPU: {cpu:.0f}%")
         except ImportError:
             pass
+        except Exception as e:
+            _log.debug("System monitor error: %s", e)
 
         self._resource_label.setText(" | ".join(parts) if parts else "")

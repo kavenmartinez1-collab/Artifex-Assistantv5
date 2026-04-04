@@ -37,10 +37,13 @@ from core.config import (
 )
 from core.inference import STOP_STRINGS, _clean_response
 
-# Model types that require AutoModelForMultimodalLM instead of AutoModelForCausalLM
+# Model types that require AutoModelForMultimodalLM instead of AutoModelForCausalLM.
+# Exact matches checked first, then prefix matching as fallback for future variants.
 _MULTIMODAL_MODEL_TYPES = {
     "gemma3n", "gemma3n_text", "gemma3n_vision", "gemma3n_audio",
 }
+# Prefixes: any model_type starting with these is treated as multimodal
+_MULTIMODAL_MODEL_PREFIXES = ("gemma3n", "gemma4", "gemma_4")
 
 
 def _detect_model_type_from_config(model_path: str):
@@ -55,15 +58,30 @@ def _detect_model_type_from_config(model_path: str):
     return None
 
 
+def _is_multimodal_model(model_type: str) -> bool:
+    """Check if a model_type indicates a multimodal model.
+
+    Uses exact set match first, then prefix matching for future variants
+    (e.g. gemma4_xxx, gemma3n_xxx).
+    """
+    if not model_type:
+        return False
+    if model_type in _MULTIMODAL_MODEL_TYPES:
+        return True
+    # Prefix matching catches future naming variants
+    model_type_lower = model_type.lower()
+    return any(model_type_lower.startswith(p) for p in _MULTIMODAL_MODEL_PREFIXES)
+
+
 def _get_auto_model_class(model_path: str):
     """Return the appropriate AutoModel class for a given model.
 
-    Gemma 4 (model_type gemma3n*) requires AutoModelForMultimodalLM.
+    Gemma 4 (model_type gemma3n*, gemma4*) requires AutoModelForMultimodalLM.
     All other models use AutoModelForCausalLM.
     Requires transformers >= 5.5.0 for multimodal support.
     """
     model_type = _detect_model_type_from_config(model_path)
-    if model_type in _MULTIMODAL_MODEL_TYPES:
+    if _is_multimodal_model(model_type):
         try:
             from transformers import AutoModelForMultimodalLM
             return AutoModelForMultimodalLM
@@ -153,7 +171,7 @@ class TransformersEngine(BaseEngine):
         Falls back silently for text-only models that don't ship a processor.
         """
         model_type = _detect_model_type_from_config(model_path)
-        if model_type not in _MULTIMODAL_MODEL_TYPES:
+        if not _is_multimodal_model(model_type):
             self.processor = None
             return
         try:
