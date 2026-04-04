@@ -213,16 +213,19 @@ class MultimodalService:
             status_fn(f"Need {needed_gb:.1f}GB, {free_gb:.1f}GB free — "
                        "evicting cached pipelines...")
 
+            # Snapshot cache inside lock to avoid race with concurrent threads
             with self._lock:
                 by_age = sorted(self._cache.items(),
                                 key=lambda x: x[1].last_used)
+                # Copy to list so we iterate a stable snapshot
+                by_age = list(by_age)
 
             for ptype, cached in by_age:
                 if cached.pipeline.is_loaded():
                     status_fn(f"Unloading {cached.pipeline.display_name}...")
                     cached.pipeline.unload()
                     with self._lock:
-                        del self._cache[ptype]
+                        self._cache.pop(ptype, None)  # pop() won't raise if already removed
 
                     # Recalculate free VRAM
                     import gc

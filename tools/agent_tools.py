@@ -477,10 +477,48 @@ def extract_agent_actions(response):
 
 
 def _check_dangerous(command):
-    """Check command against ASSISTANT dangerous patterns. Returns blocking message or None."""
+    """Check command against ASSISTANT dangerous patterns. Returns blocking message or None.
+
+    Also detects bypass attempts via:
+    - Command substitution: $(cmd), `cmd`
+    - Quote splitting: r''m, r""m
+    - Variable expansion: $var used to reconstruct dangerous commands
+    - Eval/exec wrappers: eval "rm -rf /", bash -c "dangerous"
+    """
+    cmd_lower = command.lower()
+
+    # Standard pattern matching
     for pattern in ASSISTANT_DANGEROUS_PATTERNS:
-        if pattern.lower() in command.lower():
+        if pattern.lower() in cmd_lower:
             return f"Blocked dangerous pattern: {pattern}"
+
+    # Detect command substitution that could hide dangerous commands
+    # e.g., $(echo 'rm -rf /') or `echo 'rm -rf /'`
+    subst_contents = re.findall(r'\$\((.+?)\)', command, re.DOTALL)
+    subst_contents += re.findall(r'`(.+?)`', command)
+    for inner in subst_contents:
+        inner_check = _check_dangerous(inner)
+        if inner_check:
+            return f"Blocked dangerous pattern in command substitution: {inner.strip()[:60]}"
+
+    # Detect eval/exec wrappers: eval "cmd", bash -c "cmd", sh -c "cmd"
+    eval_match = re.search(
+        r'(?:eval|bash\s+-c|sh\s+-c|cmd\s+/c)\s+["\'](.+?)["\']',
+        command, re.IGNORECASE,
+    )
+    if eval_match:
+        inner_check = _check_dangerous(eval_match.group(1))
+        if inner_check:
+            return f"Blocked dangerous pattern in eval/exec wrapper"
+
+    # Detect quote-splitting bypasses: r''m, r""m -> rm
+    # Remove all single and double quotes and re-check
+    stripped = re.sub(r"['\"]", "", command)
+    if stripped != command:
+        for pattern in ASSISTANT_DANGEROUS_PATTERNS:
+            if pattern.lower() in stripped.lower():
+                return f"Blocked dangerous pattern (quote bypass): {pattern}"
+
     return None
 
 

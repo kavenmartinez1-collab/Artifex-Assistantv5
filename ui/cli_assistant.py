@@ -6,6 +6,8 @@ General-purpose AI assistant with shell, Python, and web search execution.
 import sys
 import os
 import gc
+import platform
+import subprocess
 
 import torch
 from colorama import Fore, Style
@@ -31,6 +33,24 @@ from core.health import run_health_check, format_health_report
 from core.logging_config import get_logger
 
 _log = get_logger(__name__)
+
+# Expected file types for each pipeline mode
+_MODE_FILE_TYPES = {
+    "image_edit": {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff"},
+    "vision":     {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff"},
+    "stt":        {".wav", ".mp3", ".flac", ".ogg", ".m4a"},
+}
+
+
+def _open_file_externally(path: str):
+    """Open a file with the system's default application (cross-platform)."""
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(path)
+    elif system == "Darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
 
 
 def _truncate(text, limit=None):
@@ -678,6 +698,14 @@ def run_assistant():
                     else:
                         print(f"{Fore.YELLOW}  No files attached. Usage: /attach <path>{Style.RESET_ALL}\n")
                 elif os.path.isfile(path):
+                    # Validate file type matches current pipeline mode
+                    expected_exts = _MODE_FILE_TYPES.get(_cli_pipeline_mode)
+                    if expected_exts:
+                        ext = os.path.splitext(path)[1].lower()
+                        if ext not in expected_exts:
+                            print(f"{Fore.YELLOW}  Warning: '{os.path.basename(path)}' may not work "
+                                  f"with {_cli_pipeline_mode} mode. "
+                                  f"Expected: {', '.join(sorted(expected_exts))}{Style.RESET_ALL}")
                     _cli_attached_files.append(os.path.abspath(path))
                     print(f"{Fore.CYAN}  Attached: {os.path.basename(path)}{Style.RESET_ALL}\n")
                 else:
@@ -700,7 +728,7 @@ def run_assistant():
             if user_input.lower().startswith("/open"):
                 path = user_input[5:].strip()
                 if path and os.path.isfile(path):
-                    os.startfile(path)
+                    _open_file_externally(path)
                     print(f"{Fore.CYAN}  Opened: {path}{Style.RESET_ALL}\n")
                 else:
                     print(f"{Fore.YELLOW}  File not found: {path}{Style.RESET_ALL}\n")
@@ -763,7 +791,7 @@ def run_assistant():
                         # Auto-open images
                         if result.output_type == "image" and path and os.path.isfile(path):
                             try:
-                                os.startfile(path)
+                                _open_file_externally(path)
                             except Exception:
                                 pass
                 else:

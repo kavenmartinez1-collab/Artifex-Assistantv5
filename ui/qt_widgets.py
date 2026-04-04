@@ -5,8 +5,21 @@ and rich chat bubbles with inline media.
 """
 
 import os
+import platform
+import subprocess
 import time
 from pathlib import Path
+
+
+def _open_file_externally(path: str):
+    """Open a file with the system's default application (cross-platform)."""
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(path)
+    elif system == "Darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
 
 from PyQt6.QtCore import Qt, pyqtSignal, QUrl, QSize
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont
@@ -185,7 +198,7 @@ class _FullscreenImageDialog(QDialog):
         if source_path:
             btn_layout = QHBoxLayout()
             open_btn = QPushButton("Open in Explorer")
-            open_btn.clicked.connect(lambda: os.startfile(source_path))
+            open_btn.clicked.connect(lambda: _open_file_externally(source_path))
             btn_layout.addStretch()
             btn_layout.addWidget(open_btn)
             btn_layout.addStretch()
@@ -279,7 +292,7 @@ class AudioPlayer(QWidget):
 
     def _open_external(self):
         if self._file_path and os.path.isfile(self._file_path):
-            os.startfile(self._file_path)
+            _open_file_externally(self._file_path)
 
     @staticmethod
     def _fmt(ms):
@@ -376,7 +389,7 @@ class VideoPlayer(QWidget):
 
     def _open_external(self):
         if self._file_path and os.path.isfile(self._file_path):
-            os.startfile(self._file_path)
+            _open_file_externally(self._file_path)
 
     @staticmethod
     def _fmt(ms):

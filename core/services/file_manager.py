@@ -4,15 +4,19 @@ Provides a unified file storage layer used by the GUI, CLI, and API.
 """
 
 import json
+import logging
 import mimetypes
 import os
 import shutil
+import tempfile
 import time
 import threading
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
+
+_log = logging.getLogger(__name__)
 
 
 # Allowed file extensions per category
@@ -88,6 +92,8 @@ class FileManager:
     def store_upload(self, file_bytes: bytes, original_name: str,
                      content_type: str = None) -> FileRecord:
         """Store an uploaded file. Returns its FileRecord."""
+        # Sanitize original_name to prevent path traversal in metadata
+        original_name = Path(original_name).name
         ext = Path(original_name).suffix.lower()
         file_type = _detect_file_type(original_name)
         if content_type is None:
@@ -97,21 +103,21 @@ class FileManager:
         stored_name = f"{file_id}{ext}"
         stored_path = os.path.join(self._upload_dir, stored_name)
 
-        with open(stored_path, "wb") as f:
-            f.write(file_bytes)
-
-        record = FileRecord(
-            file_id=file_id,
-            original_name=original_name,
-            stored_path=stored_path,
-            content_type=content_type,
-            file_type=file_type,
-            size_bytes=len(file_bytes),
-            created_at=time.time(),
-            purpose="upload",
-        )
-
         with self._lock:
+            with open(stored_path, "wb") as f:
+                f.write(file_bytes)
+
+            record = FileRecord(
+                file_id=file_id,
+                original_name=original_name,
+                stored_path=stored_path,
+                content_type=content_type,
+                file_type=file_type,
+                size_bytes=len(file_bytes),
+                created_at=time.time(),
+                purpose="upload",
+            )
+
             self._index[file_id] = record
             self._save_index()
 
@@ -120,6 +126,11 @@ class FileManager:
     def store_upload_from_path(self, source_path: str,
                                content_type: str = None) -> FileRecord:
         """Store a file from a local path (copies it into managed storage)."""
+        if os.path.islink(source_path):
+            raise ValueError(
+                f"Refusing to copy symlink: {source_path}. "
+                "Provide the real file path instead."
+            )
         original_name = os.path.basename(source_path)
         with open(source_path, "rb") as f:
             data = f.read()
@@ -142,8 +153,13 @@ class FileManager:
 
         # Resolve content to bytes + extension
         if isinstance(content, (str, Path)) and os.path.isfile(str(content)):
-            # Content is a file path — copy it
+            # Content is a file path — copy it (reject symlinks for safety)
             source_path = str(content)
+            if os.path.islink(source_path):
+                raise ValueError(
+                    f"Refusing to copy symlink: {source_path}. "
+                    "Provide the real file path instead."
+                )
             if extension is None:
                 extension = Path(source_path).suffix.lower() or f".{output_type}"
             stored_name = f"{file_id}{extension}"
@@ -254,13 +270,29 @@ class FileManager:
                 data = json.load(f)
             for fid, rec_dict in data.items():
                 self._index[fid] = FileRecord(**rec_dict)
-        except (json.JSONDecodeError, TypeError, KeyError):
-            pass  # corrupted index, start fresh
+        except (json.JSONDecodeError, TypeError, KeyError) as e:
+            _log.warning(
+                "File index corrupted (%s), starting fresh: %s",
+                self._index_path, e,
+            )
 
     def _save_index(self):
-        """Persist file index to disk. Caller must hold _lock."""
+        """Persist file index to disk atomically. Caller must hold _lock."""
         data = {}
         for fid, record in self._index.items():
             data[fid] = asdict(record)
-        with open(self._index_path, "w") as f:
-            json.dump(data, f, indent=2)
+        # Write to temp file, then atomic rename to prevent corruption
+        dir_name = os.path.dirname(self._index_path)
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+            # On Windows, os.replace is atomic within the same volume
+            os.replace(tmp_path, self._index_path)
+        except Exception:
+            # Clean up temp file on failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
