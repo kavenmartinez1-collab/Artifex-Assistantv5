@@ -591,6 +591,12 @@ class ArtifexMainWindow(QMainWindow):
         max_tokens = int(self._tokens_input.text() or "2048")
         temperature = self._temp_slider.value() / 10.0
 
+        # Voice Assistant with recording but no text — transcribe first
+        if mode == "Voice Assistant" and not prompt and has_recording:
+            self._prompt_input.clear()
+            self._run_voice_from_recording(self._drop_zone._attached_files[0])
+            return
+
         self._busy = True
         self._cancel_event.clear()
         self._execute_btn.setText("CANCEL")
@@ -715,26 +721,9 @@ class ArtifexMainWindow(QMainWindow):
         elif mode == "Video Gen":
             kwargs = {"prompt": prompt, "num_frames": 16, "fps": 8}
         elif mode == "Voice Assistant":
+            # Text input — skip STT, go straight to LLM → TTS
             if prompt:
-                # Text input — skip STT, go straight to LLM → TTS
                 kwargs = {"text": prompt, "play_audio": True}
-            else:
-                # Audio from mic recording — run full STT → LLM → TTS
-                files = self._drop_zone.attached_files
-                if files:
-                    import numpy as np
-                    from scipy.io import wavfile
-                    try:
-                        sr, audio = wavfile.read(files[0])
-                        if audio.dtype == np.int16:
-                            audio = audio.astype(np.float32) / 32768.0
-                        elif audio.dtype != np.float32:
-                            audio = audio.astype(np.float32)
-                        if audio.ndim > 1:
-                            audio = audio.mean(axis=1)
-                        kwargs = {"audio_data": audio, "play_audio": True}
-                    except Exception:
-                        kwargs = {}
 
         return kwargs
 
@@ -881,7 +870,7 @@ class ArtifexMainWindow(QMainWindow):
             self._run_voice_from_recording(path)
 
     def _run_voice_from_recording(self, wav_path: str):
-        """Voice Assistant: load the WAV, transcribe via pipeline, send to LLM."""
+        """Voice Assistant: load WAV and transcribe."""
         import numpy as np
         from scipy.io import wavfile
 
@@ -904,20 +893,49 @@ class ArtifexMainWindow(QMainWindow):
         self._run_voice_from_audio(audio)
 
     def _run_voice_from_audio(self, audio):
-        """Voice Assistant: send raw float32 audio through STT → LLM → TTS."""
-        pipeline_type = "voice-assistant"
-        svc = get_service()
-        kwargs = {"audio_data": audio, "play_audio": True}
+        """Voice Assistant: transcribe audio first, show text, then send to LLM."""
+        self._set_status("Transcribing speech...")
+        self._pending_voice_audio = audio
 
+        # Step 1: STT only — transcribe and show the text
+        svc = get_service()
+        worker = PipelineWorker(
+            svc, "voice-assistant",
+            kwargs={"audio_data": audio, "stt_only": True},
+            cancel_event=self._cancel_event,
+        )
+        worker.result_ready.connect(self._on_stt_result)
+        worker.error.connect(self._on_generation_error)
+        worker.status_changed.connect(self._set_status)
+        self._current_worker = worker
+        worker.start()
+
+    def _on_stt_result(self, result):
+        """STT finished — show transcription then auto-send to LLM → TTS."""
+        if not result.success or not result.content or not result.content.strip():
+            self._set_status("No speech detected — try again")
+            return
+
+        transcribed = result.content.strip()
+
+        # Show what we heard as a user bubble
+        user_bubble = self._chat_view.add_bubble("user")
+        user_bubble.add_text(transcribed)
+        self.messages.append({"role": "user", "content": transcribed})
+        self._chat_view.scroll_to_bottom()
+
+        # Step 2: Send the text through LLM �� TTS
+        self._set_status("Thinking...")
         self._busy = True
         self._cancel_event.clear()
         self._execute_btn.setText("CANCEL")
         self._progress_bar.setVisible(True)
         self._progress_bar.setRange(0, 0)
-        self._set_status("Transcribing speech...")
 
+        svc = get_service()
         worker = PipelineWorker(
-            svc, pipeline_type, kwargs=kwargs,
+            svc, "voice-assistant",
+            kwargs={"text": transcribed, "play_audio": True},
             cancel_event=self._cancel_event,
         )
         worker.progress.connect(self._on_pipeline_progress)
@@ -928,7 +946,7 @@ class ArtifexMainWindow(QMainWindow):
         worker.start()
 
     def _on_voice_result(self, result):
-        """Handle voice assistant result — show transcription + response in chat."""
+        """Handle voice assistant LLM → TTS result — show response in chat."""
         self._progress_bar.setVisible(False)
 
         if not result.success:
@@ -938,16 +956,8 @@ class ArtifexMainWindow(QMainWindow):
             self._finish_busy("Voice pipeline failed")
             return
 
-        user_text = result.metadata.get("user_text", "")
         response_text = result.metadata.get("response_text", "")
 
-        # Show user's transcribed speech and add to main chat history
-        if user_text:
-            user_bubble = self._chat_view.add_bubble("user")
-            user_bubble.add_text(user_text)
-            self.messages.append({"role": "user", "content": user_text})
-
-        # Show Artifex response and add to main chat history
         if response_text:
             bubble = self._chat_view.add_bubble("assistant")
             bubble.add_text(response_text)
@@ -958,9 +968,6 @@ class ArtifexMainWindow(QMainWindow):
             if audio_path and os.path.isfile(str(audio_path)):
                 bubble.add_audio(str(audio_path))
                 self._audio_player.load_file(str(audio_path))
-        elif not user_text:
-            bubble = self._chat_view.add_bubble("assistant")
-            bubble.add_text("No speech detected. Hold Space and speak, then release.")
 
         self._chat_view.scroll_to_bottom()
         self._finish_busy("Hold Space to talk | Or type and EXECUTE")
