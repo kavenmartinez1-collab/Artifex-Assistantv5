@@ -1,5 +1,5 @@
 """
-Artifex-Lite v2 — Knowledge Tree & Context Engine.
+Artifex-Assistant v5 — Knowledge Tree & Context Engine.
 
 Architecture:
   KnowledgeEntry   — one atomic knowledge item with lifecycle metadata

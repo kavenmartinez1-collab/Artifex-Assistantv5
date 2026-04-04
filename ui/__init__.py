@@ -1,1 +1,1 @@
-# Artifex-Lite v2 — User interface modules
+# Artifex-Assistant v5 — User interface modules

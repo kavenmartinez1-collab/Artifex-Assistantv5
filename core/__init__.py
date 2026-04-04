@@ -1,1 +1,1 @@
-# Artifex-Lite v2 — Core infrastructure
+# Artifex-Assistant v5 — Core infrastructure

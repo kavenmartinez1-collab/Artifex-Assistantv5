@@ -1,5 +1,5 @@
 """
-Artifex-Lite v2 — General-purpose tool execution for ASSISTANT mode.
+Artifex-Assistant v5 — General-purpose tool execution for ASSISTANT mode.
 Enables shell commands, Python execution, web search, file reading, and web page reading.
 """
 

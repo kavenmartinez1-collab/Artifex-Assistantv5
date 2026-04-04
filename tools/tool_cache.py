@@ -1,5 +1,5 @@
 """
-Artifex-Lite v2 — Tool Output Cache.
+Artifex-Assistant v5 — Tool Output Cache.
 
 Large tool outputs bloat conversation history and exhaust the model's context window.
 This module intercepts large outputs, saves them to disk, and returns a compact
