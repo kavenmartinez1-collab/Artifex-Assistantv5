@@ -445,7 +445,7 @@ The SSE stream uses an extended OpenAI format with these additional fields:
 | `x_tool_done` | Signals tool execution complete, follow-up response starting |
 | `x_usage` | Token usage stats on the final chunk |
 
-Standard OpenAI clients will ignore the `x_` fields and receive normal content. Clients that understand the extensions (like upstream client suite) can render thinking blocks, tool indicators, and usage stats.
+Standard OpenAI clients will ignore the `x_` fields and receive normal content. Clients that understand the extensions can render thinking blocks, tool indicators, and usage stats.
 
 ### Authentication
 
