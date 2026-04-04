@@ -106,7 +106,6 @@ STATUS_BG = THEMES["CYBERPUNK"]["status_bg"]
 MODE_COLORS = {
     "ASSISTANT": {"accent": "#00f0ff", "button": "#00f0ff", "status": "#00f0ff"},
     "BLOOD_DRAGON": {"accent": "#ff2a6d", "button": "#ff2a6d", "status": "#ff2a6d"},
-    "RED_TEAM": {"accent": "#ff6600", "button": "#ff6600", "status": "#ff6600"},
 }
 
 # ===== FONTS =====

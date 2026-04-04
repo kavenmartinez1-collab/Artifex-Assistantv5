@@ -1,5 +1,5 @@
 """
-Artifex-Lite v2 — Hardware telemetry and system sensing.
+Artifex-Assistant v5 — Hardware telemetry and system sensing.
 Merged from chatbot.py get_hardware_manifest() and pentest_tools.py sense_system().
 """
 

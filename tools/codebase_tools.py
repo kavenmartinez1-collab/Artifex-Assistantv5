@@ -1,5 +1,5 @@
 """
-Artifex-Lite v2 -Deterministic codebase intelligence tools.
+Artifex-Assistant v5 — Deterministic codebase intelligence tools.
 
 These are NOT AI-powered -they use AST parsing, regex, and file system
 traversal to provide accurate, reliable results the model can trust.

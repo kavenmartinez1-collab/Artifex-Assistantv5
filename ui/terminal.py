@@ -1,5 +1,5 @@
 """
-Artifex-Lite v2 — Terminal rendering effects.
+Artifex-Assistant v5 — Terminal rendering effects.
 Boot sequence, glitch text, and BLOOD_DRAGON visual styling.
 """
 
@@ -45,26 +45,3 @@ def glitch_print(text, color=Fore.CYAN, delay=0.005):
         time.sleep(delay)
 
 
-def print_banner(available_tools, missing_tools):
-    """Red Team Assistant banner."""
-    import platform
-
-    print(f"{Fore.RED}{'=' * 65}")
-    print(f"{Fore.RED}  RED TEAM ASSISTANT {Fore.WHITE}// {Fore.YELLOW}Local AI Pentest Helper")
-    print(f"{Fore.RED}  Model: {Fore.WHITE}Qwen3.5-9B (4-bit NF4)")
-    print(f"{Fore.RED}  Platform: {Fore.WHITE}{platform.system()} ({platform.machine()})")
-    print(f"{Fore.RED}{'=' * 65}")
-    print(f"{Fore.WHITE}  For legal CTF use only: HTB / VulnHub / TryHackMe")
-    print(
-        f"{Fore.WHITE}  Type {Fore.YELLOW}/help{Fore.WHITE} for commands, "
-        f"{Fore.YELLOW}/tools{Fore.WHITE} for available tools"
-    )
-    if available_tools:
-        print(
-            f"{Fore.GREEN}  Tools found: {Fore.WHITE}{', '.join(sorted(available_tools.keys()))}"
-        )
-    if missing_tools:
-        print(
-            f"{Fore.YELLOW}  Not found: {Fore.WHITE}{', '.join(sorted(missing_tools))}"
-        )
-    print(f"{Fore.RED}{'=' * 65}\n")
