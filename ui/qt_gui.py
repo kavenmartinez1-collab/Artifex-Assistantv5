@@ -578,8 +578,14 @@ class ArtifexMainWindow(QMainWindow):
         mode = self._mode_combo.currentText()
         prompt = self._prompt_input.toPlainText().strip()
 
-        if mode in _PROMPT_MODES and not prompt:
-            self._set_status("Enter a prompt first")
+        # Voice Assistant can work with either text OR a recorded audio file
+        has_recording = (mode == "Voice Assistant"
+                         and self._drop_zone._attached_files)
+        if mode in _PROMPT_MODES and not prompt and not has_recording:
+            if mode == "Voice Assistant":
+                self._set_status("Hold Space to talk, or type a message")
+            else:
+                self._set_status("Enter a prompt first")
             return
 
         max_tokens = int(self._tokens_input.text() or "2048")
@@ -668,7 +674,11 @@ class ArtifexMainWindow(QMainWindow):
             cancel_event=self._cancel_event,
         )
         worker.progress.connect(self._on_pipeline_progress)
-        worker.result_ready.connect(self._on_pipeline_result)
+        # Voice Assistant results need the voice handler (shows chat + stays on Chat tab)
+        if mode == "Voice Assistant":
+            worker.result_ready.connect(self._on_voice_result)
+        else:
+            worker.result_ready.connect(self._on_pipeline_result)
         worker.error.connect(self._on_generation_error)
         worker.status_changed.connect(self._set_status)
         self._current_worker = worker
@@ -705,9 +715,26 @@ class ArtifexMainWindow(QMainWindow):
         elif mode == "Video Gen":
             kwargs = {"prompt": prompt, "num_frames": 16, "fps": 8}
         elif mode == "Voice Assistant":
-            # Voice Assistant accepts text input (skips STT stage)
-            # or audio_data from mic recording (handled by the pipeline)
-            kwargs = {"text": prompt, "play_audio": True}
+            if prompt:
+                # Text input — skip STT, go straight to LLM → TTS
+                kwargs = {"text": prompt, "play_audio": True}
+            else:
+                # Audio from mic recording — run full STT → LLM → TTS
+                files = self._drop_zone.attached_files
+                if files:
+                    import numpy as np
+                    from scipy.io import wavfile
+                    try:
+                        sr, audio = wavfile.read(files[0])
+                        if audio.dtype == np.int16:
+                            audio = audio.astype(np.float32) / 32768.0
+                        elif audio.dtype != np.float32:
+                            audio = audio.astype(np.float32)
+                        if audio.ndim > 1:
+                            audio = audio.mean(axis=1)
+                        kwargs = {"audio_data": audio, "play_audio": True}
+                    except Exception:
+                        kwargs = {}
 
         return kwargs
 
@@ -820,7 +847,8 @@ class ArtifexMainWindow(QMainWindow):
                 if not response_text:
                     bubble.add_text(f"Audio: {os.path.basename(str(path))}")
                 self._audio_player.load_file(str(path))
-                self._tabs.setCurrentIndex(2)  # Audio tab
+                if not response_text:
+                    self._tabs.setCurrentIndex(2)  # Audio tab only for plain TTS
             elif not response_text:
                 bubble.add_text("Audio generated (no file path)")
 
