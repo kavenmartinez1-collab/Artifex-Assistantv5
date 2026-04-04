@@ -46,6 +46,10 @@ soundfile==0.13.1
 librosa==0.11.0
 trimesh==4.11.5
 
+# ── Voice Assistant ──────────────────────────────────────────────────
+faster-whisper==1.2.1
+pynput==1.8.1
+
 # ── API server / Web gateway ─────────────────────────────────────────
 fastapi==0.135.1
 uvicorn==0.42.0

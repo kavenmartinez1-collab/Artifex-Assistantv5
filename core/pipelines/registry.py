@@ -74,6 +74,12 @@ def _ensure_registered():
     except ImportError:
         pass  # diffusers not installed
 
+    try:
+        from core.pipelines.voice_assistant import VoiceAssistantPipeline
+        _register_pipeline("voice-assistant", VoiceAssistantPipeline)
+    except ImportError:
+        pass  # faster-whisper not installed
+
 
 def create_pipeline(pipeline_type: str) -> BasePipeline:
     """Create a pipeline instance for the given type.
