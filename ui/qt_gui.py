@@ -51,6 +51,7 @@ from tools.agent_tools import get_assistant_tools_prompt, get_tool_output_limit
 _PIPELINE_MODES = [
     "Chat", "Code", "Image Gen", "Image Edit", "Vision",
     "3D (ShapE)", "Audio TTS", "Audio STT", "Music Gen", "Video Gen",
+    "Voice Assistant",
 ]
 
 _PIPELINE_MAP = {
@@ -64,11 +65,13 @@ _PIPELINE_MAP = {
     "Audio STT": "automatic-speech-recognition",
     "Music Gen": "text-to-music",
     "Video Gen": "text-to-video",
+    "Voice Assistant": "voice-assistant",
 }
 
 _FILE_INPUT_MODES = {"Vision", "Audio STT", "Image Edit"}
 _PROMPT_MODES = {"Chat", "Code", "Image Gen", "Image Edit", "Vision",
-                 "3D (ShapE)", "Audio TTS", "Music Gen", "Video Gen"}
+                 "3D (ShapE)", "Audio TTS", "Music Gen", "Video Gen",
+                 "Voice Assistant"}
 
 
 class ArtifexMainWindow(QMainWindow):
@@ -360,6 +363,14 @@ class ArtifexMainWindow(QMainWindow):
         ctrl_layout.addWidget(self._vram_btn)
 
         input_layout.addLayout(ctrl_layout)
+
+        # Mode hint bar — contextual instructions
+        self._hint_label = QLabel("")
+        self._hint_label.setStyleSheet(
+            "font-family: Consolas; font-size: 9pt; color: #888; padding: 2px 4px;"
+        )
+        input_layout.addWidget(self._hint_label)
+
         layout.addWidget(input_frame)
 
         # Progress bar
@@ -476,6 +487,9 @@ class ArtifexMainWindow(QMainWindow):
         self._thinking_batcher = TokenBatcher(flush_interval_ms=50)
         self._thinking_batcher.batch_ready.connect(self._on_thinking_batch)
 
+        # Push-to-talk state
+        self._ptt_active = False
+
     # ═══════════════════════════════════════════════════════════════════
     # THEME
     # ═══════════════════════════════════════════════════════════════════
@@ -530,7 +544,24 @@ class ArtifexMainWindow(QMainWindow):
         self._drop_zone.setVisible(needs_file or mode in {
             "Image Gen", "Vision", "Image Edit"
         })
-        self._mic_recorder.setVisible(mode in {"Audio STT"})
+        self._mic_recorder.setVisible(mode in {"Audio STT", "Voice Assistant"})
+
+        # Update hint text
+        hints = {
+            "Chat": "Type a message and press Ctrl+Enter or click EXECUTE",
+            "Code": "Describe what you want to build, then EXECUTE",
+            "Image Gen": "Describe the image you want to generate",
+            "Image Edit": "Drop an image above, then describe the edit",
+            "Vision": "Drop an image above, then ask a question about it",
+            "3D (ShapE)": "Describe a 3D object to generate",
+            "Audio TTS": "Type text to convert to speech",
+            "Audio STT": "Record or drop an audio file to transcribe",
+            "Music Gen": "Describe the music you want to generate",
+            "Video Gen": "Describe the video you want to generate",
+            "Voice Assistant": "Hold Space to talk (click outside the text box first) "
+                               "| Or type a message and EXECUTE",
+        }
+        self._hint_label.setText(hints.get(mode, ""))
 
     # ═══════════════════════════════════════════════════════════════════
     # EXECUTION
@@ -673,6 +704,10 @@ class ArtifexMainWindow(QMainWindow):
             kwargs = {"prompt": prompt, "duration_seconds": 10}
         elif mode == "Video Gen":
             kwargs = {"prompt": prompt, "num_frames": 16, "fps": 8}
+        elif mode == "Voice Assistant":
+            # Voice Assistant accepts text input (skips STT stage)
+            # or audio_data from mic recording (handled by the pipeline)
+            kwargs = {"text": prompt, "play_audio": True}
 
         return kwargs
 
@@ -772,13 +807,21 @@ class ArtifexMainWindow(QMainWindow):
                 bubble.add_text("Image generated (no file path)")
 
         elif result.output_type == "audio":
-            path = result.metadata.get("stored_path") or result.metadata.get("saved_to")
-            if path and os.path.isfile(path):
-                bubble.add_audio(path)
-                bubble.add_text(f"Audio: {os.path.basename(path)}")
-                self._audio_player.load_file(path)
+            # Voice Assistant returns response_text in metadata
+            response_text = result.metadata.get("response_text")
+            if response_text:
+                bubble.add_text(response_text)
+
+            path = (result.metadata.get("stored_path")
+                    or result.metadata.get("saved_to")
+                    or result.content)
+            if path and os.path.isfile(str(path)):
+                bubble.add_audio(str(path))
+                if not response_text:
+                    bubble.add_text(f"Audio: {os.path.basename(str(path))}")
+                self._audio_player.load_file(str(path))
                 self._tabs.setCurrentIndex(2)  # Audio tab
-            else:
+            elif not response_text:
                 bubble.add_text("Audio generated (no file path)")
 
         elif result.output_type == "video":
@@ -799,10 +842,100 @@ class ArtifexMainWindow(QMainWindow):
         self._finish_busy("Pipeline complete")
 
     def _on_recording_done(self, path):
-        """Mic recording finished — auto-attach for STT."""
+        """Mic recording finished — auto-attach for STT, auto-send for Voice Assistant."""
         self._drop_zone._attached_files = [path]
         self._drop_zone._file_label.setText(os.path.basename(path))
         self._set_status(f"Recording saved: {os.path.basename(path)}")
+
+        # Voice Assistant mode: auto-transcribe and send to LLM
+        mode = self._mode_combo.currentText()
+        if mode == "Voice Assistant" and not self._busy:
+            self._run_voice_from_recording(path)
+
+    def _run_voice_from_recording(self, wav_path: str):
+        """Voice Assistant: load the WAV, transcribe via pipeline, send to LLM."""
+        import numpy as np
+        from scipy.io import wavfile
+
+        try:
+            sr, audio = wavfile.read(wav_path)
+            if audio.dtype == np.int16:
+                audio = audio.astype(np.float32) / 32768.0
+            elif audio.dtype != np.float32:
+                audio = audio.astype(np.float32)
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+        except Exception as e:
+            self._set_status(f"Failed to read recording: {e}")
+            return
+
+        if np.max(np.abs(audio)) < 0.01:
+            self._set_status("No speech detected — try again")
+            return
+
+        self._run_voice_from_audio(audio)
+
+    def _run_voice_from_audio(self, audio):
+        """Voice Assistant: send raw float32 audio through STT → LLM → TTS."""
+        pipeline_type = "voice-assistant"
+        svc = get_service()
+        kwargs = {"audio_data": audio, "play_audio": True}
+
+        self._busy = True
+        self._cancel_event.clear()
+        self._execute_btn.setText("CANCEL")
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setRange(0, 0)
+        self._set_status("Transcribing speech...")
+
+        worker = PipelineWorker(
+            svc, pipeline_type, kwargs=kwargs,
+            cancel_event=self._cancel_event,
+        )
+        worker.progress.connect(self._on_pipeline_progress)
+        worker.result_ready.connect(self._on_voice_result)
+        worker.error.connect(self._on_generation_error)
+        worker.status_changed.connect(self._set_status)
+        self._current_worker = worker
+        worker.start()
+
+    def _on_voice_result(self, result):
+        """Handle voice assistant result — show transcription + response in chat."""
+        self._progress_bar.setVisible(False)
+
+        if not result.success:
+            bubble = self._chat_view.add_bubble("assistant")
+            bubble.add_text(f"Error: {result.error}")
+            self._chat_view.scroll_to_bottom()
+            self._finish_busy("Voice pipeline failed")
+            return
+
+        user_text = result.metadata.get("user_text", "")
+        response_text = result.metadata.get("response_text", "")
+
+        # Show user's transcribed speech and add to main chat history
+        if user_text:
+            user_bubble = self._chat_view.add_bubble("user")
+            user_bubble.add_text(user_text)
+            self.messages.append({"role": "user", "content": user_text})
+
+        # Show Artifex response and add to main chat history
+        if response_text:
+            bubble = self._chat_view.add_bubble("assistant")
+            bubble.add_text(response_text)
+            self.messages.append({"role": "assistant", "content": response_text})
+
+            # Show audio player if TTS was generated
+            audio_path = result.metadata.get("audio_path") or result.content
+            if audio_path and os.path.isfile(str(audio_path)):
+                bubble.add_audio(str(audio_path))
+                self._audio_player.load_file(str(audio_path))
+        elif not user_text:
+            bubble = self._chat_view.add_bubble("assistant")
+            bubble.add_text("No speech detected. Hold Space and speak, then release.")
+
+        self._chat_view.scroll_to_bottom()
+        self._finish_busy("Hold Space to talk | Or type and EXECUTE")
 
     def _on_files_dropped(self, paths):
         """Files dropped — show preview if image."""
@@ -1102,3 +1235,71 @@ class ArtifexMainWindow(QMainWindow):
             _log.debug("System monitor error: %s", e)
 
         self._resource_label.setText(" | ".join(parts) if parts else "")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # PUSH-TO-TALK (hold Space in Voice Assistant mode)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def keyPressEvent(self, event):
+        """Hold Space to start recording in Voice Assistant mode."""
+        if (event.key() == Qt.Key.Key_Space
+                and not event.isAutoRepeat()
+                and self._mode_combo.currentText() == "Voice Assistant"
+                and not self._prompt_input.hasFocus()
+                and not self._ptt_active
+                and not self._busy):
+            self._ptt_active = True
+            self._ptt_audio_data = []
+            self._ptt_stream = None
+            try:
+                import sounddevice as sd
+                self._ptt_stream = sd.InputStream(
+                    samplerate=16000, channels=1, dtype="float32",
+                    callback=self._ptt_audio_callback, blocksize=1024,
+                )
+                self._ptt_stream.start()
+                self._set_status("Listening... (release Space to send)")
+                self._mic_recorder._record_btn.setStyleSheet("background-color: #ff4444;")
+                self._mic_recorder._status_label.setText("Recording...")
+            except Exception as e:
+                self._ptt_active = False
+                self._set_status(f"Mic error: {e}")
+            return
+        super().keyPressEvent(event)
+
+    def _ptt_audio_callback(self, indata, frames, time_info, status):
+        """Collect audio samples during push-to-talk."""
+        self._ptt_audio_data.append(indata.copy())
+
+    def keyReleaseEvent(self, event):
+        """Release Space to stop recording and auto-send."""
+        if (event.key() == Qt.Key.Key_Space
+                and not event.isAutoRepeat()
+                and self._ptt_active):
+            self._ptt_active = False
+
+            # Stop the stream
+            if self._ptt_stream:
+                self._ptt_stream.stop()
+                self._ptt_stream.close()
+                self._ptt_stream = None
+
+            self._mic_recorder._record_btn.setStyleSheet("")
+            self._mic_recorder._status_label.setText("Ready")
+
+            if not self._ptt_audio_data:
+                self._set_status("No audio captured")
+                return
+
+            # Convert to numpy and send directly to voice pipeline
+            import numpy as np
+            audio = np.concatenate(self._ptt_audio_data, axis=0).flatten()
+
+            if np.max(np.abs(audio)) < 0.01:
+                self._set_status("No speech detected — try again")
+                return
+
+            self._set_status("Processing speech...")
+            self._run_voice_from_audio(audio)
+            return
+        super().keyReleaseEvent(event)

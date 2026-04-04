@@ -176,8 +176,7 @@ class OllamaEngine(BaseEngine):
             "options": options,
         }
 
-        if enable_thinking:
-            payload["think"] = True
+        payload["think"] = bool(enable_thinking)
 
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(

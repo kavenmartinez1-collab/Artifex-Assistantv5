@@ -42,6 +42,66 @@ _MODE_FILE_TYPES = {
 }
 
 
+def _voice_push_to_talk(listener) -> str | None:
+    """Hold Space to record, release to transcribe. Returns text or None.
+
+    Falls back to typed input if the user presses Enter instead.
+    """
+    import threading
+    from pynput import keyboard
+
+    stop_event = threading.Event()
+    space_held = threading.Event()
+    typed_input = [None]
+    audio_result = [None]
+    record_thread = None
+    input_mode = [None]  # "voice" or "typed"
+
+    def record_worker():
+        audio_result[0] = listener.record_audio(stop_event)
+
+    def on_press(key):
+        nonlocal record_thread
+        if key == keyboard.Key.space and not space_held.is_set():
+            space_held.set()
+            input_mode[0] = "voice"
+            print(f"\r{Fore.CYAN}  [Recording...]{Style.RESET_ALL}", end="", flush=True)
+            record_thread = threading.Thread(target=record_worker, daemon=True)
+            record_thread.start()
+        elif key == keyboard.Key.enter:
+            input_mode[0] = "typed"
+            stop_event.set()
+            return False
+
+    def on_release(key):
+        if key == keyboard.Key.space and space_held.is_set():
+            stop_event.set()
+            print(f"\r{Fore.CYAN}  [Processing...]{Style.RESET_ALL}", end="", flush=True)
+            return False
+
+    with keyboard.Listener(on_press=on_press, on_release=on_release) as kb:
+        kb.join()
+
+    # If user pressed Enter instead, fall back to typed input
+    if input_mode[0] == "typed":
+        try:
+            text = input(f"\r{Fore.GREEN}  > {Fore.WHITE}").strip()
+            return text if text else None
+        except EOFError:
+            return None
+
+    if record_thread:
+        record_thread.join(timeout=5)
+
+    if audio_result[0] is None:
+        print(f"\r{Fore.YELLOW}  No speech detected.{Style.RESET_ALL}")
+        return None
+
+    text = listener.transcribe(audio_result[0])
+    print()  # Clear the status line
+    return text.strip() if text else None
+
+
 def _open_file_externally(path: str):
     """Open a file with the system's default application (cross-platform)."""
     system = platform.system()
@@ -399,6 +459,7 @@ def run_assistant():
         "vision": "image-text-to-text", "tts": "text-to-audio",
         "stt": "automatic-speech-recognition", "music": "text-to-music",
         "video": "text-to-video", "3d": "shap-e",
+        "voice": "voice-assistant", "artifex": "voice-assistant",
     }
 
     # Build environment info once
@@ -426,10 +487,35 @@ def run_assistant():
     history = [{"role": "system", "content": _build_system_prompt()}]
     _first_message = True
 
+    _voice_listener = None  # Lazy-loaded for voice/artifex mode
+
     while True:
         try:
-            cwd = os.getcwd()
-            user_input = input(f"{Fore.GREEN}assistant {Fore.WHITE}{cwd} > ").strip()
+            # Voice mode: push-to-talk instead of typed input
+            if _cli_pipeline_mode in ("voice", "artifex"):
+                if _voice_listener is None:
+                    try:
+                        from core.pipelines.voice_assistant import _Listener
+                        _voice_listener = _Listener()
+                        _voice_listener.load(
+                            status_callback=lambda msg: print(f"{Fore.CYAN}  {msg}{Style.RESET_ALL}")
+                        )
+                    except Exception as e:
+                        print(f"{Fore.RED}  STT init failed: {e}{Style.RESET_ALL}")
+                        print(f"{Fore.YELLOW}  Falling back to text input.{Style.RESET_ALL}\n")
+                        _cli_pipeline_mode = "chat"
+                        continue
+
+                print(f"{Fore.CYAN}  Hold Space to talk, release to send "
+                      f"(or type and press Enter){Style.RESET_ALL}")
+
+                user_input = _voice_push_to_talk(_voice_listener)
+                if user_input is None:
+                    continue
+                print(f"{Fore.GREEN}  You: {user_input}{Style.RESET_ALL}\n")
+            else:
+                cwd = os.getcwd()
+                user_input = input(f"{Fore.GREEN}assistant {Fore.WHITE}{cwd} > ").strip()
 
             if not user_input:
                 continue
@@ -684,7 +770,11 @@ def run_assistant():
                     print(f"  Available: {modes}{Style.RESET_ALL}\n")
                 elif arg in _CLI_MODE_MAP:
                     _cli_pipeline_mode = arg
-                    print(f"{Fore.CYAN}  Pipeline mode: {_cli_pipeline_mode}{Style.RESET_ALL}\n")
+                    print(f"{Fore.CYAN}  Pipeline mode: {_cli_pipeline_mode}{Style.RESET_ALL}")
+                    if arg in ("voice", "artifex"):
+                        print(f"{Fore.CYAN}  Voice Assistant active — hold Space to talk, "
+                              f"release to send{Style.RESET_ALL}")
+                    print()
                 else:
                     print(f"{Fore.YELLOW}  Unknown mode: {arg}. Available: {', '.join(_CLI_MODE_MAP.keys())}{Style.RESET_ALL}\n")
                 continue
@@ -764,6 +854,8 @@ def run_assistant():
                     kwargs = {"prompt": user_input, "num_frames": 16, "fps": 8}
                 elif _cli_pipeline_mode == "3d":
                     kwargs = {"prompt": user_input, "num_steps": 64}
+                elif _cli_pipeline_mode in ("voice", "artifex"):
+                    kwargs = {"text": user_input, "play_audio": True}
 
                 # Run through service layer with progress
                 from core.services import get_service
@@ -779,15 +871,23 @@ def run_assistant():
                 )
 
                 if result.success:
-                    if result.output_type == "text":
+                    # Voice assistant: show response text from metadata
+                    response_text = result.metadata.get("response_text")
+                    if response_text:
+                        print(f"\n{Fore.CYAN}  Artifex: {response_text}{Style.RESET_ALL}\n")
+
+                    if result.output_type == "text" and not response_text:
                         print(f"\n{Fore.WHITE}  {result.content}{Style.RESET_ALL}\n")
-                    else:
+                    elif result.output_type != "text":
                         path = result.metadata.get("stored_path") or result.metadata.get("saved_to", "")
+                        if not path and result.content and isinstance(result.content, str):
+                            path = result.content
                         file_id = result.metadata.get("file_id", "")
-                        print(f"{Fore.GREEN}  Done! Output: {os.path.basename(path)}")
-                        if file_id:
-                            print(f"  File ID: {file_id}")
-                        print(f"  Full path: {path}{Style.RESET_ALL}\n")
+                        if path and not response_text:
+                            print(f"{Fore.GREEN}  Done! Output: {os.path.basename(path)}")
+                            if file_id:
+                                print(f"  File ID: {file_id}")
+                            print(f"  Full path: {path}{Style.RESET_ALL}\n")
                         # Auto-open images
                         if result.output_type == "image" and path and os.path.isfile(path):
                             try:

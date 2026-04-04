@@ -155,6 +155,12 @@ class Shape3DGenerationRequest(BaseModel):
     prompt: str = Field(..., example="A small red chair")
     num_steps: Optional[int] = Field(64, ge=16, le=128)
 
+class VoiceAssistantRequest(BaseModel):
+    text: str = Field(..., example="What's the weather like?")
+    max_tokens: Optional[int] = Field(512, ge=1, le=4096)
+    temperature: Optional[float] = Field(0.7, ge=0.0, le=2.0)
+    play_audio: Optional[bool] = Field(False)
+
 class EmbeddingRequest(BaseModel):
     input: List[str] = Field(..., example=["Hello world"])
 
@@ -1228,5 +1234,44 @@ def create_app():
         except Exception as e:
             _log.error("3D pipeline error: %s", e)
             raise HTTPException(status_code=500, detail=f"3D pipeline failed: {e}")
+
+    @app.post("/v1/voice/chat")
+    async def voice_chat(request: Request,
+                         body: VoiceAssistantRequest):
+        """Send text to Artifex Voice Assistant and get a spoken response."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        from core.services import get_service
+        svc = get_service()
+
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
+                "voice-assistant",
+                kwargs={
+                    "text": body.text[:2000],
+                    "max_tokens": body.max_tokens,
+                    "temperature": body.temperature,
+                    "play_audio": body.play_audio,
+                },
+                store_output=True,
+            ))
+
+            if not result.success:
+                raise HTTPException(status_code=500, detail=result.error)
+
+            return {
+                "object": "voice.chat",
+                "response_text": result.metadata.get("response_text", ""),
+                "user_text": result.metadata.get("user_text", body.text),
+                "audio_file_id": result.metadata.get("file_id"),
+                "audio_chunks": result.metadata.get("audio_chunks", 0),
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            _log.error("Voice assistant error: %s", e)
+            raise HTTPException(status_code=500, detail=f"Voice assistant failed: {e}")
 
     return app
