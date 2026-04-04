@@ -886,8 +886,8 @@ class ArtifexMainWindow(QMainWindow):
             self._set_status(f"Failed to read recording: {e}")
             return
 
-        if np.max(np.abs(audio)) < 0.01:
-            self._set_status("No speech detected — try again")
+        if np.max(np.abs(audio)) < 0.0001:
+            self._set_status("No audio from microphone — check mic settings")
             return
 
         self._run_voice_from_audio(audio)

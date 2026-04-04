@@ -157,8 +157,8 @@ class _Listener:
 
         audio = np.concatenate(audio_buffer, axis=0).flatten()
 
-        # Filter out silence-only recordings
-        if np.max(np.abs(audio)) < 0.01:
+        # Filter out dead-mic recordings (no signal at all)
+        if np.max(np.abs(audio)) < 0.0001:
             return None
 
         return audio
