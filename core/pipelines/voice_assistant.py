@@ -52,11 +52,11 @@ ARTIFEX_GREETING = "Artifex voice assistant is online. How can I help?"
 _SENTENCE_RE = re.compile(r'(?<=[.!?])\s+')
 
 
-def _chunk_for_tts(text: str, max_chars: int = 250) -> list[str]:
-    """Split text into chunks safe for Bark TTS (~250 char limit).
+def _chunk_for_tts(text: str, max_chars: int = 500) -> list[str]:
+    """Split text into chunks for TTS.
 
-    Only splits when necessary. Prefers fewer, larger chunks to keep
-    voice consistency and reduce latency.
+    Piper handles longer text well, so we use a generous limit.
+    Only splits when necessary.
     """
     text = text.strip()
     if len(text) <= max_chars:
@@ -81,8 +81,8 @@ def _chunk_for_tts(text: str, max_chars: int = 250) -> list[str]:
     return chunks or [text]
 
 
-# Bark voice preset — consistent British male voice across all chunks
-_BARK_VOICE_PRESET = "v2/en_speaker_6"
+# Default Piper voice model path (relative to project root)
+_PIPER_VOICE_MODEL = os.path.join("models", "piper-voices", "en_US-joe-medium.onnx")
 
 
 # ── Listener (STT via faster-whisper) ──────────────────────────────
@@ -257,7 +257,8 @@ class VoiceAssistantPipeline(BasePipeline):
         self._listener: _Listener | None = None
         self._speaker: _Speaker | None = None
         self._engine = None
-        self._tts_pipe = None
+        self._tts_voice = None
+        self._tts_sample_rate = 22050
 
         # Conversation state
         self._messages: list[dict] = []
@@ -273,7 +274,7 @@ class VoiceAssistantPipeline(BasePipeline):
         kwargs:
             whisper_model: str — faster-whisper model size (default "base.en")
             whisper_device: str — "auto", "cuda", or "cpu"
-            tts_model: str — HF model for TTS (default "suno/bark-small")
+            piper_model: str — path to Piper ONNX voice model
             input_device: int | None — sounddevice input device index
             output_device: int | None — sounddevice output device index
             system_prompt: str — override default personality
@@ -319,32 +320,19 @@ class VoiceAssistantPipeline(BasePipeline):
         self._engine = create_engine()
         self._engine.load(status_callback=cb)
 
-        # ── TTS ─────────────────────────────────────────────────────
-        tts_model = kwargs.get("tts_model", "suno/bark-small")
-        cb(f"Loading TTS: {os.path.basename(tts_model)}...")
+        # ── TTS (Piper — ONNX, CPU, instant) ──────────────────────
+        piper_model = kwargs.get("piper_model", _PIPER_VOICE_MODEL)
+        cb(f"Loading TTS: Piper ({os.path.basename(piper_model)})...")
 
         try:
-            from transformers import pipeline as hf_pipeline
-
-            try:
-                self._tts_pipe = hf_pipeline(
-                    "text-to-audio",
-                    model=tts_model,
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                )
-            except Exception:
-                # Some models use text-to-speech task
-                self._tts_pipe = hf_pipeline(
-                    "text-to-speech",
-                    model=tts_model,
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                )
-            cb(f"TTS ready: {os.path.basename(tts_model)}")
+            from piper.voice import PiperVoice
+            self._tts_voice = PiperVoice.load(piper_model)
+            self._tts_sample_rate = self._tts_voice.config.sample_rate
+            cb(f"TTS ready: Piper {os.path.basename(piper_model)} ({self._tts_sample_rate}Hz)")
         except Exception as e:
             cb(f"TTS load failed (continuing without voice output): {e}")
-            self._tts_pipe = None
+            self._tts_voice = None
+            self._tts_sample_rate = 22050
 
         # ── Speaker ─────────────────────────────────────────────────
         output_device = kwargs.get("output_device", None)
@@ -364,9 +352,9 @@ class VoiceAssistantPipeline(BasePipeline):
             self._engine.unload(status_callback=cb)
             self._engine = None
 
-        if self._tts_pipe:
-            del self._tts_pipe
-            self._tts_pipe = None
+        if self._tts_voice:
+            del self._tts_voice
+            self._tts_voice = None
 
         self._speaker = None
         self._messages.clear()
@@ -499,47 +487,41 @@ class VoiceAssistantPipeline(BasePipeline):
 
         self._messages.append({"role": "assistant", "content": full_response})
 
-        # ── Stage 3: TTS synthesis ──────────────────────────────────
+        # ── Stage 3: TTS synthesis (Piper — CPU, instant) ──────────
         _progress("Speaking...")
 
         output_dir = os.path.join("output", "voice")
         os.makedirs(output_dir, exist_ok=True)
         out_path = os.path.join(output_dir, "artifex_response.wav")
 
-        if self._tts_pipe and full_response.strip():
-            import scipy.io.wavfile
+        if self._tts_voice and full_response.strip():
+            import io
+            import wave
 
             chunks = _chunk_for_tts(full_response)
-            all_audio = []
-            sample_rate = None
+            all_audio = b""
 
             for i, chunk in enumerate(chunks):
                 if len(chunks) > 1:
                     _progress(f"Synthesizing speech ({i + 1}/{len(chunks)})...")
                 try:
-                    result = self._tts_pipe(
-                        chunk,
-                        generate_kwargs={"voice_preset": _BARK_VOICE_PRESET},
-                    )
-                    audio_chunk = result["audio"]
-                    sample_rate = result["sampling_rate"]
-                    all_audio.append(audio_chunk.flatten())
+                    buf = io.BytesIO()
+                    with wave.open(buf, "wb") as wf:
+                        self._tts_voice.synthesize_wav(chunk, wf)
+                    # Extract raw PCM frames (skip WAV header)
+                    buf.seek(0)
+                    with wave.open(buf, "rb") as rf:
+                        all_audio += rf.readframes(rf.getnframes())
                 except Exception:
-                    # Retry without voice preset (some models don't support it)
-                    try:
-                        result = self._tts_pipe(chunk)
-                        audio_chunk = result["audio"]
-                        sample_rate = result["sampling_rate"]
-                        all_audio.append(audio_chunk.flatten())
-                    except Exception:
-                        continue
+                    continue
 
-            if all_audio and sample_rate:
-                # Concatenate all chunks into one continuous WAV
-                full_audio = np.concatenate(all_audio)
-                scipy.io.wavfile.write(out_path, sample_rate, full_audio)
+            if all_audio:
+                with wave.open(out_path, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)  # 16-bit
+                    wf.setframerate(self._tts_sample_rate)
+                    wf.writeframes(all_audio)
 
-                # Play the complete response as one audio
                 if play_audio and self._speaker:
                     _progress("Playing response...")
                     self._speaker.play_file(out_path, block=True)
@@ -592,30 +574,26 @@ class VoiceAssistantPipeline(BasePipeline):
                 error="tts_text required for TTS."
             )
 
-        if self._tts_pipe is None:
+        if self._tts_voice is None:
             return PipelineResult(
                 success=False, output_type="audio",
                 error="TTS not available."
             )
 
         play_audio = kwargs.get("play_audio", True)
-
-        try:
-            result = self._tts_pipe(
-                text,
-                generate_kwargs={"voice_preset": _BARK_VOICE_PRESET},
-            )
-        except Exception:
-            result = self._tts_pipe(text)
-        audio = result["audio"]
-        sr = result["sampling_rate"]
+        import io
+        import wave
 
         output_dir = os.path.join("output", "voice")
         os.makedirs(output_dir, exist_ok=True)
         out_path = os.path.join(output_dir, "voice_tts.wav")
 
-        import scipy.io.wavfile
-        scipy.io.wavfile.write(out_path, sr, audio)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            self._tts_voice.synthesize_wav(text, wf)
+        buf.seek(0)
+        with open(out_path, "wb") as f:
+            f.write(buf.getvalue())
 
         if play_audio and self._speaker:
             self._speaker.play_file(out_path, block=True)
@@ -623,7 +601,7 @@ class VoiceAssistantPipeline(BasePipeline):
         return PipelineResult(
             success=True, output_type="audio",
             content=out_path,
-            metadata={"text": text, "sampling_rate": sr},
+            metadata={"text": text, "sampling_rate": self._tts_sample_rate},
         )
 
     # ── Conversation management ─────────────────────────────────────
@@ -699,26 +677,26 @@ class VoiceAssistantPipeline(BasePipeline):
     # ── Pipeline metadata ───────────────────────────────────────────
 
     def get_vram_estimate(self, model_path: str = "") -> float:
-        """Voice assistant needs VRAM for: LLM + TTS + STT.
+        """Voice assistant VRAM: LLM + STT only (TTS runs on CPU).
 
         faster-whisper base.en: ~0.3 GB
-        Bark small: ~1.5 GB
+        Piper TTS: 0 GB (ONNX, CPU only)
         LLM: varies (estimated separately)
         """
-        return 4.0  # Conservative base estimate
+        return 2.5  # LLM + STT, no GPU TTS
 
     def get_capabilities(self) -> dict:
         caps = super().get_capabilities()
         caps["modes"] = ["conversation", "stt_only", "tts_only"]
         caps["stt_engine"] = "faster-whisper"
-        caps["tts_engine"] = "transformers (Bark/SpeechT5)"
+        caps["tts_engine"] = "Piper (ONNX, CPU)"
         caps["supports_streaming"] = True
         caps["supports_push_to_talk"] = True
         caps["personality"] = "Artifex"
         caps["components"] = {
             "stt_loaded": self._listener.is_loaded() if self._listener else False,
             "llm_loaded": self._engine is not None,
-            "tts_loaded": self._tts_pipe is not None,
+            "tts_loaded": self._tts_voice is not None,
             "speaker_ready": self._speaker is not None,
         }
         return caps
