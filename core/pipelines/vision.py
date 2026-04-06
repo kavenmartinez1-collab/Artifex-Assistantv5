@@ -31,7 +31,8 @@ class VisionPipeline(BasePipeline):
             model_path: Local path or HuggingFace repo ID
             status_callback: Progress callback
         """
-        from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
+        from transformers import AutoTokenizer, AutoProcessor
+        from core.engine_transformers import _get_auto_model_class
 
         if status_callback:
             status_callback(f"Loading vision model: {os.path.basename(model_path)}...")
@@ -65,7 +66,9 @@ class VisionPipeline(BasePipeline):
         else:
             load_kwargs["device_map"] = "auto"
 
-        self.model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+        # Use the correct AutoModel class — Gemma 4 needs AutoModelForMultimodalLM
+        ModelClass = _get_auto_model_class(model_path)
+        self.model = ModelClass.from_pretrained(model_path, **load_kwargs)
 
         try:
             self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)

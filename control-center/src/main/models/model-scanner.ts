@@ -1,4 +1,4 @@
-import * as fs from 'fs';
+import * as fsp from 'fs/promises';
 import * as path from 'path';
 
 export interface ModelInfo {
@@ -27,28 +27,28 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(2)} ${units[i]}`;
 }
 
-function getDirSizeSync(dirPath: string): number {
+async function getDirSize(dirPath: string): Promise<number> {
   let total = 0;
-  const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  const entries = await fsp.readdir(dirPath, { withFileTypes: true });
   for (const entry of entries) {
     const fullPath = path.join(dirPath, entry.name);
     if (entry.isFile()) {
       try {
-        const stat = fs.statSync(fullPath);
+        const stat = await fsp.stat(fullPath);
         total += stat.size;
       } catch {
         // Skip files we can't stat
       }
     } else if (entry.isDirectory()) {
-      total += getDirSizeSync(fullPath);
+      total += await getDirSize(fullPath);
     }
   }
   return total;
 }
 
-function countShards(dirPath: string): number {
+async function countShards(dirPath: string): Promise<number> {
   try {
-    const files = fs.readdirSync(dirPath);
+    const files = await fsp.readdir(dirPath);
     return files.filter(f => f.endsWith('.safetensors')).length;
   } catch {
     return 0;
@@ -67,7 +67,7 @@ function buildQuantDetail(isQuantized: boolean, quantMethod: string | null, bits
   return `${method} ${bitStr}`;
 }
 
-function parseConfig(configPath: string): {
+async function parseConfig(configPath: string): Promise<{
   modelType: string;
   hiddenSize: number;
   numLayers: number;
@@ -77,7 +77,7 @@ function parseConfig(configPath: string): {
   quantMethod: string | null;
   groupSize: number | null;
   mixedPrecision: boolean;
-} {
+}> {
   const defaults = {
     modelType: 'unknown',
     hiddenSize: 0,
@@ -91,7 +91,7 @@ function parseConfig(configPath: string): {
   };
 
   try {
-    const raw = fs.readFileSync(configPath, 'utf-8');
+    const raw = await fsp.readFile(configPath, 'utf-8');
     const config = JSON.parse(raw);
 
     // Model type at top level
@@ -122,11 +122,13 @@ function parseConfig(configPath: string): {
 export async function scanModels(projectRoot: string): Promise<ModelInfo[]> {
   const modelsDir = path.join(projectRoot, 'models');
 
-  if (!fs.existsSync(modelsDir)) {
+  try {
+    await fsp.access(modelsDir);
+  } catch {
     return [];
   }
 
-  const entries = fs.readdirSync(modelsDir, { withFileTypes: true });
+  const entries = await fsp.readdir(modelsDir, { withFileTypes: true });
   const models: ModelInfo[] = [];
 
   for (const entry of entries) {
@@ -137,9 +139,9 @@ export async function scanModels(projectRoot: string): Promise<ModelInfo[]> {
     const modelPath = path.join(modelsDir, entry.name);
     const configPath = path.join(modelPath, 'config.json');
 
-    const cfg = parseConfig(configPath);
-    const sizeBytes = getDirSizeSync(modelPath);
-    const shardCount = countShards(modelPath);
+    const cfg = await parseConfig(configPath);
+    const sizeBytes = await getDirSize(modelPath);
+    const shardCount = await countShards(modelPath);
 
     models.push({
       name: entry.name,
@@ -175,15 +177,17 @@ export async function deleteModel(modelPath: string): Promise<void> {
     throw new Error(`Safety check failed: "${resolved}" is not inside a models/ directory`);
   }
 
-  if (!fs.existsSync(resolved)) {
+  try {
+    await fsp.access(resolved);
+  } catch {
     throw new Error(`Model directory not found: "${resolved}"`);
   }
 
-  const stat = fs.statSync(resolved);
+  const stat = await fsp.stat(resolved);
   if (!stat.isDirectory()) {
     throw new Error(`Not a directory: "${resolved}"`);
   }
 
   // Recursive delete
-  fs.rmSync(resolved, { recursive: true, force: true });
+  await fsp.rm(resolved, { recursive: true, force: true });
 }

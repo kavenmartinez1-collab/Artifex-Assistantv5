@@ -19,24 +19,20 @@ _log = get_logger(__name__)
 def _check_cuda():
     """Check CUDA availability and GPU info."""
     try:
-        import torch
-        if not torch.cuda.is_available():
+        from core.device import gpu_info
+        if not gpu_info.is_available:
             return {
                 "available": False,
                 "reason": "CUDA not available (CPU-only mode)",
             }
-        props = torch.cuda.get_device_properties(0)
-        total_gb = props.total_memory / (1024 ** 3)
-        alloc_gb = torch.cuda.memory_allocated(0) / (1024 ** 3)
-        free_gb = total_gb - alloc_gb
         return {
             "available": True,
-            "gpu_name": props.name,
-            "gpu_count": torch.cuda.device_count(),
-            "vram_total_gb": round(total_gb, 2),
-            "vram_allocated_gb": round(alloc_gb, 2),
-            "vram_free_gb": round(free_gb, 2),
-            "compute_capability": f"{props.major}.{props.minor}",
+            "gpu_name": gpu_info.name,
+            "gpu_count": gpu_info.device_count,
+            "vram_total_gb": round(gpu_info.total_gb, 2),
+            "vram_allocated_gb": round(gpu_info.allocated_gb, 2),
+            "vram_free_gb": round(gpu_info.free_gb, 2),
+            "compute_capability": gpu_info.compute_cap_str,
             "gpu_tier": GPU_TIER,
         }
     except Exception as e:

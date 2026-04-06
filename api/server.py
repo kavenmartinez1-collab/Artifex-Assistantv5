@@ -42,8 +42,6 @@ _log = get_logger(__name__)
 _engine = None
 _engine_lock = threading.Lock()
 _api_key = os.environ.get("ARTIFEX_API_KEY", "")
-_inference_busy = threading.Event()  # set() = GPU busy, clear() = free
-
 # Rate limiting for failed auth attempts
 _auth_failures: dict[str, list[float]] = {}  # ip -> list of timestamps
 _AUTH_FAIL_WINDOW = 60.0    # seconds
@@ -627,6 +625,18 @@ def create_app():
             status_code=500,
             content={"error": "Internal server error"},
         )
+
+    # ─── Register model queue callback ────────────────────────────────────
+    # Provides model_queue a way to unload the transformers engine without
+    # importing api.server directly (keeps core/ decoupled from api/).
+    def _unload_transformers_engine():
+        global _engine
+        with _engine_lock:
+            if _engine is not None:
+                _engine.unload()
+                _engine = None
+
+    get_model_queue().register_transformers_unload(_unload_transformers_engine)
 
     # ─── Health ───────────────────────────────────────────────────────────
 

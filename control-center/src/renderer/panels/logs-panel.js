@@ -86,6 +86,14 @@ async function initLogsPanel(container) {
   renderLogs();
 }
 
+function cleanupLogsPanel() {
+  logContainer = null;
+  filterSource = 'all';
+  filterSeverity = 'all';
+  filterText = '';
+  autoScroll = true;
+}
+
 function addLogEntry(entry) {
   logEntries.push(entry);
   // Cap at 10K entries in memory

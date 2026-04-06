@@ -25,11 +25,16 @@ class TestHealthCheck:
         assert "System:" in formatted
 
     def test_overall_health_degrades_without_cuda(self):
+        from core.device import gpu_info
         with patch("torch.cuda.is_available", return_value=False):
-            report = run_health_check()
-            # Should still run, but may be degraded
-            assert report["overall"] in ("healthy", "degraded", "broken")
-            assert report["cuda"]["available"] is False
+            gpu_info.reset()  # clear cached GPU state so mock takes effect
+            try:
+                report = run_health_check()
+                # Should still run, but may be degraded
+                assert report["overall"] in ("healthy", "degraded", "broken")
+                assert report["cuda"]["available"] is False
+            finally:
+                gpu_info.reset()  # restore for subsequent tests
 
 
 class TestFormatReport:

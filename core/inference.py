@@ -281,11 +281,12 @@ def check_vram_pressure(threshold=0.85):
     Returns:
         (is_pressured, usage_fraction, allocated_gb, total_gb)
     """
-    if not torch.cuda.is_available():
+    from core.device import gpu_info
+    if not gpu_info.is_available:
         return False, 0.0, 0.0, 0.0
-    allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-    total = torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
-    fraction = allocated / total if total > 0 else 0.0
+    allocated = gpu_info.allocated_gb
+    total = gpu_info.total_gb
+    fraction = gpu_info.usage_fraction
     return fraction >= threshold, fraction, allocated, total
 
 

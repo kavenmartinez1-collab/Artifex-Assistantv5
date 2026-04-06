@@ -2,15 +2,16 @@
 // Panel routing, IPC bridge setup, status bar updates
 
 const panels = {
-  services: { init: initServicesPanel, label: 'Services' },
-  logs: { init: initLogsPanel, label: 'Logs' },
-  quantize: { init: initQuantPanel, label: 'Quantize' },
-  cluster: { init: initClusterPanel, label: 'Cluster' },
-  models: { init: initModelsPanel, label: 'Models' },
-  docker: { init: initDockerPanel, label: 'Docker' },
+  services: { init: initServicesPanel, cleanup: cleanupServicesPanel, label: 'Services' },
+  logs: { init: initLogsPanel, cleanup: cleanupLogsPanel, label: 'Logs' },
+  quantize: { init: initQuantPanel, cleanup: cleanupQuantPanel, label: 'Quantize' },
+  cluster: { init: initClusterPanel, cleanup: cleanupClusterPanel, label: 'Cluster' },
+  models: { init: initModelsPanel, cleanup: cleanupModelsPanel, label: 'Models' },
+  docker: { init: initDockerPanel, cleanup: cleanupDockerPanel, label: 'Docker' },
 };
 
 let activePanel = 'services';
+let activePanelInitialized = false;
 let content = null;
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -46,6 +47,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 async function switchPanel(id) {
+  // Clean up the previous panel before switching (skip on first init)
+  if (activePanelInitialized) {
+    const prevPanel = panels[activePanel];
+    if (prevPanel && prevPanel.cleanup) {
+      try { prevPanel.cleanup(); } catch (e) { console.warn('Panel cleanup error:', e); }
+    }
+  }
+
   activePanel = id;
 
   // Update sidebar active state
@@ -59,6 +68,7 @@ async function switchPanel(id) {
   const panel = panels[id];
   if (panel && panel.init) {
     await panel.init(content);
+    activePanelInitialized = true;
   } else {
     content.innerHTML = `
       <div style="padding:40px;text-align:center;color:var(--dim)">

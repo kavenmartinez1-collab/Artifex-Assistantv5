@@ -197,14 +197,13 @@ class MultimodalService:
                          status_fn):
         """Check if we need to free VRAM before loading a new pipeline."""
         try:
-            import torch
-            if not torch.cuda.is_available():
+            from core.device import gpu_info
+            if not gpu_info.is_available:
                 return
 
             needed_gb = pipeline.get_vram_estimate(model_path)
-            total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            allocated_gb = torch.cuda.memory_allocated() / (1024**3)
-            free_gb = total_gb - allocated_gb
+            total_gb = gpu_info.total_gb
+            free_gb = gpu_info.free_gb
 
             if free_gb >= needed_gb:
                 return
@@ -230,14 +229,14 @@ class MultimodalService:
                     # Recalculate free VRAM
                     import gc
                     gc.collect()
+                    import torch
                     torch.cuda.empty_cache()
-                    allocated_gb = torch.cuda.memory_allocated() / (1024**3)
-                    free_gb = total_gb - allocated_gb
+                    free_gb = gpu_info.free_gb
                     if free_gb >= needed_gb:
                         break
 
         except ImportError:
-            pass  # no torch, skip VRAM management
+            pass  # no torch/device, skip VRAM management
 
     def _store_result(self, result: PipelineResult,
                       pipeline: BasePipeline,

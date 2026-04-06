@@ -7,6 +7,7 @@ Supports runtime model/backend switching and context profile toggling.
 import json
 import os
 import platform
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -55,6 +56,12 @@ for _models_dir in _model_dirs:
                     and not _name.startswith(".") and _name not in MODELS):
                 MODELS[_name] = _full
 
+# ===== THREAD-SAFE MUTABLE STATE =====
+# All mutable runtime state is protected by this lock.
+# Reads are safe without the lock (Python GIL guarantees atomic reads of
+# simple attributes), but writes that depend on reads must hold _config_lock.
+_config_lock = threading.Lock()
+
 _active_model = None  # resolved lazily on first call
 
 # ===== BACKEND SWITCHING =====
@@ -69,12 +76,17 @@ def get_active_backend():
 def set_active_backend(name):
     """Switch active backend. Returns True on success."""
     global _active_backend
-    if name in ("transformers", "ollama"):
-        _active_backend = name
-        if name == "ollama" and not OLLAMA_MODELS:
-            refresh_ollama_models()
-        return True
-    return False
+    need_refresh = False
+    with _config_lock:
+        if name in ("transformers", "ollama"):
+            _active_backend = name
+            need_refresh = (name == "ollama" and not OLLAMA_MODELS)
+        else:
+            return False
+    # Ollama discovery does HTTP I/O — run outside the lock to avoid contention
+    if need_refresh:
+        refresh_ollama_models()
+    return True
 
 
 # ===== INFERENCE OPTIMIZATIONS =====
@@ -90,7 +102,8 @@ def get_torch_compile():
 def set_torch_compile(enabled):
     """Toggle torch.compile(). Requires model reload to take effect."""
     global _torch_compile_enabled
-    _torch_compile_enabled = bool(enabled)
+    with _config_lock:
+        _torch_compile_enabled = bool(enabled)
     return True
 
 
@@ -102,7 +115,8 @@ def get_turboquant_kv():
 def set_turboquant_kv(enabled):
     """Toggle TurboQuant KV cache. Takes effect on next generation."""
     global _turboquant_kv_enabled
-    _turboquant_kv_enabled = bool(enabled)
+    with _config_lock:
+        _turboquant_kv_enabled = bool(enabled)
     return True
 
 
@@ -160,25 +174,27 @@ def refresh_ollama_models(retries=3, delay=1.0):
 def get_active_model_path():
     """Get the currently selected transformers model's directory path."""
     global _active_model
-    if _active_model is None:
-        _active_model = MODEL_PATH  # default
-    return _active_model
+    with _config_lock:
+        if _active_model is None:
+            _active_model = MODEL_PATH  # default
+        return _active_model
 
 
 def set_active_model(name):
     """Switch active model by registry name. Works for both backends."""
     global _active_model
-    if _active_backend == "ollama":
-        if name in OLLAMA_MODELS:
+    with _config_lock:
+        if _active_backend == "ollama":
+            if name in OLLAMA_MODELS:
+                _active_model = name
+                return True
+            # Also accept raw model names not in cache
             _active_model = name
             return True
-        # Also accept raw model names not in cache
-        _active_model = name
-        return True
-    if name in MODELS:
-        _active_model = MODELS[name]
-        return True
-    return False
+        if name in MODELS:
+            _active_model = MODELS[name]
+            return True
+        return False
 
 
 def get_active_model_name():
@@ -287,11 +303,12 @@ def get_active_device():
 def set_active_device(idx):
     """Set the active CUDA device by index."""
     global _active_device
-    count = get_gpu_count()
-    if 0 <= idx < count:
-        _active_device = idx
-        return True
-    return False
+    with _config_lock:
+        count = get_gpu_count()
+        if 0 <= idx < count:
+            _active_device = idx
+            return True
+        return False
 
 
 # ===== MODE CONFIGS =====
@@ -385,10 +402,11 @@ def get_context_profile():
 def set_context_profile(name):
     """Switch context profile. Returns True on success."""
     global _active_profile
-    if name in CONTEXT_PROFILES:
-        _active_profile = name
-        return True
-    return False
+    with _config_lock:
+        if name in CONTEXT_PROFILES:
+            _active_profile = name
+            return True
+        return False
 
 
 def get_context_profile_name():

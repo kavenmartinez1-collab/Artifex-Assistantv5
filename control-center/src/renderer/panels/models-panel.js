@@ -33,6 +33,11 @@ async function initModelsPanel(container) {
   await loadModels();
 }
 
+function cleanupModelsPanel() {
+  modelsGrid = null;
+  modelsLoading = false;
+}
+
 async function loadModels() {
   if (modelsLoading || !modelsGrid) return;
   modelsLoading = true;
