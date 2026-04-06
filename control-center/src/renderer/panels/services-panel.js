@@ -2,6 +2,7 @@
 
 let selectedServiceId = null;
 let serviceCards = {};
+let serviceUpdateListener = null;
 
 async function initServicesPanel(container) {
   container.innerHTML = '';
@@ -56,11 +57,21 @@ async function initServicesPanel(container) {
     selectService(services[0].id);
   }
 
-  // Listen for updates
-  window.artifex.onServiceUpdate((status) => {
+  // Listen for updates — store reference for cleanup
+  serviceUpdateListener = (status) => {
     const card = serviceCards[status.id];
     if (card) updateServiceCard(card, status);
-  });
+  };
+  window.artifex.onServiceUpdate(serviceUpdateListener);
+}
+
+function cleanupServicesPanel() {
+  if (serviceUpdateListener && window.artifex) {
+    window.artifex.removeServiceListener(serviceUpdateListener);
+  }
+  serviceUpdateListener = null;
+  serviceCards = {};
+  selectedServiceId = null;
 }
 
 function selectService(id) {

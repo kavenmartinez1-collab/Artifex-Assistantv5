@@ -167,18 +167,23 @@ def generate_with_recovery(engine, messages, max_tokens, temperature,
     Raises:
         Exception if recovery fails or error is non-recoverable
     """
+    # First attempt — engine_recovery suppresses OOM/transient errors
     with engine_recovery(engine) as ctx:
         response = engine.generate_streaming(
             messages, max_tokens=max_tokens, temperature=temperature,
             on_token=on_token,
         )
         ctx.response = response
-        return response
 
-    # If we get here, recovery was triggered
+    # Success — return the response
+    if ctx.response is not None:
+        return ctx.response
+
+    # Recovery was triggered but not retryable
     if not ctx.should_retry:
         raise RuntimeError(f"Generation failed: {ctx.error}")
 
+    # Retry path — OOM or transient error was caught and cleaned up
     _log.info("Retrying generation after recovery...")
 
     # Compress history if possible

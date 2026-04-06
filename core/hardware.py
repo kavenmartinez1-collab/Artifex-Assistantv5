@@ -18,14 +18,14 @@ from core.config import IS_WINDOWS
 
 def get_hardware_manifest():
     """Identify host GPU, VRAM, CPU, RAM, and OS."""
+    from core.device import gpu_info
+
     gpu_name = "NO_GPU_DETECTED"
     vram_stat = "0.00 / 0.00 GB"
 
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0).upper()
-        allocated = torch.cuda.memory_allocated() / 1024 ** 3
-        total = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
-        vram_stat = f"{allocated:.2f} / {total:.2f} GB"
+    if gpu_info.is_available:
+        gpu_name = gpu_info.name.upper()
+        vram_stat = f"{gpu_info.allocated_gb:.2f} / {gpu_info.total_gb:.2f} GB"
 
     cpu_name = platform.processor() or "UNKNOWN_X86_CORE"
     ram = f"{round(psutil.virtual_memory().total / (1024 ** 3), 2)} GB"

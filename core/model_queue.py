@@ -40,11 +40,23 @@ class ModelQueue:
         self._lock = asyncio.Lock()
         self._current_model: str | None = None
         self._current_backend: str | None = None
+        self._transformers_unload_fn = None  # registered by api layer
         self._stats = {
             "total_requests": 0,
             "model_switches": 0,
             "queued": 0,
         }
+
+    def register_transformers_unload(self, fn):
+        """Register a callback to unload the transformers engine.
+
+        Called by the API layer at startup so model_queue doesn't need
+        to import api.server directly.
+
+        Args:
+            fn: callable() that unloads the current transformers engine
+        """
+        self._transformers_unload_fn = fn
 
     @property
     def current_model(self) -> str | None:
@@ -122,19 +134,20 @@ class ModelQueue:
             _log.warning("Failed to unload Ollama model %s: %s", model, e)
 
     async def _unload_transformers(self):
-        """Unload the transformers engine to free VRAM."""
+        """Unload the transformers engine to free VRAM.
+
+        Uses a registered callback instead of directly importing api.server,
+        keeping core/ decoupled from the API layer.
+        """
+        if self._transformers_unload_fn is None:
+            _log.warning("No transformers unload callback registered — skipping")
+            return
         try:
-            from core.engine_factory import create_engine
-            # The global engine will be recreated on next _get_engine() call
-            # We need to access and unload the current engine
-            import api.server as srv
-            if srv._engine is not None:
-                _log.info("Unloading transformers model...")
-                with srv._engine_lock:
-                    srv._engine.unload()
-                    srv._engine = None
-                await asyncio.sleep(1)
-                _log.info("Transformers model unloaded")
+            _log.info("Unloading transformers model...")
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._transformers_unload_fn)
+            await asyncio.sleep(1)
+            _log.info("Transformers model unloaded")
         except Exception as e:
             _log.warning("Failed to unload transformers: %s", e)
 

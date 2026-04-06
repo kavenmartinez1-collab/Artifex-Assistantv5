@@ -51,6 +51,11 @@ async function initQuantPanel(container) {
   stepIndicator = container.querySelector('#wizard-steps');
   stepContent = container.querySelector('#wizard-content');
 
+  // Delegated event handler — replaces all inline onclick/onchange
+  container.addEventListener('click', _onWizardClick);
+  container.addEventListener('change', _onWizardChange);
+  container.addEventListener('input', _onWizardInput);
+
   renderStepIndicator();
   await renderStep();
 
@@ -73,6 +78,85 @@ async function initQuantPanel(container) {
     window.artifex.onQuantProgress(progressListener);
   }
 }
+
+function cleanupQuantPanel() {
+  if (progressListener && window.artifex) {
+    window.artifex.removeQuantListener(progressListener);
+  }
+  if (wizardContainer) {
+    wizardContainer.removeEventListener('click', _onWizardClick);
+    wizardContainer.removeEventListener('change', _onWizardChange);
+    wizardContainer.removeEventListener('input', _onWizardInput);
+  }
+  progressListener = null;
+  wizardContainer = null;
+  stepIndicator = null;
+  stepContent = null;
+}
+
+// ── Delegated event handlers ──
+
+function _onWizardClick(e) {
+  const el = e.target.closest('[data-action]');
+  if (!el) return;
+
+  const action = el.dataset.action;
+  switch (action) {
+    case 'select-model':
+      selectModel(el.dataset.name, el.dataset.path, el.dataset.quantized === 'true');
+      break;
+    case 'preset':
+      setPreset(el.dataset.preset);
+      break;
+    case 'wizard-next':
+      wizardNext();
+      break;
+    case 'wizard-back':
+      wizardBack();
+      break;
+    case 'cancel-quant':
+      cancelQuant();
+      break;
+    case 'reset-wizard':
+      resetWizard();
+      break;
+    case 'back-to-review':
+      wizardState.step = 3;
+      renderStepIndicator();
+      renderStep();
+      break;
+  }
+}
+
+function _onWizardChange(e) {
+  const el = e.target;
+  const field = el.dataset.field;
+  if (!field) return;
+
+  switch (field) {
+    case 'bits':
+      wizardState.bits = parseInt(el.value);
+      break;
+    case 'group-size':
+      wizardState.groupSize = parseInt(el.value);
+      break;
+    case 'num-samples':
+      wizardState.numSamples = parseInt(el.value);
+      break;
+    case 'bf16-lmhead':
+      toggleBF16('lm_head', el.checked);
+      break;
+  }
+}
+
+function _onWizardInput(e) {
+  const el = e.target;
+  if (el.dataset.field === 'output-name') {
+    wizardState.outputName = el.value;
+  }
+}
+
+// ── Rendering ──
 
 function renderStepIndicator() {
   stepIndicator.innerHTML = STEPS.map((s, i) => {
@@ -103,8 +187,8 @@ async function renderStep() {
   const nextLabel = wizardState.step === 3 ? 'Start Quantization' : wizardState.step === 4 ? 'Running...' : 'Next';
 
   nav.innerHTML = `
-    ${canBack ? '<button class="btn btn-dim" onclick="wizardBack()">Back</button>' : '<span></span>'}
-    ${wizardState.step < 5 ? `<button class="btn btn-accent" onclick="wizardNext()" ${!canNext ? 'disabled' : ''}>${nextLabel}</button>` : ''}
+    ${canBack ? '<button class="btn btn-dim" data-action="wizard-back">Back</button>' : '<span></span>'}
+    ${wizardState.step < 5 ? `<button class="btn btn-accent" data-action="wizard-next" ${!canNext ? 'disabled' : ''}>${nextLabel}</button>` : ''}
   `;
 }
 
@@ -130,7 +214,7 @@ async function renderSelectModel() {
     <div class="model-select-grid">
       ${allModels.map(m => `
         <div class="model-select-card ${m.name === wizardState.selectedModel?.name ? 'selected' : ''} ${m.isQuantized ? 'quantized' : ''}"
-             onclick="selectModel('${m.name}', '${m.path}', ${m.isQuantized})">
+             data-action="select-model" data-name="${m.name}" data-path="${m.path}" data-quantized="${m.isQuantized}">
           <div class="model-name">${m.name}</div>
           <div class="model-meta">${m.sizeGB} ${m.isQuantized ? '(already quantized)' : '(base BF16)'}</div>
         </div>
@@ -139,8 +223,8 @@ async function renderSelectModel() {
     <div class="field-row" style="margin-top:16px">
       <label>Output name:</label>
       <input type="text" id="output-name" class="field-input"
+        data-field="output-name"
         value="${wizardState.outputName || (wizardState.selectedModel ? wizardState.selectedModel.name + '-GPTQ' : '')}"
-        oninput="wizardState.outputName = this.value"
         placeholder="e.g., qwen3.5-9b-HailMary">
     </div>
   `;
@@ -185,9 +269,9 @@ function renderRecipe() {
       <h4>Preset</h4>
       <div class="preset-btns">
         <button class="btn ${wizardState.keepBF16.includes('lm_head') ? '' : 'btn-accent'}"
-          onclick="setPreset('hailmary')">HailMary (5.7 GB)</button>
+          data-action="preset" data-preset="hailmary">HailMary (5.7 GB)</button>
         <button class="btn ${wizardState.keepBF16.includes('lm_head') ? 'btn-accent' : ''}"
-          onclick="setPreset('noact')">Conservative (9.4 GB)</button>
+          data-action="preset" data-preset="noact">Conservative (9.4 GB)</button>
       </div>
     </div>
 
@@ -197,8 +281,7 @@ function renderRecipe() {
         <label><input type="checkbox" checked disabled> norm weights (always BF16)</label>
         <label><input type="checkbox" checked disabled> embed_tokens (always BF16 -- SSM recurrence)</label>
         <label><input type="checkbox" id="bf16-ssm" checked disabled> SSM projections (always BF16 -- recurrence)</label>
-        <label><input type="checkbox" id="bf16-lmhead" ${wizardState.keepBF16.includes('lm_head') ? 'checked' : ''}
-          onchange="toggleBF16('lm_head', this.checked)"> lm_head (BF16 = higher quality, +1.4 GB)</label>
+        <label><input type="checkbox" id="bf16-lmhead" data-field="bf16-lmhead" ${wizardState.keepBF16.includes('lm_head') ? 'checked' : ''}> lm_head (BF16 = higher quality, +1.4 GB)</label>
       </div>
     </div>
 
@@ -206,14 +289,14 @@ function renderRecipe() {
       <h4>Quantization Settings</h4>
       <div class="field-row">
         <label>Bits:</label>
-        <select class="field-input" onchange="wizardState.bits = parseInt(this.value)">
+        <select class="field-input" data-field="bits">
           <option value="4" ${wizardState.bits === 4 ? 'selected' : ''}>INT4 (recommended)</option>
           <option value="8" ${wizardState.bits === 8 ? 'selected' : ''}>INT8 (higher quality, larger)</option>
         </select>
       </div>
       <div class="field-row">
         <label>Group size:</label>
-        <select class="field-input" onchange="wizardState.groupSize = parseInt(this.value)">
+        <select class="field-input" data-field="group-size">
           <option value="128" ${wizardState.groupSize === 128 ? 'selected' : ''}>128 (recommended)</option>
           <option value="64" ${wizardState.groupSize === 64 ? 'selected' : ''}>64 (slightly better quality)</option>
           <option value="32" ${wizardState.groupSize === 32 ? 'selected' : ''}>32 (best quality, larger)</option>
@@ -221,8 +304,7 @@ function renderRecipe() {
       </div>
       <div class="field-row">
         <label>Calibration samples:</label>
-        <input type="number" class="field-input" value="128" min="16" max="512" style="width:80px"
-          onchange="wizardState.numSamples = parseInt(this.value)">
+        <input type="number" class="field-input" data-field="num-samples" value="128" min="16" max="512" style="width:80px">
       </div>
     </div>
 
@@ -294,7 +376,7 @@ function renderQuantize() {
           <div class="error-title">Error</div>
           <div class="error-msg">${errMsg}</div>
         </div>
-        <button class="btn btn-accent" onclick="wizardState.step = 3; renderStepIndicator(); renderStep();">Back to Review</button>
+        <button class="btn btn-accent" data-action="back-to-review">Back to Review</button>
       ` : `
         <div class="quant-status">Starting quantization...</div>
         <div class="progress-bar-container">
@@ -326,7 +408,7 @@ function renderQuantize() {
       ${p.eta ? `<span>ETA: ${p.eta}</span>` : ''}
     </div>
     ${p.sublayer ? `<div class="quant-sublayer">${p.sublayer}</div>` : ''}
-    <button class="btn btn-error" onclick="cancelQuant()" style="margin-top:16px">Cancel</button>
+    <button class="btn btn-error" data-action="cancel-quant" style="margin-top:16px">Cancel</button>
   `;
 }
 
@@ -339,7 +421,7 @@ function renderDone() {
       <div class="done-msg">Model saved to <strong>models/${outputName}</strong></div>
       <div class="done-hint">Load it in the WebGPU engine by selecting it from the model browser.</div>
     </div>
-    <button class="btn btn-accent" onclick="resetWizard()">Quantize Another Model</button>
+    <button class="btn btn-accent" data-action="reset-wizard">Quantize Another Model</button>
   `;
 }
 
@@ -412,12 +494,3 @@ function resetWizard() {
   renderStepIndicator();
   renderStep();
 }
-
-// Make functions globally available
-window.selectModel = selectModel;
-window.setPreset = setPreset;
-window.toggleBF16 = toggleBF16;
-window.wizardNext = wizardNext;
-window.wizardBack = wizardBack;
-window.cancelQuant = cancelQuant;
-window.resetWizard = resetWizard;

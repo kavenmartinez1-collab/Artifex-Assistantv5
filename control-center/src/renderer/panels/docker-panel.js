@@ -165,6 +165,17 @@ async function initDockerPanel(container) {
   }, 10000);
 }
 
+function cleanupDockerPanel() {
+  if (dockerRefreshTimer) {
+    clearInterval(dockerRefreshTimer);
+    dockerRefreshTimer = null;
+  }
+  dockerContainerCards = {};
+  dockerLogsOverlay = null;
+  dockerComposePathInput = null;
+  dockerRefreshInProgress = false;
+}
+
 /** Refresh the entire Docker panel state */
 async function refreshDockerPanel() {
   if (dockerRefreshInProgress) return;
