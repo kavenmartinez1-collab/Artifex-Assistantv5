@@ -472,6 +472,12 @@ class ArtifexGUI:
                     update_session_map(self.session_map, action.type, action.display, output)
                 result = output if output else "(no output)"
                 result = maybe_cache_output(action.type, action.display, result)
+                # Cap per-tool result for the aggregate string passed to
+                # _feed_tool_output (which applies its own model-level
+                # truncation).  Full output already went to KB / session_map.
+                _agg_limit = get_tool_output_limit()
+                if len(result) > _agg_limit:
+                    result = result[:_agg_limit] + "\n[...truncated...]"
                 outputs.append(f"[{action.type} output] `{action.display}`:\n{result}")
             else:
                 self.window["-OUTPUT-"].update(f"ERROR: {output}\n", append=True)
@@ -498,6 +504,7 @@ class ArtifexGUI:
             self.messages, active_messages = build_active_messages(self.messages, mode_cfg.context_window)
 
             history_text = ""
+            _display_cap = 4000  # per-message cap for GUI rendering only
             for m in self.messages[1:-1]:
                 if m["role"] == "assistant":
                     label = "ASSISTANT"
@@ -505,7 +512,10 @@ class ArtifexGUI:
                     label = "[TOOL RESULT]"
                 else:
                     label = "USER"
-                history_text += f"{label}: {m['content']}\n\n"
+                content = m["content"]
+                if len(content) > _display_cap:
+                    content = content[:_display_cap] + "\n[...display truncated...]"
+                history_text += f"{label}: {content}\n\n"
             history_text += f"USER: {user_prompt}\n\nASSISTANT: "
             self.window["-OUTPUT-"].update(history_text)
             self.window["-THINKING-"].update("")
