@@ -80,15 +80,30 @@ class GenerationWorker(QThread):
         self.temperature = temperature
         self.enable_thinking = enable_thinking
         self.cancel_event = cancel_event or threading.Event()
+        # Accumulator for thinking-channel tokens. Read by the GUI's
+        # _on_generation_finished so action extraction can scan tool
+        # blocks (```edit, ```bash, etc.) regardless of whether the
+        # model emitted them in the visible response or its private
+        # reasoning channel — Gemma 4 in particular tends to put
+        # tool calls inside its analysis channel, which the regular
+        # `response` variable from generate_streaming never sees.
+        self._thinking_text: str = ""
 
     def run(self):
         try:
             from core.inference import ThinkFilter
 
-            # Set up ThinkFilter to split thinking from response
+            # Set up ThinkFilter to split thinking from response.
+            # The thinking callback both emits the streaming signal
+            # AND appends to our local accumulator so the GUI handler
+            # can read the full thinking text after generation completes.
+            def _on_thinking(t):
+                self._thinking_text += t
+                self.thinking_received.emit(t)
+
             tf = ThinkFilter(
                 on_response=lambda t: self.response_received.emit(t),
-                on_thinking=lambda t: self.thinking_received.emit(t),
+                on_thinking=_on_thinking,
             )
 
             def on_token(text):

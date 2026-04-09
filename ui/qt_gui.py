@@ -6,12 +6,16 @@ proper threading, token batching, and rich inline media display.
 """
 
 import gc
-import logging
 import os
 import sys
 import threading
 
-_log = logging.getLogger(__name__)
+# Use the project's get_logger so setup_logging() runs lazily and the
+# rotating file handler in logs/artifex.log gets registered. Bare
+# logging.getLogger doesn't trigger setup, which is why GUI-side log
+# calls were silently dropping into the void.
+from core.logging_config import get_logger
+_log = get_logger(__name__)
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QFont
@@ -72,6 +76,25 @@ _FILE_INPUT_MODES = {"Vision", "Audio STT", "Image Edit"}
 _PROMPT_MODES = {"Chat", "Code", "Image Gen", "Image Edit", "Vision",
                  "3D (ShapE)", "Audio TTS", "Music Gen", "Video Gen",
                  "Voice Assistant"}
+
+
+def _dedupe_actions(actions):
+    """Remove duplicate AgentActions by (type, content) identity.
+
+    Preserves first-occurrence order. Needed because the response and
+    thinking channels can contain the same tool block when the engine
+    folds an empty content field back to thinking, and because some
+    models echo the same action twice in a single response.
+    """
+    seen = set()
+    out = []
+    for a in actions:
+        key = (a.type, a.content)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(a)
+    return out
 
 
 class ArtifexMainWindow(QMainWindow):
@@ -757,6 +780,15 @@ class ArtifexMainWindow(QMainWindow):
         self._response_batcher.flush_now()
         self._thinking_batcher.flush_now()
 
+        # Pull the thinking accumulator off the worker BEFORE _finish_busy
+        # clears self._current_worker. Some models (notably Gemma 4 in its
+        # harmony-format Ollama variant) put tool-call blocks inside the
+        # thinking/analysis channel rather than the visible response. We
+        # need both halves to find every tool call the model intended.
+        thinking_text = ""
+        if self._current_worker is not None:
+            thinking_text = getattr(self._current_worker, "_thinking_text", "") or ""
+
         self.messages.append({"role": "assistant", "content": response})
 
         # Extract knowledge from AI response (matches old GUI)
@@ -767,10 +799,42 @@ class ArtifexMainWindow(QMainWindow):
 
         self._finish_busy("Generation complete")
 
-        # Check for agent actions
+        # Check for agent actions. Strategy:
+        #
+        #   1. Scan the visible response first. If the model committed to
+        #      tool calls in its final answer, those are the canonical ones
+        #      and we use them as-is.
+        #
+        #   2. ONLY if the response yielded nothing, fall back to scanning
+        #      the thinking/analysis channel. This catches models like
+        #      Gemma 4 that emit tool blocks inside their reasoning instead
+        #      of the visible response — without producing false positives
+        #      from a model that abandoned a tool plan mid-thought.
+        #
+        #   3. Dedupe by (type, content) so we never show the same action
+        #      twice. This matters because engine_ollama.py:245 folds
+        #      `thinking_response` into `full_response` when content is
+        #      empty, which would otherwise leak duplicates through the
+        #      `response` variable on top of the worker's thinking_text.
         try:
             from tools.agent_tools import extract_agent_actions
-            actions = extract_agent_actions(response)
+            actions = extract_agent_actions(response or "")
+            extracted_from = "response"
+            if not actions and thinking_text:
+                actions = extract_agent_actions(thinking_text)
+                extracted_from = "thinking"
+            actions = _dedupe_actions(actions)
+
+            _log.info(
+                "Action extraction: resp_len=%d think_len=%d "
+                "edit_fence_resp=%s edit_fence_think=%s extracted=%d from=%s",
+                len(response or ""),
+                len(thinking_text),
+                "```edit" in (response or ""),
+                "```edit" in thinking_text,
+                len(actions),
+                extracted_from if actions else "none",
+            )
             if actions:
                 self._pending_actions = actions
                 self._action_list.clear()
@@ -779,7 +843,7 @@ class ArtifexMainWindow(QMainWindow):
                     self._action_list.addItem(display)
                 self._action_panel.setVisible(True)
         except Exception as e:
-            _log.warning("Action extraction failed: %s", e)
+            _log.exception("Action extraction failed: %s", e)
 
     def _on_generation_error(self, error_msg: str):
         """Handle generation error."""
