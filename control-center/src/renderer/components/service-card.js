@@ -15,6 +15,11 @@ let serviceOptionDefs = {};
 // Per-service current config values (persisted during session)
 const serviceConfigs = {};
 
+// Cache of model names by backend, populated lazily by model-select fields.
+// Shape: { transformers: ['name', ...], ollama: ['name', ...] }
+let modelNamesByBackend = null;
+let modelNamesPromise = null;
+
 /** Load option definitions from the backend once */
 async function loadServiceOptions() {
   if (Object.keys(serviceOptionDefs).length > 0) return;
@@ -26,6 +31,28 @@ async function loadServiceOptions() {
       }
     }
   } catch { /* backend may not support this yet */ }
+}
+
+/** Lazily fetch and cache the names of models available on each backend. */
+function getModelNamesByBackend() {
+  if (modelNamesByBackend) return Promise.resolve(modelNamesByBackend);
+  if (modelNamesPromise) return modelNamesPromise;
+  modelNamesPromise = (async () => {
+    try {
+      modelNamesByBackend = await window.artifex.listModelNamesByBackend();
+    } catch {
+      modelNamesByBackend = { transformers: [], ollama: [] };
+    }
+    modelNamesPromise = null;
+    return modelNamesByBackend;
+  })();
+  return modelNamesPromise;
+}
+
+/** Force a refresh of the cached model names — call after install/delete. */
+function invalidateModelNamesCache() {
+  modelNamesByBackend = null;
+  modelNamesPromise = null;
 }
 
 function createServiceCard(service) {
@@ -107,6 +134,9 @@ function updateCardConfig(card, service) {
   const row = document.createElement('div');
   row.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;padding:6px 0;border-top:1px solid var(--border);margin-top:4px;';
 
+  // Track inputs by option key so dependent fields can find each other
+  const inputsByKey = {};
+
   for (const opt of opts) {
     const wrapper = document.createElement('div');
     wrapper.style.cssText = 'display:flex;flex-direction:column;gap:2px;';
@@ -127,6 +157,17 @@ function updateCardConfig(card, service) {
         if (choice === serviceConfigs[service.id][opt.key]) optEl.selected = true;
         input.appendChild(optEl);
       }
+    } else if (opt.type === 'model-select') {
+      // Dropdown that filters by the current value of `dependsOn` (e.g. backend).
+      // Populated asynchronously after the cache is loaded.
+      input = document.createElement('select');
+      input.style.cssText = 'background:var(--bg-secondary);color:var(--text);border:1px solid var(--border);border-radius:3px;padding:2px 4px;font-size:11px;min-width:160px;';
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = 'Loading models...';
+      input.appendChild(placeholder);
+      input.dataset.dependsOn = opt.dependsOn || '';
+      input.dataset.modelSelect = '1';
     } else {
       input = document.createElement('input');
       input.type = opt.type === 'number' ? 'number' : 'text';
@@ -138,15 +179,83 @@ function updateCardConfig(card, service) {
     input.dataset.optKey = opt.key;
     input.dataset.serviceId = service.id;
     input.addEventListener('change', (e) => {
-      if (!serviceConfigs[e.target.dataset.serviceId]) serviceConfigs[e.target.dataset.serviceId] = {};
-      serviceConfigs[e.target.dataset.serviceId][e.target.dataset.optKey] = e.target.value;
+      const sid = e.target.dataset.serviceId;
+      const key = e.target.dataset.optKey;
+      if (!serviceConfigs[sid]) serviceConfigs[sid] = {};
+      serviceConfigs[sid][key] = e.target.value;
+
+      // If this field is the dependsOn target of any model-select, refresh it
+      for (const dep of Object.values(inputsByKey)) {
+        if (dep.dataset.modelSelect && dep.dataset.dependsOn === key) {
+          populateModelSelect(dep, e.target.value, service.id);
+        }
+      }
     });
 
     wrapper.appendChild(input);
     row.appendChild(wrapper);
+    inputsByKey[opt.key] = input;
   }
 
   configDiv.appendChild(row);
+
+  // Populate any model-select dropdowns now that all sibling inputs exist
+  for (const opt of opts) {
+    if (opt.type !== 'model-select') continue;
+    const select = inputsByKey[opt.key];
+    const dependsKey = opt.dependsOn;
+    const backendValue = dependsKey
+      ? (serviceConfigs[service.id][dependsKey] || inputsByKey[dependsKey]?.value || '')
+      : '';
+    populateModelSelect(select, backendValue, service.id);
+  }
+}
+
+/**
+ * Fill a model-select dropdown with the names available on the given backend.
+ * Uses the cached model name map; falls back to a free-text input if the
+ * cache is unreachable, so a broken Ollama daemon doesn't strand the user.
+ */
+async function populateModelSelect(selectEl, backendValue, serviceId) {
+  const cache = await getModelNamesByBackend();
+  const names = (cache && cache[backendValue]) || [];
+
+  const previous = serviceConfigs[serviceId]?.[selectEl.dataset.optKey] || '';
+  selectEl.innerHTML = '';
+
+  if (names.length === 0) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = backendValue
+      ? `(no ${backendValue} models found)`
+      : '(select a backend first)';
+    selectEl.appendChild(opt);
+    // Persist empty so we don't pass a stale model name to the backend
+    if (serviceConfigs[serviceId]) {
+      serviceConfigs[serviceId][selectEl.dataset.optKey] = '';
+    }
+    return;
+  }
+
+  // Default sentinel — lets the API server pick the active model
+  const defaultOpt = document.createElement('option');
+  defaultOpt.value = '';
+  defaultOpt.textContent = '(default)';
+  selectEl.appendChild(defaultOpt);
+
+  for (const name of names) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    if (name === previous) opt.selected = true;
+    selectEl.appendChild(opt);
+  }
+
+  if (!serviceConfigs[serviceId]) serviceConfigs[serviceId] = {};
+  // If the previously-selected model isn't in this backend's list, clear it
+  if (previous && !names.includes(previous)) {
+    serviceConfigs[serviceId][selectEl.dataset.optKey] = '';
+  }
 }
 
 function updateCardActions(card, service) {

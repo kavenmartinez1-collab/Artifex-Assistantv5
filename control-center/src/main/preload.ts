@@ -134,8 +134,20 @@ contextBridge.exposeInMainWorld('artifex', {
     return ipcRenderer.invoke('models:scan');
   },
 
+  scanOllamaModels: (): Promise<unknown[]> => {
+    return ipcRenderer.invoke('models:scan-ollama');
+  },
+
+  listModelNamesByBackend: (): Promise<{ transformers: string[]; ollama: string[] }> => {
+    return ipcRenderer.invoke('models:list-names');
+  },
+
   deleteModel: (modelPath: string): Promise<void> => {
     return ipcRenderer.invoke('models:delete', modelPath);
+  },
+
+  deleteOllamaModel: (name: string): Promise<void> => {
+    return ipcRenderer.invoke('models:delete-ollama', name);
   },
 
   // ── Docker Management ──

@@ -1,4 +1,5 @@
 import * as fsp from 'fs/promises';
+import * as http from 'http';
 import * as path from 'path';
 
 export interface ModelInfo {
@@ -17,6 +18,19 @@ export interface ModelInfo {
   groupSize: number | null;
   mixedPrecision: boolean;
   shardCount: number;
+  source: 'transformers'; // distinguishes from Ollama models in the UI
+}
+
+export interface OllamaModelInfo {
+  name: string;            // tag, e.g. "qwen3-vl:8b-instruct"
+  sizeBytes: number;
+  sizeFormatted: string;
+  family: string;          // e.g. "qwen3vl"
+  paramSize: string;       // e.g. "8.5B"
+  quantLevel: string;      // e.g. "Q4_K_M"
+  format: string;          // e.g. "gguf"
+  modifiedAt: string;
+  source: 'ollama';
 }
 
 function formatBytes(bytes: number): string {
@@ -159,6 +173,7 @@ export async function scanModels(projectRoot: string): Promise<ModelInfo[]> {
       groupSize: cfg.groupSize,
       mixedPrecision: cfg.mixedPrecision,
       shardCount,
+      source: 'transformers',
     });
   }
 
@@ -166,6 +181,111 @@ export async function scanModels(projectRoot: string): Promise<ModelInfo[]> {
   models.sort((a, b) => b.sizeBytes - a.sizeBytes);
 
   return models;
+}
+
+/**
+ * Discover models installed in a running Ollama server.
+ *
+ * Path-independent: queries Ollama's HTTP API on localhost:11434, so it
+ * works regardless of where Ollama stores its blobs on disk. Returns an
+ * empty array if Ollama isn't reachable.
+ */
+export async function scanOllamaModels(): Promise<OllamaModelInfo[]> {
+  const raw = await ollamaHttpGet('/api/tags').catch(() => null);
+  if (!raw) return [];
+
+  let parsed: { models?: Array<Record<string, unknown>> };
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+
+  const models: OllamaModelInfo[] = [];
+  for (const m of parsed.models || []) {
+    const name = String(m.name || '');
+    if (!name) continue;
+    const details = (m.details as Record<string, unknown>) || {};
+    const sizeBytes = Number(m.size || 0);
+    models.push({
+      name,
+      sizeBytes,
+      sizeFormatted: formatBytes(sizeBytes),
+      family: String(details.family || 'unknown'),
+      paramSize: String(details.parameter_size || ''),
+      quantLevel: String(details.quantization_level || ''),
+      format: String(details.format || 'gguf'),
+      modifiedAt: String(m.modified_at || ''),
+      source: 'ollama',
+    });
+  }
+
+  // Sort by size descending (largest first), matching the Transformers list
+  models.sort((a, b) => b.sizeBytes - a.sizeBytes);
+  return models;
+}
+
+/** Minimal HTTP GET against the local Ollama server. Rejects on any error. */
+function ollamaHttpGet(pathname: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const req = http.get(
+      { host: '127.0.0.1', port: 11434, path: pathname, timeout: 3000 },
+      (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          reject(new Error(`Ollama returned HTTP ${res.statusCode}`));
+          return;
+        }
+        let body = '';
+        res.setEncoding('utf-8');
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => resolve(body));
+      },
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy(new Error('Ollama request timed out'));
+    });
+  });
+}
+
+/**
+ * Delete an Ollama model via the local server's /api/delete endpoint.
+ * Tag name only (e.g. "qwen3-vl:8b-instruct"), no filesystem path.
+ */
+export async function deleteOllamaModel(name: string): Promise<void> {
+  const body = JSON.stringify({ name });
+  await new Promise<void>((resolve, reject) => {
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port: 11434,
+        path: '/api/delete',
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+        timeout: 10000,
+      },
+      (res) => {
+        let respBody = '';
+        res.setEncoding('utf-8');
+        res.on('data', (chunk) => { respBody += chunk; });
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            resolve();
+          } else {
+            reject(new Error(`Ollama delete failed (HTTP ${res.statusCode}): ${respBody}`));
+          }
+        });
+      },
+    );
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('Ollama delete timed out')));
+    req.write(body);
+    req.end();
+  });
 }
 
 export async function deleteModel(modelPath: string): Promise<void> {

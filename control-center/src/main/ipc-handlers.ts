@@ -3,7 +3,7 @@ import * as path from 'path';
 import { ServiceManager } from './services/service-manager';
 import { LogStore } from './logs/log-store';
 import { loadConfig, updateConfig } from './state/persistence';
-import { scanModels, deleteModel } from './models/model-scanner';
+import { scanModels, scanOllamaModels, deleteModel, deleteOllamaModel } from './models/model-scanner';
 import {
   isDockerInstalled,
   listContainers,
@@ -107,8 +107,30 @@ export function registerAllHandlers(
     return scanModels(projectRoot);
   });
 
+  ipcMain.handle('models:scan-ollama', async () => {
+    return scanOllamaModels();
+  });
+
   ipcMain.handle('models:delete', async (_event, modelPath: string) => {
     return deleteModel(modelPath);
+  });
+
+  ipcMain.handle('models:delete-ollama', async (_event, name: string) => {
+    return deleteOllamaModel(name);
+  });
+
+  // Used by service-card to populate the model dropdown when a backend
+  // is selected. Returns just the names — full metadata lives on the
+  // Models tab. Both backends are queried in parallel.
+  ipcMain.handle('models:list-names', async () => {
+    const [transformers, ollama] = await Promise.all([
+      scanModels(projectRoot).catch(() => []),
+      scanOllamaModels().catch(() => []),
+    ]);
+    return {
+      transformers: transformers.map((m) => m.name),
+      ollama: ollama.map((m) => m.name),
+    };
   });
 
   // ── Docker Handlers ──

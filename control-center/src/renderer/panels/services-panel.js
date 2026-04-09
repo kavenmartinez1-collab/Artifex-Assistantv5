@@ -39,6 +39,12 @@ async function initServicesPanel(container) {
   `;
   container.appendChild(consoleSection);
 
+  // Drop any cached model name list so newly-pulled models show up in
+  // the model dropdown after the user installs them.
+  if (typeof invalidateModelNamesCache === 'function') {
+    invalidateModelNamesCache();
+  }
+
   // Load service options (port, backend, model configs) then services
   await loadServiceOptions();
   const services = await window.artifex.listServices();
