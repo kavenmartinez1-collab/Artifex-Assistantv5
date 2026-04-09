@@ -21,13 +21,29 @@ def _open_file_externally(path: str):
     else:
         subprocess.Popen(["xdg-open", path])
 
-from PyQt6.QtCore import Qt, pyqtSignal, QUrl, QSize
+from PyQt6.QtCore import Qt, pyqtSignal, QUrl, QSize, QTimer
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont
 from PyQt6.QtWidgets import (
     QFrame, QLabel, QVBoxLayout, QHBoxLayout, QWidget,
     QScrollArea, QPushButton, QSlider, QSizePolicy, QFileDialog,
-    QDialog, QTextEdit,
+    QDialog,
 )
+
+
+# NOTE: ChatBubble used to back text blocks with QTextEdit and manage their
+# heights manually. That approach had three independent failure modes:
+#
+#   1. Re-entrant relayout from contentsChanged → setMaximumHeight crashed
+#      Windows with STATUS_ACCESS_VIOLATION on Gemma 4's large flushes.
+#   2. Reading doc.size() before the widget had been shown produced a
+#      0-width textWidth, which collapsed every bubble to the 30px minimum.
+#   3. QTextEdit's own internal viewport fought the outer ChatView scroll
+#      area (ensureCursorVisible scrolled the inner view, hiding the top
+#      of long responses).
+#
+# QLabel with word wrap sidesteps all three: it has no internal viewport,
+# no QTextDocument signal storms, and auto-sizes to its wrapped content
+# via the parent layout. Selectable text gives users copy/paste back.
 
 # Accepted file extensions
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff"}
@@ -528,21 +544,26 @@ class ChatBubble(QFrame):
         """)
 
     def add_text(self, text: str):
-        """Add a text block to the bubble."""
-        label = QTextEdit()
-        label.setReadOnly(True)
-        label.setPlainText(text)
-        label.setStyleSheet(
-            "border: none; background: transparent; "
-            "font-family: Consolas; font-size: 10pt;"
+        """Add a text block to the bubble.
+
+        Uses a word-wrapped, selectable QLabel rather than QTextEdit so the
+        bubble grows naturally to fit its wrapped content via the parent
+        layout — no manual height calculation, no re-entrant signal storms,
+        no internal viewport to fight the outer chat scroll area.
+        """
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
-        # Auto-resize to content
-        doc = label.document()
-        doc.setDocumentMargin(0)
-        label.setMinimumHeight(30)
-        label.setMaximumHeight(max(30, int(doc.size().height()) + 10))
-        doc.contentsChanged.connect(
-            lambda: label.setMaximumHeight(max(30, int(doc.size().height()) + 10))
+        label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.MinimumExpanding,
+        )
+        label.setStyleSheet(
+            "background: transparent; "
+            "font-family: Consolas; font-size: 10pt;"
         )
         self._layout.addWidget(label)
         return label
@@ -569,21 +590,19 @@ class ChatBubble(QFrame):
         return player
 
     def append_text(self, text: str):
-        """Append text to the last text widget, or create one."""
-        # Find the last QTextEdit in the layout
+        """Append text to the last text label, or create one.
+
+        QLabel doesn't have a streaming insert API like QTextCursor, but
+        for chat-scale text the O(n) re-set per batch is fine — we batch
+        tokens at 50ms via TokenBatcher, so this runs ~20 times per second
+        with a few hundred chars at most per call.
+        """
         for i in range(self._layout.count() - 1, -1, -1):
             widget = self._layout.itemAt(i).widget()
-            if isinstance(widget, QTextEdit):
-                cursor = widget.textCursor()
-                cursor.movePosition(cursor.MoveOperation.End)
-                cursor.insertText(text)
-                widget.setTextCursor(cursor)
-                widget.ensureCursorVisible()
-                # Update height
-                doc = widget.document()
-                widget.setMaximumHeight(max(30, int(doc.size().height()) + 10))
+            if isinstance(widget, QLabel) and widget.wordWrap():
+                widget.setText(widget.text() + text)
                 return
-        # No text widget found — create one
+        # No text label found — create one
         self.add_text(text)
 
 

@@ -89,6 +89,13 @@ class ArtifexMainWindow(QMainWindow):
         self._busy = False
         self._cancel_event = threading.Event()
         self._current_worker = None
+        # Action workers run independently of the generation worker (an
+        # action can complete while a new generation is being kicked off
+        # by _on_action_output, so they can't share a slot). Storing on
+        # `self` is mandatory: a QThread garbage-collected while still
+        # running crashes the process with STATUS_STACK_BUFFER_OVERRUN
+        # (Windows exit code 0xC0000409) via PyQt6's __fastfail handler.
+        self._current_action_worker = None
         self._pending_actions = []
         self._current_bubble = None
         self._output_dir = os.path.join(BASE_DIR, "output")
@@ -1007,7 +1014,22 @@ class ArtifexMainWindow(QMainWindow):
         worker.output_ready.connect(self._on_action_output)
         worker.error.connect(lambda e: self._set_status(f"Action error: {e}"))
         worker.status_changed.connect(self._set_status)
+        # CRITICAL: store the worker on `self`. A QThread that goes out of
+        # scope while still running gets garbage-collected mid-execution,
+        # which PyQt6 reports as a fatal Qt invariant violation via
+        # __fastfail() — visible as Windows exit code 0xC0000409
+        # (STATUS_STACK_BUFFER_OVERRUN). Clear the reference and schedule
+        # deletion when the thread finishes so we don't leak workers.
+        self._current_action_worker = worker
+        worker.finished.connect(self._on_action_worker_done)
         worker.start()
+
+    def _on_action_worker_done(self):
+        """Release the action worker after its QThread finishes naturally."""
+        worker = self._current_action_worker
+        if worker is not None:
+            worker.deleteLater()
+            self._current_action_worker = None
 
     def _on_action_output(self, display, output):
         """Display action output and feed it back to AI for analysis."""
