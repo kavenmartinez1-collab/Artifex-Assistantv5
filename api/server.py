@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import queue
+import re
 import threading
 import time
 import uuid
@@ -132,6 +133,10 @@ class VisionAnalyzeRequest(BaseModel):
     image_base64: Optional[str] = None
     prompt: str = Field("Describe this image in detail.", example="What is in this image?")
     max_tokens: Optional[int] = Field(512, ge=1, le=4096)
+    # Optional model override. For Transformers backend this is a directory
+    # name in models/ or an HF repo id; for Ollama it's a tag like
+    # "qwen3-vl:8b-instruct". When omitted, the active model is used.
+    model: Optional[str] = None
 
 class AudioSpeechRequest(BaseModel):
     text: str = Field(..., example="Hello, how are you?")
@@ -237,6 +242,145 @@ def _messages_have_images(messages):
                 if item.get("type") == "image_url":
                     return True
     return False
+
+
+# ── Model resolution ────────────────────────────────────────────────────
+#
+# Clients shouldn't need to know which models are installed on this server.
+# When a request arrives with no model, an empty/sentinel model name, or a
+# request type that needs a specific kind of model (e.g. multimodal input
+# requires a vision-capable model), the server resolves a sensible default
+# from what's actually available on the active backend.
+#
+# Sentinels: any of these as the request's `model` field means "you pick".
+_AUTO_MODEL_SENTINELS = {"", "default", "auto", "none"}
+
+# Vision-capable model name patterns. Order = priority (first match wins).
+# Patterns are case-insensitive and matched against either Ollama tag names
+# or Transformers directory names.
+_VISION_MODEL_PATTERNS = [
+    re.compile(r"qwen3.*vl", re.I),       # Qwen3-VL — best for GUI/OCR
+    re.compile(r"qwen2\.?5.*vl", re.I),   # Qwen2.5-VL
+    re.compile(r"qwen2.*vl", re.I),       # Qwen2-VL
+    re.compile(r"llava", re.I),
+    re.compile(r"minicpm.*v", re.I),
+    re.compile(r"intern.*vl", re.I),
+    re.compile(r"gemma.*vision", re.I),
+    re.compile(r"pixtral", re.I),
+]
+
+
+def _is_auto_sentinel(name) -> bool:
+    """True if `name` is empty/None or one of the auto-resolve keywords."""
+    if name is None:
+        return True
+    return str(name).strip().lower() in _AUTO_MODEL_SENTINELS
+
+
+def _pick_vision_model(backend: str) -> str | None:
+    """Find a vision-capable model installed on `backend`, by name pattern.
+
+    For Ollama we refresh the model list first so a freshly-pulled model
+    becomes available without restarting the server. Returns None if no
+    matching model is installed.
+    """
+    from core.config import MODELS, OLLAMA_MODELS, refresh_ollama_models
+
+    if backend == "ollama":
+        refresh_ollama_models()
+        names = list(OLLAMA_MODELS.keys())
+    else:
+        names = list(MODELS.keys())
+
+    for pattern in _VISION_MODEL_PATTERNS:
+        matches = [n for n in names if pattern.search(n)]
+        if not matches:
+            continue
+        # Prefer -instruct variants (faster, no thinking-token tax)
+        instruct = sorted(n for n in matches if "instruct" in n.lower())
+        if instruct:
+            return instruct[0]
+        return sorted(matches)[0]
+
+    return None
+
+
+def _resolve_model_for_request(requested, has_images: bool, backend: str) -> str:
+    """Pick a real installed model for this request.
+
+    Behaviour:
+      • Sentinel names ("", "default", "auto", None) → server picks:
+          - multimodal request → a vision-capable model from `backend`,
+            falling back to the active model if none matches
+          - text-only request → the active model
+      • Real installed name → returned unchanged
+      • Unknown explicit name → 400 with the list of available models,
+        so typos surface immediately instead of being forwarded to the
+        backend (where they become opaque 404s)
+
+    Raises HTTPException on unresolvable cases.
+    """
+    # FastAPI is imported lazily inside create_app(), so HTTPException is
+    # not available at module scope. Import it locally to keep this helper
+    # callable from anywhere in the module.
+    from fastapi import HTTPException
+    from core.config import MODELS, OLLAMA_MODELS, get_active_model_name, refresh_ollama_models
+
+    if _is_auto_sentinel(requested):
+        if has_images:
+            picked = _pick_vision_model(backend)
+            if picked:
+                _log.info("Auto-resolved vision model: %s (%s)", picked, backend)
+                return picked
+            # Fall through to active model — better than 503 if the user
+            # has manually loaded a multimodal model that doesn't match
+            # any of our name patterns.
+            _log.warning(
+                "No vision-capable model auto-detected on %s backend; "
+                "using active model. Install one with e.g. "
+                "`ollama pull qwen3-vl:8b-instruct`.",
+                backend,
+            )
+        active = get_active_model_name()
+        if not active:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"No model loaded on the {backend} backend. "
+                    f"Install one and retry."
+                ),
+            )
+        return active
+
+    # Explicit name — validate it actually exists on this backend
+    if backend == "ollama":
+        if requested in OLLAMA_MODELS:
+            return requested
+        # Refresh once in case it was just pulled
+        refresh_ollama_models()
+        if requested in OLLAMA_MODELS:
+            return requested
+        available = sorted(OLLAMA_MODELS.keys())
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{requested}' not installed on Ollama. "
+                f"Available: {', '.join(available) if available else '(none — pull one first)'}. "
+                f"Pull with: `ollama pull {requested}`"
+            ),
+        )
+
+    # Transformers
+    if requested in MODELS:
+        return requested
+    available = sorted(MODELS.keys())
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Model '{requested}' not in Transformers registry. "
+            f"Available: {', '.join(available) if available else '(none in models/)'}."
+        ),
+    )
 
 
 def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options, timeout):
@@ -686,12 +830,18 @@ def create_app():
         max_tokens = body.max_tokens
         temperature = body.temperature
         stream = body.stream
-        model = body.model or get_active_model_name()
         use_web_tools = body.web_tools or False
         backend = get_active_backend()
 
         if not messages:
             raise HTTPException(status_code=400, detail="messages is required")
+
+        # Resolve the model up front. Sentinel names ("default", "auto", "")
+        # and image-bearing requests are auto-routed to a sensible installed
+        # model. Unknown names raise 400 here so they don't reach Ollama as
+        # opaque 404s. See _resolve_model_for_request for full behaviour.
+        has_images = _messages_have_images(messages)
+        model = _resolve_model_for_request(body.model, has_images, backend)
 
         # ── Streaming path (both backends) ────────────────────────────
         # Model queue serializes requests and handles model/backend switching
@@ -736,7 +886,6 @@ def create_app():
             if backend == "ollama":
                 try:
                     _get_engine()
-                    has_images = _messages_have_images(messages)
                     timeout = 600 if has_images else 300
                     ollama_msgs = _convert_messages_for_ollama(messages)
 
@@ -974,23 +1123,43 @@ def create_app():
 
     @app.post("/v1/vision/analyze")
     async def vision_analyze(request: Request, body: VisionAnalyzeRequest):
-        """Analyze an image using a vision model."""
+        """Analyze an image using a vision-capable model.
+
+        Routing:
+          • Ollama backend → forwards to /api/chat with the image attached.
+            Works with any multimodal Ollama model (qwen3-vl, llava, etc.).
+          • Transformers backend → uses the cached vision pipeline if a
+            multimodal model is already loaded, or loads `body.model` /
+            registry-resolved path. Returns 503 with a clear message if no
+            vision model can be resolved.
+        """
         if not _check_auth(request):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
+        import base64 as _b64
         import tempfile
+        from core.config import (
+            MODELS, OLLAMA_MODELS, get_active_backend, get_active_model_name,
+        )
         from core.services import get_service
 
         svc = get_service()
 
-        # Resolve image to a file path
+        # ── Resolve image bytes (need both raw bytes for Ollama and a
+        # filesystem path for the Transformers pipeline). ────────────────
         if body.file_id:
             image_path = svc.file_manager.get_file_path(body.file_id)
             if image_path is None:
                 raise HTTPException(status_code=404, detail="File not found")
+            with open(image_path, "rb") as f:
+                img_bytes = f.read()
+            img_b64 = _b64.b64encode(img_bytes).decode("ascii")
         elif body.image_base64:
-            import base64
-            img_bytes = base64.b64decode(body.image_base64)
+            try:
+                img_bytes = _b64.b64decode(body.image_base64)
+            except Exception:
+                raise HTTPException(status_code=400, detail="image_base64 is not valid base64")
+            img_b64 = body.image_base64
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
             tmp.write(img_bytes)
             tmp.close()
@@ -1001,10 +1170,71 @@ def create_app():
                 detail="Provide either file_id or image_base64",
             )
 
+        backend = get_active_backend()
+        # Vision endpoint always implies a multimodal request, so the
+        # resolver picks a vision-capable model regardless of body.model.
+        requested_model = _resolve_model_for_request(body.model, has_images=True, backend=backend)
+
+        # ── Ollama path: proxy as a multimodal chat completion ──────────
+        if backend == "ollama":
+            ollama_messages = [{
+                "role": "user",
+                "content": body.prompt,
+                "images": [img_b64],
+            }]
+            try:
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: _proxy_ollama_chat(
+                        ollama_messages, requested_model, 0.1,
+                        body.max_tokens, None, 600,
+                    ),
+                )
+                content = result["choices"][0]["message"]["content"]
+                return {
+                    "object": "vision.analysis",
+                    "analysis": content,
+                    "model": requested_model,
+                }
+            except (RuntimeError, ConnectionError) as e:
+                _log.error("Ollama vision proxy failed: %s", e)
+                raise HTTPException(status_code=502, detail=str(e))
+
+        # ── Transformers path: resolve a real model_path before loading ─
+        # Priority: explicit body.model → already-cached vision pipeline →
+        # registry lookup. We refuse to call pipeline.load("") because that
+        # surfaces as a confusing "Repo id ''" error from HuggingFace.
+        loaded = svc.get_loaded_pipelines()
+        already_cached = "image-text-to-text" in loaded
+
+        model_path = ""
+        if body.model:
+            model_path = MODELS.get(body.model, body.model)
+        elif not already_cached:
+            # Nothing is cached and the caller didn't tell us what to load —
+            # try the active model name as a registry lookup.
+            active = get_active_model_name()
+            if active and active in MODELS:
+                model_path = MODELS[active]
+
+        if not already_cached and not model_path:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "No vision model loaded. Either (a) load a multimodal model "
+                    "via the Control Center on the vision pipeline, (b) include "
+                    "`model` in the request body (directory name in models/ or "
+                    "HF repo id), or (c) switch the API server to the Ollama "
+                    "backend with a multimodal Ollama model installed."
+                ),
+            )
+
         try:
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
                 "image-text-to-text",
+                model_path=model_path,
                 kwargs={
                     "image_path": image_path,
                     "prompt": body.prompt,
@@ -1019,7 +1249,7 @@ def create_app():
             return {
                 "object": "vision.analysis",
                 "analysis": result.content,
-                "model": result.metadata.get("model", "vision"),
+                "model": result.metadata.get("model", body.model or "vision"),
             }
         except HTTPException:
             raise
