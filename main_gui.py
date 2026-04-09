@@ -4,6 +4,17 @@ Usage:
     python main_gui.py
 """
 
+# Enable faulthandler BEFORE any heavy imports so a C-level segfault in
+# torch / bitsandbytes / tcl / Qt produces a stack trace instead of just
+# a cryptic Windows exit code (e.g. 0xC0000005). The dump goes to a
+# dedicated file so it survives the GUI process dying without flushing
+# stdout. Read it after a crash with: tail logs/faultdump.log
+import os
+import faulthandler
+os.makedirs("logs", exist_ok=True)
+_fault_log = open(os.path.join("logs", "faultdump.log"), "a", buffering=1)
+faulthandler.enable(file=_fault_log, all_threads=True)
+
 from core.logging_config import setup_logging
 setup_logging()
 
