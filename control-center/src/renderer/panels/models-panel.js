@@ -43,42 +43,66 @@ async function loadModels() {
   modelsLoading = true;
 
   modelsGrid.innerHTML = `
-    <div class="models-loading">Scanning models directory...</div>
+    <div class="models-loading">Scanning Transformers and Ollama models...</div>
   `;
 
-  try {
-    const models = await window.artifex.scanModels();
+  // Query both backends in parallel — Ollama may not be running, in which
+  // case scanOllamaModels resolves to an empty array.
+  const [transformersResult, ollamaResult] = await Promise.allSettled([
+    window.artifex.scanModels(),
+    window.artifex.scanOllamaModels ? window.artifex.scanOllamaModels() : Promise.resolve([]),
+  ]);
 
-    modelsGrid.innerHTML = '';
+  modelsGrid.innerHTML = '';
 
-    if (!models || models.length === 0) {
-      modelsGrid.innerHTML = `
-        <div class="models-empty">
-          No models found in the models/ directory.
-        </div>
-      `;
-      modelsLoading = false;
-      return;
-    }
+  const transformerModels = transformersResult.status === 'fulfilled'
+    ? (transformersResult.value || [])
+    : [];
+  const ollamaModels = ollamaResult.status === 'fulfilled'
+    ? (ollamaResult.value || [])
+    : [];
 
-    for (const model of models) {
-      modelsGrid.appendChild(createModelCard(model));
-    }
-  } catch (err) {
+  if (transformersResult.status === 'rejected') {
+    const err = transformersResult.reason;
+    modelsGrid.appendChild(createScanErrorRow(
+      `Failed to scan Transformers models: ${err?.message || err}`
+    ));
+  }
+
+  if (transformerModels.length === 0 && ollamaModels.length === 0) {
     modelsGrid.innerHTML = `
-      <div class="models-empty" style="color:var(--error)">
-        Failed to scan models: ${err.message || err}
+      <div class="models-empty">
+        No models found. Drop Transformers checkpoints in the models/ directory
+        or pull Ollama models with <code>ollama pull &lt;name&gt;</code>.
       </div>
     `;
+    modelsLoading = false;
+    return;
+  }
+
+  for (const model of transformerModels) {
+    modelsGrid.appendChild(createModelCard(model));
+  }
+  for (const model of ollamaModels) {
+    modelsGrid.appendChild(createOllamaModelCard(model));
   }
 
   modelsLoading = false;
+}
+
+function createScanErrorRow(message) {
+  const row = document.createElement('div');
+  row.className = 'models-empty';
+  row.style.color = 'var(--error)';
+  row.textContent = message;
+  return row;
 }
 
 function createModelCard(model) {
   const card = document.createElement('div');
   card.className = 'model-card';
   card.dataset.path = model.path;
+  card.dataset.source = 'transformers';
 
   // Badge class based on quant type
   let badgeClass = 'badge-bf16';
@@ -95,6 +119,9 @@ function createModelCard(model) {
     <div class="model-card-header">
       <div class="model-name">${escapeHtml(model.name)}</div>
       <span class="model-badge ${badgeClass}">${escapeHtml(model.quantDetail)}</span>
+    </div>
+    <div class="model-source-row">
+      <span class="model-source-badge source-transformers">Transformers</span>
     </div>
     <div class="model-size">${escapeHtml(model.sizeFormatted)}</div>
     <div class="model-meta-grid">
@@ -167,6 +194,77 @@ function createModelCard(model) {
   return card;
 }
 
+function createOllamaModelCard(model) {
+  const card = document.createElement('div');
+  card.className = 'model-card';
+  card.dataset.source = 'ollama';
+  card.dataset.name = model.name;
+
+  const quantBadge = model.quantLevel || 'GGUF';
+
+  card.innerHTML = `
+    <div class="model-card-header">
+      <div class="model-name">${escapeHtml(model.name)}</div>
+      <span class="model-badge badge-quant">${escapeHtml(quantBadge)}</span>
+    </div>
+    <div class="model-source-row">
+      <span class="model-source-badge source-ollama">Ollama</span>
+    </div>
+    <div class="model-size">${escapeHtml(model.sizeFormatted)}</div>
+    <div class="model-meta-grid">
+      <div class="model-meta-item">
+        <span class="model-meta-label">Family</span>
+        <span class="model-meta-value">${escapeHtml(model.family)}</span>
+      </div>
+      <div class="model-meta-item">
+        <span class="model-meta-label">Params</span>
+        <span class="model-meta-value">${escapeHtml(model.paramSize || '—')}</span>
+      </div>
+      <div class="model-meta-item">
+        <span class="model-meta-label">Format</span>
+        <span class="model-meta-value">${escapeHtml((model.format || 'gguf').toUpperCase())}</span>
+      </div>
+    </div>
+    <div class="model-card-actions"></div>
+  `;
+
+  const actions = card.querySelector('.model-card-actions');
+  const deleteBtn = document.createElement('button');
+  deleteBtn.className = 'btn btn-danger btn-sm';
+  deleteBtn.textContent = 'Delete';
+  deleteBtn.onclick = async (e) => {
+    e.stopPropagation();
+    const confirmed = await showModal(
+      'Delete Ollama Model',
+      `Permanently delete "${model.name}" from Ollama? This will free ${model.sizeFormatted}.`
+    );
+    if (!confirmed) return;
+    deleteBtn.disabled = true;
+    deleteBtn.textContent = 'Deleting...';
+    try {
+      await window.artifex.deleteOllamaModel(model.name);
+      card.classList.add('model-card-removing');
+      setTimeout(() => {
+        card.remove();
+        if (modelsGrid && modelsGrid.querySelectorAll('.model-card').length === 0) {
+          modelsGrid.innerHTML = `
+            <div class="models-empty">
+              No models found.
+            </div>
+          `;
+        }
+      }, 300);
+    } catch (err) {
+      deleteBtn.disabled = false;
+      deleteBtn.textContent = 'Delete';
+      await showModal('Delete Failed', `Could not delete model: ${err.message || err}`);
+    }
+  };
+  actions.appendChild(deleteBtn);
+
+  return card;
+}
+
 function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
@@ -232,6 +330,30 @@ function injectModelsPanelStyles() {
       letter-spacing: 0.5px;
       white-space: nowrap;
       flex-shrink: 0;
+    }
+    .model-source-row {
+      display: flex;
+      gap: 6px;
+      margin-top: -4px;
+    }
+    .model-source-badge {
+      display: inline-block;
+      padding: 1px 8px;
+      border-radius: 8px;
+      font-size: 9px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+    .source-transformers {
+      background: rgba(0, 240, 255, 0.08);
+      color: var(--accent);
+      border: 1px solid rgba(0, 240, 255, 0.25);
+    }
+    .source-ollama {
+      background: rgba(80, 200, 120, 0.10);
+      color: #50c878;
+      border: 1px solid rgba(80, 200, 120, 0.30);
     }
     .badge-bf16 {
       background: rgba(0, 240, 255, 0.12);

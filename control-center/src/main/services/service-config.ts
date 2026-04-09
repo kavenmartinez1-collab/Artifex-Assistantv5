@@ -5,10 +5,17 @@ import * as fs from 'fs';
 export interface ServiceOption {
   key: string;        // CLI flag name (e.g. '--backend')
   label: string;      // UI label
-  type: 'select' | 'text' | 'number';
+  type: 'select' | 'text' | 'number' | 'model-select';
   default: string;
   choices?: string[]; // for 'select' type
   envVar?: string;    // if set, also passed as environment variable
+  /**
+   * For 'model-select': name of the sibling option that selects the
+   * backend (e.g. '--backend'). The dropdown's choices are populated
+   * from the backend's installed models and refresh when this option
+   * changes.
+   */
+  dependsOn?: string;
 }
 
 export interface ServiceDefinition {
@@ -95,8 +102,8 @@ export const SERVICE_DEFINITIONS: ServiceDefinition[] = [
       { key: '--port', label: 'Port', type: 'number', default: '8000' },
       { key: '--backend', label: 'Backend', type: 'select', default: 'transformers',
         choices: ['transformers', 'ollama'], envVar: 'ARTIFEX_BACKEND' },
-      { key: '--model', label: 'Model', type: 'text', default: '',
-        envVar: 'ARTIFEX_MODEL' },
+      { key: '--model', label: 'Model', type: 'model-select', default: '',
+        envVar: 'ARTIFEX_MODEL', dependsOn: '--backend' },
       { key: '--gateway', label: 'Gateway URL', type: 'text', default: 'http://localhost:8080' },
     ],
   },
