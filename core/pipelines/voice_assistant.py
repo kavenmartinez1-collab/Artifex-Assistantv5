@@ -264,6 +264,7 @@ class VoiceAssistantPipeline(BasePipeline):
         self._messages: list[dict] = []
         self._max_history_turns: int = 20
         self._system_prompt: str = ARTIFEX_VOICE_SYSTEM_PROMPT
+        self._tools_enabled: bool = True
         self._loaded = False
 
     # ── Pipeline interface ──────────────────────────────────────────
@@ -280,12 +281,21 @@ class VoiceAssistantPipeline(BasePipeline):
             system_prompt: str — override default personality
             backend: str — "transformers" or "ollama"
             model_name: str — LLM model name for Ollama
+            enable_tools: bool — enable tool execution (default True)
         """
         cb = status_callback or (lambda msg: None)
+
+        # Tool support
+        self._tools_enabled = kwargs.get("enable_tools", True)
 
         # Custom system prompt
         if "system_prompt" in kwargs:
             self._system_prompt = kwargs["system_prompt"]
+        elif self._tools_enabled:
+            from core.prompts import build_voice_tool_prompt
+            from tools.agent_tools import get_assistant_tools_prompt
+            system_info = get_assistant_tools_prompt()
+            self._system_prompt = build_voice_tool_prompt(system_info, os.getcwd())
 
         # ── STT ─────────────────────────────────────────────────────
         whisper_model = kwargs.get("whisper_model", "base.en")
@@ -414,6 +424,92 @@ class VoiceAssistantPipeline(BasePipeline):
                 error=str(e),
             )
 
+    # ── Voice tool execution ───────────────────────────────────────
+
+    MAX_VOICE_TOOL_ROUNDS = 3
+
+    def _run_voice_tools(self, actions, progress_cb=None):
+        """Execute tool actions and return concatenated output string."""
+        from tools.agent_tools import run_agent_action, get_tool_output_limit
+
+        outputs = []
+        for action in actions:
+            if progress_cb:
+                progress_cb(f"Running {action.type}: {action.display[:40]}...")
+            success, output = run_agent_action(action)
+            if success:
+                result = output if output else "(no output)"
+                limit = get_tool_output_limit(action.type)
+                if len(result) > limit:
+                    result = result[:limit] + "\n[...truncated...]"
+                outputs.append(f"[{action.type} output] `{action.display}`:\n{result}")
+            else:
+                outputs.append(
+                    f"[{action.type} ERROR] `{action.display}`:\nERROR: {output}"
+                )
+        return "\n\n".join(outputs) if outputs else None
+
+    def _execute_tool_loop(self, response, progress_cb=None, **kwargs):
+        """Extract and execute tools from a response, looping up to MAX rounds.
+
+        Returns the final response text (with tool results incorporated).
+        If no tools were requested, returns the original response immediately.
+        """
+        from tools.agent_tools import extract_agent_actions
+        from core.inference import strip_think_blocks
+
+        actions = extract_agent_actions(response)
+        if not actions:
+            return response  # Fast path — no tools, just a spoken answer
+
+        for _round in range(self.MAX_VOICE_TOOL_ROUNDS):
+            if progress_cb:
+                progress_cb(f"Tool round {_round + 1}/{self.MAX_VOICE_TOOL_ROUNDS}...")
+
+            # Store the tool-invoking assistant text in history
+            self._messages.append({"role": "assistant", "content": response})
+
+            # Execute the tools
+            tool_output = self._run_voice_tools(actions, progress_cb)
+            if not tool_output:
+                break
+
+            # Feed results back for the model to summarize
+            feedback = (
+                "[TOOL OUTPUT]\n\n" + tool_output + "\n\n"
+                "Based on the tool output above, give the user a brief spoken answer."
+            )
+            self._messages.append({"role": "user", "content": feedback})
+
+            messages = [
+                {"role": "system", "content": self._system_prompt},
+                *self._messages,
+            ]
+
+            if progress_cb:
+                progress_cb("Thinking...")
+
+            # Generate silently (no on_token — intermediate round)
+            response = self._engine.generate_streaming(
+                messages=messages,
+                max_tokens=kwargs.get("max_tokens", 512),
+                temperature=kwargs.get("temperature", 0.7),
+                on_token=None,
+                enable_thinking=False,
+            )
+            response = strip_think_blocks(response)
+
+            # Check if the new response requests more tools
+            actions = extract_agent_actions(response)
+            if not actions:
+                break  # Final spoken answer — exit loop
+
+        # Strip any leftover tool markers that would be spoken aloud
+        response = re.sub(r'@\w+\([^)]*\)', '', response)
+        response = re.sub(r'```(?:bash|sh|shell|python|py|edit)\s*\n.*?```',
+                          '', response, flags=re.DOTALL)
+        return response.strip()
+
     # ── Core conversation loop ──────────────────────────────────────
 
     def _run_conversation(self, **kwargs) -> PipelineResult:
@@ -465,25 +561,45 @@ class VoiceAssistantPipeline(BasePipeline):
             *self._messages,
         ]
 
-        full_response = ""
-
-        def collect_token(token):
-            nonlocal full_response
-            full_response += token
-            if on_token:
-                on_token(token)
-
-        self._engine.generate_streaming(
-            messages=messages,
-            max_tokens=kwargs.get("max_tokens", 512),
-            temperature=kwargs.get("temperature", 0.7),
-            on_token=collect_token,
-            enable_thinking=False,  # Voice mode — no think blocks
-        )
-
-        # Strip any leaked think blocks before TTS
         from core.inference import strip_think_blocks
-        full_response = strip_think_blocks(full_response)
+
+        if self._tools_enabled:
+            # Generate silently first — tool loop may produce multiple rounds
+            initial_response = self._engine.generate_streaming(
+                messages=messages,
+                max_tokens=kwargs.get("max_tokens", 512),
+                temperature=kwargs.get("temperature", 0.7),
+                on_token=None,
+                enable_thinking=False,
+            )
+            initial_response = strip_think_blocks(initial_response)
+
+            # Run tool loop (returns immediately if no tools requested)
+            full_response = self._execute_tool_loop(
+                initial_response, progress_cb=_progress, **kwargs
+            )
+
+            # Deliver final response to streaming callback
+            if on_token and full_response:
+                on_token(full_response)
+        else:
+            # Original path — stream directly, no tool support
+            full_response = ""
+
+            def collect_token(token):
+                nonlocal full_response
+                full_response += token
+                if on_token:
+                    on_token(token)
+
+            self._engine.generate_streaming(
+                messages=messages,
+                max_tokens=kwargs.get("max_tokens", 512),
+                temperature=kwargs.get("temperature", 0.7),
+                on_token=collect_token,
+                enable_thinking=False,
+            )
+            full_response = strip_think_blocks(full_response)
 
         self._messages.append({"role": "assistant", "content": full_response})
 
