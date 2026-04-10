@@ -93,9 +93,32 @@ class ThinkFilter:
 
 
 def strip_think_blocks(text):
-    """Remove thinking content from model output."""
+    """Remove thinking content from model output.
+
+    Handles two cases:
+      1. Matched <think>...</think> pairs — removed completely.
+      2. "Started inside a think block" — some models (Qwen3.5) emit the
+         opening <think> inside the prompt, so the output begins with raw
+         thinking content followed by </think>. We strip up to the FIRST
+         </think> ONLY if it's unpaired (appears before any <think>),
+         proving we're genuinely in the "started mid-thinking" case.
+
+    The old approach used `re.sub(r"^.*?</think>", ...)` which was
+    dangerously broad: if a model hallucinated a stray </think> ANYWHERE
+    in its output (e.g. a vision model describing HTML, or a code model
+    quoting template syntax), everything before it was silently wiped —
+    including real JSON analysis from the vision pipeline.
+    """
+    # Step 1: strip matched pairs
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    text = re.sub(r"^.*?</think>", "", text, flags=re.DOTALL)
+    # Step 2: handle the unpaired-closer case (started mid-thinking).
+    # Only strip if the first </think> comes before any <think>, meaning
+    # there's no opening tag to pair with — we're definitely mid-think.
+    first_close = text.find("</think>")
+    if first_close != -1:
+        first_open = text.find("<think>")
+        if first_open == -1 or first_close < first_open:
+            text = text[first_close + 8:]
     return text.strip()
 
 

@@ -418,7 +418,16 @@ def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options,
         raise ConnectionError(f"Cannot reach Ollama at {OLLAMA_CHAT_URL}: {e}")
 
     content = data.get("message", {}).get("content", "")
-    content = strip_think_blocks(content) if content else ""
+    # NOTE: no strip_think_blocks here. Ollama already separates
+    # message.thinking from message.content at the protocol level when
+    # thinking mode is active, so `content` is already the visible
+    # response with thinking excluded. Running strip_think_blocks on top
+    # of that was a legacy safety net from before Ollama had native
+    # thinking support — and the greedy regex (^.*?</think>) is actively
+    # dangerous: if any model hallucinates a stray </think> tag inside
+    # its content (or if the resolver picks a thinking-variant model),
+    # the regex silently wipes everything before the tag, truncating
+    # real output like JSON analysis from vision models.
 
     prompt_tokens = data.get("prompt_eval_count", 0)
     completion_tokens = data.get("eval_count", 0)
