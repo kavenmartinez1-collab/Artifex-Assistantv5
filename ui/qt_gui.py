@@ -125,6 +125,7 @@ class ArtifexMainWindow(QMainWindow):
 
         # Knowledge & context (matches old GUI)
         self.km = KnowledgeManager()
+        self.km.set_workspace(os.getcwd())  # default workspace = launch dir
         self.session_map = SessionMap()
         self._system_info = get_assistant_tools_prompt()
 
@@ -1274,10 +1275,21 @@ class ArtifexMainWindow(QMainWindow):
         if path and os.path.isdir(path):
             if self.km.set_workspace(path):
                 self.km.bind_workspace_store(path)
+                # Change the process CWD so that:
+                #   1. The system prompt's CWD field reflects the workspace
+                #      (build_assistant_prompt reads os.getcwd())
+                #   2. All agent tools resolve relative paths against the
+                #      workspace (14 os.getcwd() calls in agent_tools.py)
+                #   3. Subprocess shells (```bash blocks) execute in the
+                #      workspace directory
+                # The GUI itself uses absolute paths via BASE_DIR for its
+                # own files (logs, output, sessions), so this is safe.
+                os.chdir(path)
                 summary = self.km.get_workspace_summary()
                 self._set_status(f"Workspace: {path}")
                 bubble = self._chat_view.add_bubble("assistant")
                 bubble.add_text(f"Workspace set: {path}\n{summary}")
+                _log.info("Workspace changed: %s (CWD updated)", path)
             else:
                 self._set_status(f"Invalid workspace: {path}")
 
