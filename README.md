@@ -385,7 +385,7 @@ python main_api.py --backend transformers --model qwen3.5-27b-distilled --gatewa
 | DELETE | `/v1/files/{file_id}` | Delete a file |
 | GET | `/docs` | Interactive Swagger API documentation |
 
-**LAN access for upstream-client Web Suite:** Use `--host 0.0.0.0` to bind to all interfaces. CORS is configured to accept `192.168.x.x` origins. Set `ARTIFEX_CORS_ORIGINS` env var for additional origins.
+**LAN access:** Use `--host 0.0.0.0` to bind to all interfaces. CORS is configured to accept `192.168.x.x` origins. Set `ARTIFEX_CORS_ORIGINS` env var for additional origins.
 
 ### Example Requests
 
