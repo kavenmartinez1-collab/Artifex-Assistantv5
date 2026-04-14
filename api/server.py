@@ -387,9 +387,11 @@ def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options,
     """Forward a request to Ollama's /api/chat and return an OpenAI-format response."""
     from core.config import get_ollama_model_config
 
-    # Start with per-model config (num_ctx, etc.)
+    # Start with per-model config (num_ctx, etc.) — only if explicitly set
     model_config = get_ollama_model_config(model)
-    ollama_options = {"num_ctx": model_config.get("num_ctx", 8192)}
+    ollama_options = {}
+    if "num_ctx" in model_config:
+        ollama_options["num_ctx"] = model_config["num_ctx"]
 
     # Merge caller-provided options (can override num_ctx if explicit)
     if options:
@@ -472,9 +474,11 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
     """
     from core.config import get_ollama_model_config
 
-    # Start with per-model config (num_ctx, etc.)
+    # Start with per-model config (num_ctx, etc.) — only if explicitly set
     model_config = get_ollama_model_config(model)
-    ollama_options = {"num_ctx": model_config.get("num_ctx", 8192)}
+    ollama_options = {}
+    if "num_ctx" in model_config:
+        ollama_options["num_ctx"] = model_config["num_ctx"]
 
     # Merge caller-provided options (can override num_ctx if explicit)
     if options:
