@@ -158,12 +158,17 @@ class OllamaEngine(BaseEngine):
         """Stream a response from the Ollama /api/chat endpoint (localhost only)."""
         self.load()
 
+        # Get per-model config (num_ctx, etc.)
+        from core.config import get_ollama_model_config
+        model_config = get_ollama_model_config(self.model_name)
+
         options = {
             "num_predict": max_tokens,
             "temperature": temperature,
             "stop": STOP_STRINGS,
             "repeat_penalty": 1.15,
             "repeat_last_n": 128,
+            "num_ctx": model_config.get("num_ctx", 8192),
         }
 
         if self._num_gpu is not None:
