@@ -385,7 +385,13 @@ def _resolve_model_for_request(requested, has_images: bool, backend: str) -> str
 
 def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options, timeout):
     """Forward a request to Ollama's /api/chat and return an OpenAI-format response."""
-    ollama_options = {}
+    from core.config import get_ollama_model_config
+
+    # Start with per-model config (num_ctx, etc.)
+    model_config = get_ollama_model_config(model)
+    ollama_options = {"num_ctx": model_config.get("num_ctx", 8192)}
+
+    # Merge caller-provided options (can override num_ctx if explicit)
     if options:
         ollama_options.update(options)
     if temperature is not None:
@@ -464,7 +470,13 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
         ("usage", dict)     — final usage stats
         _SENTINEL           — marks end of stream
     """
-    ollama_options = {}
+    from core.config import get_ollama_model_config
+
+    # Start with per-model config (num_ctx, etc.)
+    model_config = get_ollama_model_config(model)
+    ollama_options = {"num_ctx": model_config.get("num_ctx", 8192)}
+
+    # Merge caller-provided options (can override num_ctx if explicit)
     if options:
         ollama_options.update(options)
     if temperature is not None:

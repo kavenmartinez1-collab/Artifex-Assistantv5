@@ -1,0 +1,6 @@
+{
+  "_comment": "Per-model Ollama settings. num_ctx is auto-estimated if not specified.",
+  "_default": {
+    "num_ctx": 8192
+  }
+}

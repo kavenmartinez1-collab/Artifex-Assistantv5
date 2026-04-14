@@ -15,6 +15,7 @@ from colorama import Fore, Style
 from core.config import (
     MODES, get_context_profile, get_context_profile_name, set_context_profile,
     CONTEXT_PROFILES, get_active_backend, set_active_backend, get_active_model_name,
+    get_ollama_model_config, set_ollama_model_config, get_active_ollama_model,
 )
 from core.engine_factory import create_engine
 from core.inference import ThinkFilter, compress_history, build_active_messages
@@ -427,7 +428,7 @@ def run_assistant():
     print(f"  Commands: /workspace <path>, /kb search|add|list|show|remove, /refresh, /clear")
     print(f"  Session:  /save [name], /load [name|#], /sessions, /export [path]")
     print(f"  Pipeline: /mode <mode>, /attach <file>, /output <dir>")
-    print(f"  System:   /backend transformers|ollama, /health, /compile on|off, /turboquant on|off")
+    print(f"  System:   /backend transformers|ollama, /ctx <num>, /health, /compile, /turboquant")
     print(f"  Type 'exit' to quit.{Style.RESET_ALL}\n")
 
     # Knowledge manager + workspace setup
@@ -613,6 +614,32 @@ def run_assistant():
                     print(f"    output={p.max_output_tokens} history={p.max_history_tokens} "
                           f"knowledge={p.knowledge_token_budget} tools={p.tool_output_limit}")
                     print(f"  Usage: /context [{profiles}]{Style.RESET_ALL}\n")
+                continue
+
+            # /ctx command — per-model Ollama context window
+            if user_input.lower().startswith("/ctx"):
+                arg = user_input[4:].strip()
+                model = get_active_ollama_model() if get_active_backend() == "ollama" else None
+                if not model:
+                    print(f"{Fore.YELLOW}  /ctx only works with Ollama backend{Style.RESET_ALL}\n")
+                    continue
+
+                if arg:
+                    try:
+                        new_ctx = int(arg)
+                        if new_ctx < 512 or new_ctx > 131072:
+                            print(f"{Fore.YELLOW}  num_ctx must be between 512 and 131072{Style.RESET_ALL}\n")
+                            continue
+                        set_ollama_model_config(model, {"num_ctx": new_ctx})
+                        print(f"{Fore.CYAN}  [{model}] num_ctx set to {new_ctx}")
+                        print(f"  Saved to ollama_config.json{Style.RESET_ALL}\n")
+                    except ValueError:
+                        print(f"{Fore.YELLOW}  Usage: /ctx <num_ctx>  (e.g., /ctx 8192){Style.RESET_ALL}\n")
+                else:
+                    cfg = get_ollama_model_config(model)
+                    ctx = cfg.get("num_ctx", "auto")
+                    print(f"{Fore.CYAN}  [{model}] num_ctx = {ctx}")
+                    print(f"  Usage: /ctx <value>  (e.g., /ctx 8192, /ctx 16384){Style.RESET_ALL}\n")
                 continue
 
             # /workspace command

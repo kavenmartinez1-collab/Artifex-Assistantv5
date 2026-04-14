@@ -123,6 +123,127 @@ def set_turboquant_kv(enabled):
 # ===== OLLAMA CONFIGURATION =====
 OLLAMA_MODELS = {}  # auto-discovered from running Ollama server
 OLLAMA_NUM_GPU = "auto"  # "auto", 0, -1, or specific int
+OLLAMA_CONFIG_PATH = os.path.join(BASE_DIR, "ollama_config.json")
+
+# Per-model Ollama settings (num_ctx, etc.) — persisted to ollama_config.json
+_ollama_model_config: dict = {}
+
+
+def _load_ollama_config():
+    """Load per-model Ollama config from disk."""
+    global _ollama_model_config
+    if os.path.isfile(OLLAMA_CONFIG_PATH):
+        try:
+            with open(OLLAMA_CONFIG_PATH, "r", encoding="utf-8") as f:
+                _ollama_model_config = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            _ollama_model_config = {}
+    return _ollama_model_config
+
+
+def _save_ollama_config():
+    """Persist per-model Ollama config to disk."""
+    try:
+        with open(OLLAMA_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(_ollama_model_config, f, indent=2)
+    except OSError:
+        pass  # non-critical
+
+
+def _estimate_default_ctx(model_size_gb: float, gpu_tier: str = None) -> int:
+    """Estimate a reasonable num_ctx default based on model size and GPU tier.
+
+    Strategy:
+    - Smaller models can afford larger context (more VRAM headroom)
+    - Larger models need smaller context to fit in VRAM
+    - GPU tier caps the maximum regardless of model size
+
+    Args:
+        model_size_gb: Model file size in GB (from Ollama)
+        gpu_tier: "TIGHT", "COMFORTABLE", or "ABUNDANT"
+
+    Returns:
+        Recommended num_ctx value
+    """
+    tier = gpu_tier or GPU_TIER
+
+    # Tier-based caps (based on Ollama's VRAM-based defaults)
+    tier_caps = {
+        "TIGHT": 8192,       # <=12GB VRAM — conservative
+        "COMFORTABLE": 16384,  # 13-20GB VRAM — moderate
+        "ABUNDANT": 32768,   # >20GB VRAM — generous
+    }
+    max_ctx = tier_caps.get(tier, 8192)
+
+    # Model size heuristics (Q4 quantized sizes)
+    # Smaller models = more room for larger context
+    if model_size_gb <= 3:
+        base_ctx = 16384  # <3GB models (0.5B-2B params)
+    elif model_size_gb <= 6:
+        base_ctx = 12288  # 3-6GB models (~4B-9B params)
+    elif model_size_gb <= 10:
+        base_ctx = 8192   # 6-10GB models (~9B-14B params)
+    elif model_size_gb <= 18:
+        base_ctx = 6144   # 10-18GB models (~27B params)
+    else:
+        base_ctx = 4096   # >18GB models (70B+ params)
+
+    return min(base_ctx, max_ctx)
+
+
+def get_ollama_model_config(model_name: str) -> dict:
+    """Get per-model Ollama config (num_ctx, etc.).
+
+    Returns config dict with at least {"num_ctx": int}.
+    Auto-generates sensible defaults for unconfigured models.
+    """
+    # Lazy load from disk on first access
+    if not _ollama_model_config:
+        _load_ollama_config()
+
+    # Normalize model name (strip :latest suffix)
+    normalized = model_name.rsplit(":latest", 1)[0] if model_name.endswith(":latest") else model_name
+
+    # Check explicit config
+    if normalized in _ollama_model_config:
+        return _ollama_model_config[normalized]
+
+    # Check _default fallback
+    if "_default" in _ollama_model_config:
+        return _ollama_model_config["_default"]
+
+    # Auto-estimate based on model size from OLLAMA_MODELS cache
+    model_info = OLLAMA_MODELS.get(normalized, {})
+    size_bytes = model_info.get("size", 0)
+    size_gb = size_bytes / (1024 ** 3) if size_bytes else 5.0  # default guess
+
+    return {"num_ctx": _estimate_default_ctx(size_gb)}
+
+
+def set_ollama_model_config(model_name: str, config: dict, persist: bool = True):
+    """Set per-model Ollama config.
+
+    Args:
+        model_name: Ollama model name (e.g., "qwen3.5:9b")
+        config: Dict with settings like {"num_ctx": 8192}
+        persist: Whether to save to disk immediately
+    """
+    global _ollama_model_config
+    if not _ollama_model_config:
+        _load_ollama_config()
+
+    normalized = model_name.rsplit(":latest", 1)[0] if model_name.endswith(":latest") else model_name
+    _ollama_model_config[normalized] = config
+
+    if persist:
+        _save_ollama_config()
+
+
+def get_all_ollama_model_configs() -> dict:
+    """Get all per-model Ollama configs (for UI/inspection)."""
+    if not _ollama_model_config:
+        _load_ollama_config()
+    return dict(_ollama_model_config)
 
 
 def _discover_ollama_models():
