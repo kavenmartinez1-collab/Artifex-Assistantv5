@@ -158,7 +158,7 @@ class OllamaEngine(BaseEngine):
         """Stream a response from the Ollama /api/chat endpoint (localhost only)."""
         self.load()
 
-        # Get per-model config (num_ctx, etc.)
+        # Get per-model config (num_ctx, etc.) — only if explicitly set
         from core.config import get_ollama_model_config
         model_config = get_ollama_model_config(self.model_name)
 
@@ -168,8 +168,9 @@ class OllamaEngine(BaseEngine):
             "stop": STOP_STRINGS,
             "repeat_penalty": 1.15,
             "repeat_last_n": 128,
-            "num_ctx": model_config.get("num_ctx", 8192),
         }
+        if "num_ctx" in model_config:
+            options["num_ctx"] = model_config["num_ctx"]
 
         if self._num_gpu is not None:
             options["num_gpu"] = self._num_gpu

@@ -1,6 +1,3 @@
 {
-  "_comment": "Per-model Ollama settings. num_ctx is auto-estimated if not specified.",
-  "_default": {
-    "num_ctx": 8192
-  }
+  "_comment": "Per-model Ollama settings. Only add num_ctx if Ollama's auto-detection is wrong for your setup. Example: \"qwen3.5:9b\": {\"num_ctx\": 8192}"
 }

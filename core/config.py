@@ -194,8 +194,9 @@ def _estimate_default_ctx(model_size_gb: float, gpu_tier: str = None) -> int:
 def get_ollama_model_config(model_name: str) -> dict:
     """Get per-model Ollama config (num_ctx, etc.).
 
-    Returns config dict with at least {"num_ctx": int}.
-    Auto-generates sensible defaults for unconfigured models.
+    Returns config dict. Only includes num_ctx if explicitly configured —
+    passing num_ctx to Ollama can trigger bugs where content returns empty.
+    When not configured, returns empty dict so Ollama uses its own defaults.
     """
     # Lazy load from disk on first access
     if not _ollama_model_config:
@@ -204,20 +205,17 @@ def get_ollama_model_config(model_name: str) -> dict:
     # Normalize model name (strip :latest suffix)
     normalized = model_name.rsplit(":latest", 1)[0] if model_name.endswith(":latest") else model_name
 
-    # Check explicit config
+    # Check explicit config (user set via /ctx or edited config file)
     if normalized in _ollama_model_config:
         return _ollama_model_config[normalized]
 
-    # Check _default fallback
+    # Check _default fallback — but skip "_comment" entries
     if "_default" in _ollama_model_config:
         return _ollama_model_config["_default"]
 
-    # Auto-estimate based on model size from OLLAMA_MODELS cache
-    model_info = OLLAMA_MODELS.get(normalized, {})
-    size_bytes = model_info.get("size", 0)
-    size_gb = size_bytes / (1024 ** 3) if size_bytes else 5.0  # default guess
-
-    return {"num_ctx": _estimate_default_ctx(size_gb)}
+    # No explicit config — return empty dict, let Ollama use its defaults
+    # (Passing num_ctx explicitly can cause empty content bug in some models)
+    return {}
 
 
 def set_ollama_model_config(model_name: str, config: dict, persist: bool = True):
