@@ -360,15 +360,16 @@ def _resolve_model_for_request(requested, has_images: bool, backend: str) -> str
         refresh_ollama_models()
         if requested in OLLAMA_MODELS:
             return requested
-        available = sorted(OLLAMA_MODELS.keys())
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Model '{requested}' not installed on Ollama. "
-                f"Available: {', '.join(available) if available else '(none — pull one first)'}. "
-                f"Pull with: `ollama pull {requested}`"
-            ),
-        )
+        # Model not found — fall back to smallest available model
+        # For text requests, skip VLM models (they're optimized for vision)
+        candidates = OLLAMA_MODELS.items()
+        if not has_images:
+            candidates = [(n, i) for n, i in candidates if "vl" not in n.lower() and "vision" not in n.lower()]
+        if not candidates:
+            candidates = OLLAMA_MODELS.items()  # fallback if no text models
+        smallest = min(candidates, key=lambda x: x[1].get("size", float("inf")))
+        _log.warning("Model '%s' not found, falling back to %s (smallest)", requested, smallest[0])
+        return smallest[0]
 
     # Transformers
     if requested in MODELS:
