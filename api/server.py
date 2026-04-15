@@ -244,6 +244,64 @@ def _messages_have_images(messages):
     return False
 
 
+def _describe_content_shape(messages) -> str:
+    """Compact per-message content shape for logging.
+
+    Format: `role(part:size,part:size) ...` — e.g.
+        system(text:500) user(text:17000,image_url:application/pdf:2048KB)
+
+    Purpose: when requests fail or return wrong output, the log shows what
+    shape the client actually sent — in particular whether attachments came
+    through as image_url data URLs and what mime type (image/png vs
+    application/pdf vs etc.), since PDF sent as image_url is a common
+    silently-dropped case with text-only models.
+    """
+    out = []
+    for msg in messages:
+        role = msg.get("role", "?")
+        content = msg.get("content")
+        # Ollama post-conversion: content is a string plus optional `images`
+        # (list of base64 strings). OpenAI multimodal: content is a list of
+        # {type, text/image_url} dicts. Handle both so callers can use the
+        # same helper regardless of where they sit in the pipeline.
+        if isinstance(content, str):
+            parts = [f"text:{len(content)}"]
+            images = msg.get("images")
+            if isinstance(images, list) and images:
+                total_kb = sum(
+                    len(img) * 3 // 4 // 1024
+                    for img in images if isinstance(img, str)
+                )
+                parts.append(f"images[{len(images)}]:~{total_kb}KB")
+            out.append(f"{role}({','.join(parts)})")
+            continue
+        if not isinstance(content, list):
+            out.append(f"{role}(other:{type(content).__name__})")
+            continue
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            t = item.get("type", "?")
+            if t == "text":
+                parts.append(f"text:{len(item.get('text', ''))}")
+            elif t == "image_url":
+                url = item.get("image_url", {}).get("url", "")
+                if url.startswith("data:"):
+                    header_end = url.find(",")
+                    header = url[5:header_end] if header_end > 0 else url[5:]
+                    mime = header.split(";", 1)[0] or "unknown"
+                    b64_len = len(url) - header_end - 1 if header_end > 0 else 0
+                    size_kb = b64_len * 3 // 4 // 1024
+                    parts.append(f"image_url:{mime}:{size_kb}KB")
+                else:
+                    parts.append("image_url:url")
+            else:
+                parts.append(t)
+        out.append(f"{role}({','.join(parts) if parts else 'empty'})")
+    return " ".join(out)
+
+
 # ── Model resolution ────────────────────────────────────────────────────
 #
 # Clients shouldn't need to know which models are installed on this server.
@@ -387,20 +445,28 @@ def _resolve_model_for_request(requested, has_images: bool, backend: str) -> str
 def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options, timeout):
     """Forward a request to Ollama's /api/chat and return an OpenAI-format response."""
     from core.config import get_ollama_model_config
+    from core.ollama_ctx import compute_safe_ctx, estimate_prompt_tokens
 
-    # Start with per-model config (num_ctx, etc.) — only if explicitly set
     model_config = get_ollama_model_config(model)
     ollama_options = {}
-    if "num_ctx" in model_config:
-        ollama_options["num_ctx"] = model_config["num_ctx"]
 
-    # Merge caller-provided options (can override num_ctx if explicit)
+    # Auto-size num_ctx from prompt + VRAM budget. Per-model config can pin
+    # num_ctx outright or set a max_ctx ceiling (see core/ollama_ctx.py).
+    est_tokens = estimate_prompt_tokens(ollama_messages)
+    ollama_options["num_ctx"] = compute_safe_ctx(model, est_tokens, model_config)
+
     if options:
         ollama_options.update(options)
     if temperature is not None:
         ollama_options["temperature"] = temperature
     if max_tokens is not None:
         ollama_options["num_predict"] = max_tokens
+
+    # Scale socket timeout with num_ctx. A 300s text default works for 8B
+    # models on small prompts, but 27B 2-bit doing 17K-token prompt + 5K-gen
+    # legitimately runs 6-7 min. num_ctx is a reasonable proxy for worst-case
+    # work, and caps at 1800s (30 min) to still catch genuine hangs.
+    timeout = max(timeout, min(1800, ollama_options["num_ctx"] // 30))
 
     payload = {
         "model": model,
@@ -441,6 +507,13 @@ def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options,
     prompt_tokens = data.get("prompt_eval_count", 0)
     completion_tokens = data.get("eval_count", 0)
 
+    preview = content[:160].replace("\n", "\\n").replace("\r", "")
+    _log.info(
+        "Ollama proxy complete: model=%s num_ctx=%d prompt=%d completion=%d content=%d preview=%r",
+        model, ollama_options.get("num_ctx", 0),
+        prompt_tokens, completion_tokens, len(content), preview,
+    )
+
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
         "object": "chat.completion",
@@ -474,20 +547,30 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
         _SENTINEL           — marks end of stream
     """
     from core.config import get_ollama_model_config
+    from core.ollama_ctx import compute_safe_ctx, estimate_prompt_tokens
 
-    # Start with per-model config (num_ctx, etc.) — only if explicitly set
     model_config = get_ollama_model_config(model)
     ollama_options = {}
-    if "num_ctx" in model_config:
-        ollama_options["num_ctx"] = model_config["num_ctx"]
 
-    # Merge caller-provided options (can override num_ctx if explicit)
+    # Auto-size num_ctx from prompt + VRAM budget.
+    est_tokens = estimate_prompt_tokens(ollama_messages)
+    ollama_options["num_ctx"] = compute_safe_ctx(model, est_tokens, model_config)
+
     if options:
         ollama_options.update(options)
     if temperature is not None:
         ollama_options["temperature"] = temperature
     if max_tokens is not None:
         ollama_options["num_predict"] = max_tokens
+
+    # See _proxy_ollama_chat for rationale — same num_ctx-scaled timeout.
+    timeout = max(timeout, min(1800, ollama_options["num_ctx"] // 30))
+
+    _log.info(
+        "Ollama stream start: model=%s num_ctx=%d est_prompt_tokens=%d shape=[%s]",
+        model, ollama_options["num_ctx"], est_tokens,
+        _describe_content_shape(ollama_messages),
+    )
 
     payload = {
         "model": model,
@@ -916,8 +999,9 @@ def create_app():
                     ollama_msgs = _convert_messages_for_ollama(messages)
 
                     _log.info(
-                        "Ollama proxy: model=%s images=%s msgs=%d",
+                        "Ollama proxy: model=%s images=%s msgs=%d shape=[%s]",
                         model, has_images, len(messages),
+                        _describe_content_shape(messages),
                     )
 
                     loop = asyncio.get_event_loop()
