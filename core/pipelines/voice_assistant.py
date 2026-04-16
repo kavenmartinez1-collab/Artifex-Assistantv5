@@ -404,6 +404,13 @@ class VoiceAssistantPipeline(BasePipeline):
             PipelineResult with output_type "audio" (full/tts) or "text" (stt)
             metadata includes: user_text, response_text, audio_path, audio_chunks
         """
+        from core.pipelines.schemas import VoiceAssistantInput
+        from pydantic import ValidationError
+        try:
+            params = VoiceAssistantInput(**kwargs)
+        except ValidationError as e:
+            return PipelineResult(success=False, output_type="audio", error=f"Invalid input: {e}")
+
         if not self.is_loaded():
             return PipelineResult(
                 success=False, output_type="audio",
@@ -412,12 +419,12 @@ class VoiceAssistantPipeline(BasePipeline):
 
         try:
             # Route to the right sub-pipeline
-            if kwargs.get("stt_only"):
-                return self._run_stt_only(**kwargs)
-            elif kwargs.get("tts_only"):
-                return self._run_tts_only(**kwargs)
+            if params.stt_only:
+                return self._run_stt_only(params)
+            elif params.tts_only:
+                return self._run_tts_only(params)
             else:
-                return self._run_conversation(**kwargs)
+                return self._run_conversation(params)
         except Exception as e:
             return PipelineResult(
                 success=False, output_type="audio",
@@ -449,7 +456,7 @@ class VoiceAssistantPipeline(BasePipeline):
                 )
         return "\n\n".join(outputs) if outputs else None
 
-    def _execute_tool_loop(self, response, progress_cb=None, **kwargs):
+    def _execute_tool_loop(self, response, params, progress_cb=None):
         """Extract and execute tools from a response, looping up to MAX rounds.
 
         Returns the final response text (with tool results incorporated).
@@ -492,8 +499,8 @@ class VoiceAssistantPipeline(BasePipeline):
             # Generate silently (no on_token — intermediate round)
             response = self._engine.generate_streaming(
                 messages=messages,
-                max_tokens=kwargs.get("max_tokens", 512),
-                temperature=kwargs.get("temperature", 0.7),
+                max_tokens=params.max_tokens,
+                temperature=params.temperature,
                 on_token=None,
                 enable_thinking=False,
             )
@@ -512,22 +519,22 @@ class VoiceAssistantPipeline(BasePipeline):
 
     # ── Core conversation loop ──────────────────────────────────────
 
-    def _run_conversation(self, **kwargs) -> PipelineResult:
+    def _run_conversation(self, params) -> PipelineResult:
         """Full STT → LLM → TTS conversation turn."""
-        on_token = kwargs.get("on_token", None)
-        play_audio = kwargs.get("play_audio", True)
-        progress_callback = kwargs.get("progress_callback", None)
+        on_token = params.on_token
+        play_audio = params.play_audio
+        progress_callback = params.progress_callback
 
         def _progress(msg):
             if progress_callback:
                 progress_callback(0, 0, msg)
 
         # ── Stage 1: Get user text ──────────────────────────────────
-        user_text = kwargs.get("text", None)
+        user_text = params.text
 
         if user_text is None:
             # STT from audio data
-            audio_data = kwargs.get("audio_data", None)
+            audio_data = params.audio_data
             if audio_data is None:
                 return PipelineResult(
                     success=False, output_type="audio",
@@ -567,8 +574,8 @@ class VoiceAssistantPipeline(BasePipeline):
             # Generate silently first — tool loop may produce multiple rounds
             initial_response = self._engine.generate_streaming(
                 messages=messages,
-                max_tokens=kwargs.get("max_tokens", 512),
-                temperature=kwargs.get("temperature", 0.7),
+                max_tokens=params.max_tokens,
+                temperature=params.temperature,
                 on_token=None,
                 enable_thinking=False,
             )
@@ -576,7 +583,7 @@ class VoiceAssistantPipeline(BasePipeline):
 
             # Run tool loop (returns immediately if no tools requested)
             full_response = self._execute_tool_loop(
-                initial_response, progress_cb=_progress, **kwargs
+                initial_response, params, progress_cb=_progress,
             )
 
             # Deliver final response to streaming callback
@@ -594,8 +601,8 @@ class VoiceAssistantPipeline(BasePipeline):
 
             self._engine.generate_streaming(
                 messages=messages,
-                max_tokens=kwargs.get("max_tokens", 512),
-                temperature=kwargs.get("temperature", 0.7),
+                max_tokens=params.max_tokens,
+                temperature=params.temperature,
                 on_token=collect_token,
                 enable_thinking=False,
             )
@@ -657,9 +664,9 @@ class VoiceAssistantPipeline(BasePipeline):
 
     # ── STT-only ────────────────────────────────────────────────────
 
-    def _run_stt_only(self, **kwargs) -> PipelineResult:
+    def _run_stt_only(self, params) -> PipelineResult:
         """Transcribe audio data to text."""
-        audio_data = kwargs.get("audio_data", None)
+        audio_data = params.audio_data
         if audio_data is None:
             return PipelineResult(
                 success=False, output_type="text",
@@ -681,9 +688,9 @@ class VoiceAssistantPipeline(BasePipeline):
 
     # ── TTS-only ────────────────────────────────────────────────────
 
-    def _run_tts_only(self, **kwargs) -> PipelineResult:
+    def _run_tts_only(self, params) -> PipelineResult:
         """Synthesize text to audio file."""
-        text = kwargs.get("tts_text", "")
+        text = params.tts_text
         if not text:
             return PipelineResult(
                 success=False, output_type="audio",
@@ -696,7 +703,7 @@ class VoiceAssistantPipeline(BasePipeline):
                 error="TTS not available."
             )
 
-        play_audio = kwargs.get("play_audio", True)
+        play_audio = params.play_audio
         import io
         import wave
 

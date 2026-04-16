@@ -103,44 +103,47 @@ class Shape3DPipeline(BasePipeline):
         Returns:
             PipelineResult with mesh file path as content
         """
+        from core.pipelines.schemas import Shape3DInput
+        from pydantic import ValidationError
+        try:
+            params = Shape3DInput(**kwargs)
+        except ValidationError as e:
+            return PipelineResult(success=False, output_type="mesh", error=f"Invalid input: {e}")
+
         if not self.is_loaded():
             return PipelineResult(
                 success=False, output_type="mesh",
                 error="No model loaded."
             )
 
-        prompt = kwargs.get("prompt", "")
-        num_steps = kwargs.get("num_steps", 64)
-        frame_size = kwargs.get("frame_size", 64)
-        output_path = kwargs.get("output_path", None)
-        output_format = kwargs.get("output_format", "ply")
-
-        if not prompt:
+        if not params.prompt:
             return PipelineResult(
                 success=False, output_type="mesh",
                 error="Prompt is required."
             )
 
+        output_path = params.output_path
+
         try:
             images = self.pipe(
-                prompt,
+                params.prompt,
                 guidance_scale=15.0,
-                num_inference_steps=num_steps,
-                frame_size=frame_size,
+                num_inference_steps=params.num_steps,
+                frame_size=params.frame_size,
             ).images
 
             # Export mesh
             if output_path is None:
                 os.makedirs("output", exist_ok=True)
-                safe_name = "".join(c if c.isalnum() or c in " -_" else "" for c in prompt)[:50]
-                output_path = os.path.join("output", f"{safe_name}.{output_format}")
+                safe_name = "".join(c if c.isalnum() or c in " -_" else "" for c in params.prompt)[:50]
+                output_path = os.path.join("output", f"{safe_name}.{params.output_format}")
 
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
             # Convert ShapE output to mesh
             try:
                 from diffusers.utils import export_to_ply, export_to_obj
-                if output_format == "obj":
+                if params.output_format == "obj":
                     export_to_obj(images[0], output_path)
                 else:
                     export_to_ply(images[0], output_path)
@@ -154,9 +157,9 @@ class Shape3DPipeline(BasePipeline):
                 output_type="mesh",
                 content=output_path,
                 metadata={
-                    "prompt": prompt,
-                    "steps": num_steps,
-                    "format": output_format,
+                    "prompt": params.prompt,
+                    "steps": params.num_steps,
+                    "format": params.output_format,
                 },
             )
 

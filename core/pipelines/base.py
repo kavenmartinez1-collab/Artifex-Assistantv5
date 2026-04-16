@@ -16,6 +16,11 @@ class PipelineResult:
     content: Any = None       # The actual output (text string, PIL Image, file path, etc.)
     metadata: dict = field(default_factory=dict)
     error: Optional[str] = None
+    # Which engine served the request — "transformers", "ollama", or "" if N/A
+    # (e.g. pure diffusers image gen doesn't flow through a text engine).
+    # API handlers surface this to callers as `x_backend` so clients can
+    # tell which runtime actually handled their request.
+    backend: str = ""
 
 
 class BasePipeline(ABC):

@@ -116,17 +116,23 @@ class MusicPipeline(BasePipeline):
         Returns:
             PipelineResult with audio file path
         """
+        from core.pipelines.schemas import MusicInput
+        from pydantic import ValidationError
+        try:
+            params = MusicInput(**kwargs)
+        except ValidationError as e:
+            return PipelineResult(success=False, output_type="audio", error=f"Invalid input: {e}")
+
         if not self.is_loaded():
             return PipelineResult(
                 success=False, output_type="audio",
                 error="No model loaded."
             )
 
-        prompt = kwargs.get("prompt", "")
-        duration = min(kwargs.get("duration_seconds", 10), 30)
-        output_path = kwargs.get("output_path", None)
+        duration = min(params.duration_seconds, 30)
+        output_path = params.output_path
 
-        if not prompt:
+        if not params.prompt:
             return PipelineResult(
                 success=False, output_type="audio",
                 error="Prompt is required."
@@ -134,7 +140,7 @@ class MusicPipeline(BasePipeline):
 
         try:
             inputs = self.processor(
-                text=[prompt],
+                text=[params.prompt],
                 padding=True,
                 return_tensors="pt",
             )
@@ -157,7 +163,7 @@ class MusicPipeline(BasePipeline):
             # Save
             if output_path is None:
                 os.makedirs("output", exist_ok=True)
-                safe = "".join(c if c.isalnum() or c in " -_" else "" for c in prompt)[:30]
+                safe = "".join(c if c.isalnum() or c in " -_" else "" for c in params.prompt)[:30]
                 output_path = os.path.join("output", f"music_{safe}.wav")
 
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -170,7 +176,7 @@ class MusicPipeline(BasePipeline):
                 output_type="audio",
                 content=output_path,
                 metadata={
-                    "prompt": prompt,
+                    "prompt": params.prompt,
                     "duration_seconds": duration,
                     "sampling_rate": self._sampling_rate,
                 },

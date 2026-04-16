@@ -59,32 +59,34 @@ class TextGenerationPipeline(BasePipeline):
         Returns:
             PipelineResult with text content
         """
+        from core.pipelines.schemas import TextGenerationInput
+        from pydantic import ValidationError
+        try:
+            params = TextGenerationInput(**kwargs)
+        except ValidationError as e:
+            return PipelineResult(success=False, output_type="text", error=f"Invalid input: {e}")
+
         if not self.is_loaded():
             return PipelineResult(
                 success=False, output_type="text",
                 error="No model loaded. Call load() first."
             )
 
-        messages = kwargs.get("messages", [])
-        max_tokens = kwargs.get("max_tokens", 1024)
-        temperature = kwargs.get("temperature", 0.7)
-        on_token = kwargs.get("on_token", None)
-        on_complete = kwargs.get("on_complete", None)
-        enable_thinking = kwargs.get("enable_thinking", True)
-
         try:
             response = self.engine.generate_streaming(
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                on_token=on_token,
-                on_complete=on_complete,
-                enable_thinking=enable_thinking,
+                messages=params.messages,
+                max_tokens=params.max_tokens,
+                temperature=params.temperature,
+                on_token=params.on_token,
+                on_complete=params.on_complete,
+                enable_thinking=params.enable_thinking,
             )
+            backend = "transformers" if "Transformers" in type(self.engine).__name__ else "ollama"
             return PipelineResult(
                 success=True,
                 output_type="text",
                 content=response,
+                backend=backend,
             )
         except Exception as e:
             return PipelineResult(

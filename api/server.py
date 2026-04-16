@@ -507,11 +507,18 @@ def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options,
     prompt_tokens = data.get("prompt_eval_count", 0)
     completion_tokens = data.get("eval_count", 0)
 
+    # Ollama's done_reason is "stop" (EOS), "length" (hit num_predict),
+    # "load" (just loaded the model), etc. Map to OpenAI finish_reason:
+    # only "length" and "stop" are meaningful to OpenAI clients — pass
+    # "length" through verbatim, treat everything else as a natural stop.
+    done_reason = data.get("done_reason", "stop")
+    finish_reason = "length" if done_reason == "length" else "stop"
+
     preview = content[:160].replace("\n", "\\n").replace("\r", "")
     _log.info(
-        "Ollama proxy complete: model=%s num_ctx=%d prompt=%d completion=%d content=%d preview=%r",
+        "Ollama proxy complete: model=%s num_ctx=%d prompt=%d completion=%d content=%d finish=%s preview=%r",
         model, ollama_options.get("num_ctx", 0),
-        prompt_tokens, completion_tokens, len(content), preview,
+        prompt_tokens, completion_tokens, len(content), finish_reason, preview,
     )
 
     return {
@@ -523,7 +530,7 @@ def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options,
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
@@ -531,6 +538,7 @@ def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         },
+        "x_backend": "ollama",
     }
 
 
@@ -615,9 +623,13 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
                 out_queue.put(("content", content))
 
             if chunk.get("done", False):
+                # Pass Ollama's done_reason through so the caller can render
+                # an honest finish_reason. "length" = hit num_predict cap,
+                # anything else collapses to a natural "stop".
                 out_queue.put(("usage", {
                     "prompt_tokens": chunk.get("prompt_eval_count", 0),
                     "completion_tokens": chunk.get("eval_count", 0),
+                    "done_reason": chunk.get("done_reason", "stop"),
                 }))
                 break
     except Exception as e:
@@ -654,10 +666,13 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
         )
         tf.flush()
 
-        # Approximate token counts
+        # Use real token counts from engine._last_gen_stats (populated by
+        # TransformersEngine.generate_streaming) instead of char//4 heuristic.
+        stats = getattr(engine, "_last_gen_stats", None) or {}
         out_queue.put(("usage", {
-            "prompt_tokens": sum(len(m.get("content", "")) // 4 for m in messages),
-            "completion_tokens": len(full_text) // 4,
+            "prompt_tokens": stats.get("prompt_tokens", 0),
+            "completion_tokens": stats.get("completion_tokens", 0),
+            "finish_reason": stats.get("finish_reason", "stop"),
         }))
     except Exception as e:
         out_queue.put(("error", str(e)))
@@ -677,6 +692,7 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     search_cache = []  # Request-scoped cache for @web_read(N)
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    last_finish_reason = "stop"  # Updated from engine usage events
 
     current_messages = list(messages)
     round_count = 0
@@ -731,6 +747,14 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
         # Accumulate usage across rounds
         total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
         total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+        # Derive finish_reason: Ollama passes done_reason, Transformers
+        # passes finish_reason directly. Map Ollama's "length" through;
+        # everything else collapses to "stop".
+        done_reason = usage.get("done_reason")
+        if done_reason is not None:
+            last_finish_reason = "length" if done_reason == "length" else "stop"
+        else:
+            last_finish_reason = usage.get("finish_reason", "stop")
 
         _log.info("Generation complete: %d chars, web_tools=%s, response='%s'",
                    len(full_response), use_web_tools, full_response[:120])
@@ -822,8 +846,8 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
         # Loop continues with new generation round
 
     # ── Final events ──────────────────────────────────────────────────
-    yield _make_sse_chunk(chat_id, model, {}, finish_reason="stop",
-                          extra={"x_usage": total_usage})
+    yield _make_sse_chunk(chat_id, model, {}, finish_reason=last_finish_reason,
+                          extra={"x_usage": total_usage, "x_backend": backend})
     yield "data: [DONE]\n\n"
 
 
@@ -1029,6 +1053,12 @@ def create_app():
             )
             response = strip_think_blocks(response) if response else ""
 
+            # Real token counts + finish_reason from engine stats
+            stats = getattr(engine, "_last_gen_stats", None) or {}
+            prompt_tokens = stats.get("prompt_tokens", 0)
+            completion_tokens = stats.get("completion_tokens", 0)
+            finish_reason = stats.get("finish_reason", "stop")
+
             return {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
                 "object": "chat.completion",
@@ -1038,15 +1068,15 @@ def create_app():
                     {
                         "index": 0,
                         "message": {"role": "assistant", "content": response},
-                        "finish_reason": "stop",
+                        "finish_reason": finish_reason,
                     }
                 ],
                 "usage": {
-                    "prompt_tokens": sum(len(m.get("content", "")) // 4 for m in messages),
-                    "completion_tokens": len(response) // 4,
-                    "total_tokens": (sum(len(m.get("content", "")) // 4 for m in messages)
-                                    + len(response) // 4),
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
                 },
+                "x_backend": "transformers",
             }
 
     # ─── Image Generation ────────────────────────────────────────────────
@@ -1079,6 +1109,7 @@ def create_app():
                         "file_id": result.metadata.get("file_id"),
                         "url": f"/v1/files/{result.metadata.get('file_id', '')}",
                     }],
+                    "x_backend": result.backend or "transformers",
                 }
             raise HTTPException(status_code=500, detail=result.error)
         except ValueError as e:
@@ -1306,6 +1337,7 @@ def create_app():
                     "object": "vision.analysis",
                     "analysis": content,
                     "model": requested_model,
+                    "x_backend": "ollama",
                 }
             except (RuntimeError, ConnectionError) as e:
                 _log.error("Ollama vision proxy failed: %s", e)
@@ -1360,6 +1392,7 @@ def create_app():
                 "object": "vision.analysis",
                 "analysis": result.content,
                 "model": result.metadata.get("model", body.model or "vision"),
+                "x_backend": result.backend or "transformers",
             }
         except HTTPException:
             raise

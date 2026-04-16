@@ -120,20 +120,23 @@ class VideoGenerationPipeline(BasePipeline):
         Returns:
             PipelineResult with video file path
         """
+        from core.pipelines.schemas import VideoGenerationInput
+        from pydantic import ValidationError
+        try:
+            params = VideoGenerationInput(**kwargs)
+        except ValidationError as e:
+            return PipelineResult(success=False, output_type="video", error=f"Invalid input: {e}")
+
         if not self.is_loaded():
             return PipelineResult(
                 success=False, output_type="video",
                 error="No model loaded."
             )
 
-        prompt = kwargs.get("prompt", "")
-        negative_prompt = kwargs.get("negative_prompt", "")
-        num_frames = min(kwargs.get("num_frames", 16), 32)
-        fps = kwargs.get("fps", 8)
-        num_steps = kwargs.get("num_steps", 25)
-        output_path = kwargs.get("output_path", None)
+        num_frames = min(params.num_frames, 32)
+        output_path = params.output_path
 
-        if not prompt:
+        if not params.prompt:
             return PipelineResult(
                 success=False, output_type="video",
                 error="Prompt is required."
@@ -141,12 +144,12 @@ class VideoGenerationPipeline(BasePipeline):
 
         try:
             gen_kwargs = {
-                "prompt": prompt,
+                "prompt": params.prompt,
                 "num_frames": num_frames,
-                "num_inference_steps": num_steps,
+                "num_inference_steps": params.num_steps,
             }
-            if negative_prompt:
-                gen_kwargs["negative_prompt"] = negative_prompt
+            if params.negative_prompt:
+                gen_kwargs["negative_prompt"] = params.negative_prompt
 
             result = self.pipe(**gen_kwargs)
             frames = result.frames[0]  # list of PIL Images
@@ -154,23 +157,23 @@ class VideoGenerationPipeline(BasePipeline):
             # Save
             if output_path is None:
                 os.makedirs("output", exist_ok=True)
-                safe = "".join(c if c.isalnum() or c in " -_" else "" for c in prompt)[:30]
+                safe = "".join(c if c.isalnum() or c in " -_" else "" for c in params.prompt)[:30]
                 output_path = os.path.join("output", f"video_{safe}.mp4")
 
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
             from diffusers.utils import export_to_video
-            export_to_video(frames, output_path, fps=fps)
+            export_to_video(frames, output_path, fps=params.fps)
 
             return PipelineResult(
                 success=True,
                 output_type="video",
                 content=output_path,
                 metadata={
-                    "prompt": prompt,
+                    "prompt": params.prompt,
                     "num_frames": num_frames,
-                    "fps": fps,
-                    "steps": num_steps,
+                    "fps": params.fps,
+                    "steps": params.num_steps,
                 },
             )
 

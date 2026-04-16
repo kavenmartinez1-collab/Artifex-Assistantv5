@@ -877,6 +877,11 @@ class TransformersEngine(BaseEngine):
             return_dict=True,
         ).to(model.device)
 
+        # Real prompt token count — input_ids is (batch, seq_len).
+        # Used by API handlers to populate usage.prompt_tokens honestly
+        # instead of the old len(content)//4 heuristic.
+        prompt_tokens = int(inputs["input_ids"].shape[-1])
+
         streamer = TextIteratorStreamer(
             self.processor or tokenizer,
             skip_prompt=True, skip_special_tokens=True,
@@ -1011,23 +1016,45 @@ class TransformersEngine(BaseEngine):
         t_end = _time.perf_counter()
         thread.join()
 
+        # Real completion token count from the tokenizer (streamer chunks are
+        # text fragments, not tokens — token_count above is fragment count,
+        # not a true token count). Fall back to fragment count if encoding
+        # fails for any reason.
+        try:
+            completion_tokens = len(
+                tokenizer.encode(full_response, add_special_tokens=False)
+            )
+        except Exception:
+            completion_tokens = token_count
+
+        # finish_reason: "length" if we hit the generation cap, else "stop"
+        # (EOS or StopStringCriteria both count as a natural stop). Uses the
+        # real token count since max_new_tokens is measured in tokens, not
+        # streamer chunks.
+        finish_reason = "length" if completion_tokens >= max_tokens else "stop"
+
         # Log throughput stats
         wall_time = t_end - t_start
         ttft = (t_first - t_start) if t_first else 0
-        toks_per_sec = token_count / wall_time if wall_time > 0 else 0
+        toks_per_sec = completion_tokens / wall_time if wall_time > 0 else 0
         # Decode-only speed (excludes first-token latency)
-        decode_tokens = max(token_count - 1, 0)
+        decode_tokens = max(completion_tokens - 1, 0)
         decode_time = (t_end - t_first) if t_first else wall_time
         decode_tps = decode_tokens / decode_time if decode_time > 0 else 0
 
         log = logging.getLogger(__name__)
         log.info(
-            "Generation: %d tokens in %.1fs (%.1f tok/s, TTFT=%.2fs, decode=%.1f tok/s)",
-            token_count, wall_time, toks_per_sec, ttft, decode_tps,
+            "Generation: %d tokens in %.1fs (%.1f tok/s, TTFT=%.2fs, decode=%.1f tok/s, finish=%s)",
+            completion_tokens, wall_time, toks_per_sec, ttft, decode_tps, finish_reason,
         )
-        # Store for GUI / API access
+        # Store for GUI / API access. prompt_tokens, completion_tokens, and
+        # finish_reason are how api/server.py fills in honest usage figures
+        # for /v1/chat/completions responses.
         self._last_gen_stats = {
-            "tokens": token_count,
+            "tokens": completion_tokens,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "finish_reason": finish_reason,
             "wall_time": round(wall_time, 2),
             "tok_per_sec": round(toks_per_sec, 1),
             "ttft": round(ttft, 3),

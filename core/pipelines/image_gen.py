@@ -128,22 +128,20 @@ class ImageGenerationPipeline(BasePipeline):
         Returns:
             PipelineResult with PIL Image as content
         """
+        from core.pipelines.schemas import ImageGenerationInput
+        from pydantic import ValidationError
+        try:
+            params = ImageGenerationInput(**kwargs)
+        except ValidationError as e:
+            return PipelineResult(success=False, output_type="image", error=f"Invalid input: {e}")
+
         if not self.is_loaded():
             return PipelineResult(
                 success=False, output_type="image",
                 error="No model loaded."
             )
 
-        prompt = kwargs.get("prompt", "")
-        negative_prompt = kwargs.get("negative_prompt", "")
-        width = kwargs.get("width", 512)
-        height = kwargs.get("height", 512)
-        num_steps = kwargs.get("num_steps", 30)
-        guidance_scale = kwargs.get("guidance_scale", 7.5)
-        seed = kwargs.get("seed", -1)
-        output_path = kwargs.get("output_path", None)
-
-        if not prompt:
+        if not params.prompt:
             return PipelineResult(
                 success=False, output_type="image",
                 error="Prompt is required."
@@ -151,18 +149,18 @@ class ImageGenerationPipeline(BasePipeline):
 
         try:
             generator = None
-            if seed >= 0:
-                generator = torch.Generator(device="cpu").manual_seed(seed)
+            if params.seed >= 0:
+                generator = torch.Generator(device="cpu").manual_seed(params.seed)
 
             gen_kwargs = {
-                "prompt": prompt,
-                "num_inference_steps": num_steps,
-                "guidance_scale": guidance_scale,
-                "width": width,
-                "height": height,
+                "prompt": params.prompt,
+                "num_inference_steps": params.num_steps,
+                "guidance_scale": params.guidance_scale,
+                "width": params.width,
+                "height": params.height,
             }
-            if negative_prompt:
-                gen_kwargs["negative_prompt"] = negative_prompt
+            if params.negative_prompt:
+                gen_kwargs["negative_prompt"] = params.negative_prompt
             if generator:
                 gen_kwargs["generator"] = generator
 
@@ -170,22 +168,23 @@ class ImageGenerationPipeline(BasePipeline):
             image = result.images[0]
 
             # Save if path provided
-            if output_path:
-                os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-                image.save(output_path)
+            if params.output_path:
+                os.makedirs(os.path.dirname(params.output_path) or ".", exist_ok=True)
+                image.save(params.output_path)
 
             return PipelineResult(
                 success=True,
                 output_type="image",
                 content=image,
                 metadata={
-                    "prompt": prompt,
-                    "width": width,
-                    "height": height,
-                    "steps": num_steps,
-                    "seed": seed,
-                    "saved_to": output_path,
+                    "prompt": params.prompt,
+                    "width": params.width,
+                    "height": params.height,
+                    "steps": params.num_steps,
+                    "seed": params.seed,
+                    "saved_to": params.output_path,
                 },
+                backend="transformers",
             )
 
         except Exception as e:
