@@ -233,6 +233,9 @@ class AudioPipeline(BasePipeline):
 
     def _run_stt(self, **kwargs) -> PipelineResult:
         """Speech-to-text recognition. Accepts audio or video input."""
+        import soundfile as sf
+        import numpy as np
+
         audio_path = kwargs.get("audio_path", "")
 
         if not audio_path or not os.path.isfile(audio_path):
@@ -241,15 +244,31 @@ class AudioPipeline(BasePipeline):
                 error=f"Audio file not found: {audio_path}"
             )
 
+        ext = os.path.splitext(audio_path)[1].lower()
+        source_is_video = ext in _VIDEO_EXTS
+        needs_ffmpeg = source_is_video or ext not in {".wav", ".flac", ".ogg"}
+
         temp_wav = None
-        input_path = audio_path
-        source_is_video = os.path.splitext(audio_path)[1].lower() in _VIDEO_EXTS
-        if source_is_video:
+        load_path = audio_path
+        if needs_ffmpeg:
             temp_wav = _extract_audio_from_video(audio_path)
-            input_path = temp_wav
+            load_path = temp_wav
 
         try:
-            result = self.pipe(input_path)
+            audio_array, sr = sf.read(load_path, dtype="float32")
+            if audio_array.ndim > 1:
+                audio_array = audio_array.mean(axis=1).astype(np.float32)
+            result = self.pipe(
+                {"raw": audio_array, "sampling_rate": sr},
+                return_timestamps=True,
+                generate_kwargs={
+                    "language": "en",
+                    "task": "transcribe",
+                    "condition_on_prev_tokens": False,
+                    "no_speech_threshold": 0.6,
+                    "compression_ratio_threshold": 2.4,
+                },
+            )
             text = result.get("text", "")
         finally:
             if temp_wav:
