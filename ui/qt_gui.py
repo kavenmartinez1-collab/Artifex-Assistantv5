@@ -95,8 +95,11 @@ at load. Below is what works for each mode.</p>
 
 <h3>Vision</h3>
 <p><b>Type:</b> Multimodal vision-language model. Use the
-<b>transformers</b> backend.</p>
+<b>transformers</b> backend.
+<i>Image or video files are accepted</i> &mdash; video requires
+<code>qwen-vl-utils</code> (<code>pip install 'qwen-vl-utils[decord]'</code>).</p>
 <ul>
+  <li><code>Qwen/Qwen3-VL-Instruct</code></li>
   <li><code>Qwen/Qwen2.5-VL-7B-Instruct</code></li>
   <li><code>llava-hf/llava-1.5-7b-hf</code></li>
   <li><code>google/gemma-3-4b-it</code> (vision-capable variants)</li>
@@ -484,6 +487,41 @@ class ArtifexMainWindow(QMainWindow):
 
         input_layout.addLayout(ctrl_layout)
 
+        # Vision-mode video sampling controls — blank = auto-plan based on
+        # video length + free RAM. Hidden unless mode == "Vision".
+        self._vision_ctrl = QWidget()
+        vision_layout = QHBoxLayout(self._vision_ctrl)
+        vision_layout.setContentsMargins(0, 0, 0, 0)
+        vision_layout.addWidget(QLabel("Frames:"))
+        self._vision_nframes = QLineEdit()
+        self._vision_nframes.setMaximumWidth(60)
+        self._vision_nframes.setPlaceholderText("auto")
+        self._vision_nframes.setToolTip(
+            "Fixed number of frames to sample from the video. "
+            "Blank = auto (based on video length + free RAM)."
+        )
+        vision_layout.addWidget(self._vision_nframes)
+
+        vision_layout.addWidget(QLabel("FPS:"))
+        self._vision_fps = QLineEdit()
+        self._vision_fps.setMaximumWidth(60)
+        self._vision_fps.setPlaceholderText("auto")
+        self._vision_fps.setToolTip(
+            "Uniform sampling rate. Overrides Frames. Blank = auto."
+        )
+        vision_layout.addWidget(self._vision_fps)
+
+        vision_layout.addWidget(QLabel("Max px:"))
+        self._vision_max_pixels = QLineEdit()
+        self._vision_max_pixels.setMaximumWidth(80)
+        self._vision_max_pixels.setPlaceholderText(str(360 * 420))
+        self._vision_max_pixels.setToolTip(
+            "Per-frame pixel cap after resize. Lower = less VRAM, worse OCR."
+        )
+        vision_layout.addWidget(self._vision_max_pixels)
+        vision_layout.addStretch()
+        input_layout.addWidget(self._vision_ctrl)
+
         # Mode hint bar — contextual instructions
         self._hint_label = QLabel("")
         self._hint_label.setStyleSheet(
@@ -686,6 +724,7 @@ class ArtifexMainWindow(QMainWindow):
             "Image Gen", "Vision", "Image Edit"
         })
         self._mic_recorder.setVisible(mode in {"Audio STT", "Voice Assistant"})
+        self._vision_ctrl.setVisible(mode == "Vision")
 
         # Update hint text
         hints = {
@@ -693,7 +732,7 @@ class ArtifexMainWindow(QMainWindow):
             "Code": "Describe what you want to build, then EXECUTE",
             "Image Gen": "Describe the image you want to generate",
             "Image Edit": "Drop an image above, then describe the edit",
-            "Vision": "Drop an image above, then ask a question about it",
+            "Vision": "Drop an image or video above, then ask a question about it",
             "3D (ShapE)": "Describe a 3D object to generate",
             "Audio TTS": "Type text to convert to speech",
             "Audio STT": "Record or drop an audio file to transcribe",
@@ -849,8 +888,33 @@ class ArtifexMainWindow(QMainWindow):
         elif mode == "Vision":
             files = self._drop_zone.attached_files
             if files:
-                kwargs = {"image_path": files[0], "prompt": prompt or "Describe this image in detail.",
-                          "max_tokens": 512}
+                try:
+                    max_tokens = int(self._tokens_input.text() or "512")
+                except ValueError:
+                    max_tokens = 512
+                kwargs = {"image_path": files[0],
+                          "prompt": prompt or "Describe what is happening in detail.",
+                          "max_tokens": max_tokens}
+
+                # Video sampling overrides — blank fields leave auto-planning active.
+                nframes_text = self._vision_nframes.text().strip()
+                if nframes_text:
+                    try:
+                        kwargs["nframes"] = int(nframes_text)
+                    except ValueError:
+                        pass
+                fps_text = self._vision_fps.text().strip()
+                if fps_text:
+                    try:
+                        kwargs["fps"] = float(fps_text)
+                    except ValueError:
+                        pass
+                pixels_text = self._vision_max_pixels.text().strip()
+                if pixels_text:
+                    try:
+                        kwargs["max_pixels"] = int(pixels_text)
+                    except ValueError:
+                        pass
         elif mode == "3D (ShapE)":
             kwargs = {"prompt": prompt, "num_steps": 64}
         elif mode == "Audio TTS":
