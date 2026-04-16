@@ -78,6 +78,88 @@ _PROMPT_MODES = {"Chat", "Code", "Image Gen", "Image Edit", "Vision",
                  "Voice Assistant"}
 
 
+_MODEL_GUIDE_HTML = """
+<h2>Choosing a model for each pipeline</h2>
+<p>Each pipeline mode expects a specific kind of model. Picking the wrong type
+(for example, a text LLM for Audio STT, or a TTS voice for Vision) will fail
+at load. Below is what works for each mode.</p>
+
+<h3>Chat / Code</h3>
+<p><b>Type:</b> Text LLM &mdash; works on either backend.</p>
+<ul>
+  <li><b>Ollama:</b> <code>qwen3.5:9b</code>, <code>qwen3.5-27b-iq2xxs</code>,
+      <code>gemma4</code>, <code>llama3.2</code></li>
+  <li><b>Transformers:</b> any HF causal LM, e.g.
+      <code>Qwen/Qwen2.5-7B-Instruct</code></li>
+</ul>
+
+<h3>Vision</h3>
+<p><b>Type:</b> Multimodal vision-language model. Use the
+<b>transformers</b> backend.</p>
+<ul>
+  <li><code>Qwen/Qwen2.5-VL-7B-Instruct</code></li>
+  <li><code>llava-hf/llava-1.5-7b-hf</code></li>
+  <li><code>google/gemma-3-4b-it</code> (vision-capable variants)</li>
+</ul>
+
+<h3>Image Gen / Image Edit</h3>
+<p><b>Type:</b> Diffusion model (Stable Diffusion / FLUX). Use
+<b>transformers</b> backend.</p>
+<ul>
+  <li><code>stabilityai/stable-diffusion-xl-base-1.0</code></li>
+  <li><code>runwayml/stable-diffusion-v1-5</code></li>
+  <li><code>black-forest-labs/FLUX.1-schnell</code></li>
+</ul>
+
+<h3>3D (ShapE)</h3>
+<p><b>Type:</b> Hardcoded to <code>openai/shap-e</code>. No model selection
+needed; it downloads on first use.</p>
+
+<h3>Audio TTS (text &rarr; speech)</h3>
+<p><b>Type:</b> Text-to-speech model. Examples:</p>
+<ul>
+  <li><b>Piper</b> ONNX voices (already in your <code>models/piper-voices</code>)</li>
+  <li><code>suno/bark-small</code></li>
+  <li><code>microsoft/speecht5_tts</code></li>
+</ul>
+
+<h3>Audio STT (speech &rarr; text)</h3>
+<p><b>Type:</b> Whisper or wav2vec2 ASR model. Use <b>transformers</b> backend.
+<i>Audio or video files are accepted</i> &mdash; video audio tracks are auto-extracted.</p>
+<ul>
+  <li><code>openai/whisper-small</code> (good default, ~500&nbsp;MB)</li>
+  <li><code>openai/whisper-base</code> (smaller, faster)</li>
+  <li><code>openai/whisper-large-v3</code> (best quality)</li>
+  <li><code>Systran/faster-whisper-base.en</code> (CTranslate2-optimized, fast)</li>
+</ul>
+<p><b>Note:</b> Piper voices and text LLMs <b>cannot</b> transcribe audio.</p>
+
+<h3>Music Gen</h3>
+<p><b>Type:</b> MusicGen. Use <b>transformers</b> backend.</p>
+<ul>
+  <li><code>facebook/musicgen-small</code></li>
+  <li><code>facebook/musicgen-medium</code></li>
+</ul>
+
+<h3>Video Gen</h3>
+<p><b>Type:</b> Text-to-video diffusion. Use <b>transformers</b> backend.</p>
+<ul>
+  <li><code>THUDM/CogVideoX-2b</code></li>
+  <li><code>damo-vilab/text-to-video-ms-1.7b</code></li>
+</ul>
+
+<h3>Voice Assistant</h3>
+<p>Bundled pipeline: uses <b>faster-whisper</b> for STT and <b>Piper</b> for TTS
+internally. The model dropdown here only picks the <i>LLM</i> &mdash; any
+text model from the Chat list works.</p>
+
+<hr>
+<p style="color:#888"><i>Tip: if a download is required, the model fetches
+on first use from Hugging Face. Make sure you have a working internet connection
+the first time you run a new pipeline.</i></p>
+"""
+
+
 def _dedupe_actions(actions):
     """Remove duplicate AgentActions by (type, content) identity.
 
@@ -209,6 +291,13 @@ class ArtifexMainWindow(QMainWindow):
         self._ctx_btn = QPushButton(f"CTX: {get_context_profile_name()}")
         self._ctx_btn.setProperty("class", "secondary")
         bg_layout.addWidget(self._ctx_btn)
+
+        self._model_help_btn = QPushButton("Help choose model")
+        self._model_help_btn.setProperty("class", "secondary")
+        self._model_help_btn.setToolTip(
+            "Show which kinds of models work for each pipeline (Chat, Vision, STT, etc.)"
+        )
+        bg_layout.addWidget(self._model_help_btn)
 
         layout.addWidget(backend_group)
 
@@ -459,6 +548,7 @@ class ArtifexMainWindow(QMainWindow):
         self._backend_combo.currentTextChanged.connect(self._on_backend_changed)
         self._model_combo.currentTextChanged.connect(self._on_model_changed)
         self._ctx_btn.clicked.connect(self._on_ctx_toggle)
+        self._model_help_btn.clicked.connect(self._on_help_choose_model)
 
         # Optimizations
         self._torch_compile_cb.toggled.connect(
@@ -561,6 +651,26 @@ class ArtifexMainWindow(QMainWindow):
         self._ctx_btn.setText(f"CTX: {new}")
         profile = get_context_profile()
         self._tokens_input.setText(str(profile.max_output_tokens))
+
+    def _on_help_choose_model(self):
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTextBrowser, QDialogButtonBox
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Help choose a model for each pipeline")
+        dlg.resize(640, 560)
+        layout = QVBoxLayout(dlg)
+
+        browser = QTextBrowser(dlg)
+        browser.setOpenExternalLinks(True)
+        browser.setHtml(_MODEL_GUIDE_HTML)
+        layout.addWidget(browser)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dlg)
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+
+        dlg.exec()
 
     # ═══════════════════════════════════════════════════════════════════
     # MODE SWITCHING

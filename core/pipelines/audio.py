@@ -5,10 +5,40 @@ Text-to-speech (TTS) and speech-to-text (STT) using transformers.
 
 import gc
 import os
+import subprocess
+import tempfile
 
 import torch
 
 from core.pipelines.base import BasePipeline, PipelineResult
+
+_VIDEO_EXTS = {".mp4", ".avi", ".webm", ".mov", ".mkv", ".m4v", ".flv", ".wmv"}
+
+
+def _extract_audio_from_video(video_path: str) -> str:
+    """Extract a 16kHz mono WAV from a video file. Returns the temp WAV path."""
+    import imageio_ffmpeg
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
+    fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="artifex_stt_")
+    os.close(fd)
+
+    proc = subprocess.run(
+        [ffmpeg, "-y", "-i", video_path,
+         "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", wav_path],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0 or not os.path.getsize(wav_path):
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
+        stderr_tail = (proc.stderr or "").strip().splitlines()[-3:]
+        raise RuntimeError(
+            "Failed to extract audio from video "
+            f"(does it have an audio track?): {' | '.join(stderr_tail)}"
+        )
+    return wav_path
 
 
 class AudioPipeline(BasePipeline):
@@ -202,7 +232,7 @@ class AudioPipeline(BasePipeline):
         )
 
     def _run_stt(self, **kwargs) -> PipelineResult:
-        """Speech-to-text recognition."""
+        """Speech-to-text recognition. Accepts audio or video input."""
         audio_path = kwargs.get("audio_path", "")
 
         if not audio_path or not os.path.isfile(audio_path):
@@ -211,14 +241,32 @@ class AudioPipeline(BasePipeline):
                 error=f"Audio file not found: {audio_path}"
             )
 
-        result = self.pipe(audio_path)
-        text = result.get("text", "")
+        temp_wav = None
+        input_path = audio_path
+        source_is_video = os.path.splitext(audio_path)[1].lower() in _VIDEO_EXTS
+        if source_is_video:
+            temp_wav = _extract_audio_from_video(audio_path)
+            input_path = temp_wav
+
+        try:
+            result = self.pipe(input_path)
+            text = result.get("text", "")
+        finally:
+            if temp_wav:
+                try:
+                    os.unlink(temp_wav)
+                except OSError:
+                    pass
+
+        meta = {"audio_path": audio_path}
+        if source_is_video:
+            meta["extracted_from_video"] = True
 
         return PipelineResult(
             success=True,
             output_type="text",
             content=text,
-            metadata={"audio_path": audio_path},
+            metadata=meta,
         )
 
     def get_vram_estimate(self, model_path: str) -> float:
@@ -231,4 +279,5 @@ class AudioPipeline(BasePipeline):
         caps = super().get_capabilities()
         caps["modes"] = ["tts", "stt"]
         caps["audio_formats"] = ["wav", "mp3", "flac"]
+        caps["stt_video_formats"] = sorted(e.lstrip(".") for e in _VIDEO_EXTS)
         return caps
