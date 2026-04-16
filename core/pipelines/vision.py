@@ -219,15 +219,20 @@ class VisionPipeline(BasePipeline):
         Returns:
             PipelineResult with text description
         """
+        from core.pipelines.schemas import VisionInput
+        from pydantic import ValidationError
+        try:
+            params = VisionInput(**kwargs)
+        except ValidationError as e:
+            return PipelineResult(success=False, output_type="text", error=f"Invalid input: {e}")
+
         if not self.is_loaded():
             return PipelineResult(
                 success=False, output_type="text",
                 error="No model loaded."
             )
 
-        media_path = kwargs.pop("image_path", "") or kwargs.pop("video_path", "")
-        prompt = kwargs.pop("prompt", "Describe what is happening in detail.")
-        max_tokens = kwargs.pop("max_tokens", 512)
+        media_path = params.image_path
 
         if not media_path or not os.path.isfile(media_path):
             return PipelineResult(
@@ -239,8 +244,11 @@ class VisionPipeline(BasePipeline):
 
         try:
             if is_video:
-                return self._run_video(media_path, prompt, max_tokens, **kwargs)
-            return self._run_image(media_path, prompt, max_tokens)
+                return self._run_video(
+                    media_path, params.prompt, params.max_tokens,
+                    nframes=params.nframes, fps=params.fps, max_pixels=params.max_pixels,
+                )
+            return self._run_image(media_path, params.prompt, params.max_tokens)
         except Exception as e:
             return PipelineResult(
                 success=False, output_type="text",
@@ -274,6 +282,7 @@ class VisionPipeline(BasePipeline):
             success=True, output_type="text",
             content=response.strip(),
             metadata={"image_path": image_path, "prompt": prompt},
+            backend="transformers",
         )
 
     def _run_video(self, video_path: str, prompt: str, max_tokens: int, **kwargs) -> PipelineResult:
@@ -353,6 +362,7 @@ class VisionPipeline(BasePipeline):
                 "nframes": nframes,
                 "max_pixels": max_pixels,
             },
+            backend="transformers",
         )
 
     def get_vram_estimate(self, model_path: str) -> float:

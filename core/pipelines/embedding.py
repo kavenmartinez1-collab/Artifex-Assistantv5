@@ -101,37 +101,39 @@ class EmbeddingPipeline(BasePipeline):
               - If texts: content = numpy array of embeddings
               - If query + corpus_embeddings: content = list of (score, index) tuples
         """
+        from core.pipelines.schemas import EmbeddingInput
+        from pydantic import ValidationError
+        try:
+            params = EmbeddingInput(**kwargs)
+        except ValidationError as e:
+            return PipelineResult(success=False, output_type="embedding", error=f"Invalid input: {e}")
+
         if not self.is_loaded():
             return PipelineResult(
                 success=False, output_type="embedding",
                 error="No model loaded."
             )
 
-        texts = kwargs.get("texts", [])
-        query = kwargs.get("query", "")
-        corpus_embeddings = kwargs.get("corpus_embeddings", None)
-        top_k = kwargs.get("top_k", 5)
-
         try:
-            if texts:
-                embeddings = self._encode(texts)
+            if params.texts:
+                embeddings = self._encode(params.texts)
                 return PipelineResult(
                     success=True,
                     output_type="embedding",
                     content=embeddings,
-                    metadata={"count": len(texts), "dim": embeddings.shape[1]},
+                    metadata={"count": len(params.texts), "dim": embeddings.shape[1]},
                 )
 
-            if query and corpus_embeddings is not None:
-                query_emb = self._encode([query])
-                scores = self._cosine_similarity(query_emb, corpus_embeddings)[0]
-                top_indices = np.argsort(scores)[::-1][:top_k]
+            if params.query and params.corpus_embeddings is not None:
+                query_emb = self._encode([params.query])
+                scores = self._cosine_similarity(query_emb, params.corpus_embeddings)[0]
+                top_indices = np.argsort(scores)[::-1][:params.top_k]
                 results = [(float(scores[i]), int(i)) for i in top_indices]
                 return PipelineResult(
                     success=True,
                     output_type="embedding",
                     content=results,
-                    metadata={"query": query, "top_k": top_k},
+                    metadata={"query": params.query, "top_k": params.top_k},
                 )
 
             return PipelineResult(

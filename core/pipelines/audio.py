@@ -180,6 +180,13 @@ class AudioPipeline(BasePipeline):
         Returns:
             PipelineResult with audio path (TTS) or text (STT)
         """
+        from core.pipelines.schemas import AudioInput
+        from pydantic import ValidationError
+        try:
+            params = AudioInput(**kwargs)
+        except ValidationError as e:
+            return PipelineResult(success=False, output_type="audio", error=f"Invalid input: {e}")
+
         if not self.is_loaded():
             return PipelineResult(
                 success=False, output_type="audio",
@@ -188,9 +195,9 @@ class AudioPipeline(BasePipeline):
 
         try:
             if self._mode == "stt":
-                return self._run_stt(**kwargs)
+                return self._run_stt(params)
             else:
-                return self._run_tts(**kwargs)
+                return self._run_tts(params)
         except Exception as e:
             return PipelineResult(
                 success=False,
@@ -198,10 +205,10 @@ class AudioPipeline(BasePipeline):
                 error=str(e),
             )
 
-    def _run_tts(self, **kwargs) -> PipelineResult:
+    def _run_tts(self, params) -> PipelineResult:
         """Text-to-speech generation."""
-        text = kwargs.get("text", "")
-        output_path = kwargs.get("output_path", None)
+        text = params.text
+        output_path = params.output_path
 
         if not text:
             return PipelineResult(
@@ -231,12 +238,12 @@ class AudioPipeline(BasePipeline):
             metadata={"text": text, "sampling_rate": sampling_rate},
         )
 
-    def _run_stt(self, **kwargs) -> PipelineResult:
+    def _run_stt(self, params) -> PipelineResult:
         """Speech-to-text recognition. Accepts audio or video input."""
         import soundfile as sf
         import numpy as np
 
-        audio_path = kwargs.get("audio_path", "")
+        audio_path = params.audio_path
 
         if not audio_path or not os.path.isfile(audio_path):
             return PipelineResult(

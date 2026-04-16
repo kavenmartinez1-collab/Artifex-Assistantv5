@@ -121,45 +121,45 @@ class ImageEditPipeline(BasePipeline):
         Returns:
             PipelineResult with output image path
         """
+        from core.pipelines.schemas import ImageEditInput
+        from pydantic import ValidationError
+        try:
+            params = ImageEditInput(**kwargs)
+        except ValidationError as e:
+            return PipelineResult(success=False, output_type="image", error=f"Invalid input: {e}")
+
         if not self.is_loaded():
             return PipelineResult(
                 success=False, output_type="image",
                 error="No model loaded."
             )
 
-        image_path = kwargs.get("image_path", "")
-        prompt = kwargs.get("prompt", "")
-        negative_prompt = kwargs.get("negative_prompt", "")
-        mask_path = kwargs.get("mask_path", "")
-        strength = kwargs.get("strength", 0.75)
-        num_steps = kwargs.get("num_steps", 30)
-        guidance_scale = kwargs.get("guidance_scale", 7.5)
-        output_path = kwargs.get("output_path", None)
-
-        if not image_path or not os.path.isfile(image_path):
+        if not params.image_path or not os.path.isfile(params.image_path):
             return PipelineResult(
                 success=False, output_type="image",
-                error=f"Image not found: {image_path}"
+                error=f"Image not found: {params.image_path}"
             )
+
+        output_path = params.output_path
 
         try:
             from PIL import Image
-            source = Image.open(image_path).convert("RGB")
+            source = Image.open(params.image_path).convert("RGB")
 
             gen_kwargs = {
-                "prompt": prompt,
+                "prompt": params.prompt,
                 "image": source,
-                "num_inference_steps": num_steps,
-                "guidance_scale": guidance_scale,
+                "num_inference_steps": params.num_steps,
+                "guidance_scale": params.guidance_scale,
             }
 
-            if negative_prompt:
-                gen_kwargs["negative_prompt"] = negative_prompt
+            if params.negative_prompt:
+                gen_kwargs["negative_prompt"] = params.negative_prompt
 
-            if self._mode == "inpaint" and mask_path and os.path.isfile(mask_path):
-                gen_kwargs["mask_image"] = Image.open(mask_path).convert("L")
+            if self._mode == "inpaint" and params.mask_path and os.path.isfile(params.mask_path):
+                gen_kwargs["mask_image"] = Image.open(params.mask_path).convert("L")
             elif self._mode != "upscale":
-                gen_kwargs["strength"] = strength
+                gen_kwargs["strength"] = params.strength
 
             result = self.pipe(**gen_kwargs)
             image = result.images[0]
@@ -167,7 +167,7 @@ class ImageEditPipeline(BasePipeline):
             # Save output
             if output_path is None:
                 os.makedirs("output", exist_ok=True)
-                base = os.path.splitext(os.path.basename(image_path))[0]
+                base = os.path.splitext(os.path.basename(params.image_path))[0]
                 output_path = os.path.join("output", f"{base}_{self._mode}.png")
 
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -179,9 +179,9 @@ class ImageEditPipeline(BasePipeline):
                 content=output_path,
                 metadata={
                     "mode": self._mode,
-                    "prompt": prompt,
-                    "strength": strength,
-                    "steps": num_steps,
+                    "prompt": params.prompt,
+                    "strength": params.strength,
+                    "steps": params.num_steps,
                 },
             )
 
