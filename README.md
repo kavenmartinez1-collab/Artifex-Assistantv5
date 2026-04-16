@@ -804,6 +804,28 @@ The engine detects `model_type: gemma3n` in `config.json` and automatically uses
 
 Gemma 4 also works via Ollama: `ollama pull gemma4:e4b`
 
+### Vision Pipeline — Images vs Video
+
+The Vision pipeline (`core/pipelines/vision.py`) auto-detects the input type by file extension and takes two distinct code paths. **Know which one you need before picking a model** — the two paths support different model families.
+
+**Image mode** (any `.jpg`, `.png`, `.webp`, `.bmp`):
+
+- Works with **any standard HuggingFace VLM** that ships an `AutoProcessor`: LLaVA, Qwen2-VL, Qwen2.5-VL, Qwen3-VL, Llama-3.2-Vision, Phi-3.5-Vision, InternVL, MiniCPM-V, Pixtral, SmolVLM, and more.
+- `_resolve_vlm_class()` reads `config.json` and picks the right Auto class (`AutoModelForImageTextToText`, `AutoModelForMultimodalLM` for Gemma-4, falling back to `AutoModelForVision2Seq` / `AutoModelForCausalLM`).
+- Single forward pass on the image + prompt. Returns a text description.
+
+**Video mode** (`.mp4`, `.avi`, `.webm`, `.mov`, `.mkv`, `.m4v`, `.flv`, `.wmv`):
+
+- **Qwen-VL family only** (Qwen2-VL, Qwen2.5-VL, Qwen3-VL). The video path uses `qwen_vl_utils.process_vision_info` and Qwen's message schema with native temporal reasoning. Other VLMs are not supported for video here — drop an image instead or extract frames manually.
+- Requires `qwen-vl-utils[decord]`: `pip install 'qwen-vl-utils[decord]'`
+- **Auto-sampling**: if the GUI/API doesn't specify `nframes` or `fps`, `_plan_video_sampling()` probes the video's duration + resolution and free host RAM, then picks a frame count that fits a memory budget (25% of free RAM, clamped 512 MB–2 GB). Targets roughly 1 frame per 20 s, floor 8 frames, ceiling 128. Prints the decision to console: `[vision] auto-sample: 36 frames from 722s 1920x1080 video (~1/20.1s, budget 2048 MB)`.
+- **Manual overrides**: the GUI Vision mode exposes three inputs — **Frames** (fixed count), **FPS** (uniform sampling rate, wins over Frames if both set), **Max px** (per-frame pixel cap after resize, default 360×420). Leave blank for auto.
+- Long videos on RAM-constrained machines should favor higher **Frames** counts over higher **FPS** — decord decodes raw frames at native resolution into host RAM before resizing, so per-frame cost is `width × height × 3` bytes.
+
+**Why not Ollama for video?** Ollama supports image VLMs (Qwen2-VL, LLaVA, Llama-3.2-Vision) but doesn't stream video natively — you'd have to pre-extract frames and send each as an image, losing the model's temporal reasoning. This is why the transformers backend exists as an escape hatch: images can go either backend, video must go through transformers.
+
+**Loader note for Qwen3-VL on Windows**: transformers 5.2.0's meta-tensor `_materialize_copy` path segfaults on Qwen3-VL-8B+ on Windows (`device_map="auto"` and `device_map={"": "cuda:0"}` both crash at `torch.storage.__getitem__`). The pipeline uses the classic load path (no `device_map`, no `low_cpu_mem_usage`) for GPUs ≥20 GB, which stages weights to host RAM before moving to GPU. Budget ~2× the model's disk size in free host commit for Qwen3-VL-8B (~19 GB), or use **Qwen3-VL-4B-Instruct** which stages comfortably in ~9 GB. Qwen2.5-VL loads via the standard meta-tensor path without issue.
+
 ### Shared Service Layer
 
 All pipelines are accessed through a shared `MultimodalService` layer (`core/services/`) used by the GUI, CLI, and API. This provides:
