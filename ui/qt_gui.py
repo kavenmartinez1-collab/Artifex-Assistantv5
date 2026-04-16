@@ -39,8 +39,8 @@ from ui.qt_workers import GenerationWorker, PipelineWorker, ActionWorker, TokenB
 
 from core.config import (
     MODES, get_active_backend, set_active_backend, get_model_names,
-    get_active_model_name, set_active_model, get_context_profile,
-    get_context_profile_name, set_context_profile,
+    get_active_model_name, get_active_model_path, set_active_model,
+    get_context_profile, get_context_profile_name, set_context_profile,
     get_torch_compile, set_torch_compile, get_turboquant_kv, set_turboquant_kv,
     BASE_DIR,
 )
@@ -816,8 +816,10 @@ class ArtifexMainWindow(QMainWindow):
         self._progress_bar.setVisible(True)
         self._progress_bar.setRange(0, 0)  # Indeterminate
 
+        model_path = get_active_model_path() if get_active_backend() == "transformers" else ""
+
         worker = PipelineWorker(
-            svc, pipeline_type, kwargs=kwargs,
+            svc, pipeline_type, model_path=model_path, kwargs=kwargs,
             cancel_event=self._cancel_event,
         )
         worker.progress.connect(self._on_pipeline_progress)
@@ -961,8 +963,14 @@ class ArtifexMainWindow(QMainWindow):
         self._response_batcher.flush_now()
         self._thinking_batcher.flush_now()
 
+        _log.error("Pipeline/generation error: %s", error_msg)
+
         if self._current_bubble:
             self._current_bubble.append_text(f"\n\nERROR: {error_msg}")
+        else:
+            bubble = self._chat_view.add_bubble("assistant")
+            bubble.add_text(f"ERROR: {error_msg}")
+            self._chat_view.scroll_to_bottom()
         self._finish_busy("ERROR")
 
     def _on_pipeline_progress(self, current, total, message):
