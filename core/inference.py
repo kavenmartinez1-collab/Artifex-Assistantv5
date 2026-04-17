@@ -28,20 +28,21 @@ class ThinkFilter:
     """
     Splits streaming model output into thinking and response content.
 
-    Qwen3.5 with enable_thinking=True starts generation inside a <think> block
-    (the opening <think> tag is in the prompt, not the output). So streamed
-    output begins with thinking content, followed by </think>, then the response.
+    Transformers models (Qwen3.5 with enable_thinking=True) start generation
+    inside a <think> block — use starts_in_think=True. Ollama wraps thinking
+    in explicit <think>...</think> tags in the stream — use starts_in_think=False.
 
     Usage:
-        tf = ThinkFilter(on_response=print, on_thinking=debug_print)
+        tf = ThinkFilter(on_response=print, on_thinking=debug_print,
+                         starts_in_think=False)  # for Ollama
         engine.generate_streaming(..., on_token=tf.feed)
         tf.flush()  # after streaming completes
     """
 
-    def __init__(self, on_response, on_thinking=None):
+    def __init__(self, on_response, on_thinking=None, starts_in_think=True):
         self.on_response = on_response
         self.on_thinking = on_thinking
-        self.in_think = True  # Generation starts inside <think> block
+        self.in_think = starts_in_think
         self.buffer = ""
 
     def feed(self, text):

@@ -66,6 +66,7 @@ class OllamaEngine(BaseEngine):
         self._loaded = False
         self._num_gpu = None
         self._model_size_gb = None
+        self._thinking_supported = True
 
     # =========================================================================
     # BaseEngine — LIFECYCLE
@@ -75,6 +76,7 @@ class OllamaEngine(BaseEngine):
         """Verify that Ollama is running, the model exists, and resolve GPU layer count."""
         if self._loaded:
             return
+        self._thinking_supported = True
 
         if status_callback:
             status_callback(f"Connecting to Ollama ({self.base_url})...")
@@ -182,7 +184,7 @@ class OllamaEngine(BaseEngine):
             "options": options,
         }
 
-        payload["think"] = bool(enable_thinking)
+        payload["think"] = bool(enable_thinking) and self._thinking_supported
 
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -239,6 +241,13 @@ class OllamaEngine(BaseEngine):
 
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8", errors="replace")
+            if e.code == 400 and "does not support thinking" in error_body:
+                self._thinking_supported = False
+                return self.generate_streaming(
+                    messages, max_tokens=max_tokens, temperature=temperature,
+                    on_token=on_token, on_complete=on_complete,
+                    enable_thinking=False,
+                )
             raise RuntimeError(
                 f"Ollama API error ({e.code}): {error_body}"
             )

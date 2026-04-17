@@ -101,9 +101,13 @@ class GenerationWorker(QThread):
                 self._thinking_text += t
                 self.thinking_received.emit(t)
 
+            from core.engine_ollama import OllamaEngine
+            starts_in_think = self.enable_thinking and not isinstance(self.engine, OllamaEngine)
+
             tf = ThinkFilter(
                 on_response=lambda t: self.response_received.emit(t),
                 on_thinking=_on_thinking,
+                starts_in_think=starts_in_think,
             )
 
             def on_token(text):
