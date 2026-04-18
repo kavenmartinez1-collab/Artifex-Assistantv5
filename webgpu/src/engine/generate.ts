@@ -126,25 +126,86 @@ function sampleFromLogits(
     return maxIdx;
   }
 
-  // Apply temperature
+  // ── PERF (Step 2): top-K via heap, not full sort ─────────────────────
+  // Old code allocated ~vocabSize two-element arrays and sorted the entire
+  // vocabulary just to keep the top-K. With vocab=248,320 this measured at
+  // ~80ms/token (22% of total decode time). The replacement uses a min-heap
+  // of size K over typed arrays — O(N log K) with zero per-element allocation.
+  // Temperature is also deferred until AFTER top-K so we don't pay the
+  // multiply for the ~99.98% of vocab entries that get discarded.
+  //
+  // Old (full-sort) implementation kept here for easy revert:
+  // const invTemp = 1.0 / config.temperature;
+  // for (let i = 0; i < vocabSize; i++) logits[i] *= invTemp;
+  // const indexed: Array<[number, number]> = [];
+  // for (let i = 0; i < vocabSize; i++) indexed.push([i, logits[i]]);
+  // indexed.sort((a, b) => b[1] - a[1]);
+  // let candidates = indexed;
+  // if (config.topK > 0 && config.topK < vocabSize) candidates = candidates.slice(0, config.topK);
+
+  // Resolve effective K: clamp to vocab and treat <=0 as "no limit" (full vocab)
+  const k = (config.topK > 0 && config.topK < vocabSize) ? config.topK : vocabSize;
+
+  // Heap-based top-K. Min-heap so root holds the smallest survivor; any new
+  // candidate larger than root replaces it and we sift down.
+  const topIdx = new Int32Array(k);
+  const topVal = new Float32Array(k);
+  // Seed heap with first K logits in heap order (we just fill then heapify).
+  for (let i = 0; i < k; i++) { topIdx[i] = i; topVal[i] = logits[i]; }
+  // Heapify (Floyd's algorithm) — siftDown from last parent to root.
+  for (let parent = (k >>> 1) - 1; parent >= 0; parent--) {
+    let p = parent;
+    while (true) {
+      const l = (p << 1) + 1; if (l >= k) break;
+      const r = l + 1;
+      let smallest = p;
+      if (topVal[l] < topVal[smallest]) smallest = l;
+      if (r < k && topVal[r] < topVal[smallest]) smallest = r;
+      if (smallest === p) break;
+      const tv = topVal[p]; topVal[p] = topVal[smallest]; topVal[smallest] = tv;
+      const ti = topIdx[p]; topIdx[p] = topIdx[smallest]; topIdx[smallest] = ti;
+      p = smallest;
+    }
+  }
+  // Stream remaining logits; replace heap root whenever we find a bigger one.
+  for (let i = k; i < vocabSize; i++) {
+    const v = logits[i];
+    if (v > topVal[0]) {
+      topVal[0] = v;
+      topIdx[0] = i;
+      // siftDown root
+      let p = 0;
+      while (true) {
+        const l = (p << 1) + 1; if (l >= k) break;
+        const r = l + 1;
+        let smallest = p;
+        if (topVal[l] < topVal[smallest]) smallest = l;
+        if (r < k && topVal[r] < topVal[smallest]) smallest = r;
+        if (smallest === p) break;
+        const tv = topVal[p]; topVal[p] = topVal[smallest]; topVal[smallest] = tv;
+        const ti = topIdx[p]; topIdx[p] = topIdx[smallest]; topIdx[smallest] = ti;
+        p = smallest;
+      }
+    }
+  }
+  // Sort the K survivors descending so top-P (cumulative) works in order.
+  // K is small (default 50), so a tiny indirect sort is fine.
+  const order = new Int32Array(k);
+  for (let i = 0; i < k; i++) order[i] = i;
+  // Simple insertion sort — K=50 → ~1250 comparisons, negligible.
+  for (let i = 1; i < k; i++) {
+    const oi = order[i]; const v = topVal[oi];
+    let j = i - 1;
+    while (j >= 0 && topVal[order[j]] < v) { order[j + 1] = order[j]; j--; }
+    order[j + 1] = oi;
+  }
+  // Materialize candidates in the same [idx, logit] shape the rest of the
+  // function expects, applying temperature now (only on K elements, not 248K).
   const invTemp = 1.0 / config.temperature;
-  for (let i = 0; i < vocabSize; i++) {
-    logits[i] *= invTemp;
-  }
-
-  // Build (index, logit) pairs for sorting
-  const indexed: Array<[number, number]> = [];
-  for (let i = 0; i < vocabSize; i++) {
-    indexed.push([i, logits[i]]);
-  }
-
-  // Sort descending by logit
-  indexed.sort((a, b) => b[1] - a[1]);
-
-  // Top-k filtering
-  let candidates = indexed;
-  if (config.topK > 0 && config.topK < vocabSize) {
-    candidates = candidates.slice(0, config.topK);
+  let candidates: Array<[number, number]> = new Array(k);
+  for (let i = 0; i < k; i++) {
+    const o = order[i];
+    candidates[i] = [topIdx[o], topVal[o] * invTemp];
   }
 
   // Softmax on candidates
