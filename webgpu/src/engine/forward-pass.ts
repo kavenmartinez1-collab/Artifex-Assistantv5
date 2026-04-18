@@ -362,6 +362,15 @@ export function createForwardPassEngine(
   // Small buffer for extracting last token's hidden state (for LM head after batch prefill)
   const lastHiddenBuf = createStorageBuffer(device, null, H * 4, 'last-hidden', true);
 
+  // Option A (chunked-prefill for hybrid models): per-token scratch buffers used
+  // to wrap the existing single-token SSM block in a per-token JS loop while the
+  // surrounding non-SSM stages process seqLen > 1 tokens in batched fashion.
+  // ssmInputBuf holds one token-row sliced out of the multi-token normedBuf;
+  // ssmOutBuf holds the SSM block's output for one token before being copied
+  // into the multi-token attnProjBuf at that token's offset.
+  const ssmInputBuf = isHybrid ? createStorageBuffer(device, null, H * 4, 'ssm-input', true) : null;
+  const ssmOutBuf = isHybrid ? createStorageBuffer(device, null, H * 4, 'ssm-out', true) : null;
+
   // Linear attention intermediate buffers (only for hybrid models)
   const linQKVBuf = isHybrid ? createStorageBuffer(device, null, linQKVDim * 4, 'lin-qkv', true) : null;
   const linQBuf = isHybrid ? createStorageBuffer(device, null, linNKH * linKD * 4, 'lin-q', true) : null;
@@ -973,17 +982,28 @@ export function createForwardPassEngine(
         const hBuf = kvCache.ssmState.hiddenStates[ssmIdx];
         const csBuf = kvCache.ssmState.convStates[ssmIdx];
 
-        // Debug: normed input before projections
-        if (isDebug && l === 0) {
-          flushBatch();
-          await debugRead(normedBuf, 'L0-normed-input', 8);
-        }
+        // Option A (chunked-prefill): the gated DeltaNet recurrence is sequential
+        // by construction, but the surrounding stages (embed, full attention, FFN,
+        // final norm, lm_head) all support seqLen > 1. Wrap the existing single-
+        // token SSM block in a per-token JS loop so multi-token chunks work without
+        // changing any SSM/conv kernel. ssmInputBuf is the per-token slice of
+        // normedBuf; ssmOutBuf is the per-token output written back into
+        // attnProjBuf at offset ssmT*H*4 so downstream stages see all tokens.
+        for (let ssmT = 0; ssmT < seqLen; ssmT++) {
+          // Slice this token's normed input out of the multi-token buffer.
+          batchCopy(normedBuf, ssmT * H * 4, ssmInputBuf!, 0, H * 4);
 
-        // 1. Fused QKV projection
-        dispatchProjection(normedBuf, lw, 'linearInProjQKV', linQKVBuf!, 1, linQKVDim, H, `L${l}-lin-qkv`);
+          // Debug: normed input before projections (first token only to keep logs sane)
+          if (isDebug && l === 0 && ssmT === 0) {
+            flushBatch();
+            await debugRead(ssmInputBuf!, 'L0-normed-input', 8);
+          }
 
-        // Debug: raw QKV projection output (before conv1d)
-        if (isDebug && l === 0) {
+          // 1. Fused QKV projection
+          dispatchProjection(ssmInputBuf!, lw, 'linearInProjQKV', linQKVBuf!, 1, linQKVDim, H, `L${l}-lin-qkv`);
+
+        // Debug: raw QKV projection output (before conv1d) — first token only
+        if (isDebug && l === 0 && ssmT === 0) {
           flushBatch();
           await device.queue.onSubmittedWorkDone();
           // Read first 8 values of Q, K, V sections from the fused QKV buffer
@@ -1033,8 +1053,8 @@ export function createForwardPassEngine(
         batchCopy(linQKVBuf!, qSize, linKBuf!, 0, kSize);
         batchCopy(linQKVBuf!, qSize + kSize, linVBuf!, 0, vSize);
 
-        // Debug: conv1d output and silu output
-        if (isDebug && l === 0) {
+        // Debug: conv1d output and silu output — first token only
+        if (isDebug && l === 0 && ssmT === 0) {
           flushBatch();
           await device.queue.onSubmittedWorkDone();
           const qkvAfterSilu = new Float32Array(await readBuffer(device, linQKVBuf!, (4104) * 4));
@@ -1048,12 +1068,13 @@ export function createForwardPassEngine(
 
         // 4. Project A, B, Z (these use the ORIGINAL normed input, not conv output)
         // NOTE: in_proj_b output is num_v_heads (32), NOT num_k_heads (16)!
-        dispatchProjection(normedBuf, lw, 'linearInProjA', linABuf!, 1, linNVH, H, `L${l}-lin-a`);
-        dispatchProjection(normedBuf, lw, 'linearInProjB', linBBuf!, 1, linNVH, H, `L${l}-lin-b`);
-        dispatchProjection(normedBuf, lw, 'linearInProjZ', linZBuf!, 1, H, H, `L${l}-lin-z`);
+        // Option A: read from per-token slice ssmInputBuf instead of multi-token normedBuf.
+        dispatchProjection(ssmInputBuf!, lw, 'linearInProjA', linABuf!, 1, linNVH, H, `L${l}-lin-a`);
+        dispatchProjection(ssmInputBuf!, lw, 'linearInProjB', linBBuf!, 1, linNVH, H, `L${l}-lin-b`);
+        dispatchProjection(ssmInputBuf!, lw, 'linearInProjZ', linZBuf!, 1, H, H, `L${l}-lin-z`);
 
-        // Debug: A, B, Z projection outputs
-        if (isDebug && l === 0) {
+        // Debug: A, B, Z projection outputs — first token only
+        if (isDebug && l === 0 && ssmT === 0) {
           flushBatch();
           await device.queue.onSubmittedWorkDone();
           const aVals = new Float32Array(await readBuffer(device, linABuf!, 4 * 4));
@@ -1098,8 +1119,8 @@ export function createForwardPassEngine(
           ], `L${l}-l2norm-k`);
           bd(l2NormPipeline, [l2bgK], [workgroupCount(kDim, 256)], `L${l}-l2norm-k`);
 
-          // Debug: verify L2 norm actually wrote to output
-          if (isDebug && l === 0) {
+          // Debug: verify L2 norm actually wrote to output — first token only
+          if (isDebug && l === 0 && ssmT === 0) {
             flushBatch();
             await device.queue.onSubmittedWorkDone();
             const rawK = await readBuffer(device, linKBuf!, 8 * 4);
@@ -1120,8 +1141,8 @@ export function createForwardPassEngine(
           dispatchElementwise(decayPipeline, lw.linearALog, linDecayBuf!, linNVH, `L${l}-decay`, linDtBuf!);
         }
 
-        // Debug SSM intermediates (layer 0, first pass)
-        if (isDebug && l === 0) {
+        // Debug SSM intermediates (layer 0, first token only)
+        if (isDebug && l === 0 && ssmT === 0) {
           flushBatch();
           await device.queue.onSubmittedWorkDone();
           const betaRaw = await readBuffer(device, linBBuf!, linNKH * 4);
@@ -1168,8 +1189,8 @@ export function createForwardPassEngine(
             [linNKH], `L${l}-ssm-step`);
         }
 
-        // Debug SSM output (layer 0, first pass)
-        if (isDebug && l === 0) {
+        // Debug SSM output (layer 0, first token only)
+        if (isDebug && l === 0 && ssmT === 0) {
           flushBatch();
           await device.queue.onSubmittedWorkDone();
           const ssmOutRaw = await readBuffer(device, linOutBuf!, 8 * 4);
@@ -1187,9 +1208,14 @@ export function createForwardPassEngine(
           new Float32Array(gnParamData, 4, 1)[0] = eps;
           new Uint32Array(gnParamData, 8, 1)[0] = 0; // use_residual_weight = 0 (weight directly)
           const gnParams = getCachedUniform(new Uint8Array(gnParamData), `L${l}-gn-p`);
+          // Option A: RMSNormGated and the subsequent silu-gate write to a per-token
+          // scratch (ssmOutBuf) instead of attnProjBuf. Otherwise this iteration
+          // would clobber tokens already written at offsets 0..(ssmT-1)*H by prior
+          // iterations of the per-token loop. The final value of ssmOutBuf is
+          // copied into attnProjBuf at the correct per-token offset below.
           const gnBG = createBindGroup(device, rmsnormPipeline, 0, [
             { binding: 0, resource: { buffer: linOutBuf! } },
-            { binding: 1, resource: { buffer: attnProjBuf } },
+            { binding: 1, resource: { buffer: ssmOutBuf! } },
             { binding: 2, resource: { buffer: lw.linearNormWeight } },
             { binding: 3, resource: { buffer: gnParams } },
           ], `L${l}-rms-gated`);
@@ -1199,21 +1225,27 @@ export function createForwardPassEngine(
           // Multiply by silu(Z): output = normed * silu(z)
           if (gateSiluPipeline) {
             const outDim = linNKH * linGroupedVD;
-            dispatchElementwise(gateSiluPipeline, attnProjBuf, linOutBuf!, outDim, `L${l}-gate`, linZBuf!);
+            dispatchElementwise(gateSiluPipeline, ssmOutBuf!, linOutBuf!, outDim, `L${l}-gate`, linZBuf!);
           }
         }
 
-        // 9. Output projection → attnProjBuf [1, H]
+        // 9. Output projection → ssmOutBuf [1, H] (per-token scratch)
         const outDim = linNKH * linGroupedVD;
-        dispatchProjection(linOutBuf!, lw, 'linearOutProj', attnProjBuf, 1, H, outDim, `L${l}-lin-out`);
+        dispatchProjection(linOutBuf!, lw, 'linearOutProj', ssmOutBuf!, 1, H, outDim, `L${l}-lin-out`);
 
-        // Q8 out_proj debug readback (guarded behind debug flag)
-        if (isDebug && l === 0) {
+        // Q8 out_proj debug readback (first token only)
+        if (isDebug && l === 0 && ssmT === 0) {
           flushBatch();
           await device.queue.onSubmittedWorkDone();
-          const outData = new Float32Array(await readBuffer(device, attnProjBuf, 8 * 4));
+          const outData = new Float32Array(await readBuffer(device, ssmOutBuf!, 8 * 4));
           console.log(`[Q8 DEBUG] L0 out_proj output[0:8]: [${Array.from(outData).map(v => v.toFixed(6)).join(', ')}]`);
         }
+
+        // Option A: write this token's SSM output into the multi-token attnProjBuf
+        // at offset ssmT*H*4. Downstream stages (residual add, post-attn norm, FFN)
+        // already process all seqLen tokens in batched fashion.
+        batchCopy(ssmOutBuf!, 0, attnProjBuf, ssmT * H * 4, H * 4);
+      } // end per-token SSM loop (Option A)
 
       } else {
         // ── STANDARD SOFTMAX ATTENTION ────────────────────────────────
