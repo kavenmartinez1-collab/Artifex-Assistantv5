@@ -78,13 +78,13 @@ export interface LayerWeights {
   downProj: GPUBuffer;     // [hidden_size, intermediate_size]
 
   // GPTQ quantized weight buffers (optional, only for INT4 models)
-  qProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  kProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  vProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  oProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  gateProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  upProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  downProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  qProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  kProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  vProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  oProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  gateProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  upProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  downProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
 
   // E8 lattice 2-bit quantized weight buffers (optional, per-layer via recipe)
   qProj_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
@@ -96,35 +96,35 @@ export interface LayerWeights {
   downProj_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
 
   // INT8 quantized weight buffers (optional, per-layer via recipe)
-  qProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  kProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  vProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  oProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  gateProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  upProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  downProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  qProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  kProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  vProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  oProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  gateProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  upProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  downProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
 
   // Linear attention (Gated DeltaNet) weights — only for hybrid models
   linearInProjQKV?: GPUBuffer;
-  linearInProjQKV_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  linearInProjQKV_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
   linearInProjA?: GPUBuffer;
-  linearInProjA_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  linearInProjA_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
   linearInProjB?: GPUBuffer;
-  linearInProjB_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  linearInProjB_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
   linearInProjZ?: GPUBuffer;
-  linearInProjZ_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  linearInProjZ_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
   linearOutProj?: GPUBuffer;
-  linearOutProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  linearOutProj_q4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
   linearInProjQKV_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
   linearInProjA_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
   linearInProjB_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
   linearInProjZ_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
   linearOutProj_e8?: { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer };
-  linearInProjQKV_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  linearInProjA_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  linearInProjB_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  linearInProjZ_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
-  linearOutProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };
+  linearInProjQKV_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  linearInProjA_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  linearInProjB_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  linearInProjZ_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+  linearOutProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
   // Full attention Q/K norm weights (Qwen3.5 only)
   qNorm?: GPUBuffer;              // [head_dim] per-head RMSNorm weight for Q
   kNorm?: GPUBuffer;              // [head_dim] per-head RMSNorm weight for K
@@ -139,13 +139,13 @@ export interface LayerWeights {
 export interface GlobalWeights {
   embedTokens: GPUBuffer;  // [vocab_size, hidden_size] (f32, f16 packed, or dummy if Q4)
   embedIsF16?: boolean;    // true if embedding stored as F16/BF16 (large vocab models)
-  embedQ4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };  // GPTQ INT4 embedding
+  embedQ4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };  // GPTQ INT4 embedding
   /** E8 codebook buffer, shared across all layers [256*8] f32 */
   e8Codebook?: GPUBuffer;
   finalNorm: GPUBuffer;    // [hidden_size]
   lmHead: GPUBuffer;       // [vocab_size, hidden_size] or same as embedTokens
   lmHeadIsBF16?: boolean;  // true if lm_head stored as BF16 (large vocab models)
-  lmHeadQ4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer };  // GPTQ INT4 lm_head
+  lmHeadQ4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };  // GPTQ INT4 lm_head
 }
 
 /** All model weights on the GPU. */
@@ -263,8 +263,22 @@ export function createForwardPassEngine(
   // GEMV fast-path for M=1 (decode). Same bindings as matmul_bt_q4 so bind
   // groups can be swapped without rebuilding. One thread per output column,
   // so all 256 threads are useful (vs 16/256 with the tiled kernel at M=1).
+  //
+  // Two pipeline variants are compiled upfront, differing only by the WGSL
+  // override constant USE_ACTORDER. The fast variant (USE_ACTORDER=0) skips
+  // the per-K g_idx VRAM read and computes group_id = k / group_size directly.
+  // The correct-but-slower variant (USE_ACTORDER=1) consults g_idx, needed for
+  // GPTQ models quantized with desc_act=true. dispatchMatmulQ4 picks per-tensor
+  // based on the q4.hasActOrder flag.
   const matmulQ4GemvPipeline = config.isQuantized
-    ? createComputePipeline(device, matmulQ4GemvWGSL, 'matmul_bt_q4_gemv', 'matmul-q4-gemv')
+    ? createComputePipeline(
+        device, matmulQ4GemvWGSL, 'matmul_bt_q4_gemv', 'matmul-q4-gemv',
+        { USE_ACTORDER: 0 })
+    : null;
+  const matmulQ4GemvActOrderPipeline = config.isQuantized
+    ? createComputePipeline(
+        device, matmulQ4GemvWGSL, 'matmul_bt_q4_gemv', 'matmul-q4-gemv-actorder',
+        { USE_ACTORDER: 1 })
     : null;
   // E8 lattice 2-bit dequantizing matmul (weights packed as codebook indices)
   const matmulE8Pipeline = config.isQuantized
@@ -411,7 +425,7 @@ export function createForwardPassEngine(
   /** C[M,N] = A[M,K] @ dequant(q4_packed, scales, zeros)^T — GPTQ INT4 */
   function dispatchMatmulQ4(
     aBuf: GPUBuffer,
-    q4: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer },
+    q4: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean },
     cBuf: GPUBuffer,
     M: number, N: number, K: number, label: string,
   ) {
@@ -428,8 +442,11 @@ export function createForwardPassEngine(
     // GEMV fast path: at M=1 the tiled kernel wastes 15/16 threads per
     // workgroup. Swap to the dedicated GEMV shader which is one-thread-per-
     // output-column. Bindings are identical → bind group unchanged.
+    // Pick the actorder variant if this tensor's g_idx is non-trivial;
+    // otherwise use the faster variant that skips the g_idx VRAM reads.
     const useGemv = M === 1 && matmulQ4GemvPipeline !== null;
-    const pipeline = useGemv ? matmulQ4GemvPipeline! : matmulQ4Pipeline;
+    const gemvPipeline = q4.hasActOrder ? matmulQ4GemvActOrderPipeline : matmulQ4GemvPipeline;
+    const pipeline = useGemv ? gemvPipeline! : matmulQ4Pipeline;
     const bg = createBindGroup(device, pipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
       { binding: 1, resource: { buffer: q4.qweight } },
@@ -479,7 +496,7 @@ export function createForwardPassEngine(
   let q8DispatchCount = 0;
   function dispatchMatmulQ8(
     aBuf: GPUBuffer,
-    q8: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer },
+    q8: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean },
     cBuf: GPUBuffer,
     M: number, N: number, K: number, label: string,
   ) {
@@ -527,14 +544,14 @@ export function createForwardPassEngine(
     }
 
     const q8key = `${proj}_q8` as keyof LayerWeights;
-    const q8 = lw[q8key] as { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer } | undefined;
+    const q8 = lw[q8key] as { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean } | undefined;
     if (q8) {
       dispatchMatmulQ8(inputBuf, q8, outputBuf, M, N, K, label);
       return;
     }
 
     const q4key = `${proj}_q4` as keyof LayerWeights;
-    const q4 = lw[q4key] as { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer } | undefined;
+    const q4 = lw[q4key] as { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean } | undefined;
     if (q4) {
       dispatchMatmulQ4(inputBuf, q4, outputBuf, M, N, K, label);
     } else {

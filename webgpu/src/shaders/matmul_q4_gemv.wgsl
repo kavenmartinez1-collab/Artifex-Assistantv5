@@ -22,6 +22,16 @@
 const WG_SIZE: u32 = 256;
 const K_CHUNK: u32 = 1024;  // 4 KB workgroup memory for A chunks
 
+// Pipeline-override constant: when 0, group_id is computed as k / group_size
+// directly in registers, eliminating K in-loop VRAM reads of g_idx per output
+// column. When 1, g_idx is consulted — required for GPTQ models quantized
+// with actorder (desc_act=true). The engine compiles both variants and picks
+// the right one per-tensor based on whether the model's g_idx was loaded from
+// the file or synthesized as trivial k/group_size.
+// u32 (not bool) because some WebGPU drivers historically had spottier bool-
+// override support; 0/1 is universally safe.
+override USE_ACTORDER: u32 = 0u;
+
 struct Params {
   M: u32,           // must be 1 for this kernel
   N: u32,
@@ -101,7 +111,14 @@ fn matmul_bt_q4_gemv(@builtin(local_invocation_id) lid: vec3u,
         let packed = B_packed[p * N + col];
         for (var nib: u32 = 0u; nib < 8u; nib = nib + 1u) {
           let k = p * 8u + nib;
-          let group_id = g_idx[k];
+          // With actorder we need the reordered mapping from g_idx; without
+          // it the mapping is trivially k / group_size and costs no memory.
+          var group_id: u32;
+          if (USE_ACTORDER != 0u) {
+            group_id = g_idx[k];
+          } else {
+            group_id = k / params.group_size;
+          }
           if (group_id != cur_group) {
             cur_group = group_id;
             cached_scale = read_f16_scale(group_id * N + col);

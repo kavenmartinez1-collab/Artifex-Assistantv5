@@ -656,8 +656,13 @@ loadBtn.addEventListener('click', async () => {
         const sc = tryGetTensor(`${base}.scales`);
         const qz = tryGetTensor(`${base}.qzeros`);
         if (qw && sc && qz) {
-          // Try to load actorder g_idx, fall back to trivial
+          // Try to load actorder g_idx, fall back to trivial.
+          // hasActOrder: true when the model file ships a real g_idx tensor
+          // (may encode column reordering from desc_act=true quantization).
+          // false when we synthesized a trivial k/group_size mapping — in that
+          // case the GEMV fast-path can skip the g_idx VRAM read entirely.
           let gIdx = tryGetTensor(`${base}.g_idx`);
+          const hasActOrder = gIdx !== undefined;
           if (!gIdx) {
             // Derive K from qweight: shape is [K/8, N], stored as int32
             const qwTensor = currentModel!.tensors.get(`${base}.qweight`);
@@ -673,7 +678,7 @@ loadBtn.addEventListener('click', async () => {
             console.error(`[Q4] ${base}: FAILED to get g_idx — q4 object will be skipped!`);
             return undefined;
           }
-          return { qweight: qw, scales: sc, qzeros: qz, g_idx: gIdx };
+          return { qweight: qw, scales: sc, qzeros: qz, g_idx: gIdx, hasActOrder };
         }
         return undefined;
       };

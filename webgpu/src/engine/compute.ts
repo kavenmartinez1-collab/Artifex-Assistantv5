@@ -11,15 +11,21 @@ const pipelineCache = new Map<string, GPUComputePipeline>();
 
 /**
  * Compile a WGSL shader and create a compute pipeline.
- * Results are cached by shader source hash.
+ * Results are cached by shader source hash (and override constants if any).
+ * `constants` supplies WGSL pipeline-override constant values, letting
+ * specialized variants share one shader module.
  */
 export function createComputePipeline(
   device: GPUDevice,
   wgslSource: string,
   entryPoint = 'main',
   label = '',
+  constants?: Record<string, number>,
 ): GPUComputePipeline {
-  const cacheKey = `${label}:${entryPoint}:${simpleHash(wgslSource)}`;
+  const constantsKey = constants
+    ? ':' + Object.keys(constants).sort().map(k => `${k}=${constants[k]}`).join(',')
+    : '';
+  const cacheKey = `${label}:${entryPoint}:${simpleHash(wgslSource)}${constantsKey}`;
 
   const cached = pipelineCache.get(cacheKey);
   if (cached) return cached;
@@ -39,7 +45,7 @@ export function createComputePipeline(
 
   const pipeline = device.createComputePipeline({
     layout: 'auto',
-    compute: { module, entryPoint },
+    compute: { module, entryPoint, ...(constants ? { constants } : {}) },
     label,
   });
 
