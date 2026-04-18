@@ -257,6 +257,11 @@ export function generate(
     // Standard transformer models can batch prefill up to 512 tokens at once.
     const isHybrid = engine.config.isHybrid === true;
     const PREFILL_CHUNK = isHybrid ? 1 : 512;
+    // Debug: if first-forward-pass debug is armed, also fire debug for the
+    // last prefill position (true generation-context snapshot).
+    if ((globalThis as any).__DEBUG_FORWARD_PASS__ === true) {
+      (globalThis as any).__DEBUG_LAST_PREFILL_POS__ = promptTokens - 1;
+    }
     let prefillOutput;
     for (let i = 0; i < promptTokens; i += PREFILL_CHUNK) {
       const chunkEnd = Math.min(i + PREFILL_CHUNK, promptTokens);

@@ -851,9 +851,13 @@ export function createForwardPassEngine(
     const pos = kvCache.position;
     const cacheLen = pos + seqLen;
     // Check global debug flag — auto-test sets this before each run
-    const isDebug = (globalThis as any).__DEBUG_FORWARD_PASS__ === true && pos === 0;
+    const g = globalThis as any;
+    const debugLastPos = g.__DEBUG_LAST_PREFILL_POS__;
+    const fireAtLastPrefill = typeof debugLastPos === 'number' && pos === debugLastPos;
+    const isDebug = (g.__DEBUG_FORWARD_PASS__ === true && pos === 0) || fireAtLastPrefill;
     const isDebug2 = false;
-    if (isDebug) (globalThis as any).__DEBUG_FORWARD_PASS__ = false; // one-shot
+    if (isDebug && pos === 0) g.__DEBUG_FORWARD_PASS__ = false; // first-call one-shot
+    if (fireAtLastPrefill) g.__DEBUG_LAST_PREFILL_POS__ = undefined; // last-prefill one-shot
     debugCallCount++;
 
     // Upload token IDs
@@ -878,6 +882,7 @@ export function createForwardPassEngine(
         { binding: 5, resource: { buffer: eq4.qzeros } },
       ], 'embed-q4');
       bd(embedQ4Pipeline, [embedBG], [seqLen], 'embed-q4');
+      if (isDebug) console.log(`[EMBED-PATH] q4, qweight.size=${eq4.qweight.size}`);
     } else {
       const useF16Embed = weights.global.embedIsF16 === true;
       const embedPipe = useF16Embed ? embedF16Pipeline : embedPipeline;
@@ -889,6 +894,16 @@ export function createForwardPassEngine(
         { binding: 3, resource: { buffer: embedParams } },
       ], 'embed');
       bd(embedPipe, [embedBG], [seqLen], 'embed');
+      if (isDebug) {
+        const tbl = weights.global.embedTokens;
+        const expectedBF16 = V * H * 2;
+        const expectedF32 = V * H * 4;
+        console.log(
+          `[EMBED-PATH] ${useF16Embed ? 'f16/bf16' : 'f32'}, `
+          + `embedTokens.size=${tbl.size} (expected BF16=${expectedBF16}, F32=${expectedF32}), `
+          + `H=${H}, V=${V}, seqLen=${seqLen}`
+        );
+      }
     }
 
     // Debug: dump embed output on first call (uncomment to diagnose INT4 embed issues)
@@ -908,6 +923,30 @@ export function createForwardPassEngine(
     if (isDebug) {
       flushBatch();
       await debugRead(hiddenBuf, 'embed-out', 8);
+      // Also sample the embed table directly to verify binding/data
+      try {
+        const tbl = weights.global.embedTokens;
+        const firstTok = tokenIds[0];
+        const useF16 = weights.global.embedIsF16 === true;
+        const isQ4 = !!(weights.global.embedQ4 && embedQ4Pipeline);
+        if (!isQ4) {
+          // Read 16 bytes from start of embed table (row 0) and from row for first token
+          const head = new Uint8Array(await readBuffer(device, tbl, 16));
+          const rowOffset = useF16 ? firstTok * H * 2 : firstTok * H * 4;
+          const rowBytes = useF16 ? 16 : 32;
+          // Only read if within buffer
+          if (rowOffset + rowBytes <= tbl.size) {
+            const row = new Uint8Array(await readBuffer(device, tbl, rowBytes, rowOffset));
+            const hex = (b: Uint8Array) => Array.from(b).map(x => x.toString(16).padStart(2, '0')).join(' ');
+            console.log(`[EMBED-TABLE] head16=[${hex(head)}]`);
+            console.log(`[EMBED-TABLE] token ${firstTok} row (first ${rowBytes} bytes) =[${hex(row)}]`);
+          } else {
+            console.log(`[EMBED-TABLE] row offset ${rowOffset} + ${rowBytes} exceeds buffer size ${tbl.size}`);
+          }
+        }
+      } catch (e) {
+        console.error('[EMBED-TABLE] readback failed:', e);
+      }
     }
 
     // ── Transformer layers ───────────────────────────────────────────
@@ -1305,6 +1344,14 @@ export function createForwardPassEngine(
           );
         }
 
+        // Debug at key full_attn layers: L23 (last normal) and L27 (first blowup)
+        if (isDebug && (l === 23 || l === 27)) {
+          flushBatch();
+          await debugRead(vBuf, `L${l}-V`, 8);
+          await debugRead(attnOutBuf, `L${l}-attn-out-preGate`, 8);
+          if (attnGateBuf) await debugRead(attnGateBuf, `L${l}-gate-raw`, 8);
+        }
+
         // Qwen3.5: output gating — attn_output = attn_output * sigmoid(gate)
         // gate is in linZBuf (from Q projection split)
         // gate shape is [seqLen, nHeads * dHead] — reshaped from [seqLen, nHeads, dHead]
@@ -1315,6 +1362,11 @@ export function createForwardPassEngine(
           // attn * sigmoid(gate) → attnOutBuf (in-place via copy pattern)
           batchCopy(attnOutBuf, 0, ffnTempBuf, 0, gateDim * 4);
           dispatchElementwise(mulPipeline, ffnTempBuf, attnOutBuf, gateDim, `L${l}-attn-gate`, normedBuf);
+        }
+
+        if (isDebug && (l === 23 || l === 27)) {
+          flushBatch();
+          await debugRead(attnOutBuf, `L${l}-attn-out-postGate`, 8);
         }
 
         // QuIP#/QuaRot: Hadamard rotation before o_proj (its weights were also rotated)
@@ -1343,6 +1395,10 @@ export function createForwardPassEngine(
         flushBatch();
         await debugRead(attnProjBuf, `L0-attn-proj(pos=${pos})`, 8);
         await debugRead(hiddenBuf, `L0-after-attn-residual(pos=${pos})`, 8);
+      }
+      if (isDebug && (l === 23 || l === 27)) {
+        flushBatch();
+        await debugRead(attnProjBuf, `L${l}-attn-proj-out`, 8);
       }
 
       // Save for second residual
@@ -1422,27 +1478,27 @@ export function createForwardPassEngine(
       currentBatch = null;
     }
 
-    // Debug: dump logits with global argmax (uncomment to diagnose lm_head issues)
-    // if (debugCallCount <= 3) {
-    //   await device.queue.onSubmittedWorkDone();
-    //   const allLogits = new Float32Array(await readBuffer(device, logitsBuf, V * 4));
-    //   let globalMax = -Infinity, globalArgmax = 0;
-    //   let nanCount = 0, infCount = 0;
-    //   for (let i = 0; i < V; i++) {
-    //     if (isNaN(allLogits[i])) nanCount++;
-    //     else if (!isFinite(allLogits[i])) infCount++;
-    //     else if (allLogits[i] > globalMax) { globalMax = allLogits[i]; globalArgmax = i; }
-    //   }
-    //   const indices = Array.from({length: V}, (_, i) => i);
-    //   indices.sort((a, b) => allLogits[b] - allLogits[a]);
-    //   const top5 = indices.slice(0, 5).map(i => `${i}:${allLogits[i].toFixed(2)}`);
-    //   const highSamples = [100000, 150000, 200000, 248000, 248044, 248319].map(
-    //     i => `[${i}]=${allLogits[Math.min(i, V-1)].toFixed(2)}`
-    //   );
-    //   console.log(`[FWD #${debugCallCount} pos=${kvCache.position}] argmax=${globalArgmax} max=${globalMax.toFixed(2)} NaN=${nanCount} Inf=${infCount}`);
-    //   console.log(`  top5: ${top5.join(', ')}`);
-    //   console.log(`  high-idx: ${highSamples.join(', ')}`);
-    // }
+    // Debug: dump logits with global argmax on first forward pass
+    if (isDebug) {
+      await device.queue.onSubmittedWorkDone();
+      const allLogits = new Float32Array(await readBuffer(device, logitsBuf, V * 4));
+      let globalMax = -Infinity, globalArgmax = 0;
+      let globalMin = Infinity;
+      let nanCount = 0, infCount = 0;
+      for (let i = 0; i < V; i++) {
+        if (isNaN(allLogits[i])) nanCount++;
+        else if (!isFinite(allLogits[i])) infCount++;
+        else {
+          if (allLogits[i] > globalMax) { globalMax = allLogits[i]; globalArgmax = i; }
+          if (allLogits[i] < globalMin) globalMin = allLogits[i];
+        }
+      }
+      const indices = Array.from({length: V}, (_, i) => i);
+      indices.sort((a, b) => allLogits[b] - allLogits[a]);
+      const top10 = indices.slice(0, 10).map(i => `${i}:${allLogits[i].toFixed(2)}`);
+      console.log(`[FWD #${debugCallCount} pos=${kvCache.position}] argmax=${globalArgmax} max=${globalMax.toFixed(2)} min=${globalMin.toFixed(2)} NaN=${nanCount} Inf=${infCount}`);
+      console.log(`  top10: ${top10.join(', ')}`);
+    }
 
     // Update cache position
     kvCache.position += seqLen;

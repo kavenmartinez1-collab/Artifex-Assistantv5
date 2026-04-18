@@ -592,6 +592,12 @@ loadBtn.addEventListener('click', async () => {
       // This happens when: (a) keepBF16=true and tensor is >1MB, or (b) f32 would exceed 2GB buffer limit
       const embedTensor = currentModel!.tensors.get(nameMap.embedTokens);
       const embedIsF16 = embedTensor ? (embedTensor.dtype === 'BF16' || embedTensor.dtype === 'F16') : false;
+      console.log(
+        `[Engine] embed lookup: nameMap.embedTokens="${nameMap.embedTokens}", `
+        + `found=${!!embedTensor}, dtype=${embedTensor?.dtype}, `
+        + `byteLength=${embedTensor?.byteLength}, shape=${embedTensor?.shape}, `
+        + `embedIsF16=${embedIsF16}`
+      );
       if (embedIsF16) {
         console.log(`[Engine] Embedding is ${embedTensor!.dtype}, using packed-16 embed shader`);
       }

@@ -1295,6 +1295,53 @@ All 15 WGSL kernels verified correct against PyTorch (`scripts/audit_kernels.py`
 
 **Lesson**: When hand-writing GPU compute kernels, always build a reference test suite that compares against a known-correct implementation (PyTorch). A single config parsing bug can waste days of debugging.
 
+### The RMSNorm `(1 + w)` Config-Flatten Bug (2026-04-18)
+
+After everything above was fixed, HailMary *still* produced gibberish on WebGPU — despite a correct embedding lookup, correct GPTQ dequantization, and verified attention/RoPE/softmax kernels. A systematic layer-by-layer compare against a PyTorch float32 reference (`scripts/verify_layers.py` + `scripts/reference_output.txt`) at position 0 revealed:
+
+| Check | PyTorch reference | WebGPU | Status |
+|---|---|---|---|
+| Embedding[0..7] | `[-0.0071, 0.0082, -0.0001, -0.0008, 0.0007, -0.0074, -0.0026, 0.0029]` | identical | match |
+| L0 QKV raw Q[0] | `0.138` | `0.0037` | 37× too small |
+| L0 QKV raw K[0] | `1.925` | `0.0232` | 83× too small |
+| L0 QKV raw V[1] | `4.992` | `0.185` | 27× too small |
+| L0 in_proj_a[0..3] | `[6.65, 0.60, 8.46, 12.81]` | `[0.19, -0.14, 0.22, 0.33]` | ~34× too small |
+| L0 in_proj_b[0..3] | `[-3.52, 1.66, -1.69, 0.44]` | `[-0.12, 0.07, -0.01, 0.01]` | ~30× too small |
+| L0 in_proj_z[0..7] | `[1.41, -0.27, -1.27, -0.71, ...]` | `[0.07, -0.04, -0.11, -0.11, ...]` | ~12–20× too small |
+| Top-1 token at pos 0 | `846` = `'user'` | `220` = `' '` (space) | wrong |
+
+All six independent weight tensors at layer 0 (Q, K, V, A, B, Z projections) were uniformly 12–80× smaller than PyTorch. Since these projections share only one input — the output of `input_layernorm` — the shared input had to be the defect.
+
+**Root cause**. Qwen3.5's `Qwen3_5RMSNorm` uses the `(1 + weight)` convention: it stores weights as trained *deltas around zero* and computes `(1 + w[i]) * x[i] / rms(x)`. The WGSL shader supports both conventions via a `use_residual_weight` uniform flag, selected in `forward-pass.ts:636`:
+
+```ts
+const useResidualWeight = config.modelType === 'qwen3_5_text' ? 1 : 0;
+```
+
+The config parser *attempts* to flatten Qwen3.5's multimodal-wrapper config (where the text model lives under `hfConfig.text_config`) and rename `modelType` from the wrapper name (`qwen3_5`) to the inner name (`qwen3_5_text`). But the flatten gate was:
+
+```ts
+if (hfConfig.text_config && !hfConfig.hidden_size) { ... }
+```
+
+HailMary's `config.json` — unlike the stock upstream multimodal config — duplicates `hidden_size: 4096` at both the top level *and* inside `text_config`. The `!hfConfig.hidden_size` guard saw a truthy `hidden_size` at the top level and skipped flattening. `modelType` stayed as the wrapper's `"qwen3_5"`, `useResidualWeight` silently fell back to `0`, and the shader applied `w[i] * x[i] / rms(x)` — which, because Qwen3.5's trained deltas hover near zero, collapsed the norm output by 10–80×. Everything downstream — Q, K, V, A, B, Z, attention scores, hidden states, logits — inherited the collapse proportionally, producing well-formed-looking numbers that were systematically wrong in direction.
+
+**Fix** (one line in `webgpu/src/model/model-config.ts`):
+
+```ts
+// OLD: gate on field absence (fragile when wrappers duplicate fields)
+// if (hfConfig.text_config && !hfConfig.hidden_size) { ... }
+if (hfConfig.text_config && hfConfig.model_type === 'qwen3_5') { ... }
+```
+
+After this change the console shows `[Config] Flattened text_config for qwen3_5_text`, `useResidualWeight = 1`, and HailMary generates coherent physics explanations (Newton's and Coulomb's laws with correct formulas and reasoning).
+
+**Lesson #1 — wrapper detection**: when a model family wraps an inner config under `text_config` / `vision_config` / `audio_config`, wrappers often *duplicate* fields into the top level for convenience. Gating flatten logic on "field absence at top level" is fragile. Gate on the wrapper's `model_type` (or `architectures[]`) instead — those are deterministic signals of "this config is a wrapper."
+
+**Lesson #2 — diagnose uniform divergence at a shared input**: when many independent downstream tensors are all wrong by roughly the same factor at the same layer, the bug is almost certainly upstream of where they diverge — in the *shared* input. Don't audit six weight shaders individually; audit the one thing feeding them. For a transformer, that usually means the layer-norm immediately before the projections.
+
+**Lesson #3 — the shader code was correct the whole time**: the `rmsnorm.wgsl` kernel had both conventions implemented and tested. The bug was a branch *selector* living in TypeScript config-parsing code, completely outside the GPU. Kernel audits won't catch defects in how the host code dispatches them. A full end-to-end layer-by-layer compare against a trusted reference is the only thing that reliably finds this class of bug.
+
 ---
 
 ## 15. The Multimodal Service Layer
