@@ -70,6 +70,7 @@ export async function readBuffer(
   device: GPUDevice,
   source: GPUBuffer,
   sizeBytes?: number,
+  sourceOffset = 0,
 ): Promise<ArrayBuffer> {
   const size = sizeBytes ?? source.size;
 
@@ -80,7 +81,7 @@ export async function readBuffer(
   });
 
   const encoder = device.createCommandEncoder();
-  encoder.copyBufferToBuffer(source, 0, staging, 0, size);
+  encoder.copyBufferToBuffer(source, sourceOffset, staging, 0, size);
   device.queue.submit([encoder.finish()]);
 
   await staging.mapAsync(GPUMapMode.READ);

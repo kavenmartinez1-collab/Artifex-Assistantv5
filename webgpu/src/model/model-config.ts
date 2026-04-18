@@ -282,8 +282,11 @@ const WEIGHT_NAME_PATTERNS: Record<string, WeightNameMap> = {
  * Handles field name differences across model families automatically.
  */
 export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
-  // Qwen3.5 multimodal wraps text config under text_config — flatten it
-  if (hfConfig.text_config && !hfConfig.hidden_size) {
+  // Qwen3.5 multimodal wraps text config under text_config — flatten it.
+  // Trigger when text_config is present AND top-level model_type is the multimodal
+  // wrapper ('qwen3_5'); some configs (e.g., HailMary) duplicate hidden_size at
+  // top level, so don't rely on !hidden_size as the gate.
+  if (hfConfig.text_config && hfConfig.model_type === 'qwen3_5') {
     const textCfg = hfConfig.text_config;
     // Merge text_config fields into top level (text_config takes priority)
     hfConfig = { ...hfConfig, ...textCfg };

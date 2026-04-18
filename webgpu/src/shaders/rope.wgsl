@@ -1,11 +1,13 @@
-// Rotary Position Embeddings (RoPE)
+// Rotary Position Embeddings (RoPE) — rotate_half (Llama/Qwen) scheme
 // Applies rotary embeddings to Q and K tensors for positional encoding.
 // Qwen3.5 uses RoPE with theta = 10,000,000 and partial_rotary_factor = 0.25
 //
-// For each pair of dimensions (2i, 2i+1):
-//   q_rot[2i]   = q[2i] * cos(theta) - q[2i+1] * sin(theta)
-//   q_rot[2i+1] = q[2i] * sin(theta) + q[2i+1] * cos(theta)
-// where theta = pos / (base ^ (2i / d))
+// HF convention: rotate_half pairs element i with element i + rot_dim/2
+//   q_rot[i]            = q[i]        * cos(theta) - q[i+rot/2] * sin(theta)
+//   q_rot[i + rot/2]    = q[i+rot/2]  * cos(theta) + q[i]       * sin(theta)
+// where theta = pos / (base ^ (2i / rot_dim)), and cos/sin are shared
+// between the first-half element and its second-half partner.
+// NOTE: This is NOT the interleaved (2i, 2i+1) GPT-NeoX scheme.
 
 struct Params {
   seq_len: u32,     // number of positions to encode
@@ -42,14 +44,14 @@ fn rope(@builtin(global_invocation_id) gid: vec3u) {
   let cos_val = cos(angle);
   let sin_val = sin(angle);
 
-  // Compute buffer indices for the pair
+  // rotate_half pairing: element i with element i + half_rot
   let base_idx = (seq_pos * params.num_heads + head) * params.head_dim;
-  let i0 = base_idx + 2u * pair_idx;
-  let i1 = base_idx + 2u * pair_idx + 1u;
+  let i0 = base_idx + pair_idx;
+  let i1 = base_idx + pair_idx + half_rot;
 
   let v0 = qk[i0];
   let v1 = qk[i1];
 
   qk[i0] = v0 * cos_val - v1 * sin_val;
-  qk[i1] = v0 * sin_val + v1 * cos_val;
+  qk[i1] = v1 * cos_val + v0 * sin_val;
 }
