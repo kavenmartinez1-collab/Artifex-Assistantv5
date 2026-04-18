@@ -302,8 +302,9 @@ export function createForwardPassEngine(
 
   // ── Gated DeltaNet / Mamba-2 pipelines (hybrid models only) ──────
   const isHybrid = config.isHybrid;
-  const gateSiluPipeline = isHybrid
-    ? createComputePipeline(device, elementwiseWGSL, 'gate_silu', 'gate-silu') : null;
+  // gate_silu is also used by SwiGLU FFN fusion (silu(gate) * up → one dispatch),
+  // so create it unconditionally. Keeps platform-generality for non-hybrid models.
+  const gateSiluPipeline = createComputePipeline(device, elementwiseWGSL, 'gate_silu', 'gate-silu');
   const softplusPipeline = isHybrid
     ? createComputePipeline(device, elementwiseWGSL, 'softplus', 'softplus') : null;
   const conv1dPipeline = isHybrid
@@ -1469,11 +1470,14 @@ export function createForwardPassEngine(
       dispatchProjection(normedBuf, lw, 'upProj', upBuf, seqLen, ffnDim, H, `L${l}-up`);
 
       // MODEL-SPECIFIC: SiLU for most models, GELU for some
-      // Cannot use same buffer for input and output in WebGPU — use dedicated temp
-      dispatchElementwise(siluPipeline, gateBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silu`);
-      dispatchElementwise(mulPipeline, ffnTempBuf, gateBuf, seqLen * ffnDim, `L${l}-mul`, upBuf);
+      // Fused SwiGLU activation: ffnTemp = up * silu(gate) in a single dispatch.
+      // Saves one dispatch + one full ffnDim read/write of VRAM traffic per layer.
+      // Old two-dispatch path (kept for reference / GELU variants):
+      // dispatchElementwise(siluPipeline, gateBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silu`);
+      // dispatchElementwise(mulPipeline, ffnTempBuf, gateBuf, seqLen * ffnDim, `L${l}-mul`, upBuf);
+      dispatchElementwise(gateSiluPipeline, upBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silumul`, gateBuf);
 
-      dispatchProjection(gateBuf, lw, 'downProj', downBuf, seqLen, H, ffnDim, `L${l}-down`);
+      dispatchProjection(ffnTempBuf, lw, 'downProj', downBuf, seqLen, H, ffnDim, `L${l}-down`);
 
       // Residual: hidden = residual + ffn_output
       dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res2`, downBuf);
