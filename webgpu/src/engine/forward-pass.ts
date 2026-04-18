@@ -47,6 +47,7 @@ import elementwiseWGSL from '../shaders/elementwise.wgsl?raw';
 import embedWGSL from '../shaders/embed.wgsl?raw';
 import attentionWGSL from '../shaders/attention.wgsl?raw';
 import matmulQ4WGSL from '../shaders/matmul_q4.wgsl?raw';
+import matmulQ4GemvWGSL from '../shaders/matmul_q4_gemv.wgsl?raw';
 import matmulE8WGSL from '../shaders/matmul_e8.wgsl?raw';
 import matmulQ8WGSL from '../shaders/matmul_q8.wgsl?raw';
 import tqEncodeWGSL from '../shaders/turboquant_encode.wgsl?raw';
@@ -259,6 +260,12 @@ export function createForwardPassEngine(
   const matmulQ4Pipeline = config.isQuantized
     ? createComputePipeline(device, matmulQ4WGSL, 'matmul_bt_q4', 'matmul-q4')
     : null;
+  // GEMV fast-path for M=1 (decode). Same bindings as matmul_bt_q4 so bind
+  // groups can be swapped without rebuilding. One thread per output column,
+  // so all 256 threads are useful (vs 16/256 with the tiled kernel at M=1).
+  const matmulQ4GemvPipeline = config.isQuantized
+    ? createComputePipeline(device, matmulQ4GemvWGSL, 'matmul_bt_q4_gemv', 'matmul-q4-gemv')
+    : null;
   // E8 lattice 2-bit dequantizing matmul (weights packed as codebook indices)
   const matmulE8Pipeline = config.isQuantized
     ? createComputePipeline(device, matmulE8WGSL, 'matmul_e8', 'matmul-e8')
@@ -418,7 +425,12 @@ export function createForwardPassEngine(
     }
     const params = getCachedUniform(
       new Uint32Array([M, N, K, config.quantGroupSize]), `${label}-p`);
-    const bg = createBindGroup(device, matmulQ4Pipeline, 0, [
+    // GEMV fast path: at M=1 the tiled kernel wastes 15/16 threads per
+    // workgroup. Swap to the dedicated GEMV shader which is one-thread-per-
+    // output-column. Bindings are identical → bind group unchanged.
+    const useGemv = M === 1 && matmulQ4GemvPipeline !== null;
+    const pipeline = useGemv ? matmulQ4GemvPipeline! : matmulQ4Pipeline;
+    const bg = createBindGroup(device, pipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
       { binding: 1, resource: { buffer: q4.qweight } },
       { binding: 2, resource: { buffer: cBuf } },
@@ -427,7 +439,10 @@ export function createForwardPassEngine(
       { binding: 5, resource: { buffer: q4.qzeros } },
       { binding: 6, resource: { buffer: q4.g_idx } },
     ], label);
-    bd(matmulQ4Pipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
+    const dispatchDims: [number, number, number] = useGemv
+      ? [Math.ceil(N / 256), 1, 1]
+      : [Math.ceil(M / 16), Math.ceil(N / 16), 1];
+    bd(pipeline, [bg], dispatchDims, label);
   }
 
   /** C[M,N] = A[M,K] @ dequant_e8(indices, scales, offsets, codebook)^T — E8 2-bit */
