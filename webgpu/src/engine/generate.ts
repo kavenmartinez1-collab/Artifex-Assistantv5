@@ -252,11 +252,15 @@ export function generate(
     }
 
     // ── Step 3: Prefill ─────────────────────────────────────────────
-    // Hybrid models (with Gated DeltaNet linear attention) need token-by-token
-    // prefill because the SSM recurrence must process each token sequentially.
-    // Standard transformer models can batch prefill up to 512 tokens at once.
+    // Hybrid models (Gated DeltaNet) have a sequential SSM recurrence inside each
+    // SSM layer, but the surrounding stages (embed, full-attention layers, FFN,
+    // final norm, lm_head) all process seqLen > 1 in a single dispatch. Option A
+    // wraps the existing single-token SSM block in a per-token JS loop INSIDE
+    // engine.forward, so multi-token chunks no longer require N separate JS→GPU
+    // round-trips for the non-SSM stages.
     const isHybrid = engine.config.isHybrid === true;
-    const PREFILL_CHUNK = isHybrid ? 1 : 512;
+    // const PREFILL_CHUNK = isHybrid ? 1 : 512;  // Pre-Option-A: 1 token/chunk
+    const PREFILL_CHUNK = isHybrid ? 16 : 512;
     // Debug: if first-forward-pass debug is armed, also fire debug for the
     // last prefill position (true generation-context snapshot).
     if ((globalThis as any).__DEBUG_FORWARD_PASS__ === true) {
