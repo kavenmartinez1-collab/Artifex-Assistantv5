@@ -300,6 +300,14 @@ export function generate(
       }
 
       // ── Step 5: Decode loop ──────────────────────────────────────
+      // Step 1 (perf measurement): per-step CPU/GPU/readback/sample breakdown
+      // for the first few decode tokens. Lets us confirm whether the per-token
+      // bottleneck is JS dispatch building, GPU compute, or logits readback —
+      // critical before deciding which optimization (bind-group cache, encoder
+      // persistence, kernel fusion) is actually worth doing.
+      const __perfStepBudget = 5; // log first N decode steps
+      let __perfFwdCpuSum = 0, __perfGpuWaitSum = 0, __perfReadbackSum = 0, __perfSampleSum = 0;
+      let __perfDispatchSum = 0, __perfStepCount = 0;
       for (let step = 1; step < config.maxNewTokens; step++) {
         if (aborted) {
           stopReason = 'aborted';
@@ -308,15 +316,19 @@ export function generate(
 
         // Forward pass with the last GENERATED token (not prompt token)
         const input = new Uint32Array([lastTokenId]);
+        const __tFwdStart = performance.now();
         const output = await engine.forward(input, kvCache);
+        const __tFwdEnd = performance.now();
 
         // Read logits back from GPU
         await device.queue.onSubmittedWorkDone();
+        const __tGpuDone = performance.now();
         const logitsRaw = await readBuffer(
           device,
           output.logitsBuffer,
           engine.config.vocabSize * 4,
         );
+        const __tReadback = performance.now();
         const logits = new Float32Array(logitsRaw);
 
       // Debug: log top-5 logits on first decode step
@@ -335,6 +347,51 @@ export function generate(
 
       // Sample next token
       const nextId = sampleFromLogits(logits, config, generatedIds);
+      const __tSample = performance.now();
+
+      // ── Per-step perf accounting (Step 1 measurement layer) ──────────
+      // fwdCpu  = wall time inside engine.forward (encoder build + submit)
+      // gpuWait = time blocked on device.queue.onSubmittedWorkDone (GPU compute)
+      // readback= time mapping the logits buffer
+      // sample  = sampleFromLogits cost
+      // dispatches = how many compute dispatches the forward pass enqueued
+      const __fwdCpuMs = __tFwdEnd - __tFwdStart;
+      const __gpuWaitMs = __tGpuDone - __tFwdEnd;
+      const __readbackMs = __tReadback - __tGpuDone;
+      const __sampleMs = __tSample - __tReadback;
+      const __lastFwd = (globalThis as any).__perfLastForward as
+        | { dispatches: number; copies: number; cpuMs: number } | undefined;
+      const __dispatchCount = __lastFwd ? __lastFwd.dispatches : -1;
+      __perfFwdCpuSum += __fwdCpuMs;
+      __perfGpuWaitSum += __gpuWaitMs;
+      __perfReadbackSum += __readbackMs;
+      __perfSampleSum += __sampleMs;
+      __perfDispatchSum += __dispatchCount;
+      __perfStepCount++;
+      if (step <= __perfStepBudget) {
+        const __total = __fwdCpuMs + __gpuWaitMs + __readbackMs + __sampleMs;
+        console.log(
+          `[perf decode #${step}] fwd_cpu=${__fwdCpuMs.toFixed(1)}ms `
+          + `gpu_wait=${__gpuWaitMs.toFixed(1)}ms `
+          + `readback=${__readbackMs.toFixed(1)}ms `
+          + `sample=${__sampleMs.toFixed(1)}ms `
+          + `total=${__total.toFixed(1)}ms `
+          + `dispatches=${__dispatchCount}`
+        );
+      } else if (step === __perfStepBudget + 1) {
+        // Print bottleneck diagnosis once, then go silent
+        const __sum = __fwdCpuMs + __gpuWaitMs + __readbackMs + __sampleMs;
+        const pct = (n: number) => ((n / __sum) * 100).toFixed(0) + '%';
+        let diag = 'mixed';
+        if (__fwdCpuMs > __gpuWaitMs * 1.5) diag = 'CPU/dispatch-bound — bind-group cache & encoder fusion will help most';
+        else if (__gpuWaitMs > __fwdCpuMs * 1.5) diag = 'GPU-bound — kernel fusion (norm+proj, FFN) is the win';
+        else if (__readbackMs > __fwdCpuMs && __readbackMs > __gpuWaitMs) diag = 'readback-bound — async overlap will help most';
+        console.log(
+          `[perf decode] DIAGNOSIS: ${diag} `
+          + `(fwd_cpu=${pct(__fwdCpuMs)}, gpu_wait=${pct(__gpuWaitMs)}, `
+          + `readback=${pct(__readbackMs)}, sample=${pct(__sampleMs)})`
+        );
+      }
 
       // Check for EOS
       if (tokenizer.isEos(nextId)) {
@@ -357,6 +414,36 @@ export function generate(
         console.log(`[Generate] Stopping: repetition detected at step ${step}`);
         break;
       }
+      }
+
+      // ── Per-decode summary (Step 1 measurement layer) ────────────────
+      // Averaged breakdown across ALL decode steps; this is the load-bearing
+      // number for picking the next optimization. 'fwd_cpu' = JS dispatch
+      // building inside engine.forward; 'gpu_wait' = GPU compute time;
+      // 'readback' = mapAsync of the logits buffer; 'sample' = JS sampling.
+      if (__perfStepCount > 0) {
+        const n = __perfStepCount;
+        const avgFwd = __perfFwdCpuSum / n;
+        const avgGpu = __perfGpuWaitSum / n;
+        const avgRb = __perfReadbackSum / n;
+        const avgSp = __perfSampleSum / n;
+        const avgDisp = __perfDispatchSum / n;
+        const avgTotal = avgFwd + avgGpu + avgRb + avgSp;
+        const pct = (n: number) => ((n / avgTotal) * 100).toFixed(0) + '%';
+        let diag = 'mixed (no clear single bottleneck)';
+        if (avgFwd > avgGpu * 1.5) diag = 'CPU/dispatch-bound — bind-group cache & encoder fusion are highest leverage';
+        else if (avgGpu > avgFwd * 1.5) diag = 'GPU-bound — kernel fusion (norm+proj, FFN swiglu) is the win';
+        else if (avgRb > avgFwd && avgRb > avgGpu) diag = 'readback-bound — async overlap will help most';
+        console.log(
+          `[perf decode SUMMARY over ${n} steps] `
+          + `avg_total=${avgTotal.toFixed(1)}ms (=${(1000 / avgTotal).toFixed(2)} tok/s) | `
+          + `fwd_cpu=${avgFwd.toFixed(1)}ms (${pct(avgFwd)}) `
+          + `gpu_wait=${avgGpu.toFixed(1)}ms (${pct(avgGpu)}) `
+          + `readback=${avgRb.toFixed(1)}ms (${pct(avgRb)}) `
+          + `sample=${avgSp.toFixed(1)}ms (${pct(avgSp)}) | `
+          + `avg_dispatches/token=${avgDisp.toFixed(0)}`
+        );
+        console.log(`[perf decode SUMMARY] DIAGNOSIS: ${diag}`);
       }
     } // end if !eos from first token
 

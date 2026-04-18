@@ -550,10 +550,19 @@ export function createForwardPassEngine(
   let deferredDestroys: GPUBuffer[] = [];
 
   /** Dispatch a compute pass — batched if currentBatch is set, else immediate. */
+  // ── Performance instrumentation (Step 1: measurement layer) ────────
+  // Module-scope counters so we can attribute per-forward dispatch/copy load
+  // without threading a context object through every helper. The counters are
+  // sampled at forward() entry/exit; the deltas are what gets logged.
+  let __perfDispatchCount = 0;
+  let __perfCopyCount = 0;
+  let __perfBindGroupCount = 0;
+
   function bd(
     pipeline: GPUComputePipeline, bindGroups: GPUBindGroup[],
     workgroupCounts: [number, number?, number?], label?: string,
   ) {
+    __perfDispatchCount++;
     if (currentBatch) {
       currentBatch.dispatch(pipeline, bindGroups, workgroupCounts, label);
     } else {
@@ -576,6 +585,7 @@ export function createForwardPassEngine(
     dst: GPUBuffer, dstOff: number,
     size: number,
   ) {
+    __perfCopyCount++;
     if (currentBatch) {
       currentBatch.copyBuffer(src, srcOff, dst, dstOff, size);
     } else {
@@ -868,6 +878,14 @@ export function createForwardPassEngine(
     if (isDebug && pos === 0) g.__DEBUG_FORWARD_PASS__ = false; // first-call one-shot
     if (fireAtLastPrefill) g.__DEBUG_LAST_PREFILL_POS__ = undefined; // last-prefill one-shot
     debugCallCount++;
+
+    // ── Performance instrumentation (Step 1) ─────────────────────────
+    // Count CPU time and dispatch/copy load for this forward pass. The numbers
+    // are written to globalThis.__perfLastForward so generate.ts can compose a
+    // per-decode-step breakdown, and an auto-log fires for the first few calls.
+    const __perfT0 = performance.now();
+    const __perfDispStart = __perfDispatchCount;
+    const __perfCopyStart = __perfCopyCount;
 
     // Upload token IDs
     device.queue.writeBuffer(tokenIdBuf, 0, tokenIds.buffer, tokenIds.byteOffset, tokenIds.byteLength);
@@ -1534,6 +1552,29 @@ export function createForwardPassEngine(
 
     // Update cache position
     kvCache.position += seqLen;
+
+    // ── Performance instrumentation (Step 1, exit) ────────────────────
+    // CPU-side ms = wall time spent inside forward() (encoder build + submit).
+    // Dispatch/copy deltas attribute GPU-work load to this single call.
+    const __perfT1 = performance.now();
+    const __perfDisp = __perfDispatchCount - __perfDispStart;
+    const __perfCopy = __perfCopyCount - __perfCopyStart;
+    const __perfMs = __perfT1 - __perfT0;
+    (globalThis as any).__perfLastForward = {
+      seqLen, cpuMs: __perfMs, dispatches: __perfDisp, copies: __perfCopy,
+    };
+    // Auto-log for the first 5 forward calls so the user sees the breakdown
+    // without needing to set any global flag. After that, silence (avoids log
+    // spam during long generations).
+    if (debugCallCount <= 5) {
+      console.log(
+        `[perf forward #${debugCallCount} seqLen=${seqLen} pos=${pos}] `
+        + `cpu=${__perfMs.toFixed(1)}ms `
+        + `dispatches=${__perfDisp} copies=${__perfCopy} `
+        + `(per-token: ${(__perfMs / seqLen).toFixed(1)}ms, `
+        + `${(__perfDisp / seqLen).toFixed(0)} dispatches)`
+      );
+    }
 
     return { logitsBuffer: logitsBuf };
   }
