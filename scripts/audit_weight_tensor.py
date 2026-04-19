@@ -80,7 +80,7 @@ def fmt_stats(t: torch.Tensor) -> str:
 
 def dequantize_gptq(qweight: torch.Tensor, scales: torch.Tensor,
                     qzeros: torch.Tensor, g_idx: torch.Tensor,
-                    bits: int = 4) -> torch.Tensor:
+                    bits: int = 4, gptq_v2: bool = True) -> torch.Tensor:
     """Reconstruct a [in_features, out_features] FP32 weight from GPTQ tensors.
 
     Standard auto-gptq layout:
@@ -89,6 +89,16 @@ def dequantize_gptq(qweight: torch.Tensor, scales: torch.Tensor,
       scales  : [num_groups, out_features] fp16
       g_idx   : [in_features] int32 (group index per input row)
     Output: [in_features, out_features] fp32 (transpose later if needed).
+
+    Format selector `gptq_v2` controls zero-point decoding:
+      * gptq_v2=True  (default): zero-point is the unpacked 4-bit value directly.
+                      Matches `checkpoint_format: "gptq_v2"` in quantization_config
+                      and matches the WGSL kernel in this repo's webgpu engine.
+      * gptq_v2=False: legacy auto-gptq v0.x encoded zero-points as (zero - 1),
+                      so +1 is added after unpacking. Needed only for old
+                      checkpoints.
+    Verified against BF16 reference 2026-04-19: gptq_v2 gives rel_L2 ~0.12 on
+    Qwen3.5-9B-HailMary up_proj; legacy (+1) gives rel_L2 ~0.37 (offset bug).
     """
     pack = 32 // bits
     mask = (1 << bits) - 1
@@ -103,11 +113,12 @@ def dequantize_gptq(qweight: torch.Tensor, scales: torch.Tensor,
     weights_int = ((qw.unsqueeze(1) >> shifts.view(1, -1, 1)) & mask).to(torch.int32)
     weights_int = weights_int.reshape(in_features, out_features)
 
-    # Unpack qzeros into [num_groups, out_features] int values; auto-gptq stores
-    # zero - 1, so the conventional decode adds 1 after unpacking.
+    # Unpack qzeros into [num_groups, out_features] int values.
     qz = qzeros.to(torch.int64)
     zeros_int = ((qz.unsqueeze(2) >> shifts.view(1, 1, -1)) & mask).to(torch.int32)
-    zeros_int = zeros_int.reshape(qzeros.shape[0], out_features) + 1
+    zeros_int = zeros_int.reshape(qzeros.shape[0], out_features)
+    if not gptq_v2:
+        zeros_int = zeros_int + 1
 
     # Per-row scale + zero via g_idx
     scales_f = scales.to(torch.float32)
