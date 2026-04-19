@@ -461,6 +461,22 @@ loadBtn.addEventListener('click', async () => {
   loadBtn.disabled = true;
   setStatus(`Loading ${repo}...`);
 
+  // Diagnostic: VRAM upload audit. Enable via ?vramAudit=prefix1,prefix2 in URL
+  // or localStorage.setItem('vramAuditPrefixes', 'prefix1,prefix2'). After each
+  // tensor whose name starts with any prefix is uploaded, the GPU buffer is
+  // read back and byte-compared to the CPU source. Logs OK/MISMATCH per tensor.
+  const urlParams = new URLSearchParams(window.location.search);
+  const vramAuditFromUrl = urlParams.get('vramAudit');
+  const vramAuditFromStorage = localStorage.getItem('vramAuditPrefixes');
+  const vramAuditRaw = vramAuditFromUrl || vramAuditFromStorage;
+  if (vramAuditRaw) {
+    (globalThis as any).__DEBUG_VRAM_AUDIT_PREFIXES__ =
+      vramAuditRaw.split(',').map(s => s.trim()).filter(s => s.length > 0);
+    console.log(`[VRAM-AUDIT] enabled for prefixes:`, (globalThis as any).__DEBUG_VRAM_AUDIT_PREFIXES__);
+  } else {
+    (globalThis as any).__DEBUG_VRAM_AUDIT_PREFIXES__ = [];
+  }
+
   try {
     // Check if model is available in local HF cache (50-100x faster than CDN)
     let usingLocalCache = false;

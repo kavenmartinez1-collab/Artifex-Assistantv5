@@ -24,6 +24,7 @@ import {
 
 import { getCache, putCache, hasCache } from './cache';
 import { reportMetric } from '../utils/metrics';
+import { readBuffer } from '../engine/buffers';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -312,11 +313,12 @@ export async function loadModel(
         if (tensorSize > CHUNK_SIZE) {
           rawData = await fetchRange(shard.url, dataStart, dataEnd);
         } else {
-          const chunkIdx = Math.floor(dataStart / CHUNK_SIZE);
+          const firstChunkIdx = Math.floor(dataStart / CHUNK_SIZE);
+          const lastChunkIdx = Math.floor((dataEnd - 1) / CHUNK_SIZE);
 
-          // Prefetch upcoming chunks in parallel
+          // Prefetch upcoming chunks in parallel (ahead of the last chunk we need)
           for (let ahead = 1; ahead <= PARALLEL_CHUNKS; ahead++) {
-            const futureIdx = chunkIdx + ahead;
+            const futureIdx = lastChunkIdx + ahead;
             if (futureIdx < totalChunks && !chunkCache.has(futureIdx)) {
               const p = fetchChunk(futureIdx);
               chunkCache.set(futureIdx, p);
@@ -327,22 +329,46 @@ export async function loadModel(
             }
           }
 
-          // Get current chunk (may already be downloaded via prefetch)
-          const chunk = await getChunk(chunkIdx);
-
           progress({ phase: 'downloading',
-            message: `Shard ${shardIdx + 1}: chunk ${chunkIdx + 1}/${totalChunks}, tensor ${tensorIdx}/${header.tensors.size}`,
+            message: `Shard ${shardIdx + 1}: chunk ${firstChunkIdx + 1}/${totalChunks}, tensor ${tensorIdx}/${header.tensors.size}`,
             shard: shardIdx + 1, totalShards: shards.length,
-            shardProgress: (chunkIdx + 1) / totalChunks,
+            shardProgress: (firstChunkIdx + 1) / totalChunks,
             overallProgress: bytesDownloadedTotal / totalDownloadSize });
 
-          // Free old chunks to limit memory (~1 GB max)
-          for (const [k, v] of chunkCache) {
-            if (k < chunkIdx - 1 && v instanceof ArrayBuffer) chunkCache.delete(k);
+          if (firstChunkIdx === lastChunkIdx) {
+            // Fast path: tensor fits within a single chunk
+            const chunk = await getChunk(firstChunkIdx);
+            const offsetInChunk = dataStart - firstChunkIdx * CHUNK_SIZE;
+            rawData = chunk.slice(offsetInChunk, offsetInChunk + tensorSize);
+          } else {
+            // Cross-chunk path: tensor straddles one or more chunk boundaries.
+            // Stitch bytes from each chunk it spans. Without this, chunk.slice()
+            // silently truncates at the chunk end — producing undersized buffers
+            // and silently-wrong outputs (see L21 audit investigation).
+            const stitched = new Uint8Array(tensorSize);
+            let written = 0;
+            for (let idx = firstChunkIdx; idx <= lastChunkIdx; idx++) {
+              const chunk = await getChunk(idx);
+              const chunkStart = idx * CHUNK_SIZE;
+              const readStart = Math.max(dataStart, chunkStart) - chunkStart;
+              const readEnd = Math.min(dataEnd, chunkStart + chunk.byteLength) - chunkStart;
+              const part = new Uint8Array(chunk, readStart, readEnd - readStart);
+              stitched.set(part, written);
+              written += part.byteLength;
+            }
+            if (written !== tensorSize) {
+              throw new Error(
+                `Chunk stitching shortfall for ${name}: stitched ${written} of ${tensorSize} bytes`
+              );
+            }
+            rawData = stitched.buffer;
           }
 
-          const offsetInChunk = dataStart - chunkIdx * CHUNK_SIZE;
-          rawData = chunk.slice(offsetInChunk, offsetInChunk + tensorSize);
+          // Free old chunks to limit memory (~1 GB max). Keep previous chunk in
+          // case the next tensor also spans a boundary backwards.
+          for (const [k, v] of chunkCache) {
+            if (k < firstChunkIdx - 1 && v instanceof ArrayBuffer) chunkCache.delete(k);
+          }
         }
         tensorIdx++;
       }
@@ -491,6 +517,43 @@ export async function loadModel(
         new Uint8Array(gpuData.buffer, gpuData.byteOffset, gpuData.byteLength)
       );
       gpuBuffer.unmap();
+
+      // ── VRAM audit (debug) ───────────────────────────────────────────
+      // When __DEBUG_VRAM_AUDIT_PREFIXES__ is set on globalThis, read back the
+      // just-uploaded GPU buffer and byte-compare it to the CPU source bytes.
+      // Detects upload corruption, buffer-limit truncation, or byte-alignment bugs.
+      // One-shot diagnostic for narrowing per-tensor engine bugs.
+      const vramAuditPrefixes: string[] =
+        (globalThis as any).__DEBUG_VRAM_AUDIT_PREFIXES__ ?? [];
+      if (vramAuditPrefixes.length > 0 && vramAuditPrefixes.some(p => name.startsWith(p))) {
+        const diskBytes = new Uint8Array(gpuData.buffer, gpuData.byteOffset, gpuData.byteLength);
+        const vramRaw = await readBuffer(device, gpuBuffer, gpuData.byteLength);
+        const vramBytes = new Uint8Array(vramRaw);
+        let mismatchCount = 0;
+        let firstMismatch = -1;
+        const n = Math.min(diskBytes.length, vramBytes.length);
+        for (let i = 0; i < n; i++) {
+          if (diskBytes[i] !== vramBytes[i]) {
+            if (firstMismatch === -1) firstMismatch = i;
+            mismatchCount++;
+          }
+        }
+        const hexSlice = (arr: Uint8Array, start: number, len: number) =>
+          Array.from(arr.slice(start, start + len))
+            .map(b => b.toString(16).padStart(2, '0')).join(' ');
+        const status = mismatchCount === 0 ? 'OK' : 'MISMATCH';
+        console.log(
+          `[VRAM-AUDIT ${status}] ${name} (${gpuDtype}) ` +
+          `disk=${diskBytes.length}B vram=${vramBytes.length}B ` +
+          `mismatches=${mismatchCount}/${n} firstAt=${firstMismatch}`
+        );
+        console.log(`  disk[0:16] = ${hexSlice(diskBytes, 0, 16)}`);
+        console.log(`  vram[0:16] = ${hexSlice(vramBytes, 0, 16)}`);
+        if (mismatchCount > 0) {
+          console.log(`  disk@first = ${hexSlice(diskBytes, Math.max(0, firstMismatch - 4), 16)}`);
+          console.log(`  vram@first = ${hexSlice(vramBytes, Math.max(0, firstMismatch - 4), 16)}`);
+        }
+      }
 
       // For GPTQ g_idx tensors, probe whether the values are trivially
       // floor(k / group_size). If so, the engine can use the fast GEMV path.
