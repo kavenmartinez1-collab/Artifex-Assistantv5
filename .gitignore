@@ -82,7 +82,10 @@ coverage.xml
 SESSION-NOTES.md
 debug*.json
 webgpu/debug-output.json
+webgpu/debug-output.*.json
 scripts/reference_output.txt
+reference_dump*.json
+weight_sweep.json
 
 # ── Runtime / temp files ────────────────────────────────────────────
 *.log

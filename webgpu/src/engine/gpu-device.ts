@@ -114,7 +114,15 @@ export async function initWebGPU(selectedAdapter?: GPUAdapter): Promise<GPUConte
     2 * 1024 * 1024 * 1024
   );
 
+  // Request the timestamp-query feature if supported — enables per-dispatch
+  // kernel timing for the diagnostic profiler. Graceful no-op if unavailable.
+  const requiredFeatures: GPUFeatureName[] = [];
+  if (adapter.features.has('timestamp-query')) {
+    requiredFeatures.push('timestamp-query');
+  }
+
   const device = await adapter.requestDevice({
+    requiredFeatures,
     requiredLimits: {
       maxBufferSize,
       maxStorageBufferBindingSize: maxStorageBinding,

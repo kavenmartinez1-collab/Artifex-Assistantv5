@@ -36,6 +36,14 @@ export interface GPUTensor {
   elementCount: number;
   /** True for GPTQ packed weights (.qweight, .qzeros, .scales) */
   isQuantized?: boolean;
+  /**
+   * For GPTQ `*.g_idx` tensors only: true iff the values are trivially
+   * `floor(k / group_size)` for some detected group_size. Many GPTQ exports
+   * ship an identity g_idx for tooling compatibility even when they didn't
+   * reorder columns (desc_act=false). When this is true the GEMV fast-path
+   * can skip the per-K g_idx VRAM read and compute group_id in registers.
+   */
+  isTrivialGIdx?: boolean;
 }
 
 export interface LoadedModel {
@@ -59,6 +67,43 @@ export interface LoadProgress {
 }
 
 type ProgressCallback = (progress: LoadProgress) => void;
+
+/**
+ * Detect whether a GPTQ `g_idx` tensor is the trivial identity mapping
+ * (i.e. g_idx[k] == floor(k / group_size) for some power-of-two group_size).
+ *
+ * The group_size is recovered empirically: it's the first k where g_idx[k]
+ * transitions from 0 → 1. Once known we verify every remaining entry.
+ * Returns false immediately if any divergence is found.
+ *
+ * Accepts a raw ArrayBuffer holding i32 little-endian values (safetensors
+ * always stores I32 as LE on disk).
+ */
+function isTrivialGIdxBuffer(raw: ArrayBuffer, length: number): boolean {
+  if (length < 2) return false;
+  const view = new Int32Array(raw, 0, length);
+  if (view[0] !== 0) return false;
+
+  // Find first index where value changes — that's the group_size.
+  let gs = -1;
+  for (let k = 1; k < length; k++) {
+    if (view[k] !== 0) {
+      if (view[k] !== 1) return false; // non-monotone or jumped past 1
+      gs = k;
+      break;
+    }
+  }
+  if (gs <= 0) return false; // all zeros (degenerate) — treat as non-trivial
+  // Group size must divide length (GPTQ pads K to a multiple of gs).
+  if (length % gs !== 0) return false;
+
+  // Verify the remainder matches floor(k / gs). Tight loop — ~16 KB tensor
+  // typical for K=4096, so this is negligible (<1ms).
+  for (let k = 0; k < length; k++) {
+    if (view[k] !== Math.floor(k / gs)) return false;
+  }
+  return true;
+}
 
 // ─── Weight Loader ───────────────────────────────────────────────────────────
 
@@ -447,10 +492,18 @@ export async function loadModel(
       );
       gpuBuffer.unmap();
 
+      // For GPTQ g_idx tensors, probe whether the values are trivially
+      // floor(k / group_size). If so, the engine can use the fast GEMV path.
+      let isTrivialGIdx: boolean | undefined;
+      if (name.endsWith('.g_idx') || name.endsWith('.g_idx_q8')) {
+        isTrivialGIdx = isTrivialGIdxBuffer(rawData, tensorInfo.elementCount);
+      }
+
       allTensors.set(name, {
         name, buffer: gpuBuffer, shape: tensorInfo.shape,
         dtype: gpuDtype, byteLength: gpuData.byteLength,
         elementCount: tensorInfo.elementCount, isQuantized: isGPTQ,
+        isTrivialGIdx,
       });
 
       totalGPUBytes += gpuData.byteLength;
