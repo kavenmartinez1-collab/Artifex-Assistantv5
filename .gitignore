@@ -80,12 +80,21 @@ coverage.xml
 
 # ── Debug output and session notes (personal, not project code) ───
 SESSION-NOTES.md
+PICKUP.md
 debug*.json
 webgpu/debug-output.json
 webgpu/debug-output.*.json
 scripts/reference_output.txt
 reference_dump*.json
-weight_sweep.json
+weight_sweep*.json
+
+# ── Session-specific diagnostic probes (one-off investigation tools) ─
+scripts/l21_*.py
+scripts/zero_offset_probe*.py
+scripts/gidx_trivial_probe.py
+scripts/run-probe*.sh
+scripts/run-test.sh
+scripts/run-temp-test.sh
 
 # ── Runtime / temp files ────────────────────────────────────────────
 *.log
