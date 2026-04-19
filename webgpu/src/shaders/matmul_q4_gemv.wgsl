@@ -19,8 +19,20 @@
 //
 // Kahan compensation retained — matches the tiled kernel's numerical behavior.
 
-const WG_SIZE: u32 = 256;
-const K_CHUNK: u32 = 1024;  // 4 KB workgroup memory for A chunks
+const K_CHUNK: u32 = 1024;    // 4 KB workgroup memory for A chunks
+
+// WG_SIZE and MAX_GROUPS are pipeline-override constants so the engine can
+// compile one shader but specialize (threads-per-workgroup, cache capacity)
+// per matmul shape. This is how a single kernel scales from 7B (num_groups
+// ≤ 32) through 70B-class FFN layers (num_groups up to ~448 at gs=128).
+//
+// The cache memory is MAX_GROUPS × WG_SIZE × 4 bytes. Plus a_chunk (4 KB)
+// this must stay under Blackwell's 32 KB workgroup storage limit — budget
+// for scales_wg is thus 28 KB → MAX_GROUPS × WG_SIZE ≤ 7168. The engine
+// picks canonical pairs on that Pareto frontier (larger WG_SIZE preferred
+// for fewer workgroup launches when num_groups permits).
+override WG_SIZE: u32 = 128u;
+override MAX_GROUPS: u32 = 32u;  // cached-scale path: must hold all K/group_size groups
 
 // Pipeline-override constant: when 0, group_id is computed as k / group_size
 // directly in registers, eliminating K in-loop VRAM reads of g_idx per output
@@ -31,6 +43,20 @@ const K_CHUNK: u32 = 1024;  // 4 KB workgroup memory for A chunks
 // u32 (not bool) because some WebGPU drivers historically had spottier bool-
 // override support; 0/1 is universally safe.
 override USE_ACTORDER: u32 = 0u;
+
+// Pipeline-override: when 1, cooperatively preload every group's decoded f32
+// scale for this workgroup's 128-column slice into workgroup memory at kernel
+// start. Inner-loop cur_group invalidations then read the scale from workgroup
+// memory instead of re-decoding f16 from VRAM — eliminates the dominant part
+// of the 128× scale traffic amplification that makes actorder matmuls slow.
+// Only valid when num_groups = K/group_size ≤ MAX_GROUPS.
+//
+// Zeros are intentionally NOT cached: Blackwell's workgroup storage limit is
+// 32 KB; caching both scales (16 KB) and zeros (16 KB) plus a_chunk (4 KB)
+// exceeds it. Zeros are cheap to recompute — a single qzeros read + bit-shift
+// — and qzeros is ~8× smaller than scales (packed 8 nibbles per i32) so its
+// VRAM pressure is modest to begin with.
+override USE_SCALE_CACHE: u32 = 0u;
 
 struct Params {
   M: u32,           // must be 1 for this kernel
@@ -48,6 +74,12 @@ struct Params {
 @group(0) @binding(6) var<storage, read> g_idx: array<u32>;
 
 var<workgroup> a_chunk: array<f32, 1024>;
+// When USE_SCALE_CACHE=1: decoded f32 scale for every group, per column in
+// this workgroup's WG_SIZE-column tile. Sized by pipeline overrides (see
+// header). When USE_SCALE_CACHE=0 the preload + read path is dead code and
+// drivers typically elide it; MAX_GROUPS is set to 1 in that case to avoid
+// reserving unused workgroup memory.
+var<workgroup> scales_wg: array<f32, MAX_GROUPS * WG_SIZE>;
 
 fn extract_q4(packed: i32, nibble_idx: u32) -> u32 {
   return u32((packed >> (nibble_idx * 4u)) & 0xF);
@@ -71,7 +103,7 @@ fn read_f16_scale(idx: u32) -> f32 {
   return bitcast<f32>(f32_bits);
 }
 
-@compute @workgroup_size(256, 1, 1)
+@compute @workgroup_size(WG_SIZE, 1, 1)
 fn matmul_bt_q4_gemv(@builtin(local_invocation_id) lid: vec3u,
                      @builtin(workgroup_id) wid: vec3u) {
   let col = wid.x * WG_SIZE + lid.x;
@@ -85,6 +117,21 @@ fn matmul_bt_q4_gemv(@builtin(local_invocation_id) lid: vec3u,
   var cached_scale: f32 = 0.0;
   var cached_zero: u32 = 0u;
 
+  // Preload this workgroup's column-slice of scales into workgroup memory.
+  // One thread per column handles all groups for that column. This eliminates
+  // VRAM traffic for the expensive f16 scale decode on cur_group changes in
+  // the inner loop — the dominant cost in the actorder path where cur_group
+  // can change every k. Zeros are left uncached (see header comment).
+  if (USE_SCALE_CACHE != 0u) {
+    let num_groups = (K + params.group_size - 1u) / params.group_size;
+    if (col < N) {
+      for (var g: u32 = 0u; g < num_groups; g = g + 1u) {
+        scales_wg[g * WG_SIZE + tid] = read_f16_scale(g * N + col);
+      }
+    }
+    workgroupBarrier();
+  }
+
   let num_chunks = (K + K_CHUNK - 1u) / K_CHUNK;
 
   for (var chunk: u32 = 0u; chunk < num_chunks; chunk = chunk + 1u) {
@@ -94,7 +141,7 @@ fn matmul_bt_q4_gemv(@builtin(local_invocation_id) lid: vec3u,
     let chunk_size = k_end - k_base;
 
     // Cooperative load of this chunk of A into workgroup memory.
-    // All 256 threads participate, striding by WG_SIZE.
+    // All WG_SIZE threads participate, striding by WG_SIZE.
     for (var i: u32 = tid; i < chunk_size; i = i + WG_SIZE) {
       a_chunk[i] = A[k_base + i];
     }
@@ -121,10 +168,21 @@ fn matmul_bt_q4_gemv(@builtin(local_invocation_id) lid: vec3u,
           }
           if (group_id != cur_group) {
             cur_group = group_id;
-            cached_scale = read_f16_scale(group_id * N + col);
-            let zero_packed_idx = group_id * ((N + 7u) / 8u) + col / 8u;
-            let zero_nibble = col % 8u;
-            cached_zero = extract_q4(qzeros[zero_packed_idx], zero_nibble);
+            if (USE_SCALE_CACHE != 0u) {
+              // Scale from workgroup memory (~50-cycle LDS read vs an f16
+              // decode + VRAM round-trip). Zero still decoded from VRAM:
+              // qzeros is 8× denser than scales and a packed i32 read +
+              // bit-shift is cheap relative to the f16→f32 sequence.
+              cached_scale = scales_wg[group_id * WG_SIZE + tid];
+              let zero_packed_idx = group_id * ((N + 7u) / 8u) + col / 8u;
+              let zero_nibble = col % 8u;
+              cached_zero = extract_q4(qzeros[zero_packed_idx], zero_nibble);
+            } else {
+              cached_scale = read_f16_scale(group_id * N + col);
+              let zero_packed_idx = group_id * ((N + 7u) / 8u) + col / 8u;
+              let zero_nibble = col % 8u;
+              cached_zero = extract_q4(qzeros[zero_packed_idx], zero_nibble);
+            }
           }
           let q4_val = extract_q4(packed, nib);
           let w = (f32(q4_val) - f32(cached_zero)) * cached_scale;

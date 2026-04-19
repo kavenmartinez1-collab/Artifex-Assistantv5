@@ -262,24 +262,19 @@ export function createForwardPassEngine(
     : null;
   // GEMV fast-path for M=1 (decode). Same bindings as matmul_bt_q4 so bind
   // groups can be swapped without rebuilding. One thread per output column,
-  // so all 256 threads are useful (vs 16/256 with the tiled kernel at M=1).
+  // so every thread is useful (vs 16/256 with the tiled kernel at M=1).
   //
-  // Two pipeline variants are compiled upfront, differing only by the WGSL
-  // override constant USE_ACTORDER. The fast variant (USE_ACTORDER=0) skips
-  // the per-K g_idx VRAM read and computes group_id = k / group_size directly.
-  // The correct-but-slower variant (USE_ACTORDER=1) consults g_idx, needed for
-  // GPTQ models quantized with desc_act=true. dispatchMatmulQ4 picks per-tensor
-  // based on the q4.hasActOrder flag.
-  const matmulQ4GemvPipeline = config.isQuantized
-    ? createComputePipeline(
-        device, matmulQ4GemvWGSL, 'matmul_bt_q4_gemv', 'matmul-q4-gemv',
-        { USE_ACTORDER: 0 })
-    : null;
-  const matmulQ4GemvActOrderPipeline = config.isQuantized
-    ? createComputePipeline(
-        device, matmulQ4GemvWGSL, 'matmul_bt_q4_gemv', 'matmul-q4-gemv-actorder',
-        { USE_ACTORDER: 1 })
-    : null;
+  // Pipeline variants differ by four WGSL override constants:
+  //   USE_ACTORDER     — 0: group_id = k/group_size (fast, no g_idx reads)
+  //                      1: group_id = g_idx[k]     (needed for desc_act=true)
+  //   USE_SCALE_CACHE  — 0: decode f16 scales from VRAM on every group change
+  //                      1: preload workgroup's scale column-slice to LDS once
+  //   WG_SIZE          — threads per workgroup = columns processed per workgroup
+  //   MAX_GROUPS       — workgroup array capacity (must ≥ num_groups)
+  //
+  // Variants are compiled lazily via getGemvPipeline() so the set of (MAX_GROUPS,
+  // WG_SIZE) pairs is driven by the actual matmul shapes in the loaded model,
+  // not hard-coded. See dispatchMatmulQ4 below for the per-tensor selection.
   // E8 lattice 2-bit dequantizing matmul (weights packed as codebook indices)
   const matmulE8Pipeline = config.isQuantized
     ? createComputePipeline(device, matmulE8WGSL, 'matmul_e8', 'matmul-e8')
@@ -355,6 +350,151 @@ export function createForwardPassEngine(
     ? createComputePipeline(device, elementwiseWGSL, 'decay_compute', 'decay') : null;
   const l2NormPipeline = isHybrid
     ? createComputePipeline(device, l2normWGSL, 'l2_normalize', 'l2-norm') : null;
+
+  // ── Per-kernel timing infrastructure (optional) ─────────────────────
+  // Uses WebGPU's optional `timestamp-query` feature to measure each compute
+  // pass on-device, then aggregates results by "category" (one category per
+  // shader pipeline — e.g. all matmul_q4 dispatches roll up into one total).
+  //
+  // Registered here because the pipeline→category mapping is stable for the
+  // lifetime of the engine. dispatchMatmul* helpers don't need to know; bd()
+  // looks up the pipeline identity and emits timestampWrites when the timing
+  // context is active. Categories are strings so new shaders auto-surface.
+  const supportsTimestamps = device.features.has('timestamp-query');
+  const pipelineCategories = new Map<GPUComputePipeline, string>();
+  const registerCat = (p: GPUComputePipeline | null, cat: string) => {
+    if (p) pipelineCategories.set(p, cat);
+  };
+  registerCat(embedPipeline, 'embed');
+  registerCat(embedF16Pipeline, 'embed');
+  registerCat(embedQ4Pipeline, 'embed_q4');
+  registerCat(rmsnormPipeline, 'rmsnorm');
+  registerCat(siluPipeline, 'silu');
+  registerCat(mulPipeline, 'mul');
+  registerCat(addPipeline, 'add');
+  registerCat(matmulPipeline, 'matmul_f32');
+  registerCat(matmulBTPipeline, 'matmul_bt_f32');
+  registerCat(matmulBTBF16Pipeline, 'matmul_bt_bf16');
+  registerCat(matmulQ4Pipeline, 'matmul_q4_tiled');
+  // GEMV variants are registered lazily by getGemvPipeline() on first compile.
+  registerCat(matmulE8Pipeline, 'matmul_e8');
+  registerCat(matmulQ8Pipeline, 'matmul_q8');
+  registerCat(hadamardPipeline, 'hadamard');
+  registerCat(ropePipeline, 'rope');
+  registerCat(attentionPipeline, 'attention');
+  registerCat(attentionTqPipeline, 'attention_tq');
+  registerCat(tqEncodePipeline, 'tq_encode');
+  registerCat(tqDecodePipeline, 'tq_decode');
+  registerCat(gateSiluPipeline, 'gate_silu');
+  registerCat(softplusPipeline, 'softplus');
+  registerCat(conv1dPipeline, 'conv1d');
+  registerCat(conv1dUpdatePipeline, 'conv1d_update');
+  registerCat(groupNormPipeline, 'group_norm');
+  registerCat(ssmStepPipeline, 'ssm_step');
+  registerCat(sigmoidPipeline, 'sigmoid');
+  registerCat(decayPipeline, 'decay');
+  registerCat(l2NormPipeline, 'l2norm');
+
+  // ── Matmul-Q4 GEMV pipeline selection ──────────────────────────────
+  // Cached-scales variants are parameterized by (MAX_GROUPS, WG_SIZE). The
+  // product MAX_GROUPS * WG_SIZE (= scale cache entries) must fit the 28 KB
+  // scale budget (4 KB goes to a_chunk, total ≤ 32 KB Blackwell limit).
+  //
+  // The table is sorted so pickGemvCacheShape() can linearly scan and return
+  // the first entry whose MAX_GROUPS covers num_groups. Larger WG_SIZE is
+  // preferred when it fits — fewer workgroup launches, better occupancy for
+  // small-K matmuls.
+  const GEMV_CACHE_SHAPES: Array<{ maxGroups: number; wgSize: number }> = [
+    { maxGroups: 32,  wgSize: 128 },  // 16 KB scales, covers K ≤ 4096 at gs=128
+    { maxGroups: 56,  wgSize: 128 },  // 28 KB scales, covers K ≤ 7168
+    { maxGroups: 112, wgSize: 64  },  // 28 KB scales, covers K ≤ 14336
+    { maxGroups: 224, wgSize: 32  },  // 28 KB scales, covers K ≤ 28672
+    { maxGroups: 448, wgSize: 16  },  // 28 KB scales, covers K ≤ 57344 (70B-class FFN)
+  ];
+  function pickGemvCacheShape(numGroups: number): { maxGroups: number; wgSize: number } | null {
+    for (const s of GEMV_CACHE_SHAPES) {
+      if (s.maxGroups >= numGroups) return s;
+    }
+    return null;  // num_groups too large for any cached variant; fall back to uncached
+  }
+
+  // Uncached variants don't use scales_wg, so MAX_GROUPS=1 minimizes workgroup
+  // storage reservation (the array is declared unconditionally at module scope).
+  const GEMV_UNCACHED_SHAPE = { maxGroups: 1, wgSize: 128 };
+
+  // Lazy pipeline compilation + cache. Keyed by the four override constants so
+  // every unique (USE_ACTORDER, USE_SCALE_CACHE, MAX_GROUPS, WG_SIZE) tuple
+  // compiles at most once. Categories are registered on first compile so the
+  // per-kernel timing aggregator rolls variants up into three buckets.
+  const gemvPipelineByKey = new Map<string, GPUComputePipeline>();
+  function getGemvPipeline(
+    useActorder: boolean,
+    useScaleCache: boolean,
+    maxGroups: number,
+    wgSize: number,
+  ): GPUComputePipeline | null {
+    if (!config.isQuantized) return null;
+    const key = `${useActorder ? 1 : 0}:${useScaleCache ? 1 : 0}:${maxGroups}:${wgSize}`;
+    let p = gemvPipelineByKey.get(key);
+    if (p) return p;
+    const variantTag = useScaleCache
+      ? `actorder-cached-g${maxGroups}w${wgSize}`
+      : useActorder
+        ? `actorder-g${maxGroups}w${wgSize}`
+        : `noao-g${maxGroups}w${wgSize}`;
+    p = createComputePipeline(
+      device, matmulQ4GemvWGSL, 'matmul_bt_q4_gemv',
+      `matmul-q4-gemv-${variantTag}`,
+      {
+        USE_ACTORDER: useActorder ? 1 : 0,
+        USE_SCALE_CACHE: useScaleCache ? 1 : 0,
+        MAX_GROUPS: maxGroups,
+        WG_SIZE: wgSize,
+      },
+    );
+    const category = useScaleCache
+      ? 'matmul_q4_gemv_actorder_cached'
+      : useActorder
+        ? 'matmul_q4_gemv_actorder'
+        : 'matmul_q4_gemv';
+    pipelineCategories.set(p, category);
+    gemvPipelineByKey.set(key, p);
+    return p;
+  }
+
+  // Active timing context — set by forward() for a bounded number of decode
+  // calls, then drained and nulled out. bd() checks this each dispatch.
+  // The querySet + buffers are lazily created on first use (so engines that
+  // never profile pay zero overhead).
+  interface TimingCtx {
+    querySet: GPUQuerySet;
+    resolveBuf: GPUBuffer;      // QUERY_RESOLVE | COPY_SRC
+    readBuf: GPUBuffer;         // MAP_READ | COPY_DST
+    capacity: number;           // total u64 slots
+    used: number;               // slots consumed this forward
+    categories: string[];       // category per pass-pair (length = used/2)
+  }
+  let __timingCtx: TimingCtx | null = null;
+  let __timingBuffersInit: { querySet: GPUQuerySet; resolveBuf: GPUBuffer; readBuf: GPUBuffer; capacity: number } | null = null;
+  let __timingCallsRemaining = supportsTimestamps ? 2 : 0;  // profile first N eligible decode calls
+
+  function ensureTimingBuffers(): NonNullable<typeof __timingBuffersInit> {
+    if (__timingBuffersInit) return __timingBuffersInit;
+    const capacity = 4096;  // ~2048 passes; a 32-layer forward has ~730
+    const querySet = device.createQuerySet({ type: 'timestamp', count: capacity, label: 'forward-timestamps' });
+    const resolveBuf = device.createBuffer({
+      size: capacity * 8,
+      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+      label: 'timestamp-resolve',
+    });
+    const readBuf = device.createBuffer({
+      size: capacity * 8,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      label: 'timestamp-read',
+    });
+    __timingBuffersInit = { querySet, resolveBuf, readBuf, capacity };
+    return __timingBuffersInit;
+  }
 
   // ── Reusable intermediate buffers ──────────────────────────────────
   // Sized for batch prefill (up to MAX_PREFILL tokens per forward pass).
@@ -442,11 +582,31 @@ export function createForwardPassEngine(
     // GEMV fast path: at M=1 the tiled kernel wastes 15/16 threads per
     // workgroup. Swap to the dedicated GEMV shader which is one-thread-per-
     // output-column. Bindings are identical → bind group unchanged.
-    // Pick the actorder variant if this tensor's g_idx is non-trivial;
-    // otherwise use the faster variant that skips the g_idx VRAM reads.
-    const useGemv = M === 1 && matmulQ4GemvPipeline !== null;
-    const gemvPipeline = q4.hasActOrder ? matmulQ4GemvActOrderPipeline : matmulQ4GemvPipeline;
-    const pipeline = useGemv ? gemvPipeline! : matmulQ4Pipeline;
+    // Variant selection:
+    //   - trivial g_idx → USE_ACTORDER=0, USE_SCALE_CACHE=0 (fast path)
+    //   - actorder, cache shape fits num_groups → cached path
+    //   - actorder, num_groups exceeds every candidate shape → uncached fallback
+    const useGemv = M === 1 && config.isQuantized;
+    const gs = config.quantGroupSize || 128;
+    const numGroups = Math.ceil(K / gs);
+    let gemvPipeline: GPUComputePipeline | null = null;
+    let gemvWgSize = 128;
+    if (useGemv) {
+      if (q4.hasActOrder) {
+        const shape = pickGemvCacheShape(numGroups);
+        if (shape) {
+          gemvPipeline = getGemvPipeline(true, true, shape.maxGroups, shape.wgSize);
+          gemvWgSize = shape.wgSize;
+        } else {
+          gemvPipeline = getGemvPipeline(true, false, GEMV_UNCACHED_SHAPE.maxGroups, GEMV_UNCACHED_SHAPE.wgSize);
+          gemvWgSize = GEMV_UNCACHED_SHAPE.wgSize;
+        }
+      } else {
+        gemvPipeline = getGemvPipeline(false, false, GEMV_UNCACHED_SHAPE.maxGroups, GEMV_UNCACHED_SHAPE.wgSize);
+        gemvWgSize = GEMV_UNCACHED_SHAPE.wgSize;
+      }
+    }
+    const pipeline = useGemv && gemvPipeline ? gemvPipeline : matmulQ4Pipeline;
     const bg = createBindGroup(device, pipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
       { binding: 1, resource: { buffer: q4.qweight } },
@@ -456,8 +616,8 @@ export function createForwardPassEngine(
       { binding: 5, resource: { buffer: q4.qzeros } },
       { binding: 6, resource: { buffer: q4.g_idx } },
     ], label);
-    const dispatchDims: [number, number, number] = useGemv
-      ? [Math.ceil(N / 256), 1, 1]
+    const dispatchDims: [number, number, number] = useGemv && gemvPipeline
+      ? [Math.ceil(N / gemvWgSize), 1, 1]
       : [Math.ceil(M / 16), Math.ceil(N / 16), 1];
     bd(pipeline, [bg], dispatchDims, label);
   }
@@ -575,6 +735,54 @@ export function createForwardPassEngine(
     console.log(`[DEBUG ${label}] first ${n}: [${str}]`);
   }
 
+  // ── Debug: full-buffer stats + sampled last-row vector for divergence probe ──
+  // Reads the whole buffer, computes min/max/absMean/std/nan/inf over all
+  // elements, and extracts a sample vector of up to `sampleLen` f32 values
+  // starting at `sampleOffset`. Pushes {label, size, stats, sample} to the
+  // supplied array. Caller is responsible for flushing the batch + awaiting
+  // GPU completion before calling.
+  async function dumpBufStats(
+    buf: GPUBuffer,
+    label: string,
+    totalFloats: number,
+    sampleOffset: number,
+    sampleLen: number,
+    results: any[],
+  ) {
+    const raw = await readBuffer(device, buf, totalFloats * 4);
+    const vals = new Float32Array(raw);
+    let mn = Infinity, mx = -Infinity, sum = 0, absSum = 0, sqSum = 0;
+    let nanCount = 0, infCount = 0;
+    for (let i = 0; i < vals.length; i++) {
+      const v = vals[i];
+      if (Number.isNaN(v)) { nanCount++; continue; }
+      if (!Number.isFinite(v)) { infCount++; continue; }
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
+      sum += v;
+      absSum += Math.abs(v);
+      sqSum += v * v;
+    }
+    const valid = vals.length - nanCount - infCount;
+    const mean = valid > 0 ? sum / valid : 0;
+    const absMean = valid > 0 ? absSum / valid : 0;
+    const variance = valid > 0 ? (sqSum / valid) - mean * mean : 0;
+    const std = Math.sqrt(Math.max(0, variance));
+    const end = Math.min(sampleOffset + sampleLen, vals.length);
+    const sample = Array.from(vals.slice(sampleOffset, end));
+    const stats = {
+      size: vals.length,
+      min: mn === Infinity ? 0 : mn,
+      max: mx === -Infinity ? 0 : mx,
+      mean, absMean, std, nanCount, infCount,
+    };
+    results.push({ label, stats, sample });
+    console.log(
+      `[DUMP ${label}] n=${vals.length} min=${stats.min.toFixed(4)} max=${stats.max.toFixed(4)} `
+      + `absMean=${absMean.toFixed(4)} std=${std.toFixed(4)} NaN=${nanCount} Inf=${infCount}`
+    );
+  }
+
   // ── Batched dispatch support ─────────────────────────────────────
   // When currentBatch is set, all dispatches and buffer copies are accumulated
   // in a single GPUCommandEncoder and submitted together via flushBatch().
@@ -597,7 +805,19 @@ export function createForwardPassEngine(
   ) {
     __perfDispatchCount++;
     if (currentBatch) {
-      currentBatch.dispatch(pipeline, bindGroups, workgroupCounts, label);
+      let tsWrites: GPUComputePassTimestampWrites | undefined;
+      if (__timingCtx && __timingCtx.used + 2 <= __timingCtx.capacity) {
+        const begin = __timingCtx.used;
+        tsWrites = {
+          querySet: __timingCtx.querySet,
+          beginningOfPassWriteIndex: begin,
+          endOfPassWriteIndex: begin + 1,
+        };
+        const cat = pipelineCategories.get(pipeline) ?? label ?? 'unknown';
+        __timingCtx.categories.push(cat);
+        __timingCtx.used += 2;
+      }
+      currentBatch.dispatch(pipeline, bindGroups, workgroupCounts, label, tsWrites);
     } else {
       dispatch(device, pipeline, bindGroups, workgroupCounts, label ?? '');
     }
@@ -912,6 +1132,44 @@ export function createForwardPassEngine(
     if (fireAtLastPrefill) g.__DEBUG_LAST_PREFILL_POS__ = undefined; // last-prefill one-shot
     debugCallCount++;
 
+    // Divergence-probe dump: when __DEBUG_DUMP_STATS__ is set, collect
+    // per-layer stats + last-token hidden states for comparison vs a PyTorch
+    // reference. The flag is consumed (set to false) so caller can re-arm
+    // at subsequent steps with distinct tags. Results accumulate in
+    // g.__DEBUG_DUMP_RESULT__, keyed by tag, so multiple dump points (prefill-
+    // end, decode-1, decode-10, ...) co-exist in a single run.
+    //
+    // Flag shape: `true` → default tag "dump"; string → use as tag.
+    const dumpFlag = g.__DEBUG_DUMP_STATS__;
+    const dumpFire = dumpFlag === true || typeof dumpFlag === 'string';
+    const dumpTag: string = typeof dumpFlag === 'string' ? dumpFlag : 'dump';
+    const dumpResults: any[] | null = dumpFire ? [] : null;
+    if (dumpFire) {
+      g.__DEBUG_DUMP_STATS__ = false; // consume; caller re-arms for next step
+      console.log(`[DUMP ${dumpTag}] armed for forward seqLen=${seqLen} pos=${pos}`);
+    }
+    const lastRowOffset = (seqLen - 1) * H;
+
+    // ── Per-tensor audit ───────────────────────────────────────────
+    // When __DEBUG_AUDIT_LAYERS__ is set to a list of layer indices, dump the
+    // last-row output of each linear projection inside those layers. Only
+    // fires on dump-active forward calls (so the cost is paid alongside the
+    // existing per-layer dump). Labels are generic (`L${l}-${proj}-out`) so
+    // this works for any future model family — the engine emits a flat label
+    // list, and the comparison script maps labels to HF submodule paths via a
+    // per-family JSON file (see scripts/compare_label_map.*.json).
+    const auditLayersRaw = g.__DEBUG_AUDIT_LAYERS__;
+    const auditLayers = new Set<number>(
+      Array.isArray(auditLayersRaw) ? (auditLayersRaw as number[]) : []
+    );
+    async function maybeAudit(layer: number, buf: GPUBuffer, label: string, M: number, N: number) {
+      if (!dumpResults || !auditLayers.has(layer)) return;
+      flushBatch();
+      await device.queue.onSubmittedWorkDone();
+      const lastRowStart = Math.max(0, (M - 1) * N);
+      await dumpBufStats(buf, label, M * N, lastRowStart, N, dumpResults);
+    }
+
     // ── Performance instrumentation (Step 1) ─────────────────────────
     // Count CPU time and dispatch/copy load for this forward pass. The numbers
     // are written to globalThis.__perfLastForward so generate.ts can compose a
@@ -926,6 +1184,21 @@ export function createForwardPassEngine(
     // Batch all GPU work into a single submit for speed
     currentBatch = new BatchedDispatcher(device, 'forward');
     deferredDestroys = [];
+
+    // Activate per-kernel timing on the first N eligible decode calls. Decode
+    // (seqLen==1) is where the optimization effort is focused and dispatch
+    // counts are stable, so profiling there gives the most actionable numbers.
+    if (supportsTimestamps && __timingCallsRemaining > 0 && seqLen === 1) {
+      const bufs = ensureTimingBuffers();
+      __timingCtx = {
+        querySet: bufs.querySet,
+        resolveBuf: bufs.resolveBuf,
+        readBuf: bufs.readBuf,
+        capacity: bufs.capacity,
+        used: 0,
+        categories: [],
+      };
+    }
 
     // ── Embedding (f32, BF16/F16, or GPTQ INT4) ────────────────────
     if (weights.global.embedQ4 && embedQ4Pipeline) {
@@ -980,6 +1253,11 @@ export function createForwardPassEngine(
     //   if (hasNaN) console.error('[EMBED] WARNING: NaN detected — dequant bug');
     //   if (hasInf) console.error('[EMBED] WARNING: Inf detected — overflow');
     // }
+    if (dumpResults) {
+      flushBatch();
+      await device.queue.onSubmittedWorkDone();
+      await dumpBufStats(hiddenBuf, 'embed-out', seqLen * H, lastRowOffset, H, dumpResults);
+    }
     if (isDebug) {
       flushBatch();
       await debugRead(hiddenBuf, 'embed-out', 8);
@@ -1052,6 +1330,7 @@ export function createForwardPassEngine(
 
           // 1. Fused QKV projection
           dispatchProjection(ssmInputBuf!, lw, 'linearInProjQKV', linQKVBuf!, 1, linQKVDim, H, `L${l}-lin-qkv`);
+          if (ssmT === seqLen - 1) await maybeAudit(l, linQKVBuf!, `L${l}-lin-qkv-out`, 1, linQKVDim);
 
         // Debug: raw QKV projection output (before conv1d) — first token only
         if (isDebug && l === 0 && ssmT === 0) {
@@ -1123,6 +1402,11 @@ export function createForwardPassEngine(
         dispatchProjection(ssmInputBuf!, lw, 'linearInProjA', linABuf!, 1, linNVH, H, `L${l}-lin-a`);
         dispatchProjection(ssmInputBuf!, lw, 'linearInProjB', linBBuf!, 1, linNVH, H, `L${l}-lin-b`);
         dispatchProjection(ssmInputBuf!, lw, 'linearInProjZ', linZBuf!, 1, H, H, `L${l}-lin-z`);
+        if (ssmT === seqLen - 1) {
+          await maybeAudit(l, linABuf!, `L${l}-lin-a-out`, 1, linNVH);
+          await maybeAudit(l, linBBuf!, `L${l}-lin-b-out`, 1, linNVH);
+          await maybeAudit(l, linZBuf!, `L${l}-lin-z-out`, 1, H);
+        }
 
         // Debug: A, B, Z projection outputs — first token only
         if (isDebug && l === 0 && ssmT === 0) {
@@ -1283,6 +1567,7 @@ export function createForwardPassEngine(
         // 9. Output projection → ssmOutBuf [1, H] (per-token scratch)
         const outDim = linNKH * linGroupedVD;
         dispatchProjection(linOutBuf!, lw, 'linearOutProj', ssmOutBuf!, 1, H, outDim, `L${l}-lin-out`);
+        if (ssmT === seqLen - 1) await maybeAudit(l, ssmOutBuf!, `L${l}-lin-out-out`, 1, H);
 
         // Q8 out_proj debug readback (first token only)
         if (isDebug && l === 0 && ssmT === 0) {
@@ -1306,6 +1591,7 @@ export function createForwardPassEngine(
           // Qwen3.5: Q proj outputs [nHeads, dHead*2] — interleaved [Q_h0, gate_h0, Q_h1, gate_h1, ...]
           // Project to qBuf (sized 2x), then deinterleave in-place
           dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHead * 2, H, `L${l}-q`);
+          await maybeAudit(l, qBuf, `L${l}-q-out`, seqLen, nHeads * dHead * 2);
           // Deinterleave from qBuf → attnOutBuf (Q) + attnGateBuf (gate)
           for (let s = 0; s < seqLen; s++) {
             for (let h = 0; h < nHeads; h++) {
@@ -1319,9 +1605,12 @@ export function createForwardPassEngine(
           batchCopy(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHead * 4);
         } else {
           dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHead, H, `L${l}-q`);
+          await maybeAudit(l, qBuf, `L${l}-q-out`, seqLen, nHeads * dHead);
         }
         dispatchProjection(normedBuf, lw, 'kProj', kBuf, seqLen, kvDim, H, `L${l}-k`);
+        await maybeAudit(l, kBuf, `L${l}-k-out`, seqLen, kvDim);
         dispatchProjection(normedBuf, lw, 'vProj', vBuf, seqLen, kvDim, H, `L${l}-v`);
+        await maybeAudit(l, vBuf, `L${l}-v-out`, seqLen, kvDim);
 
         // Qwen3.5: per-head RMSNorm on Q and K (q_norm, k_norm)
         // Uses (1+weight) convention — same as input layernorm
@@ -1463,6 +1752,7 @@ export function createForwardPassEngine(
 
         // Output projection: [seq, nHeads*dHead] → [seq, H]
         dispatchProjection(attnOutBuf, lw, 'oProj', attnProjBuf, seqLen, H, nHeads * dHead, `L${l}-o`);
+        await maybeAudit(l, attnProjBuf, `L${l}-o-out`, seqLen, H);
 
         // O projection bias
         if (config.attentionBias && lw.oBias) {
@@ -1499,7 +1789,9 @@ export function createForwardPassEngine(
       // ── FFN (SwiGLU) ───────────────────────────────────────────────
       // MODEL-SPECIFIC: Phi fuses gate+up into one projection.
       dispatchProjection(normedBuf, lw, 'gateProj', gateBuf, seqLen, ffnDim, H, `L${l}-gate`);
+      await maybeAudit(l, gateBuf, `L${l}-gate-out`, seqLen, ffnDim);
       dispatchProjection(normedBuf, lw, 'upProj', upBuf, seqLen, ffnDim, H, `L${l}-up`);
+      await maybeAudit(l, upBuf, `L${l}-up-out`, seqLen, ffnDim);
 
       // MODEL-SPECIFIC: SiLU for most models, GELU for some
       // Fused SwiGLU activation: ffnTemp = up * silu(gate) in a single dispatch.
@@ -1510,6 +1802,7 @@ export function createForwardPassEngine(
       dispatchElementwise(gateSiluPipeline, upBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silumul`, gateBuf);
 
       dispatchProjection(ffnTempBuf, lw, 'downProj', downBuf, seqLen, H, ffnDim, `L${l}-down`);
+      await maybeAudit(l, downBuf, `L${l}-down-out`, seqLen, H);
 
       // Residual: hidden = residual + ffn_output
       dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res2`, downBuf);
@@ -1521,10 +1814,21 @@ export function createForwardPassEngine(
         const layerOut = new Float32Array(await readBuffer(device, hiddenBuf, 8 * 4));
         console.log(`[LAYER ${l}] output: [${Array.from(layerOut).map(v => v.toFixed(4)).join(', ')}]`);
       }
+      if (dumpResults) {
+        flushBatch();
+        await device.queue.onSubmittedWorkDone();
+        await dumpBufStats(hiddenBuf, `layer-${l}-out`, seqLen * H, lastRowOffset, H, dumpResults);
+      }
     }
 
     // ── Final norm + LM head ─────────────────────────────────────────
     dispatchRMSNorm(hiddenBuf, normedBuf, weights.global.finalNorm, seqLen, 'final-norm');
+
+    if (dumpResults) {
+      flushBatch();
+      await device.queue.onSubmittedWorkDone();
+      await dumpBufStats(normedBuf, 'final-norm-out', seqLen * H, lastRowOffset, H, dumpResults);
+    }
 
     // LM head projection (last token only for generation)
     const lmHeadBuf = config.tieWordEmbeddings
@@ -1556,12 +1860,95 @@ export function createForwardPassEngine(
       dispatchMatmulBT(lmInputBuf, lmHeadBuf, logitsBuf, 1, V, H, 'lm-head');
     }
 
+    // If timing is active, encode the resolve + staging copy into the same
+    // batch so they ride along with the forward pass (single submit).
+    const __timingDrained = __timingCtx;
+    if (__timingDrained && currentBatch && __timingDrained.used > 0) {
+      currentBatch.resolveQuerySet(
+        __timingDrained.querySet, 0, __timingDrained.used,
+        __timingDrained.resolveBuf, 0,
+      );
+      currentBatch.copyBuffer(
+        __timingDrained.resolveBuf, 0,
+        __timingDrained.readBuf, 0,
+        __timingDrained.used * 8,
+      );
+    }
+    __timingCtx = null;
+
     // Flush batched GPU work (if batching is enabled)
     if (currentBatch) {
       currentBatch.flush();
       for (const buf of deferredDestroys) buf.destroy();
       deferredDestroys = [];
       currentBatch = null;
+    }
+
+    // Drain timing data (async — waits for GPU). Only runs on profiled calls.
+    if (__timingDrained && __timingDrained.used > 0) {
+      __timingCallsRemaining--;
+      const ctx = __timingDrained;
+      const bytes = ctx.used * 8;
+      await ctx.readBuf.mapAsync(GPUMapMode.READ, 0, bytes);
+      const copy = new BigUint64Array(ctx.readBuf.getMappedRange(0, bytes).slice(0));
+      ctx.readBuf.unmap();
+
+      // Aggregate (beginNs, endNs) pairs by category.
+      const totals = new Map<string, { ns: bigint; count: number }>();
+      let grandNs = 0n;
+      for (let i = 0; i < ctx.categories.length; i++) {
+        const b = copy[i * 2];
+        const e = copy[i * 2 + 1];
+        // Skip invalid writes (driver may emit 0 for dropped passes).
+        if (e <= b) continue;
+        const dt = e - b;
+        grandNs += dt;
+        const cat = ctx.categories[i];
+        const rec = totals.get(cat) ?? { ns: 0n, count: 0 };
+        rec.ns += dt;
+        rec.count += 1;
+        totals.set(cat, rec);
+      }
+
+      const grandMs = Number(grandNs) / 1e6;
+      const rows = [...totals.entries()]
+        .map(([cat, r]) => ({
+          category: cat,
+          count: r.count,
+          total_ms: Number(r.ns) / 1e6,
+          pct: grandMs > 0 ? (Number(r.ns) / 1e6 / grandMs) * 100 : 0,
+          avg_us: r.count > 0 ? Number(r.ns) / 1e3 / r.count : 0,
+        }))
+        .sort((a, b) => b.total_ms - a.total_ms);
+
+      console.log(`[timing forward #${debugCallCount} seqLen=${seqLen} pos=${pos}] GPU-sum=${grandMs.toFixed(2)}ms across ${ctx.categories.length} dispatches`);
+      console.table(rows.map(r => ({
+        category: r.category,
+        count: r.count,
+        total_ms: r.total_ms.toFixed(3),
+        pct: r.pct.toFixed(1) + '%',
+        avg_us: r.avg_us.toFixed(1),
+      })));
+    }
+
+    // Divergence probe: dump full logits and stash collected results for
+    // download. Main.ts serializes __DEBUG_DUMP_RESULT__ to JSON.
+    // Results are keyed by tag so multiple fires (prefill-end, decode-1, ...)
+    // accumulate into one object.
+    if (dumpResults) {
+      await device.queue.onSubmittedWorkDone();
+      // Logits: sample the full vector (V is bounded; 150K * 4 = 600 KB).
+      await dumpBufStats(logitsBuf, 'logits', V, 0, V, dumpResults);
+      const acc = (globalThis as any).__DEBUG_DUMP_RESULT__ ?? {};
+      acc[dumpTag] = {
+        tag: dumpTag,
+        seqLen, pos,
+        H, V,
+        layers: dumpResults,
+        timestamp: Date.now(),
+      };
+      (globalThis as any).__DEBUG_DUMP_RESULT__ = acc;
+      console.log(`[DUMP ${dumpTag}] collected ${dumpResults.length} entries → __DEBUG_DUMP_RESULT__[${dumpTag}]`);
     }
 
     // Debug: dump logits with global argmax on first forward pass
