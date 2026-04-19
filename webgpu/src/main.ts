@@ -657,12 +657,15 @@ loadBtn.addEventListener('click', async () => {
         const qz = tryGetTensor(`${base}.qzeros`);
         if (qw && sc && qz) {
           // Try to load actorder g_idx, fall back to trivial.
-          // hasActOrder: true when the model file ships a real g_idx tensor
-          // (may encode column reordering from desc_act=true quantization).
-          // false when we synthesized a trivial k/group_size mapping — in that
-          // case the GEMV fast-path can skip the g_idx VRAM read entirely.
-          let gIdx = tryGetTensor(`${base}.g_idx`);
-          const hasActOrder = gIdx !== undefined;
+          // hasActOrder: true only when the file ships a g_idx tensor AND the
+          // loader verified its values are non-trivial (actual column reorder).
+          // If the tensor is present but values are floor(k / group_size) —
+          // which many GPTQ exports ship for tool compatibility even without
+          // desc_act=true — we treat it as non-actorder so the GEMV fast-path
+          // kicks in.
+          const gIdxTensor = currentModel!.tensors.get(`${base}.g_idx`);
+          let gIdx = gIdxTensor?.buffer;
+          const hasActOrder = gIdxTensor !== undefined && gIdxTensor.isTrivialGIdx !== true;
           if (!gIdx) {
             // Derive K from qweight: shape is [K/8, N], stored as int32
             const qwTensor = currentModel!.tensors.get(`${base}.qweight`);
@@ -911,6 +914,19 @@ loadBtn.addEventListener('click', async () => {
       } else {
         console.log(`[Engine] All weights in f32 (bf16Buffers empty)`);
       }
+
+      // Summarize g_idx trivialness probe — tells us whether the GEMV fast path
+      // or actorder path will dominate during decode.
+      let gidxTotal = 0, gidxTrivial = 0, gidxReal = 0;
+      for (const [n, t] of currentModel!.tensors) {
+        if (!n.endsWith('.g_idx')) continue;
+        gidxTotal++;
+        if (t.isTrivialGIdx) gidxTrivial++;
+        else gidxReal++;
+      }
+      if (gidxTotal > 0) {
+        console.log(`[Engine] g_idx probe: ${gidxTrivial}/${gidxTotal} trivial (fast path), ${gidxReal}/${gidxTotal} actorder (slow path)`);
+      }
       const engine = createForwardPassEngine(gpu!.device, config, { global, layers, bf16Buffers });
       const tokenizer = await createTokenizer({ modelId: repo });
 
@@ -968,6 +984,35 @@ loadBtn.addEventListener('click', async () => {
               // Enable debug mode for this run's first forward pass
               (globalThis as any).__DEBUG_FORWARD_PASS__ = true;
 
+              // Divergence probe: when the test request asks for it, arm the
+              // full per-layer dump on the first forward pass. Dump lands in
+              // globalThis.__DEBUG_DUMP_RESULT__ and rides back with the POST.
+              if (test.dumpStats === true) {
+                (globalThis as any).__DEBUG_DUMP_RESULT__ = undefined;
+                (globalThis as any).__DEBUG_DUMP_STATS__ = true;
+                // Optional: caller may request additional dumps at specific decode
+                // steps. Default schedule covers early/mid/late decode drift.
+                const decodeSteps = Array.isArray(test.decodeDumpSteps)
+                  ? test.decodeDumpSteps
+                  : [1, 10, 50];
+                (globalThis as any).__DEBUG_DUMP_DECODE_STEPS__ = decodeSteps;
+              }
+              // Diagnostic: caller may force a non-default prefill chunk size.
+              if (typeof test.prefillChunk === 'number' && test.prefillChunk > 0) {
+                (globalThis as any).__DEBUG_PREFILL_CHUNK__ = test.prefillChunk;
+              } else {
+                (globalThis as any).__DEBUG_PREFILL_CHUNK__ = undefined;
+              }
+              // Per-tensor audit: list of layer indices to dump every linear
+              // projection output for. Generic by design — labels are
+              // L${l}-${proj}-out so future model families need only a
+              // per-family JSON name-map (no engine changes).
+              if (Array.isArray(test.auditLayers) && test.auditLayers.length > 0) {
+                (globalThis as any).__DEBUG_AUDIT_LAYERS__ = test.auditLayers;
+              } else {
+                (globalThis as any).__DEBUG_AUDIT_LAYERS__ = undefined;
+              }
+
               // Capture console.log output during inference
               debugLogs = [];
               console.log = (...args: any[]) => {
@@ -992,6 +1037,7 @@ loadBtn.addEventListener('click', async () => {
               // Restore console.log
               console.log = _origLog;
 
+              const dumpResult = (globalThis as any).__DEBUG_DUMP_RESULT__;
               const debugData = {
                 prompt: test.prompt,
                 output: result.text,
@@ -1000,8 +1046,13 @@ loadBtn.addEventListener('click', async () => {
                 stopReason: result.stopReason,
                 elapsedMs: Math.round(elapsed),
                 promptTokens: result.promptTokens,
+                tokenIds: result.tokenIds,
                 consoleLogs: debugLogs,
+                layerDump: dumpResult ?? null,
               };
+              (globalThis as any).__DEBUG_DUMP_RESULT__ = undefined;
+              (globalThis as any).__DEBUG_DUMP_DECODE_STEPS__ = undefined;
+              (globalThis as any).__DEBUG_AUDIT_LAYERS__ = undefined;
               console.log(`[AutoTest] Result: "${result.text}" (${result.numTokens} tok, ${result.tokensPerSecond.toFixed(1)} tok/s)`);
               await fetch('/api/debug', {
                 method: 'POST',

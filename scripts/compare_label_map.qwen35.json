@@ -1,0 +1,18 @@
+{
+  "_comment": "Maps engine projection short-names to HF named_modules() dotted paths inside one decoder layer. Engine emits 'L${l}-${proj}-out'; reference emits 'L${l}-${dotted_path}-out'. compare_dumps.py uses this to align them. To support a new family (e.g., gemma4), copy this file to compare_label_map.gemma4.json and remap.",
+  "_family": "qwen3_5",
+  "projections": {
+    "lin-qkv": "linear_attn.in_proj_qkv",
+    "lin-a":   "linear_attn.in_proj_a",
+    "lin-b":   "linear_attn.in_proj_b",
+    "lin-z":   "linear_attn.in_proj_z",
+    "lin-out": "linear_attn.out_proj",
+    "q":       "self_attn.q_proj",
+    "k":       "self_attn.k_proj",
+    "v":       "self_attn.v_proj",
+    "o":       "self_attn.o_proj",
+    "gate":    "mlp.gate_proj",
+    "up":      "mlp.up_proj",
+    "down":    "mlp.down_proj"
+  }
+}
