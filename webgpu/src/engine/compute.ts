@@ -149,9 +149,12 @@ export class BatchedDispatcher {
     bindGroups: GPUBindGroup[],
     workgroupCounts: [number, number?, number?],
     label?: string,
+    timestampWrites?: GPUComputePassTimestampWrites,
   ): void {
     const passLabel = label ? `${label}-pass` : `batch-pass-${this.count}`;
-    const pass = this.encoder.beginComputePass({ label: passLabel });
+    const passDesc: GPUComputePassDescriptor = { label: passLabel };
+    if (timestampWrites) passDesc.timestampWrites = timestampWrites;
+    const pass = this.encoder.beginComputePass(passDesc);
 
     pass.setPipeline(pipeline);
     for (let i = 0; i < bindGroups.length; i++) {
@@ -164,6 +167,17 @@ export class BatchedDispatcher {
     );
     pass.end();
     this.count++;
+  }
+
+  /** Encode a query-set resolve into the current batch (for timestamp profiling). */
+  resolveQuerySet(
+    querySet: GPUQuerySet,
+    firstQuery: number,
+    queryCount: number,
+    destination: GPUBuffer,
+    destinationOffset: number,
+  ): void {
+    this.encoder.resolveQuerySet(querySet, firstQuery, queryCount, destination, destinationOffset);
   }
 
   /** Add a buffer-to-buffer copy to the batch (no GPU submission yet). */

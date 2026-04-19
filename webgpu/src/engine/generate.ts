@@ -321,16 +321,46 @@ export function generate(
     // round-trips for the non-SSM stages.
     const isHybrid = engine.config.isHybrid === true;
     // const PREFILL_CHUNK = isHybrid ? 1 : 512;  // Pre-Option-A: 1 token/chunk
-    const PREFILL_CHUNK = isHybrid ? 16 : 512;
+    const PREFILL_CHUNK_DEFAULT = isHybrid ? 16 : 512;
+    // Diagnostic override: caller may set __DEBUG_PREFILL_CHUNK__ (positive int)
+    // to force a specific chunk size, e.g. 1 to take the single-row path on every
+    // prompt token (slow, but isolates batched-GEMM precision from chunked-prefill
+    // semantics). When unset, use the production default.
+    const chunkOverride = (globalThis as any).__DEBUG_PREFILL_CHUNK__;
+    const PREFILL_CHUNK = (typeof chunkOverride === 'number' && chunkOverride > 0)
+      ? Math.floor(chunkOverride)
+      : PREFILL_CHUNK_DEFAULT;
+    if (PREFILL_CHUNK !== PREFILL_CHUNK_DEFAULT) {
+      console.log(`[Generate] PREFILL_CHUNK override: ${PREFILL_CHUNK} (default ${PREFILL_CHUNK_DEFAULT})`);
+    }
     // Debug: if first-forward-pass debug is armed, also fire debug for the
     // last prefill position (true generation-context snapshot).
     if ((globalThis as any).__DEBUG_FORWARD_PASS__ === true) {
       (globalThis as any).__DEBUG_LAST_PREFILL_POS__ = promptTokens - 1;
     }
     let prefillOutput;
+    // Divergence probe: if the caller pre-armed __DEBUG_DUMP_STATS__ (any
+    // truthy value), use that as the trigger for multi-step dumps. The caller
+    // may also set __DEBUG_DUMP_DECODE_STEPS__ = [1, 10, 50, ...] to collect
+    // dumps at those decode positions. The flag is consumed by forward() each
+    // time it fires; we re-arm with a unique tag per dump point.
+    const probeEnabled = !!(globalThis as any).__DEBUG_DUMP_STATS__;
+    const decodeDumpSteps: number[] = Array.isArray((globalThis as any).__DEBUG_DUMP_DECODE_STEPS__)
+      ? (globalThis as any).__DEBUG_DUMP_DECODE_STEPS__ as number[]
+      : [];
+    // Start clean — we'll set the flag with a tag string at the right moments.
+    (globalThis as any).__DEBUG_DUMP_STATS__ = false;
+    if (probeEnabled) {
+      (globalThis as any).__DEBUG_DUMP_RESULT__ = {};  // reset accumulator
+      console.log(`[Probe] enabled; decode dump steps: [${decodeDumpSteps.join(', ')}]`);
+    }
     for (let i = 0; i < promptTokens; i += PREFILL_CHUNK) {
       const chunkEnd = Math.min(i + PREFILL_CHUNK, promptTokens);
       const chunk = new Uint32Array(promptIds.slice(i, chunkEnd));
+      const isLastChunk = chunkEnd >= promptTokens;
+      if (probeEnabled && isLastChunk) {
+        (globalThis as any).__DEBUG_DUMP_STATS__ = 'prefill-end';
+      }
       prefillOutput = await engine.forward(chunk, kvCache);
     }
     await device.queue.onSubmittedWorkDone();
@@ -373,6 +403,12 @@ export function generate(
         if (aborted) {
           stopReason = 'aborted';
           break;
+        }
+
+        // Divergence probe: re-arm dump flag with a step-specific tag when
+        // step number matches the caller-configured decode dump schedule.
+        if (probeEnabled && decodeDumpSteps.includes(step)) {
+          (globalThis as any).__DEBUG_DUMP_STATS__ = `decode-${step}`;
         }
 
         // Forward pass with the last GENERATED token (not prompt token)
