@@ -26,6 +26,7 @@
  */
 
 import type { ModelConfig } from '../model/model-config';
+import { getLayerAttentionKind } from '../model/model-config';
 import {
   createComputePipeline,
   createBindGroup,
@@ -1306,7 +1307,12 @@ export function createForwardPassEngine(
     // ── Transformer layers ───────────────────────────────────────────
     for (let l = 0; l < L; l++) {
       const lw = weights.layers[l];
-      const isLinearLayer = config.layerTypes?.[l] === 'linear_attention';
+      // Layer attention kind: 'linear' (Gated DeltaNet / Mamba-2),
+      // 'sliding_softmax' (Gemma 4 / Mistral SWA), or 'full_softmax' (default).
+      // Only layer_types from config parameterizes this — no model-family checks.
+      const attentionKind = getLayerAttentionKind(config, l);
+      const isLinearLayer = attentionKind === 'linear';
+      const isSlidingLayer = attentionKind === 'sliding_softmax';
 
       // Save hidden state for residual connection
       batchCopy(hiddenBuf, 0, residualBuf, 0, seqLen * H * 4);
@@ -1685,6 +1691,11 @@ export function createForwardPassEngine(
 
       } else {
         // ── STANDARD SOFTMAX ATTENTION ────────────────────────────────
+        // For `isSlidingLayer`, task #20 will apply a sliding-window mask
+        // of size config.slidingWindow on top of the causal mask. Until
+        // that kernel lands, sliding layers fall through to full attention
+        // (correct result, just more compute on long contexts).
+        void isSlidingLayer;
 
         // Q, K, V projections (auto-selects f32 or INT4 matmul)
         if (config.attnOutputGate) {

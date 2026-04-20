@@ -622,6 +622,65 @@ export function resolveLayerWeightName(pattern: string, layerIndex: number): str
 }
 
 /**
+ * Per-layer attention kind. Distinguishes the three routes the forward-pass
+ * needs to dispatch on:
+ *   - 'linear'           → Gated DeltaNet / Mamba-2 (Qwen3.5 hybrid)
+ *   - 'sliding_softmax'  → Softmax attention with a local sliding window
+ *                          (Gemma 4 sliding_attention, Mistral SWA)
+ *   - 'full_softmax'     → Standard causal softmax attention (default)
+ *
+ * For models with no `layer_types` field, all layers default to 'full_softmax'.
+ */
+export type AttentionKind = 'linear' | 'sliding_softmax' | 'full_softmax';
+
+export function getLayerAttentionKind(
+  config: ModelConfig,
+  layerIndex: number,
+): AttentionKind {
+  const t = config.layerTypes?.[layerIndex];
+  if (t === 'linear_attention') return 'linear';
+  if (t === 'sliding_attention') return 'sliding_softmax';
+  return 'full_softmax';
+}
+
+/**
+ * Per-layer head_dim. Gemma 4 uses different head dims for sliding
+ * (`config.headDim`) vs full (`config.globalHeadDim`). Homogeneous models
+ * use `config.headDim` for every layer.
+ */
+export function getLayerHeadDim(config: ModelConfig, layerIndex: number): number {
+  const kind = getLayerAttentionKind(config, layerIndex);
+  if (kind === 'full_softmax' && config.globalHeadDim !== undefined) {
+    return config.globalHeadDim;
+  }
+  return config.headDim;
+}
+
+/**
+ * Per-layer RoPE spec. Gemma 4 has separate RoPE parameters for each
+ * attention layer type; other models fall back to the single top-level
+ * `ropeTheta` / `partialRotaryFactor`.
+ */
+export function getLayerRope(
+  config: ModelConfig,
+  layerIndex: number,
+): { theta: number; type?: string; partialRotaryFactor?: number } {
+  const kind = getLayerAttentionKind(config, layerIndex);
+  // Map internal kind back to HF attention-type key used by rope_parameters.
+  const hfKey =
+    kind === 'sliding_softmax' ? 'sliding_attention'
+    : kind === 'full_softmax' ? 'full_attention'
+    : undefined;
+  if (hfKey && config.ropePerAttentionType?.[hfKey]) {
+    return config.ropePerAttentionType[hfKey];
+  }
+  return {
+    theta: config.ropeTheta,
+    partialRotaryFactor: config.partialRotaryFactor,
+  };
+}
+
+/**
  * Get all weight names needed for a model (for the weight loader).
  */
 export function getAllWeightNames(config: ModelConfig): string[] {
