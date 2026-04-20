@@ -289,8 +289,18 @@ export function createForwardPassEngine(
     : null;
 
   const ropePipeline = createComputePipeline(device, ropeWGSL, 'rope', 'rope');
-  const attentionPipeline = createComputePipeline(device, attentionWGSL, 'attention', 'attention');
-  const attentionTqPipeline = createComputePipeline(device, attentionTqWGSL, 'attention_tq', 'attention-tq');
+  // Attention pipelines — two variants each (softmax default, softpick variant).
+  // Softpick replaces exp normalization with rectified softmax to eliminate
+  // attention-sink saturation on long decodes. Selected at dispatch time via
+  // globalThis.__USE_SOFTPICK__.
+  const attentionPipeline = createComputePipeline(device, attentionWGSL, 'attention', 'attention',
+    { USE_SOFTPICK: 0 });
+  const attentionPipelineSoftpick = createComputePipeline(device, attentionWGSL, 'attention', 'attention-softpick',
+    { USE_SOFTPICK: 1 });
+  const attentionTqPipeline = createComputePipeline(device, attentionTqWGSL, 'attention_tq', 'attention-tq',
+    { USE_SOFTPICK: 0 });
+  const attentionTqPipelineSoftpick = createComputePipeline(device, attentionTqWGSL, 'attention_tq', 'attention-tq-softpick',
+    { USE_SOFTPICK: 1 });
 
   // ── TurboQuant pipelines & setup ───────────────────────────────────
   // 4 bits for d≤64 (small models), 3 bits for d≥128 (noise averages better)
@@ -382,7 +392,9 @@ export function createForwardPassEngine(
   registerCat(hadamardPipeline, 'hadamard');
   registerCat(ropePipeline, 'rope');
   registerCat(attentionPipeline, 'attention');
+  registerCat(attentionPipelineSoftpick, 'attention');
   registerCat(attentionTqPipeline, 'attention_tq');
+  registerCat(attentionTqPipelineSoftpick, 'attention_tq');
   registerCat(tqEncodePipeline, 'tq_encode');
   registerCat(tqDecodePipeline, 'tq_decode');
   registerCat(gateSiluPipeline, 'gate_silu');
@@ -1010,7 +1022,9 @@ export function createForwardPassEngine(
     u32View[7] = posOffset;
     const paramBuf = getCachedUniform(new Uint8Array(paramData), `${label}-p`);
 
-    const bg = createBindGroup(device, attentionPipeline, 0, [
+    const useSoftpick = (globalThis as any).__USE_SOFTPICK__ === true;
+    const pipe = useSoftpick ? attentionPipelineSoftpick : attentionPipeline;
+    const bg = createBindGroup(device, pipe, 0, [
       { binding: 0, resource: { buffer: qBuf } },
       { binding: 1, resource: { buffer: kCacheBuf } },
       { binding: 2, resource: { buffer: vCacheBuf } },
@@ -1018,7 +1032,7 @@ export function createForwardPassEngine(
       { binding: 4, resource: { buffer: paramBuf } },
     ], label);
 
-    bd(attentionPipeline, [bg], [newSeqLen, nHeads], label);
+    bd(pipe, [bg], [newSeqLen, nHeads], label);
   }
 
   function dispatchAttentionTQ(
@@ -1044,7 +1058,9 @@ export function createForwardPassEngine(
     u32View[9] = tqSignWords; // sign_words_per_vec
     const paramBuf = getCachedUniform(new Uint8Array(paramData), `${label}-p`);
 
-    const bg0 = createBindGroup(device, attentionTqPipeline, 0, [
+    const useSoftpick = (globalThis as any).__USE_SOFTPICK__ === true;
+    const pipe = useSoftpick ? attentionTqPipelineSoftpick : attentionTqPipeline;
+    const bg0 = createBindGroup(device, pipe, 0, [
       { binding: 0, resource: { buffer: qBuf } },
       { binding: 1, resource: { buffer: kCacheBuf } },
       { binding: 2, resource: { buffer: vCacheBuf } },
@@ -1052,14 +1068,14 @@ export function createForwardPassEngine(
       { binding: 4, resource: { buffer: paramBuf } },
     ], `${label}-g0`);
 
-    const bg1 = createBindGroup(device, attentionTqPipeline, 1, [
+    const bg1 = createBindGroup(device, pipe, 1, [
       { binding: 0, resource: { buffer: signBitsK } },
       { binding: 1, resource: { buffer: normsK } },
       { binding: 2, resource: { buffer: residualNormsK } },
       { binding: 3, resource: { buffer: tqSetup.spiMatrix } },
     ], `${label}-g1`);
 
-    bd(attentionTqPipeline, [bg0, bg1], [newSeqLen, nHeads], label);
+    bd(pipe, [bg0, bg1], [newSeqLen, nHeads], label);
   }
 
   function copyToKVCache(
@@ -1524,6 +1540,90 @@ export function createForwardPassEngine(
             [linNKH], `L${l}-ssm-step`);
         }
 
+        // ── SSM state-drift probe ────────────────────────────────────
+        // Gated on __DEBUG_SSM_STATE__ (number): how many forward() calls between
+        // samples. Small value (1) = every step, expensive. Larger (e.g. 50) =
+        // sparse sampling, cheap. Set to undefined/0 to disable.
+        //
+        // Reads back the per-layer hidden state `h`, computes ‖h‖₂ and max|h| on
+        // CPU, logs one line per SSM layer. Only fires on the LAST token of a
+        // chunk (so prefill chunks log once at chunk end; decode logs every
+        // sampled step). This is the primary diagnostic for the Move-2
+        // hypothesis that INT4 quantization causes the DeltaNet recurrent state
+        // to drift into a degenerate attractor over long decodes.
+        {
+          const ssmProbeInterval = (globalThis as any).__DEBUG_SSM_STATE__ as number | undefined;
+          const ssmProbeEnabled = typeof ssmProbeInterval === 'number'
+            && ssmProbeInterval > 0
+            && (debugCallCount % ssmProbeInterval === 0)
+            && ssmT === seqLen - 1;
+          if (ssmProbeEnabled) {
+            flushBatch();
+            await device.queue.onSubmittedWorkDone();
+            const hBytes = await readBuffer(device, hBuf, hBuf.size);
+            const hArr = new Float32Array(hBytes);
+            let sumSq = 0;
+            let maxAbs = 0;
+            let nanCount = 0;
+            let nonzeroCount = 0;
+            for (let i = 0; i < hArr.length; i++) {
+              const v = hArr[i];
+              if (Number.isNaN(v)) { nanCount++; continue; }
+              const a = Math.abs(v);
+              if (a > 0) nonzeroCount++;
+              sumSq += v * v;
+              if (a > maxAbs) maxAbs = a;
+            }
+            const norm = Math.sqrt(sumSq);
+            const pct = ((nonzeroCount / hArr.length) * 100).toFixed(1);
+
+            // Channel-saturation probe: collapse h[NKH, KD, VD] over (NKH, KD)
+            // to a per-channel max over VD, then log the top-K channels.
+            // Stable aggregate norm can hide a single channel saturating.
+            // A frozen attractor would show the SAME top channels at every probe.
+            const probeChannels = (globalThis as any).__DEBUG_SSM_CHANNELS__ as number | undefined;
+            const topK = typeof probeChannels === 'number' && probeChannels > 0 ? probeChannels : 0;
+            if (topK > 0) {
+              const VD = linGroupedVD;
+              const nGroups = Math.floor(hArr.length / VD);
+              // Per-channel (VD index) max over all (head, kd) groups.
+              const chanMax = new Float32Array(VD);
+              for (let g = 0; g < nGroups; g++) {
+                const base = g * VD;
+                for (let c = 0; c < VD; c++) {
+                  const a = Math.abs(hArr[base + c]);
+                  if (a > chanMax[c]) chanMax[c] = a;
+                }
+              }
+              // Top-K selection via simple partial sort (VD is small, e.g. 256).
+              const idx = new Array<number>(VD);
+              for (let i = 0; i < VD; i++) idx[i] = i;
+              idx.sort((a, b) => chanMax[b] - chanMax[a]);
+              const top = idx.slice(0, Math.min(topK, VD))
+                .map(i => `${i}:${chanMax[i].toExponential(2)}`)
+                .join(',');
+              console.log(
+                `[SSM-PROBE fwd#${debugCallCount} pos=${pos + ssmT} L${l}] `
+                + `‖h‖=${norm.toExponential(3)} `
+                + `max|h|=${maxAbs.toExponential(3)} `
+                + `nonzero=${pct}% `
+                + (nanCount > 0 ? `NaN=${nanCount} ` : '')
+                + `n=${hArr.length} `
+                + `topVD=[${top}]`
+              );
+            } else {
+              console.log(
+                `[SSM-PROBE fwd#${debugCallCount} pos=${pos + ssmT} L${l}] `
+                + `‖h‖=${norm.toExponential(3)} `
+                + `max|h|=${maxAbs.toExponential(3)} `
+                + `nonzero=${pct}% `
+                + (nanCount > 0 ? `NaN=${nanCount} ` : '')
+                + `n=${hArr.length}`
+              );
+            }
+          }
+        }
+
         // Debug SSM output (layer 0, first token only)
         if (isDebug && l === 0 && ssmT === 0) {
           flushBatch();
@@ -1709,6 +1809,80 @@ export function createForwardPassEngine(
         } else {
           copyToKVCache(kBuf, kvCache.keys[l], seqLen, kvDim, pos);
           copyToKVCache(vBuf, kvCache.values[l], seqLen, kvDim, pos);
+
+          // ── Attention KV-cache probe ───────────────────────────────
+          // Gated on __DEBUG_ATTN_KV__ (number): interval between samples
+          // in forward() calls. Only fires on attention layers (this branch)
+          // and only at the last sampled position of the chunk. Reads back
+          // the valid portion of kvCache.keys[l] / kvCache.values[l] up to
+          // pos+seqLen and computes ‖K‖, ‖V‖, max|K|, max|V|. Smoking gun
+          // for long-context collapse originating in attention (sink
+          // saturation, cache dequant drift, RoPE accumulation).
+          {
+            const attnProbeInterval = (globalThis as any).__DEBUG_ATTN_KV__ as number | undefined;
+            const attnProbeEnabled = typeof attnProbeInterval === 'number'
+              && attnProbeInterval > 0
+              && (debugCallCount % attnProbeInterval === 0);
+            if (attnProbeEnabled) {
+              flushBatch();
+              await device.queue.onSubmittedWorkDone();
+              const validTokens = pos + seqLen;
+              const validBytes = validTokens * kvDim * 4;
+              const kBytes = await readBuffer(device, kvCache.keys[l], validBytes);
+              const vBytes = await readBuffer(device, kvCache.values[l], validBytes);
+              const kArr = new Float32Array(kBytes);
+              const vArr = new Float32Array(vBytes);
+              let kSumSq = 0, vSumSq = 0;
+              let kMax = 0, vMax = 0;
+              let kNaN = 0, vNaN = 0;
+              for (let i = 0; i < kArr.length; i++) {
+                const v = kArr[i];
+                if (Number.isNaN(v)) { kNaN++; continue; }
+                const a = Math.abs(v);
+                kSumSq += v * v;
+                if (a > kMax) kMax = a;
+              }
+              for (let i = 0; i < vArr.length; i++) {
+                const v = vArr[i];
+                if (Number.isNaN(v)) { vNaN++; continue; }
+                const a = Math.abs(v);
+                vSumSq += v * v;
+                if (a > vMax) vMax = a;
+              }
+              // Last-token slice stats — isolates what was just written.
+              const lastOff = pos * kvDim;
+              let kLastSq = 0, vLastSq = 0;
+              let kLastMax = 0, vLastMax = 0;
+              for (let i = 0; i < seqLen * kvDim; i++) {
+                const kv = kArr[lastOff + i];
+                const vv = vArr[lastOff + i];
+                if (!Number.isNaN(kv)) {
+                  kLastSq += kv * kv;
+                  const a = Math.abs(kv);
+                  if (a > kLastMax) kLastMax = a;
+                }
+                if (!Number.isNaN(vv)) {
+                  vLastSq += vv * vv;
+                  const a = Math.abs(vv);
+                  if (a > vLastMax) vLastMax = a;
+                }
+              }
+              console.log(
+                `[ATTN-PROBE fwd#${debugCallCount} pos=${pos + seqLen - 1} L${l}] `
+                + `‖K_all‖=${Math.sqrt(kSumSq).toExponential(3)} `
+                + `max|K|=${kMax.toExponential(3)} `
+                + `‖V_all‖=${Math.sqrt(vSumSq).toExponential(3)} `
+                + `max|V|=${vMax.toExponential(3)} `
+                + `‖K_last‖=${Math.sqrt(kLastSq).toExponential(3)} `
+                + `max|K_last|=${kLastMax.toExponential(3)} `
+                + `‖V_last‖=${Math.sqrt(vLastSq).toExponential(3)} `
+                + `max|V_last|=${vLastMax.toExponential(3)} `
+                + (kNaN > 0 ? `K_NaN=${kNaN} ` : '')
+                + (vNaN > 0 ? `V_NaN=${vNaN} ` : '')
+                + `tokens=${validTokens} kvDim=${kvDim}`
+              );
+            }
+          }
 
           dispatchAttention(
             qBuf, kvCache.keys[l], kvCache.values[l], attnOutBuf,

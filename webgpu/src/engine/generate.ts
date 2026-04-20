@@ -29,6 +29,24 @@ export interface SamplingConfig {
   maxNewTokens?: number;
   /** Repetition penalty. 1.0 = disabled. Default: 1.0 */
   repetitionPenalty?: number;
+  /**
+   * Min-p: keep tokens whose prob >= topProb * minP. Dynamic nucleus —
+   * adapts to model confidence. 2026 canonical setting is 0.02-0.1.
+   * 0 = disabled. Default: 0.05.
+   */
+  minP?: number;
+  /**
+   * DRY (Don't Repeat Yourself) penalty multiplier. Penalizes tokens that
+   * would create an n-gram repeat with the recent context. 0 = disabled.
+   * Standard range 0.5-1.5. Default: 0.8.
+   */
+  dryMultiplier?: number;
+  /** DRY exponential base — penalty = multiplier * base^(match_len - allowedLen). Default: 1.75 */
+  dryBase?: number;
+  /** DRY minimum n-gram length that triggers a penalty. Default: 2 */
+  dryAllowedLength?: number;
+  /** DRY lookback window in tokens. Default: 512 */
+  dryRangeLastN?: number;
   /** Use TurboQuant compressed KV cache (saves ~80% KV memory). Default: false */
   useCompressedKV?: boolean;
 }
@@ -89,12 +107,110 @@ function detectRepetition(ids: number[], ngramSize = 3, minRepeats = 3): boolean
   return false;
 }
 
+/**
+ * DRY (Don't Repeat Yourself) penalty — logit-space.
+ *
+ * For each position i in the recent window, compute the length L of the longest
+ * suffix ending at i that matches the most-recent suffix ending at the current
+ * token. If L >= allowedLength, the token at position i+1 is what we'd regurgitate
+ * if we continued the match — penalize it by `multiplier * base^(L - allowedLength)`.
+ *
+ * Matches exllamav2 / llama.cpp DRY semantics. O(N^2) in the window size, which at
+ * N=512 is ~262K comparisons worst case (sub-ms on modern CPU). The early-break in
+ * the match-length loop keeps the typical case far below that.
+ *
+ * Notes on placement in the sampler pipeline:
+ *   - Applied in RAW logit space, before temperature and before top-K filtering.
+ *     Applying after temperature would make the multiplier scale with temperature,
+ *     which is not what the algorithm expects.
+ *   - Composes with frequency-repetition penalty — they attack different failure
+ *     modes (frequency penalizes over-used tokens; DRY penalizes exact repeats).
+ */
+function applyDRY(
+  logits: Float32Array,
+  tokens: number[],
+  multiplier: number,
+  base: number,
+  allowedLength: number,
+  rangeLastN: number,
+): void {
+  if (multiplier <= 0 || tokens.length < 2) return;
+  const start = Math.max(0, tokens.length - rangeLastN);
+  const rel = tokens.length - start === tokens.length ? tokens : tokens.slice(start);
+  const N = rel.length;
+  if (N < 2) return;
+
+  // penalty[tokenId] = max match length that would regurgitate that token
+  const penalty = new Map<number, number>();
+
+  // For each past position i, measure how far back rel[i - L] matches rel[N - 1 - L].
+  // If the match is long enough, rel[i + 1] is the token we'd "complete the loop"
+  // with, so penalize it.
+  for (let i = 0; i < N - 1; i++) {
+    let L = 0;
+    while (i - L >= 0 && N - 1 - L >= 0 && rel[i - L] === rel[N - 1 - L]) {
+      L++;
+    }
+    if (L >= allowedLength) {
+      const candidate = rel[i + 1];
+      const prev = penalty.get(candidate);
+      if (prev === undefined || L > prev) penalty.set(candidate, L);
+    }
+  }
+
+  const vocabSize = logits.length;
+  for (const [tokenId, L] of penalty) {
+    if (tokenId < vocabSize) {
+      logits[tokenId] -= multiplier * Math.pow(base, L - allowedLength);
+    }
+  }
+}
+
 function sampleFromLogits(
   logits: Float32Array,
   config: Required<SamplingConfig>,
   generatedIds: number[],
 ): number {
   const vocabSize = logits.length;
+
+  // ── Logit-distribution probe ──────────────────────────────────────────
+  // Gated on __DEBUG_LOGIT_TOPK__ (number): interval in decode steps.
+  // Logs raw top-5 token ids + values, plus distribution stats, so we can
+  // tell whether the model's logits are concentrated (collapse) or broad.
+  {
+    const probeInterval = (globalThis as any).__DEBUG_LOGIT_TOPK__ as number | undefined;
+    if (typeof probeInterval === 'number' && probeInterval > 0
+        && generatedIds.length % probeInterval === 0) {
+      let max = -Infinity, min = Infinity, sum = 0;
+      for (let i = 0; i < vocabSize; i++) {
+        const v = logits[i];
+        if (v > max) max = v;
+        if (v < min) min = v;
+        sum += v;
+      }
+      const mean = sum / vocabSize;
+      // Top-5 via simple selection — vocabSize is ~150k, one-shot cost is fine
+      const top: { id: number; val: number }[] = [];
+      const K = 5;
+      for (let i = 0; i < vocabSize; i++) {
+        const v = logits[i];
+        if (top.length < K) {
+          top.push({ id: i, val: v });
+          if (top.length === K) top.sort((a, b) => b.val - a.val);
+        } else if (v > top[K - 1].val) {
+          top[K - 1] = { id: i, val: v };
+          top.sort((a, b) => b.val - a.val);
+        }
+      }
+      const topStr = top.map(t => `${t.id}:${t.val.toFixed(2)}`).join(',');
+      const gap = top.length >= 2 ? (top[0].val - top[1].val).toFixed(2) : 'n/a';
+      console.log(
+        `[LOGIT-PROBE step=${generatedIds.length}] `
+        + `max=${max.toFixed(2)} min=${min.toFixed(2)} mean=${mean.toFixed(3)} `
+        + `top1-gap=${gap} top5=[${topStr}]`
+      );
+    }
+  }
 
   // Apply repetition penalty — frequency-scaled (stronger for tokens seen more often)
   if (config.repetitionPenalty !== 1.0) {
@@ -111,6 +227,19 @@ function sampleFromLogits(
         }
       }
     }
+  }
+
+  // DRY penalty (operates on raw logits, before temperature & top-K).
+  // See applyDRY() for algorithm notes.
+  if (config.dryMultiplier > 0) {
+    applyDRY(
+      logits,
+      generatedIds,
+      config.dryMultiplier,
+      config.dryBase,
+      config.dryAllowedLength,
+      config.dryRangeLastN,
+    );
   }
 
   // Greedy: just return argmax
@@ -242,6 +371,25 @@ function sampleFromLogits(
     }
   }
 
+  // Min-p (dynamic nucleus). Candidates are already sorted desc by logit,
+  // so probs[0] is the top — threshold at topProb * minP and cut anything
+  // below. This is stricter than top-p when the model is confident and
+  // looser when it's uncertain — which is the whole point.
+  if (config.minP > 0 && probs.length > 1) {
+    const threshold = probs[0] * config.minP;
+    let cutoff = probs.length;
+    for (let i = 1; i < probs.length; i++) {
+      if (probs[i] < threshold) { cutoff = i; break; }
+    }
+    if (cutoff < probs.length && cutoff > 0) {
+      candidates = candidates.slice(0, cutoff);
+      probs.length = cutoff;
+      let newSum = 0;
+      for (let i = 0; i < probs.length; i++) newSum += probs[i];
+      for (let i = 0; i < probs.length; i++) probs[i] /= newSum;
+    }
+  }
+
   // Weighted random sample
   const r = Math.random();
   let cumulative = 0;
@@ -285,6 +433,17 @@ export function generate(
     topP: sampling.topP ?? 0.9,
     maxNewTokens: sampling.maxNewTokens ?? 512,
     repetitionPenalty: sampling.repetitionPenalty ?? 1.0,
+    // Sampler defaults are NEUTRAL (off) — the caller (UI / preset layer) is
+    // responsible for opting into any aggressive sampler. Aggressive defaults
+    // here were previously invisible from the chat UI and caused word-chain
+    // collapse past ~500 tokens on Qwen3.5 (2026-04-19 investigation: greedy
+    // decode produced coherent output while the same engine with minP=0.05 +
+    // DRY=0.8 collapsed). Keep these at zero; let presets flip them on.
+    minP: sampling.minP ?? 0,
+    dryMultiplier: sampling.dryMultiplier ?? 0,
+    dryBase: sampling.dryBase ?? 1.75,
+    dryAllowedLength: sampling.dryAllowedLength ?? 2,
+    dryRangeLastN: sampling.dryRangeLastN ?? 512,
     useCompressedKV: sampling.useCompressedKV ?? false,
   };
 

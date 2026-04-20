@@ -119,6 +119,37 @@ function cpuSoftmax(x: Float32Array, cols: number): Float32Array {
   return out;
 }
 
+// Softpick (rectified softmax, arXiv:2504.20966): matches the shader logic
+// in attention.wgsl / attention_tq.wgsl when USE_SOFTPICK=1. Entries with
+// raw score <= -1e8 (causal-mask sentinel) are skipped entirely so they
+// neither contribute to the numerator nor the |·| denominator.
+export function cpuSoftpick(x: Float32Array, cols: number): Float32Array {
+  const rows = x.length / cols;
+  const out = new Float32Array(x.length);
+  for (let r = 0; r < rows; r++) {
+    let max = -Infinity;
+    for (let c = 0; c < cols; c++) {
+      const v = x[r * cols + c];
+      if (v > max) max = v;
+    }
+    const p = Math.exp(-Math.max(max, 0));
+    let sumAbs = 0;
+    for (let c = 0; c < cols; c++) {
+      const raw = x[r * cols + c];
+      if (raw > -1e8) {
+        const diff = Math.exp(raw - max) - p;
+        out[r * cols + c] = Math.max(0, diff);
+        sumAbs += Math.abs(diff);
+      } else {
+        out[r * cols + c] = 0;
+      }
+    }
+    const inv = 1 / Math.max(sumAbs, 1e-20);
+    for (let c = 0; c < cols; c++) out[r * cols + c] *= inv;
+  }
+  return out;
+}
+
 function cpuRMSNorm(x: Float32Array, weight: Float32Array, hidden: number, eps: number): Float32Array {
   const rows = x.length / hidden;
   const out = new Float32Array(x.length);

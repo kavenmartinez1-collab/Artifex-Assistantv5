@@ -32,6 +32,9 @@ struct Params {
   sign_words_per_vec: u32,  // ceil(head_dim / 32)
 }
 
+// Softpick override — see attention.wgsl for full rationale.
+override USE_SOFTPICK: u32 = 0u;
+
 // Group 0: standard attention I/O
 @group(0) @binding(0) var<storage, read> q: array<f32>;
 @group(0) @binding(1) var<storage, read> k_cache: array<f32>;    // PolarQuant-decoded K
@@ -171,13 +174,25 @@ fn attention_tq(@builtin(local_invocation_id) lid: vec3u,
   workgroupBarrier();
   let max_score = shmem[0];
 
-  // Compute exp(score - max) and sum
+  // Softmax / Softpick (gated on USE_SOFTPICK). See attention.wgsl.
+  let softpick_p = select(0.0, exp(-max(max_score, 0.0)), USE_SOFTPICK != 0u);
   var local_sum: f32 = 0.0;
   j = tid;
   while (j < cache_len) {
-    let e = exp(scores[j] - max_score);
-    scores[j] = e;
-    local_sum += e;
+    let raw = scores[j];
+    let ex = exp(raw - max_score);
+    if (USE_SOFTPICK != 0u) {
+      if (raw > -1.0e8) {
+        let diff = ex - softpick_p;
+        scores[j] = max(0.0, diff);
+        local_sum += abs(diff);
+      } else {
+        scores[j] = 0.0;
+      }
+    } else {
+      scores[j] = ex;
+      local_sum += ex;
+    }
     j = j + 256u;
   }
   shmem[tid] = local_sum;
@@ -202,8 +217,8 @@ fn attention_tq(@builtin(local_invocation_id) lid: vec3u,
   workgroupBarrier();
   let sum_exp = shmem[0];
 
-  // Normalize
-  let inv_sum = 1.0 / sum_exp;
+  // Normalize (softpick-safe epsilon)
+  let inv_sum = 1.0 / max(sum_exp, 1.0e-20);
   j = tid;
   while (j < cache_len) {
     scores[j] = scores[j] * inv_sum;
