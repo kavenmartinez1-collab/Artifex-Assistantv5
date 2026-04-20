@@ -167,7 +167,7 @@ export async function createInferenceSession(
     sampling?: SamplingConfig,
     onToken?: OnTokenCallback,
   ): GenerationHandle {
-    const prompt = applyChatTemplate(tokenizer, messages);
+    const prompt = applyChatTemplate(tokenizer, messages, { modelType: config.modelType });
     return generate(gpu.device, engine, tokenizer, prompt, sampling, onToken);
   }
 

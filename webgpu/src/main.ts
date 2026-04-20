@@ -1042,7 +1042,7 @@ loadBtn.addEventListener('click', async () => {
       session = {
         run: (prompt, sampling, onToken) => generate(gpu!.device, engine, tokenizer, prompt, sampling, onToken),
         chat: (messages: Array<{role: string; content: string}>, sampling: any, onToken: any, opts?: { enableThinking?: boolean }) => {
-          const tokenIds = applyChatTemplate(tokenizer, messages, opts);
+          const tokenIds = applyChatTemplate(tokenizer, messages, { ...opts, modelType: config.modelType });
           return generate(gpu!.device, engine, tokenizer, tokenIds, sampling, onToken);
         },
         config,

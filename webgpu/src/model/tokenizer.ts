@@ -167,10 +167,45 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
 export function applyChatTemplate(
   tokenizer: Tokenizer,
   messages: Array<{ role: string; content: string }>,
-  options?: { enableThinking?: boolean },
+  options?: { enableThinking?: boolean; modelType?: string },
 ): number[] {
   const enableThinking = options?.enableThinking ?? true;
+  const modelType = (options?.modelType ?? '').toLowerCase();
 
+  // ── Gemma 4: use the model's native template ─────────────────────────
+  // Gemma 4 uses <|turn>role\n...<turn|>\n format with <bos> prefix and a
+  // separate 'model' role for assistant. The built-in chat_template.jinja
+  // that ships with the tokenizer handles all of that correctly, including
+  // tool calls, thinking channels, and multimodal tokens. Don't override.
+  if (modelType === 'gemma4' || modelType === 'gemma4_text') {
+    try {
+      const result = (tokenizer.inner as any).apply_chat_template(messages, {
+        add_generation_prompt: true,
+        tokenize: true,
+        return_tensor: false,
+        // enable_thinking is read by the native template
+        enable_thinking: enableThinking,
+      });
+      if (result && result.length > 0) {
+        console.log(`[Tokenizer] Gemma 4 native template applied (thinking=${enableThinking}, tokens=${result.length})`);
+        return Array.from(result).map(Number);
+      }
+    } catch (e) {
+      console.warn('[Tokenizer] Gemma 4 native template failed, using fallback:', e);
+    }
+
+    // Fallback: hand-roll the <|turn> format. bos_token is handled by the
+    // tokenizer's add_special_tokens when we encode the first segment.
+    const parts: string[] = ['<bos>'];
+    for (const msg of messages) {
+      const role = msg.role === 'assistant' ? 'model' : msg.role;
+      parts.push(`<|turn>${role}\n${msg.content}<turn|>\n`);
+    }
+    parts.push('<|turn>model\n');
+    return tokenizer.encode(parts.join(''));
+  }
+
+  // ── ChatML (Qwen3.5 and others) ──────────────────────────────────────
   // Use a clean ChatML template — Qwen3.5's built-in template adds empty <think></think>
   // blocks when thinking is disabled, which confuses smaller models. We control thinking
   // explicitly: when enabled, end with <think>\n so the model generates its own reasoning;
