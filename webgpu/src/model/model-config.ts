@@ -87,6 +87,41 @@ export interface ModelConfig {
   /** Whether attention output is gated (linear + full attention) */
   attnOutputGate?: boolean;
 
+  // ── Gemma 4 specific ───────────────────────────────────────────────
+  /** Sliding-window size (Gemma 4: 512). Only relevant if layerTypes has 'sliding_attention'. */
+  slidingWindow?: number;
+  /**
+   * Alternate head_dim used by 'full_attention' layers when a model uses
+   * different per-layer-type head dimensions (Gemma 4: 512 for full,
+   * `headDim`=256 for sliding). Undefined for homogeneous models.
+   */
+  globalHeadDim?: number;
+  /**
+   * Per-Layer Embeddings (PLE): extra embedding contribution per layer.
+   * `hiddenSizePerLayerInput` is the dim of the per-layer vector (Gemma 4: 256).
+   * `vocabSizePerLayerInput` is the vocab of the PLE table (Gemma 4: 262144).
+   * Undefined for models without PLE.
+   */
+  hiddenSizePerLayerInput?: number;
+  vocabSizePerLayerInput?: number;
+  /** Number of layers that share their KV cache with a neighbor (Gemma 4: 18). */
+  numKvSharedLayers?: number;
+  /**
+   * Clip final logits via `tanh(x / cap) * cap` before sampling.
+   * Gemma 4: 30.0. Gemma 2 used ~30 also.
+   */
+  finalLogitSoftcapping?: number;
+  /**
+   * RoPE configuration keyed by attention layer type. Gemma 4 has separate
+   * RoPE params for 'full_attention' vs 'sliding_attention'. For models
+   * without per-type RoPE this is undefined and callers use `ropeTheta`.
+   */
+  ropePerAttentionType?: Record<string, {
+    theta: number;
+    type?: string; // 'default' | 'proportional' | ...
+    partialRotaryFactor?: number;
+  }>;
+
   // ── Derived ────────────────────────────────────────────────────────
   /** Number of Q heads per KV head group (for GQA). = numAttentionHeads / numKVHeads */
   numQPerKV: number;
@@ -94,6 +129,8 @@ export interface ModelConfig {
   isGQA: boolean;
   /** Whether this model uses quantized weights */
   isQuantized: boolean;
+  /** Whether this model uses Per-Layer Embeddings (Gemma 4). */
+  hasPLE: boolean;
 }
 
 /**
@@ -254,6 +291,33 @@ const WEIGHT_NAME_PATTERNS: Record<string, WeightNameMap> = {
       normWeight: 'model.language_model.layers.{L}.linear_attn.norm.weight',
     },
   },
+  // Gemma 4 — standard naming, no language_model prefix. Weight paths match
+  // default for core attention/FFN; PLE and altup paths are added when needed.
+  // The loader must also look for per_layer_embeddings, altup_projections,
+  // laurel_left_projections, and laurel_right_projections per layer — these
+  // are Gemma 4-specific and will be auto-detected via autoDetectWeightNameMap.
+  gemma4_text: {
+    embedTokens: 'model.embed_tokens.weight',
+    finalNorm: 'model.norm.weight',
+    lmHead: 'lm_head.weight', // tied to embeddings — loader handles alias
+    layer: {
+      inputNorm: 'model.layers.{L}.input_layernorm.weight',
+      qProj: 'model.layers.{L}.self_attn.q_proj.weight',
+      kProj: 'model.layers.{L}.self_attn.k_proj.weight',
+      vProj: 'model.layers.{L}.self_attn.v_proj.weight',
+      oProj: 'model.layers.{L}.self_attn.o_proj.weight',
+      qBias: 'model.layers.{L}.self_attn.q_proj.bias',
+      kBias: 'model.layers.{L}.self_attn.k_proj.bias',
+      vBias: 'model.layers.{L}.self_attn.v_proj.bias',
+      oBias: 'model.layers.{L}.self_attn.o_proj.bias',
+      qNorm: 'model.layers.{L}.self_attn.q_norm.weight',
+      kNorm: 'model.layers.{L}.self_attn.k_norm.weight',
+      postAttnNorm: 'model.layers.{L}.post_attention_layernorm.weight',
+      gateProj: 'model.layers.{L}.mlp.gate_proj.weight',
+      upProj: 'model.layers.{L}.mlp.up_proj.weight',
+      downProj: 'model.layers.{L}.mlp.down_proj.weight',
+    },
+  },
   // Phi models use a different structure
   phi: {
     embedTokens: 'model.embed_tokens.weight',
@@ -297,6 +361,23 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
     console.log(`[Config] Flattened text_config for ${hfConfig.model_type}`);
   }
 
+  // Gemma 4 multimodal wraps text config under text_config — same pattern.
+  // Top-level model_type is 'gemma4'; text submodel is 'gemma4_text'.
+  if (hfConfig.text_config && hfConfig.model_type === 'gemma4') {
+    const textCfg = hfConfig.text_config;
+    // Preserve top-level softcap/special tokens before merging (text_config wins
+    // for architectural fields but we want the outer config's gemma4-wide bits).
+    const outerSoftcap = hfConfig.final_logit_softcapping;
+    hfConfig = { ...hfConfig, ...textCfg };
+    if (outerSoftcap !== undefined && hfConfig.final_logit_softcapping === undefined) {
+      hfConfig.final_logit_softcapping = outerSoftcap;
+    }
+    if (hfConfig.model_type === 'gemma4') {
+      hfConfig.model_type = 'gemma4_text';
+    }
+    console.log(`[Config] Flattened text_config for ${hfConfig.model_type}`);
+  }
+
   const modelType = (hfConfig.model_type ?? 'unknown').toLowerCase();
   const fieldMap = HF_FIELD_MAPS[modelType] ?? HF_FIELD_MAPS.default;
 
@@ -324,7 +405,10 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
 
   const rmsNormEps = hfConfig.rms_norm_eps ?? hfConfig.layer_norm_eps ?? 1e-5;
   const maxPositionEmbeddings = hfConfig.max_position_embeddings ?? 4096;
-  const hiddenAct = hfConfig.hidden_act ?? hfConfig.activation_function ?? 'silu';
+  const hiddenAct = hfConfig.hidden_act
+    ?? hfConfig.hidden_activation      // Gemma uses `hidden_activation`
+    ?? hfConfig.activation_function
+    ?? 'silu';
   // attention_bias defaults depend on model family:
   // Qwen2: true (implicit, not in config.json)
   // Llama/Mistral/Gemma: false
@@ -334,6 +418,7 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
     qwen3: true,
     qwen3_5_text: false,  // Qwen3.5 explicitly sets attention_bias: false
     qwen3_moe: true,
+    gemma4_text: false,   // Gemma 4 has no bias on Q/K/V/O
   };
   const attentionBias = hfConfig.attention_bias ?? attentionBiasDefaults[modelType] ?? false;
   const tieWordEmbeddings = hfConfig.tie_word_embeddings ?? false;
@@ -349,6 +434,56 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
   // Hybrid model detection (Mamba-2 / Gated DeltaNet)
   const layerTypes: string[] | undefined = hfConfig.layer_types;
   const isHybrid = Array.isArray(layerTypes) && layerTypes.includes('linear_attention');
+
+  // ── Gemma 4 fields ──────────────────────────────────────────────────
+  // Present only on Gemma 4 text configs; undefined for other models.
+  const slidingWindow: number | undefined =
+    typeof hfConfig.sliding_window === 'number' ? hfConfig.sliding_window : undefined;
+  const globalHeadDim: number | undefined =
+    typeof hfConfig.global_head_dim === 'number' ? hfConfig.global_head_dim : undefined;
+  const hiddenSizePerLayerInput: number | undefined =
+    typeof hfConfig.hidden_size_per_layer_input === 'number'
+      ? hfConfig.hidden_size_per_layer_input
+      : undefined;
+  const vocabSizePerLayerInput: number | undefined =
+    typeof hfConfig.vocab_size_per_layer_input === 'number'
+      ? hfConfig.vocab_size_per_layer_input
+      : undefined;
+  const numKvSharedLayers: number | undefined =
+    typeof hfConfig.num_kv_shared_layers === 'number' ? hfConfig.num_kv_shared_layers : undefined;
+  const finalLogitSoftcapping: number | undefined =
+    typeof hfConfig.final_logit_softcapping === 'number'
+      ? hfConfig.final_logit_softcapping
+      : undefined;
+
+  // rope_parameters may be a per-attention-type dict (Gemma 4) or a single
+  // RoPE spec (Qwen3.5). Detect the former by the presence of nested dicts
+  // with 'rope_theta' or 'rope_type' keys.
+  let ropePerAttentionType: Record<string, {
+    theta: number;
+    type?: string;
+    partialRotaryFactor?: number;
+  }> | undefined;
+  const rp = hfConfig.rope_parameters;
+  if (rp && typeof rp === 'object') {
+    const entries = Object.entries(rp);
+    const looksPerType = entries.every(([_, v]) =>
+      v !== null && typeof v === 'object' &&
+      ('rope_theta' in (v as any) || 'rope_type' in (v as any))
+    );
+    if (looksPerType && entries.length > 0) {
+      ropePerAttentionType = {};
+      for (const [attnType, spec] of entries as Array<[string, any]>) {
+        ropePerAttentionType[attnType] = {
+          theta: spec.rope_theta ?? 10000,
+          type: spec.rope_type,
+          partialRotaryFactor: spec.partial_rotary_factor,
+        };
+      }
+    }
+  }
+
+  const hasPLE = hiddenSizePerLayerInput !== undefined && hiddenSizePerLayerInput > 0;
 
   return {
     modelType,
@@ -386,6 +521,15 @@ export function parseModelConfig(hfConfig: Record<string, any>): ModelConfig {
     partialRotaryFactor: hfConfig.partial_rotary_factor
       ?? hfConfig.rope_parameters?.partial_rotary_factor,
     attnOutputGate: hfConfig.attn_output_gate,
+    // Gemma 4-specific
+    slidingWindow,
+    globalHeadDim,
+    hiddenSizePerLayerInput,
+    vocabSizePerLayerInput,
+    numKvSharedLayers,
+    finalLogitSoftcapping,
+    ropePerAttentionType,
+    hasPLE,
   };
 }
 
