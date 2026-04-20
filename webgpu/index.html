@@ -282,12 +282,26 @@
         <div class="panel-title">Generation</div>
         <label>Max Tokens</label>
         <input type="number" id="max-tokens" value="2048" min="1" max="8192">
+        <label>Sampler Preset</label>
+        <select id="sampler-preset" style="width:100%;padding:4px 6px;background:var(--bg);color:var(--text);border:1px solid #333;border-radius:4px;font-size:11px">
+          <option value="balanced" selected>Balanced (llama.cpp-style)</option>
+          <option value="deterministic">Deterministic (greedy)</option>
+          <option value="creative">Creative (DRY + min-p)</option>
+          <option value="reference">Reference (HF transformers defaults)</option>
+          <option value="custom">Custom</option>
+        </select>
         <label>Temperature: <span id="temp-val">0.7</span></label>
         <input type="range" id="temperature" min="0" max="1.5" step="0.1" value="0.7">
         <label>Top-P: <span id="topp-val">0.9</span></label>
         <input type="range" id="top-p" min="0" max="1" step="0.05" value="0.9">
         <label>Top-K</label>
-        <input type="number" id="top-k" value="50" min="0" max="500">
+        <input type="number" id="top-k" value="40" min="0" max="500">
+        <label>Min-P: <span id="minp-val">0.00</span></label>
+        <input type="range" id="min-p" min="0" max="0.3" step="0.01" value="0">
+        <label>Repetition Penalty: <span id="reppen-val">1.00</span></label>
+        <input type="range" id="rep-pen" min="1" max="1.5" step="0.01" value="1">
+        <label>DRY Multiplier: <span id="dry-val">0.00</span></label>
+        <input type="range" id="dry-mult" min="0" max="2" step="0.05" value="0">
         <div style="margin-top:6px;display:flex;align-items:center;gap:6px">
           <input type="checkbox" id="turboquant" style="accent-color:var(--accent2)">
           <label for="turboquant" style="margin:0;cursor:pointer">TurboQuant KV cache</label>

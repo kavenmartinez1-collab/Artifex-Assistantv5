@@ -57,10 +57,21 @@ When you send a prompt, the model does a **forward pass**:
 2. **Embed** — look up each token ID in the embedding table to get a vector (a list of numbers, typically 3584 numbers long for Qwen3.5-9B)
 3. **Process** — pass through 28-40 transformer layers (each layer refines the meaning)
 4. **Project** — convert the final vector back to a probability distribution over all 152,000 tokens
-5. **Sample** — pick the most likely next token (with some randomness controlled by **temperature**)
+5. **Sample** — pick the most likely next token (with some randomness controlled by **temperature** and the sampler stack — see below)
 6. **Repeat** — append that token, run the forward pass again for the next token
 
 This is why generation is slow — it produces **one token at a time**, and each token requires the entire model to run.
+
+### The sampler stack — why output quality depends on it
+
+The model's output isn't a single token — it's a probability distribution over all ~152,000 tokens. How we pick one from that distribution is called **sampling**, and it matters enormously. Our WebGPU engine ships four presets (chosen via the Sampler Preset dropdown in the chat UI):
+
+- **Balanced** (default) — llama.cpp-style: temperature=0.7, top-p=0.9, top-k=40. Good baseline for most models.
+- **Deterministic** — temperature=0, no other samplers. Always picks the most likely token. Use this for reproducibility and debugging ("is the engine correct?"). No creativity, but no collapse either.
+- **Creative** — adds min-p=0.05 and DRY=0.8 on top of Balanced. Pushes the model toward more varied output but can induce word-chain collapse on some models (this bit us on Qwen3.5 when DRY was silently on as a default — see lesson below).
+- **Reference** — matches HuggingFace transformers' `generate(do_sample=True)` defaults exactly. For comparing our output to the reference implementation.
+
+**Key lesson (2026-04-19):** If model output looks degraded (repetition, word-chains, emoji spam), FIRST switch to the Deterministic preset. If that produces coherent output, the engine is fine and the issue is your sampler config — not a kernel bug. This one check would have saved us days of kernel audits when we diagnosed the Qwen3.5 long-context collapse.
 
 ### Why GPUs?
 

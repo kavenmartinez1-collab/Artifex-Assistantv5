@@ -37,8 +37,54 @@ const testBtn = $('test-kernels') as HTMLButtonElement;
 const testResults = $('test-results');
 const tempSlider = $('temperature') as HTMLInputElement;
 const toppSlider = $('top-p') as HTMLInputElement;
+const topkInput = $('top-k') as HTMLInputElement;
+const minpSlider = $('min-p') as HTMLInputElement;
+const reppenSlider = $('rep-pen') as HTMLInputElement;
+const drySlider = $('dry-mult') as HTMLInputElement;
+const presetSelect = $('sampler-preset') as HTMLSelectElement;
 const tempVal = $('temp-val');
 const toppVal = $('topp-val');
+const minpVal = $('minp-val');
+const reppenVal = $('reppen-val');
+const dryVal = $('dry-val');
+
+// ─── Sampler Presets ─────────────────────────────────────────────────────────
+// Presets resolve to concrete slider values. Each preset defines the full
+// sampler stack. `custom` is not a preset — it's the state when the user
+// hand-edits any slider.
+type PresetName = 'balanced' | 'deterministic' | 'creative' | 'reference';
+interface PresetValues {
+  temperature: number; topP: number; topK: number;
+  minP: number; repPen: number; dryMult: number;
+}
+const PRESETS: Record<PresetName, PresetValues> = {
+  // llama.cpp-style neutral defaults — temperature + top-p only
+  balanced:      { temperature: 0.7, topP: 0.9,  topK: 40, minP: 0,    repPen: 1.0, dryMult: 0    },
+  // Greedy argmax — no sampling randomness, for coherence diagnostics
+  deterministic: { temperature: 0,   topP: 1.0,  topK: 0,  minP: 0,    repPen: 1.0, dryMult: 0    },
+  // Adds min-p + DRY for long-form diversity (may induce word-chain collapse
+  // on some models — opt-in only)
+  creative:      { temperature: 0.9, topP: 0.95, topK: 50, minP: 0.05, repPen: 1.0, dryMult: 0.8  },
+  // Matches HuggingFace transformers generate() do_sample=True defaults
+  reference:     { temperature: 1.0, topP: 1.0,  topK: 50, minP: 0,    repPen: 1.0, dryMult: 0    },
+};
+
+let suppressPresetFlip = false;
+function applyPreset(name: PresetName): void {
+  const p = PRESETS[name];
+  suppressPresetFlip = true;
+  tempSlider.value = String(p.temperature);
+  toppSlider.value = String(p.topP);
+  topkInput.value = String(p.topK);
+  minpSlider.value = String(p.minP);
+  reppenSlider.value = String(p.repPen);
+  drySlider.value = String(p.dryMult);
+  // Fire input events so the _val spans update
+  [tempSlider, toppSlider, minpSlider, reppenSlider, drySlider].forEach(el =>
+    el.dispatchEvent(new Event('input'))
+  );
+  suppressPresetFlip = false;
+}
 const browseBtn = $('browse-btn') as HTMLButtonElement;
 const modelBrowser = $('model-browser');
 const modelList = $('model-list');
@@ -185,13 +231,46 @@ function updateFooter(data: Record<string, string>) {
 
 // ─── Slider Bindings ─────────────────────────────────────────────────────────
 
+function flipToCustom(): void {
+  if (!suppressPresetFlip && presetSelect.value !== 'custom') {
+    presetSelect.value = 'custom';
+  }
+}
+
 tempSlider.addEventListener('input', () => {
   tempVal.textContent = tempSlider.value;
+  flipToCustom();
 });
 
 toppSlider.addEventListener('input', () => {
   toppVal.textContent = toppSlider.value;
+  flipToCustom();
 });
+
+minpSlider.addEventListener('input', () => {
+  minpVal.textContent = parseFloat(minpSlider.value).toFixed(2);
+  flipToCustom();
+});
+
+reppenSlider.addEventListener('input', () => {
+  reppenVal.textContent = parseFloat(reppenSlider.value).toFixed(2);
+  flipToCustom();
+});
+
+drySlider.addEventListener('input', () => {
+  dryVal.textContent = parseFloat(drySlider.value).toFixed(2);
+  flipToCustom();
+});
+
+topkInput.addEventListener('input', flipToCustom);
+
+presetSelect.addEventListener('change', () => {
+  const v = presetSelect.value;
+  if (v !== 'custom') applyPreset(v as PresetName);
+});
+
+// Apply the default preset once at startup so the extra sliders reflect it
+applyPreset('balanced');
 
 // Auto-resize textarea
 promptEl.addEventListener('input', () => {
@@ -368,12 +447,19 @@ sendBtn.addEventListener('click', async () => {
 
     const temperature = parseFloat(tempSlider.value);
     const topP = parseFloat(toppSlider.value);
+    const topK = parseInt(topkInput.value) || 0;
+    const minP = parseFloat(minpSlider.value);
+    const repetitionPenalty = parseFloat(reppenSlider.value);
+    const dryMultiplier = parseFloat(drySlider.value);
     const maxNewTokens = parseInt(($('max-tokens') as HTMLInputElement).value) || 512;
     const useCompressedKV = ($('turboquant') as HTMLInputElement).checked;
 
     // /raw prefix: skip chat template, use raw text completion (for debugging)
     const isRaw = text.startsWith('/raw ');
-    const sampling = { temperature, topP, maxNewTokens, useCompressedKV, repetitionPenalty: 1.1 };
+    const sampling = {
+      temperature, topP, topK, minP, repetitionPenalty, dryMultiplier,
+      maxNewTokens, useCompressedKV,
+    };
     let thinkingDone = false;
     const onToken = (token: string) => {
       fullText += token;
@@ -1028,6 +1114,47 @@ loadBtn.addEventListener('click', async () => {
               } else {
                 (globalThis as any).__DEBUG_AUDIT_LAYERS__ = undefined;
               }
+              // SSM state-drift probe: read back hidden-state h from each
+              // linear_attn layer every N forward() calls and log ‖h‖, max|h|,
+              // nonzero%. Cost is ~48 MB readback per sample on Qwen3.5 so use
+              // a coarse interval for long decodes (50-200).
+              if (typeof test.ssmProbeInterval === 'number' && test.ssmProbeInterval > 0) {
+                (globalThis as any).__DEBUG_SSM_STATE__ = test.ssmProbeInterval;
+              } else {
+                (globalThis as any).__DEBUG_SSM_STATE__ = undefined;
+              }
+              // Channel-saturation probe: extends SSM-PROBE line with top-K
+              // channel indices by per-VD max|h|. A frozen attractor shows the
+              // SAME top channel indices at every sample; fluctuating ones = noise.
+              if (typeof test.ssmChannels === 'number' && test.ssmChannels > 0) {
+                (globalThis as any).__DEBUG_SSM_CHANNELS__ = test.ssmChannels;
+              } else {
+                (globalThis as any).__DEBUG_SSM_CHANNELS__ = undefined;
+              }
+              // Attention KV-cache probe: reads ‖K‖, ‖V‖ for the 8 softmax-attn
+              // layers at every N forward() calls. Cost grows with pos; use
+              // coarse intervals (100-200) on long decodes.
+              if (typeof test.attnKvInterval === 'number' && test.attnKvInterval > 0) {
+                (globalThis as any).__DEBUG_ATTN_KV__ = test.attnKvInterval;
+              } else {
+                (globalThis as any).__DEBUG_ATTN_KV__ = undefined;
+              }
+              // Softpick (rectified softmax) — replaces exp normalization in
+              // the 8 softmax attention layers to prevent sink saturation.
+              // A/B flag for evaluating whether it fixes long-decode collapse.
+              if (test.useSoftpick === true) {
+                (globalThis as any).__USE_SOFTPICK__ = true;
+              } else {
+                (globalThis as any).__USE_SOFTPICK__ = false;
+              }
+              // Logit-distribution probe — logs top-5 raw logits + stats
+              // every N decode steps. Used to tell concentrated collapse
+              // (top-1 gap >> rest) from broad uncertainty (flat distribution).
+              if (typeof test.logitProbeInterval === 'number' && test.logitProbeInterval > 0) {
+                (globalThis as any).__DEBUG_LOGIT_TOPK__ = test.logitProbeInterval;
+              } else {
+                (globalThis as any).__DEBUG_LOGIT_TOPK__ = undefined;
+              }
 
               // Capture console.log output during inference
               debugLogs = [];
@@ -1044,7 +1171,19 @@ loadBtn.addEventListener('click', async () => {
               const t0 = performance.now();
               const handle = session.chat(
                 messages,
-                { temperature: test.temperature ?? 0, topP: 0.9, maxNewTokens: test.maxTokens ?? 50, repetitionPenalty: test.repetitionPenalty ?? 1.15 },
+                {
+                  temperature: test.temperature ?? 0,
+                  topP: test.topP ?? 0.9,
+                  maxNewTokens: test.maxTokens ?? 50,
+                  repetitionPenalty: test.repetitionPenalty ?? 1.15,
+                  // New sampler params (2026). Pass-through — when undefined,
+                  // generate.ts applies its own defaults (minP=0.05, DRY=0.8).
+                  minP: test.minP,
+                  dryMultiplier: test.dryMultiplier,
+                  dryBase: test.dryBase,
+                  dryAllowedLength: test.dryAllowedLength,
+                  dryRangeLastN: test.dryRangeLastN,
+                },
                 () => {},
               );
               const result = await handle.result;
@@ -1069,6 +1208,11 @@ loadBtn.addEventListener('click', async () => {
               (globalThis as any).__DEBUG_DUMP_RESULT__ = undefined;
               (globalThis as any).__DEBUG_DUMP_DECODE_STEPS__ = undefined;
               (globalThis as any).__DEBUG_AUDIT_LAYERS__ = undefined;
+              (globalThis as any).__DEBUG_SSM_STATE__ = undefined;
+              (globalThis as any).__DEBUG_SSM_CHANNELS__ = undefined;
+              (globalThis as any).__DEBUG_ATTN_KV__ = undefined;
+              (globalThis as any).__USE_SOFTPICK__ = false;
+              (globalThis as any).__DEBUG_LOGIT_TOPK__ = undefined;
               console.log(`[AutoTest] Result: "${result.text}" (${result.numTokens} tok, ${result.tokensPerSecond.toFixed(1)} tok/s)`);
               await fetch('/api/debug', {
                 method: 'POST',

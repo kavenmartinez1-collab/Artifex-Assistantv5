@@ -29,6 +29,14 @@ struct Params {
   pos_offset: u32,      // position offset of first new token in the sequence
 }
 
+// Softpick (rectified softmax, arXiv:2504.20966): USE_SOFTPICK=1 replaces
+// the exp normalization with ReLU(e^(x-max) - e^(-max_clamped)) / sum(|...|).
+// Allows true-zero attention weights, eliminating the attention-sink failure
+// mode where softmax pins mass on one early token. Masked positions (score
+// <= -1e8) are excluded from both numerator and denominator to avoid
+// threshold pollution.
+override USE_SOFTPICK: u32 = 0u;
+
 @group(0) @binding(0) var<storage, read> q: array<f32>;
 @group(0) @binding(1) var<storage, read> k_cache: array<f32>;
 @group(0) @binding(2) var<storage, read> v_cache: array<f32>;
@@ -120,13 +128,33 @@ fn attention(@builtin(local_invocation_id) lid: vec3u,
   workgroupBarrier();
   let max_score = shmem[0];
 
-  // Compute exp(score - max) and sum
+  // Compute numerator and denominator.
+  // Standard softmax: numerator_j = exp(score_j - max), denom = sum(numerator_j).
+  // Softpick:        numerator_j = ReLU(exp(score_j - max) - p),
+  //                  denom      = sum |exp(score_j - max) - p|,
+  //                  where p = exp(-max(max_score, 0)) is the rectification
+  //                  threshold in shifted space (chosen so the numerator
+  //                  becomes positive iff the original score > 0).
+  let softpick_p = select(0.0, exp(-max(max_score, 0.0)), USE_SOFTPICK != 0u);
   var local_sum: f32 = 0.0;
   j = tid;
   while (j < cache_len) {
-    let e = exp(scores[j] - max_score);
-    scores[j] = e;
-    local_sum += e;
+    let raw = scores[j];
+    let ex = exp(raw - max_score);
+    if (USE_SOFTPICK != 0u) {
+      // Mask-aware: causal-masked entries have raw ≈ -1e9; skip them so
+      // they don't each add `p` to the denominator.
+      if (raw > -1.0e8) {
+        let diff = ex - softpick_p;
+        scores[j] = max(0.0, diff);
+        local_sum += abs(diff);
+      } else {
+        scores[j] = 0.0;
+      }
+    } else {
+      scores[j] = ex;
+      local_sum += ex;
+    }
     j = j + 256u;
   }
   shmem[tid] = local_sum;
@@ -151,8 +179,11 @@ fn attention(@builtin(local_invocation_id) lid: vec3u,
   workgroupBarrier();
   let sum_exp = shmem[0];
 
-  // Normalize: scores[j] = exp(score_j - max) / sum_exp
-  let inv_sum = 1.0 / sum_exp;
+  // Normalize: scores[j] = numerator / denom.
+  // Softpick may produce denom = 0 (row has no above-threshold keys); use
+  // epsilon to avoid NaN. Standard softmax sum_exp is strictly positive
+  // (at least one entry = exp(0) = 1), so the epsilon is a no-op there.
+  let inv_sum = 1.0 / max(sum_exp, 1.0e-20);
   j = tid;
   while (j < cache_len) {
     scores[j] = scores[j] * inv_sum;
