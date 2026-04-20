@@ -27,6 +27,7 @@ struct Params {
   scale: f32,           // 1.0 / sqrt(head_dim)
   is_causal: u32,       // 1 = apply causal mask, 0 = no mask
   pos_offset: u32,      // position offset of first new token in the sequence
+  sliding_window: u32,  // 0 = full attention; >0 = window size W, mask j < q_abs_pos - (W - 1)
 }
 
 // Softpick (rectified softmax, arXiv:2504.20966): USE_SOFTPICK=1 replaces
@@ -91,6 +92,19 @@ fn attention(@builtin(local_invocation_id) lid: vec3u,
       let q_abs_pos = params.pos_offset + q_pos;
       if (j > q_abs_pos) {
         scores[j] = -1e9;  // effectively -infinity for softmax
+      }
+    }
+
+    // Sliding-window mask (Gemma 4, Mistral SWA): mask keys more than
+    // (window-1) positions before the current query. Applied in addition
+    // to the causal mask; only active when sliding_window > 0.
+    if (params.sliding_window > 0u) {
+      let q_abs_pos_sw = params.pos_offset + q_pos;
+      let w_minus_1 = params.sliding_window - 1u;
+      // j < q_abs_pos_sw - (W - 1)  →  out of window (too far back).
+      // Use addition form to avoid underflow on unsigned arithmetic.
+      if (j + w_minus_1 < q_abs_pos_sw) {
+        scores[j] = -1e9;
       }
     }
 

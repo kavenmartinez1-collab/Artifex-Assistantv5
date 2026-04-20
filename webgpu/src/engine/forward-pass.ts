@@ -1009,8 +1009,10 @@ export function createForwardPassEngine(
     qBuf: GPUBuffer, kCacheBuf: GPUBuffer, vCacheBuf: GPUBuffer,
     outputBuf: GPUBuffer, newSeqLen: number, cacheLen: number,
     isCausal: boolean, posOffset: number, label: string,
+    slidingWindow: number = 0,
   ) {
-    const paramData = new ArrayBuffer(32);
+    // 9 u32/f32 slots (36 bytes) padded to 48 for 16-byte uniform alignment.
+    const paramData = new ArrayBuffer(48);
     const u32View = new Uint32Array(paramData);
     const f32View = new Float32Array(paramData);
     u32View[0] = nHeads;
@@ -1021,6 +1023,7 @@ export function createForwardPassEngine(
     f32View[5] = 1.0 / Math.sqrt(dHead);
     u32View[6] = isCausal ? 1 : 0;
     u32View[7] = posOffset;
+    u32View[8] = slidingWindow | 0;  // 0 = full; W = local window size
     const paramBuf = getCachedUniform(new Uint8Array(paramData), `${label}-p`);
 
     const useSoftpick = (globalThis as any).__USE_SOFTPICK__ === true;
@@ -1691,11 +1694,11 @@ export function createForwardPassEngine(
 
       } else {
         // ── STANDARD SOFTMAX ATTENTION ────────────────────────────────
-        // For `isSlidingLayer`, task #20 will apply a sliding-window mask
-        // of size config.slidingWindow on top of the causal mask. Until
-        // that kernel lands, sliding layers fall through to full attention
-        // (correct result, just more compute on long contexts).
-        void isSlidingLayer;
+        // For sliding layers (Gemma 4, Mistral SWA) we pass `slidingWindow`
+        // to the attention kernel, which masks keys more than (W-1) positions
+        // before the current query in addition to the causal mask.
+        const layerSlidingWindow =
+          isSlidingLayer && config.slidingWindow ? config.slidingWindow : 0;
 
         // Q, K, V projections (auto-selects f32 or INT4 matmul)
         if (config.attnOutputGate) {
@@ -1816,6 +1819,7 @@ export function createForwardPassEngine(
           dispatchAttention(
             qBuf, c.scratchK, c.scratchV, attnOutBuf,
             seqLen, cacheLen, isCausal, pos, `L${l}-attn`,
+            layerSlidingWindow,
           );
         } else {
           copyToKVCache(kBuf, kvCache.keys[l], seqLen, kvDim, pos);
@@ -1898,6 +1902,7 @@ export function createForwardPassEngine(
           dispatchAttention(
             qBuf, kvCache.keys[l], kvCache.values[l], attnOutBuf,
             seqLen, cacheLen, isCausal, pos, `L${l}-attn`,
+            layerSlidingWindow,
           );
         }
 
