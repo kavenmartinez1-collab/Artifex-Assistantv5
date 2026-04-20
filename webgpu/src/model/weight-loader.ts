@@ -221,13 +221,23 @@ export async function loadModel(
       const chunkKey = `${cacheKey}/chunk-${idx}`;
       // Try browser cache first
       const cachedChunk = await getCache(chunkKey);
-      if (cachedChunk) return cachedChunk;
+      if (cachedChunk) {
+        console.log(`[WeightLoader] Chunk ${idx}: cache hit (${(cachedChunk.byteLength / 1024 / 1024).toFixed(0)} MB)`);
+        return cachedChunk;
+      }
       // Download and cache for next time
       const start = idx * CHUNK_SIZE;
       const end = Math.min(start + CHUNK_SIZE, shard.size);
-      const data = await fetchRange(shard.url, start, end);
-      putCache(chunkKey, data).catch(() => {}); // fire-and-forget cache write
-      return data;
+      console.log(`[WeightLoader] Chunk ${idx}: downloading bytes ${start}-${end} from ${shard.filename}`);
+      try {
+        const data = await fetchRange(shard.url, start, end);
+        console.log(`[WeightLoader] Chunk ${idx}: downloaded ${(data.byteLength / 1024 / 1024).toFixed(0)} MB`);
+        putCache(chunkKey, data).catch(() => {}); // fire-and-forget cache write
+        return data;
+      } catch (err) {
+        console.error(`[WeightLoader] Chunk ${idx} FAILED:`, err);
+        throw err;
+      }
     }
 
     // Helper: get a chunk (from cache or download), returns ArrayBuffer
@@ -310,8 +320,147 @@ export async function loadModel(
         const dataEnd = header.headerByteLength + tensorInfo.dataOffsets[1];
         const tensorSize = dataEnd - dataStart;
 
-        if (tensorSize > CHUNK_SIZE) {
-          rawData = await fetchRange(shard.url, dataStart, dataEnd);
+        // Detect oversized BF16/F16 tensors that can't fit in a single GPU buffer.
+        // Split into multiple GPU buffers (lossless) — each under maxBufferSize.
+        const isEmbedHere = name.endsWith('embed_tokens.weight');
+        const isLmHeadHere = name === 'lm_head.weight';
+        const isOversized = (isEmbedHere || isLmHeadHere)
+          && (tensorInfo.dtype === 'BF16' || tensorInfo.dtype === 'F16')
+          && tensorSize > device.limits.maxBufferSize;
+
+        if (isOversized && isEmbedHere) {
+          // ── CPU-side BF16 embedding (lossless, saves VRAM) ─────────────
+          // Embed lookup is O(H) per token — trivial on CPU. Keeping it in
+          // JS memory saves ~2.4 GB VRAM for models with 248K vocab.
+          const [vocabSize, hiddenSize] = tensorInfo.shape;
+          const rowBytes = hiddenSize * 2;
+          const maxPartBytes = 1024 * 1024 * 1024; // 1 GB per JS array
+          const rowsPerPart = Math.floor(maxPartBytes / rowBytes);
+          const numParts = Math.ceil(vocabSize / rowsPerPart);
+          const splitPoint = Math.min(rowsPerPart, vocabSize);
+          const baseName = name.replace('.weight', '');
+
+          console.log(
+            `[WeightLoader] CPU-side BF16 embed: ${name} [${vocabSize}, ${hiddenSize}] ${tensorInfo.dtype} `
+            + `→ ${numParts} JS arrays, splitPoint=${splitPoint} (saves ${(tensorSize / 1024 / 1024).toFixed(0)} MB VRAM)`
+          );
+
+          const cpuParts: Uint8Array[] = [];
+          let rowsLoaded = 0;
+          for (let part = 0; part < numParts; part++) {
+            const partRows = Math.min(rowsPerPart, vocabSize - rowsLoaded);
+            const partBytes = partRows * rowBytes;
+            const partStart = dataStart + rowsLoaded * rowBytes;
+            const partEnd = partStart + partBytes;
+
+            const partData = new Uint8Array(partBytes);
+            let written = 0;
+            for (let off = partStart; off < partEnd; off += CHUNK_SIZE) {
+              const end = Math.min(off + CHUNK_SIZE, partEnd);
+              const chunk = await fetchRange(shard.url, off, end);
+              partData.set(new Uint8Array(chunk), written);
+              written += chunk.byteLength;
+            }
+            cpuParts.push(partData);
+            rowsLoaded += partRows;
+
+            progress({
+              phase: 'uploading',
+              message: `Loading embed to CPU: part ${part + 1}/${numParts} (${(partBytes / 1024 / 1024).toFixed(0)} MB)`,
+              shard: shardIdx + 1, totalShards: shards.length,
+              shardProgress: rowsLoaded / vocabSize,
+            });
+          }
+
+          allTensors.set(`${baseName}.cpu_embed`, {
+            name: `${baseName}.cpu_embed`,
+            buffer: device.createBuffer({ size: 4, usage: GPUBufferUsage.UNIFORM, label: 'cpu-embed-marker' }),
+            shape: [vocabSize, hiddenSize],
+            dtype: tensorInfo.dtype,
+            byteLength: 0, elementCount: 0,
+            cpuEmbedData: { parts: cpuParts, splitPoint, isBF16: tensorInfo.dtype === 'BF16' },
+          } as any);
+
+          tensorsProcessed++;
+          console.log(
+            `[WeightLoader] CPU embed done: ${baseName} — ${numParts} parts, `
+            + `${rowsLoaded} rows in JS memory (0 MB GPU)`
+          );
+          tensorIdx++;
+          continue;
+        } else if (isOversized && isLmHeadHere) {
+          // ── CPU-side BF16 lm_head (saves VRAM) ────────────────────────
+          // When total model weights exceed Chrome's GPU allocation limit,
+          // keeping lm_head on CPU saves ~2.4 GB. The forward pass reads
+          // the hidden state from GPU and computes logits via CPU matmul.
+          const [vocabSize, hiddenSize] = tensorInfo.shape;
+          const rowBytes = hiddenSize * 2;
+          const maxPartBytes = 1024 * 1024 * 1024;
+          const rowsPerPart = Math.floor(maxPartBytes / rowBytes);
+          const numParts = Math.ceil(vocabSize / rowsPerPart);
+          const splitPoint = Math.min(rowsPerPart, vocabSize);
+          const baseName = name.replace('.weight', '');
+
+          console.log(
+            `[WeightLoader] CPU-side BF16 lm_head: ${name} [${vocabSize}, ${hiddenSize}] ${tensorInfo.dtype} `
+            + `→ ${numParts} JS arrays, splitPoint=${splitPoint} (saves ${(tensorSize / 1024 / 1024).toFixed(0)} MB VRAM)`
+          );
+
+          const cpuParts: Uint8Array[] = [];
+          let rowsLoaded = 0;
+          for (let part = 0; part < numParts; part++) {
+            const partRows = Math.min(rowsPerPart, vocabSize - rowsLoaded);
+            const partBytes = partRows * rowBytes;
+            const partStart = dataStart + rowsLoaded * rowBytes;
+            const partEnd = partStart + partBytes;
+
+            const partData = new Uint8Array(partBytes);
+            let written = 0;
+            for (let off = partStart; off < partEnd; off += CHUNK_SIZE) {
+              const end = Math.min(off + CHUNK_SIZE, partEnd);
+              const chunk = await fetchRange(shard.url, off, end);
+              partData.set(new Uint8Array(chunk), written);
+              written += chunk.byteLength;
+            }
+            cpuParts.push(partData);
+            rowsLoaded += partRows;
+
+            progress({
+              phase: 'uploading',
+              message: `Loading lm_head to CPU: part ${part + 1}/${numParts} (${(partBytes / 1024 / 1024).toFixed(0)} MB)`,
+              shard: shardIdx + 1, totalShards: shards.length,
+              shardProgress: rowsLoaded / vocabSize,
+            });
+          }
+
+          allTensors.set(`${baseName}.cpu_lm_head`, {
+            name: `${baseName}.cpu_lm_head`,
+            buffer: device.createBuffer({ size: 4, usage: GPUBufferUsage.UNIFORM, label: 'cpu-lm-head-marker' }),
+            shape: [vocabSize, hiddenSize],
+            dtype: tensorInfo.dtype,
+            byteLength: 0, elementCount: 0,
+            cpuLmHeadData: { parts: cpuParts, splitPoint, isBF16: tensorInfo.dtype === 'BF16' },
+          } as any);
+
+          tensorsProcessed++;
+          console.log(
+            `[WeightLoader] CPU lm_head done: ${baseName} — ${numParts} parts, `
+            + `${rowsLoaded} rows in JS memory (0 MB GPU)`
+          );
+          tensorIdx++;
+          continue;
+        } else if (tensorSize > CHUNK_SIZE) {
+          // Large tensor: fetch in chunks and stitch (single fetch would OOM the browser)
+          console.log(`[WeightLoader] Large tensor ${name}: ${(tensorSize / 1024 / 1024).toFixed(0)} MB — chunked fetch`);
+          const stitched = new Uint8Array(tensorSize);
+          let written = 0;
+          for (let off = dataStart; off < dataEnd; off += CHUNK_SIZE) {
+            const chunkEnd = Math.min(off + CHUNK_SIZE, dataEnd);
+            const chunk = await fetchRange(shard.url, off, chunkEnd);
+            stitched.set(new Uint8Array(chunk), written);
+            written += chunk.byteLength;
+          }
+          rawData = stitched.buffer;
         } else {
           const firstChunkIdx = Math.floor(dataStart / CHUNK_SIZE);
           const lastChunkIdx = Math.floor((dataEnd - 1) / CHUNK_SIZE);
@@ -490,6 +639,90 @@ export async function loadModel(
       let gpuDtype = tensorInfo.dtype; // Track actual format on GPU (may differ from original)
       const f32Size = tensorInfo.elementCount * 4;
       const exceedsBufferLimit = f32Size > 1.9 * 1024 * 1024 * 1024;
+      const maxBufferSize = device.limits.maxBufferSize;
+
+      // Runtime handling for oversized BF16/F16 embedding/lm_head tensors.
+      // embed_tokens → CPU (trivial lookup, saves ~2.4 GB VRAM)
+      // lm_head → split BF16 GPU buffers (needs GPU matmul, lossless)
+      const isEmbed = name.endsWith('embed_tokens.weight');
+      const isLmHead = name === 'lm_head.weight';
+      const needsOversizedHandling = (isEmbed || isLmHead)
+        && (tensorInfo.dtype === 'BF16' || tensorInfo.dtype === 'F16')
+        && tensorInfo.byteLength > maxBufferSize;
+
+      if (needsOversizedHandling && isEmbed) {
+        const [vocabSize, hiddenSize] = tensorInfo.shape;
+        const rowBytes = hiddenSize * 2;
+        const maxPartBytes = 1024 * 1024 * 1024;
+        const rowsPerPart = Math.floor(maxPartBytes / rowBytes);
+        const numParts = Math.ceil(vocabSize / rowsPerPart);
+        const splitPoint = Math.min(rowsPerPart, vocabSize);
+        const baseName = name.replace('.weight', '');
+
+        console.log(
+          `[WeightLoader] In-memory CPU embed: ${name} [${vocabSize}, ${hiddenSize}] `
+          + `→ ${numParts} JS arrays, splitPoint=${splitPoint} (saves ${(tensorInfo.byteLength / 1024 / 1024).toFixed(0)} MB VRAM)`
+        );
+
+        const raw = new Uint8Array(rawData);
+        const cpuParts: Uint8Array[] = [];
+        for (let part = 0; part < numParts; part++) {
+          const startRow = part * rowsPerPart;
+          const endRow = Math.min(startRow + rowsPerPart, vocabSize);
+          const partBytes = (endRow - startRow) * rowBytes;
+          cpuParts.push(raw.slice(startRow * rowBytes, startRow * rowBytes + partBytes));
+        }
+
+        allTensors.set(`${baseName}.cpu_embed`, {
+          name: `${baseName}.cpu_embed`,
+          buffer: device.createBuffer({ size: 4, usage: GPUBufferUsage.UNIFORM, label: 'cpu-embed-marker' }),
+          shape: [vocabSize, hiddenSize],
+          dtype: tensorInfo.dtype,
+          byteLength: 0, elementCount: 0,
+          cpuEmbedData: { parts: cpuParts, splitPoint, isBF16: tensorInfo.dtype === 'BF16' },
+        } as any);
+
+        tensorsProcessed++;
+        console.log(`[WeightLoader] CPU embed done: ${baseName} — ${numParts} parts, ${vocabSize} rows in JS memory (0 MB GPU)`);
+        continue;
+      }
+
+      if (needsOversizedHandling && isLmHead) {
+        const [vocabSize, hiddenSize] = tensorInfo.shape;
+        const rowBytes = hiddenSize * 2;
+        const maxPartBytes = 1024 * 1024 * 1024;
+        const rowsPerPart = Math.floor(maxPartBytes / rowBytes);
+        const numParts = Math.ceil(vocabSize / rowsPerPart);
+        const splitPoint = Math.min(rowsPerPart, vocabSize);
+        const baseName = name.replace('.weight', '');
+
+        console.log(
+          `[WeightLoader] In-memory CPU lm_head: ${name} [${vocabSize}, ${hiddenSize}] `
+          + `→ ${numParts} JS arrays, splitPoint=${splitPoint} (saves ${(tensorInfo.byteLength / 1024 / 1024).toFixed(0)} MB VRAM)`
+        );
+
+        const raw = new Uint8Array(rawData);
+        const cpuParts: Uint8Array[] = [];
+        for (let part = 0; part < numParts; part++) {
+          const startRow = part * rowsPerPart;
+          const endRow = Math.min(startRow + rowsPerPart, vocabSize);
+          const partBytes = (endRow - startRow) * rowBytes;
+          cpuParts.push(raw.slice(startRow * rowBytes, startRow * rowBytes + partBytes));
+        }
+
+        allTensors.set(`${baseName}.cpu_lm_head`, {
+          name: `${baseName}.cpu_lm_head`,
+          buffer: device.createBuffer({ size: 4, usage: GPUBufferUsage.UNIFORM, label: 'cpu-lm-head-marker' }),
+          shape: [vocabSize, hiddenSize],
+          dtype: tensorInfo.dtype,
+          byteLength: 0, elementCount: 0,
+          cpuLmHeadData: { parts: cpuParts, splitPoint, isBF16: tensorInfo.dtype === 'BF16' },
+        } as any);
+
+        tensorsProcessed++;
+        console.log(`[WeightLoader] CPU lm_head done: ${baseName} — ${numParts} parts, ${vocabSize} rows in JS memory (0 MB GPU)`);
+        continue;
+      }
 
       if (isGPTQ) {
         gpuData = tensorToTypedArray(rawData, tensorInfo.dtype);
@@ -503,6 +736,13 @@ export async function loadModel(
       } else {
         gpuData = tensorToFloat32(rawData, tensorInfo.dtype);
         gpuDtype = 'F32';
+      }
+
+      // Skip tensors that exceed WebGPU max buffer size (typically 2 GB)
+      if (gpuData.byteLength > maxBufferSize) {
+        console.warn(`[WeightLoader] SKIPPING ${name}: ${(gpuData.byteLength / 1024 / 1024).toFixed(0)} MB exceeds GPU max buffer (${(maxBufferSize / 1024 / 1024).toFixed(0)} MB)`);
+        tensorsProcessed++;
+        continue;
       }
 
       // Create GPU buffer and upload
@@ -573,8 +813,17 @@ export async function loadModel(
       tensorsProcessed++;
     }
 
+    // Flush GPU command queue between shards to release mappedAtCreation staging
+    // memory. Without this, UPLOAD-heap copies accumulate (~12 GB staging on top
+    // of ~12 GB final buffers = 24 GB peak), causing D3D12 CreateCommittedResource OOM.
+    device.queue.submit([]);
+    await device.queue.onSubmittedWorkDone();
+
     const t_upload_end = performance.now();
-    console.log(`[Perf] Shard ${shardIdx + 1}/${shards.length}: process+upload ${(t_upload_end - t_upload_start).toFixed(0)}ms (${header.tensors.size} tensors)`);
+    console.log(
+      `[Perf] Shard ${shardIdx + 1}/${shards.length}: process+upload ${(t_upload_end - t_upload_start).toFixed(0)}ms `
+      + `(${header.tensors.size} tensors, GPU total: ${(totalGPUBytes / 1024 / 1024).toFixed(0)} MB)`
+    );
   }
 
   const loadTimeMs = performance.now() - startTime;
@@ -613,6 +862,39 @@ export async function loadModel(
  *
  * @returns Float32Array of shape [N, K] (HF weight format: [out_features, in_features])
  */
+// Shared scratch buffers for bitcast conversions (avoids per-call allocation)
+const _cvtBuf = new ArrayBuffer(4);
+const _cvtU32 = new Uint32Array(_cvtBuf);
+const _cvtF32 = new Float32Array(_cvtBuf);
+
+/** Decode BF16 u16 bits to f32 number (used by runtime quantizer) */
+function bf16ToF32Bits(bits: number): number {
+  _cvtU32[0] = bits << 16;
+  return _cvtF32[0];
+}
+
+/** Decode F16 u16 bits to f32 number (used by runtime quantizer) */
+function f16ToF32Bits(bits: number): number {
+  const sign = (bits >> 15) & 1;
+  const exp = (bits >> 10) & 0x1F;
+  const frac = bits & 0x3FF;
+  if (exp === 0) return frac === 0 ? 0 : (frac / 1024) * Math.pow(2, -14) * (sign ? -1 : 1);
+  if (exp === 31) return sign ? -Infinity : Infinity;
+  return (1 + frac / 1024) * Math.pow(2, exp - 15) * (sign ? -1 : 1);
+}
+
+/** Encode f32 to F16 u16 bits (for scales in runtime quantizer) */
+function f32ToF16Bits(val: number): number {
+  _cvtF32[0] = val;
+  const f32Bits = _cvtU32[0];
+  const sign = (f32Bits >> 31) & 1;
+  let exp = ((f32Bits >> 23) & 0xFF) - 127 + 15;
+  let frac = (f32Bits >> 13) & 0x3FF;
+  if (exp <= 0) { exp = 0; frac = 0; }
+  if (exp >= 31) { exp = 31; frac = 0; }
+  return (sign << 15) | (exp << 10) | frac;
+}
+
 /** Decode IEEE 754 half-precision (F16) u16 bits to f32 number */
 function f16ToF32(bits: number): number {
   const sign = (bits >> 15) & 1;

@@ -619,14 +619,32 @@ loadBtn.addEventListener('click', async () => {
     if (isQuantized) {
       const previewConfig = parseModelConfig(preview.config);
       if (previewConfig.isHybrid && previewConfig.layerTypes) {
-        // Estimate VRAM overhead from SSM dequant (INT4→BF16 expansion ~3.5x per weight)
-        // Each SSM layer has ~5 projections; biggest is in_proj_qkv at hidden*2*head_dim*heads
         const ssmLayerCount = previewConfig.layerTypes.filter((t: string) => t === 'linear_attention').length;
         const hiddenSize = previewConfig.hiddenSize ?? 4096;
-        // Rough estimate: each SSM layer's dequanted projections add ~hidden^2 * 6 bytes net (BF16 - INT4)
+        const vocabSize = previewConfig.vocabSize ?? 32000;
+        // Net VRAM cost of dequanting SSM layers from INT4→BF16 (~3.5× expansion per projection)
         const dequantOverheadBytes = ssmLayerCount * hiddenSize * hiddenSize * 6;
+
+        // Estimate available VRAM from GPU capabilities.
+        // WebGPU doesn't expose total VRAM, so use maxBufferSize as a proxy:
+        // 2 GB maxBuf → high-end (16-24 GB), 256 MB → low-end (4-8 GB)
+        const maxBuf = gpu!.maxBufferSize;
+        const estimatedVRAM = maxBuf >= 2 * 1024 * 1024 * 1024
+          ? 24 * 1024 * 1024 * 1024  // 2 GB maxBuf → assume 24 GB (RTX 4090, 3090, etc.)
+          : maxBuf >= 1024 * 1024 * 1024
+            ? 12 * 1024 * 1024 * 1024  // 1 GB maxBuf → assume 12 GB
+            : 8 * 1024 * 1024 * 1024;  // fallback → 8 GB
+
+        // Oversized tensors (embed/lm_head > maxBuf) are split into multiple
+        // GPU buffers — lossless, no VRAM savings. Total stays at full BF16 size.
         const estimatedTotalVRAM = preview.totalBytes + dequantOverheadBytes;
-        const GPU_VRAM_BUDGET = 7.5 * 1024 * 1024 * 1024; // conservative 7.5 GB for 8 GB cards
+        const GPU_VRAM_BUDGET = estimatedVRAM * 0.85; // 85% — leave room for KV cache, scratch, OS
+
+        console.log(
+          `[Engine] SSM dequant estimate: model=${formatBytes(preview.totalBytes)}, `
+          + `dequantCost=+${formatBytes(dequantOverheadBytes)}, `
+          + `total=${formatBytes(estimatedTotalVRAM)}, budget=${formatBytes(GPU_VRAM_BUDGET)}`
+        );
 
         if (estimatedTotalVRAM > GPU_VRAM_BUDGET) {
           console.warn(`[Engine] SSM dequant would need ~${formatBytes(estimatedTotalVRAM)} VRAM (budget: ${formatBytes(GPU_VRAM_BUDGET)}) — skipping, relying on GPTQ calibration for SSM layers`);
@@ -808,24 +826,79 @@ loadBtn.addEventListener('click', async () => {
         return undefined;
       };
 
+      // Helper: detect split BF16 buffers for a weight (embed_tokens or lm_head)
+      const detectSplit = (baseName: string) => {
+        const meta = currentModel!.tensors.get(`${baseName}.split_meta`);
+        if (!meta) return undefined;
+        const numParts = meta.shape[0];
+        const splitPoints = meta.shape.slice(1);
+        const buffers: GPUBuffer[] = [];
+        for (let p = 0; p < numParts; p++) {
+          const partTensor = currentModel!.tensors.get(`${baseName}.split${p}`);
+          if (!partTensor?.buffer) {
+            console.error(`[Engine] Missing split buffer: ${baseName}.split${p}`);
+            return undefined;
+          }
+          buffers.push(partTensor.buffer);
+        }
+        return { buffers, splitPoints };
+      };
+
+      // Check if embedding is stored CPU-side (oversized BF16, saves ~2.4 GB VRAM)
+      const embedBaseName = nameMap.embedTokens.replace('.weight', '');
+      const cpuEmbedTensor = currentModel!.tensors.get(`${embedBaseName}.cpu_embed`) as any;
+      if (cpuEmbedTensor?.cpuEmbedData) {
+        const { parts, splitPoint, isBF16 } = cpuEmbedTensor.cpuEmbedData;
+        global.embedCPU = { parts, splitPoint, hiddenSize: config.hiddenSize, isBF16 };
+        global.embedIsF16 = true;
+        console.log(`[Engine] Embedding is CPU-side BF16: ${parts.length} parts, splitPoint=${splitPoint}, saves ~${(cpuEmbedTensor.shape[0] * cpuEmbedTensor.shape[1] * 2 / 1024 / 1024).toFixed(0)} MB VRAM`);
+      }
+
+      // Check if embedding was split across multiple GPU BF16 buffers
+      const embedSplitData = !cpuEmbedTensor ? detectSplit(embedBaseName) : undefined;
+      if (embedSplitData) {
+        global.embedSplit = embedSplitData;
+        global.embedIsF16 = true;
+        console.log(`[Engine] Embedding is split BF16: ${embedSplitData.buffers.length} buffers, splitPoints=[${embedSplitData.splitPoints}]`);
+      }
+
       // Check if embedding is GPTQ INT4 (saves ~1.4 GB VRAM)
-      const embedQ4 = tryGetQ4(nameMap.embedTokens);
+      const embedQ4 = (!embedSplitData && !cpuEmbedTensor) ? tryGetQ4(nameMap.embedTokens) : undefined;
       if (embedQ4) {
         global.embedQ4 = embedQ4;
         global.embedIsF16 = false;
         console.log(`[Engine] Embedding is GPTQ INT4, using Q4 embed shader`);
       }
 
-      // Check if lm_head is GPTQ INT4 (saves ~1.4 GB VRAM)
+      // Check if lm_head is stored CPU-side or split across GPU buffers
       if (!config.tieWordEmbeddings) {
-        const lmHeadQ4 = tryGetQ4(nameMap.lmHead);
-        if (lmHeadQ4) {
-          global.lmHeadQ4 = lmHeadQ4;
-          global.lmHeadIsBF16 = false;
-          console.log(`[Engine] LM head is GPTQ INT4, using Q4 matmul`);
+        const lmHeadBaseName = nameMap.lmHead.replace('.weight', '');
+        const cpuLmHeadTensor = currentModel!.tensors.get(`${lmHeadBaseName}.cpu_lm_head`) as any;
+        if (cpuLmHeadTensor?.cpuLmHeadData) {
+          const { parts, splitPoint, isBF16 } = cpuLmHeadTensor.cpuLmHeadData;
+          global.lmHeadCPU = {
+            parts, splitPoint,
+            hiddenSize: config.hiddenSize,
+            vocabSize: config.vocabSize,
+            isBF16,
+          };
+          console.log(`[Engine] LM head is CPU-side BF16: ${parts.length} parts, splitPoint=${splitPoint}, saves ~${(cpuLmHeadTensor.shape[0] * cpuLmHeadTensor.shape[1] * 2 / 1024 / 1024).toFixed(0)} MB VRAM`);
+        } else {
+          const lmHeadSplitData = detectSplit(lmHeadBaseName);
+          if (lmHeadSplitData) {
+            global.lmHeadSplit = lmHeadSplitData;
+            global.lmHeadIsBF16 = false;
+            console.log(`[Engine] LM head is split BF16: ${lmHeadSplitData.buffers.length} buffers, splitPoints=[${lmHeadSplitData.splitPoints}]`);
+          } else {
+            const lmHeadQ4 = tryGetQ4(nameMap.lmHead);
+            if (lmHeadQ4) {
+              global.lmHeadQ4 = lmHeadQ4;
+              global.lmHeadIsBF16 = false;
+              console.log(`[Engine] LM head is GPTQ INT4, using Q4 matmul`);
+            }
+          }
         }
       } else if (embedQ4) {
-        // Tied embeddings: lm_head uses same Q4 weights as embedding
         global.lmHeadQ4 = embedQ4;
         global.lmHeadIsBF16 = false;
         console.log(`[Engine] LM head is GPTQ INT4 (tied), using Q4 matmul`);

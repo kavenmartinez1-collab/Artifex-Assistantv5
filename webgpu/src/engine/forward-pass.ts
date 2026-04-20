@@ -59,6 +59,11 @@ import ssmStepWGSL from '../shaders/ssm_step.wgsl?raw';
 import l2normWGSL from '../shaders/l2norm.wgsl?raw';
 import hadamardWGSL from '../shaders/hadamard.wgsl?raw';
 
+// ── CPU embed helpers (BF16 → F32 decode) ──────────────────────────────
+const _cpuEmbedBuf = new ArrayBuffer(4);
+const _cpuEmbedU32 = new Uint32Array(_cpuEmbedBuf);
+const _cpuEmbedF32 = new Float32Array(_cpuEmbedBuf);
+
 // ── Types ────────────────────────────────────────────────────────────────
 
 /** GPU buffers for one transformer layer's weights. */
@@ -137,8 +142,10 @@ export interface LayerWeights {
 
 /** GPU buffers for global (non-layer) weights. */
 export interface GlobalWeights {
-  embedTokens: GPUBuffer;  // [vocab_size, hidden_size] (f32, f16 packed, or dummy if Q4)
+  embedTokens: GPUBuffer;  // [vocab_size, hidden_size] (f32, f16 packed, or dummy if Q4/split)
   embedIsF16?: boolean;    // true if embedding stored as F16/BF16 (large vocab models)
+  embedSplit?: { buffers: GPUBuffer[]; splitPoints: number[] };  // Split BF16 for oversized embeddings (SSM models need lossless embed)
+  embedCPU?: { parts: Uint8Array[]; splitPoint: number; hiddenSize: number; isBF16: boolean };
   embedQ4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };  // GPTQ INT4 embedding
   /** E8 codebook buffer, shared across all layers [256*8] f32 */
   e8Codebook?: GPUBuffer;
@@ -146,6 +153,8 @@ export interface GlobalWeights {
   lmHead: GPUBuffer;       // [vocab_size, hidden_size] or same as embedTokens
   lmHeadIsBF16?: boolean;  // true if lm_head stored as BF16 (large vocab models)
   lmHeadQ4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };  // GPTQ INT4 lm_head
+  lmHeadSplit?: { buffers: GPUBuffer[]; splitPoints: number[] };  // Split BF16 for oversized lm_head
+  lmHeadCPU?: { parts: Uint8Array[]; splitPoint: number; hiddenSize: number; vocabSize: number; isBF16: boolean };
 }
 
 /** All model weights on the GPU. */
@@ -245,6 +254,7 @@ export function createForwardPassEngine(
 
   const embedPipeline = createComputePipeline(device, embedWGSL, 'embed', 'embed');
   const embedF16Pipeline = createComputePipeline(device, embedWGSL, 'embed_f16', 'embed-f16');
+  const embedF16SplitPipeline = createComputePipeline(device, embedWGSL, 'embed_f16_split', 'embed-f16-split');
   const embedQ4Pipeline = config.isQuantized
     ? createComputePipeline(device, embedWGSL, 'embed_q4', 'embed-q4') : null;
   const rmsnormPipeline = createComputePipeline(device, rmsnormWGSL, 'rmsnorm', 'rmsnorm');
@@ -1216,8 +1226,50 @@ export function createForwardPassEngine(
       };
     }
 
-    // ── Embedding (f32, BF16/F16, or GPTQ INT4) ────────────────────
-    if (weights.global.embedQ4 && embedQ4Pipeline) {
+    // ── Embedding (CPU BF16, split BF16, single BF16/f32, or GPTQ INT4) ──
+    if (weights.global.embedCPU) {
+      const { parts, splitPoint, hiddenSize: embedH, isBF16 } = weights.global.embedCPU;
+      const f32 = new Float32Array(seqLen * embedH);
+      for (let t = 0; t < seqLen; t++) {
+        const tokenId = tokenIds[t];
+        const partIdx = Math.min(Math.floor(tokenId / splitPoint), parts.length - 1);
+        const adjustedId = tokenId - partIdx * splitPoint;
+        const rowByteOff = adjustedId * embedH * 2;
+        const row = new Uint16Array(parts[partIdx].buffer, parts[partIdx].byteOffset + rowByteOff, embedH);
+        const outOff = t * embedH;
+        if (isBF16) {
+          for (let i = 0; i < embedH; i++) {
+            _cpuEmbedU32[0] = row[i] << 16;
+            f32[outOff + i] = _cpuEmbedF32[0];
+          }
+        } else {
+          for (let i = 0; i < embedH; i++) {
+            const bits = row[i];
+            const sign = (bits >> 15) & 1;
+            const exp = (bits >> 10) & 0x1F;
+            const frac = bits & 0x3FF;
+            if (exp === 0) { f32[outOff + i] = frac === 0 ? 0 : (sign ? -1 : 1) * frac / 1024 * 2 ** -14; }
+            else if (exp === 31) { f32[outOff + i] = sign ? -1e30 : 1e30; }
+            else { _cpuEmbedU32[0] = (sign << 31) | ((exp + 112) << 23) | (frac << 13); f32[outOff + i] = _cpuEmbedF32[0]; }
+          }
+        }
+      }
+      device.queue.writeBuffer(hiddenBuf, 0, f32.buffer, 0, seqLen * embedH * 4);
+    } else if (weights.global.embedSplit) {
+      // Split BF16 embedding — lossless, needed for SSM models where INT4 causes drift
+      const split = weights.global.embedSplit;
+      const embedParams = getCachedUniform(
+        new Uint32Array([H, seqLen, split.splitPoints[0], 0]), 'embed-split-p');
+      const embedBG = createBindGroup(device, embedF16SplitPipeline, 0, [
+        { binding: 0, resource: { buffer: tokenIdBuf } },
+        { binding: 1, resource: { buffer: hiddenBuf } },
+        { binding: 2, resource: { buffer: split.buffers[0] } },
+        { binding: 3, resource: { buffer: embedParams } },
+        { binding: 4, resource: { buffer: split.buffers[1] } },
+      ], 'embed-split');
+      bd(embedF16SplitPipeline, [embedBG], [seqLen], 'embed-split');
+      if (isDebug) console.log(`[EMBED-PATH] split-bf16, splitPoint=${split.splitPoints[0]}, bufs=${split.buffers.length}`);
+    } else if (weights.global.embedQ4 && embedQ4Pipeline) {
       // GPTQ INT4 embedding — dequant on the fly per token
       const eq4 = weights.global.embedQ4;
       const embedParams = getCachedUniform(
@@ -2016,9 +2068,92 @@ export function createForwardPassEngine(
       batchCopy(normedBuf, lastRowOffset, lastHiddenBuf, 0, H * 4);
       lmInputBuf = lastHiddenBuf;
     }
-    // LM head — select kernel based on weight format (BF16, INT4 GPTQ, or f32)
+    // LM head — select kernel based on weight format (CPU BF16, split BF16, BF16, INT4 GPTQ, or f32)
     const lmIsQ4 = !!(weights.global.lmHeadQ4 && matmulQ4Pipeline);
-    if (lmIsQ4) {
+    if (weights.global.lmHeadCPU) {
+      // CPU BF16 lm_head: flush GPU, read hidden state, matmul on CPU, write logits back.
+      // This saves ~2.4 GB VRAM at the cost of slower lm_head computation.
+      if (__timingCtx && currentBatch && __timingCtx.used > 0) {
+        currentBatch.resolveQuerySet(
+          __timingCtx.querySet, 0, __timingCtx.used,
+          __timingCtx.resolveBuf, 0,
+        );
+        currentBatch.copyBuffer(
+          __timingCtx.resolveBuf, 0,
+          __timingCtx.readBuf, 0,
+          __timingCtx.used * 8,
+        );
+      }
+      if (currentBatch) {
+        currentBatch.flush();
+        for (const buf of deferredDestroys) buf.destroy();
+        deferredDestroys = [];
+        currentBatch = null;
+      }
+      await device.queue.onSubmittedWorkDone();
+
+      const { parts, splitPoint, hiddenSize: lmH, vocabSize: lmV, isBF16 } = weights.global.lmHeadCPU;
+      const hiddenBytes = await readBuffer(device, lmInputBuf, lmH * 4);
+      const hidden = new Float32Array(hiddenBytes);
+      const logits = new Float32Array(lmV);
+
+      const t0 = performance.now();
+      for (let v = 0; v < lmV; v++) {
+        const partIdx = Math.min(Math.floor(v / splitPoint), parts.length - 1);
+        const adjustedV = v - partIdx * splitPoint;
+        const rowByteOff = adjustedV * lmH * 2;
+        const row = new Uint16Array(parts[partIdx].buffer, parts[partIdx].byteOffset + rowByteOff, lmH);
+        let sum = 0;
+        if (isBF16) {
+          for (let h = 0; h < lmH; h++) {
+            _cpuEmbedU32[0] = row[h] << 16;
+            sum += hidden[h] * _cpuEmbedF32[0];
+          }
+        } else {
+          for (let h = 0; h < lmH; h++) {
+            const bits = row[h];
+            const sign = (bits >> 15) & 1;
+            const exp = (bits >> 10) & 0x1F;
+            const frac = bits & 0x3FF;
+            if (exp === 0) { _cpuEmbedU32[0] = 0; }
+            else if (exp === 31) { _cpuEmbedU32[0] = (sign << 31) | 0x7F800000; }
+            else { _cpuEmbedU32[0] = (sign << 31) | ((exp + 112) << 23) | (frac << 13); }
+            sum += hidden[h] * _cpuEmbedF32[0];
+          }
+        }
+        logits[v] = sum;
+      }
+      console.log(`[LM-HEAD CPU] ${lmV} logits in ${(performance.now() - t0).toFixed(0)}ms`);
+      device.queue.writeBuffer(logitsBuf, 0, logits.buffer, 0, lmV * 4);
+    } else if (weights.global.lmHeadSplit) {
+      // Split BF16 lm_head: two matmuls, one per buffer half, writing to offset logitsBuf
+      const split = weights.global.lmHeadSplit;
+      const V_lo = split.splitPoints[0];
+      const V_hi = V - V_lo;
+      const align = device.limits.minStorageBufferOffsetAlignment || 256;
+
+      const params0 = getCachedUniform(new Uint32Array([1, V_lo, H, 0]), 'lm-head-s0-p');
+      const bg0 = createBindGroup(device, matmulBTBF16Pipeline, 0, [
+        { binding: 0, resource: { buffer: lmInputBuf } },
+        { binding: 2, resource: { buffer: logitsBuf, offset: 0, size: V_lo * 4 } },
+        { binding: 3, resource: { buffer: params0 } },
+        { binding: 5, resource: { buffer: split.buffers[0] } },
+      ], 'lm-head-s0');
+      bd(matmulBTBF16Pipeline, [bg0], [Math.ceil(1 / 16), Math.ceil(V_lo / 16)], 'lm-head-s0');
+
+      const offsetBytes = V_lo * 4;
+      if (offsetBytes % align !== 0) {
+        console.error(`[LM-HEAD] Split offset ${offsetBytes} not aligned to ${align} — output will be corrupted!`);
+      }
+      const params1 = getCachedUniform(new Uint32Array([1, V_hi, H, 0]), 'lm-head-s1-p');
+      const bg1 = createBindGroup(device, matmulBTBF16Pipeline, 0, [
+        { binding: 0, resource: { buffer: lmInputBuf } },
+        { binding: 2, resource: { buffer: logitsBuf, offset: offsetBytes, size: V_hi * 4 } },
+        { binding: 3, resource: { buffer: params1 } },
+        { binding: 5, resource: { buffer: split.buffers[1] } },
+      ], 'lm-head-s1');
+      bd(matmulBTBF16Pipeline, [bg1], [Math.ceil(1 / 16), Math.ceil(V_hi / 16)], 'lm-head-s1');
+    } else if (lmIsQ4) {
       // GPTQ INT4 lm_head (saves ~1.4 GB vs BF16)
       dispatchMatmulQ4(lmInputBuf, weights.global.lmHeadQ4!, logitsBuf, 1, V, H, 'lm-head');
     } else if (weights.global.lmHeadIsBF16) {

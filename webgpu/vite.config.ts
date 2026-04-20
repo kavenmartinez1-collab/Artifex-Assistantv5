@@ -86,8 +86,18 @@ export default defineConfig({
     proxy: {
       // Proxy metrics to the dev server
       '/metrics': 'http://127.0.0.1:3001',
-      // Proxy local HF cache to the dev server
-      '/api/hf-cache': 'http://127.0.0.1:3001',
+      // Proxy local HF cache to the dev server (streams large weight shards)
+      '/api/hf-cache': {
+        target: 'http://127.0.0.1:3001',
+        timeout: 600000,
+        proxyTimeout: 600000,
+        selfHandleResponse: false,
+        configure: (proxy) => {
+          proxy.on('proxyReq', (proxyReq) => {
+            proxyReq.setSocketKeepAlive(true);
+          });
+        },
+      },
       // Proxy Artifex API calls
       '/v1': 'http://127.0.0.1:8000',
       // WebSocket proxy to orchestration hub

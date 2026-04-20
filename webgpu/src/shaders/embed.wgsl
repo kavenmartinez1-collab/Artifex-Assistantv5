@@ -103,6 +103,52 @@ fn embed_f16(@builtin(local_invocation_id) lid: vec3u,
   }
 }
 
+// ── Split BF16 Embedding Lookup ─────────────────────────────────────
+// For models where the BF16 embedding exceeds WebGPU's 2 GB buffer limit
+// (e.g., Qwen3.5-27B: 248K × 5120 × 2 = 2.4 GB). The table is split into
+// two buffers at a row boundary (split_point). Token IDs below split_point
+// read from the low buffer; IDs >= split_point read from the high buffer.
+
+struct SplitParams {
+  hidden_size: u32,
+  seq_len: u32,
+  split_point: u32,  // number of rows in the low buffer
+  _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> token_ids_split: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output_split: array<f32>;
+@group(0) @binding(2) var<storage, read> embed_table_lo: array<u32>;
+@group(0) @binding(3) var<uniform> params_split: SplitParams;
+@group(0) @binding(4) var<storage, read> embed_table_hi: array<u32>;
+
+@compute @workgroup_size(256)
+fn embed_f16_split(@builtin(local_invocation_id) lid: vec3u,
+                   @builtin(workgroup_id) wid: vec3u) {
+  let token_idx = wid.x;
+  let tid = lid.x;
+  let hidden = params_split.hidden_size;
+
+  if (token_idx >= params_split.seq_len) { return; }
+
+  let token_id = token_ids_split[token_idx];
+  let split = params_split.split_point;
+  let is_hi = token_id >= split;
+  let adjusted_id = select(token_id, token_id - split, is_hi);
+  let row_start = adjusted_id * hidden;
+
+  var i = tid;
+  while (i < hidden) {
+    let elem_idx = row_start + i;
+    let word_idx = elem_idx / 2u;
+    let is_upper = (elem_idx & 1u) == 1u;
+    let word = select(embed_table_lo[word_idx], embed_table_hi[word_idx], is_hi);
+    let f16_bits = select(word & 0xFFFFu, word >> 16u, is_upper);
+    output_split[token_idx * hidden + i] = bf16_to_f32(f16_bits);
+    i = i + 256u;
+  }
+}
+
 // ── GPTQ INT4 Embedding Lookup ──────────────────────────────────────
 // Embedding stored as GPTQ: qweight[hidden/8, vocab] I32 (8 nibbles per i32),
 // scales[hidden/group_size, vocab] F16, qzeros[hidden/group_size, vocab/8] I32.

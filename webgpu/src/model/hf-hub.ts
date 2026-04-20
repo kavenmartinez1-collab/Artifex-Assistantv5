@@ -74,17 +74,20 @@ export function resetToRemote(): void {
 
 /** Fetch with local-first, CDN-fallback. If local returns 404, retry from CDN. */
 async function fetchLocalFirst(localUrl: string, remoteUrl: string, init?: RequestInit): Promise<Response> {
+  const rangeHeader = (init?.headers as Record<string, string>)?.Range ?? '';
   if (_localBase) {
     try {
+      console.log(`[HF Hub] Local fetch: ${localUrl.split('/').slice(-1)[0]} ${rangeHeader}`);
       const resp = await fetch(localUrl, init);
       if (resp.ok || resp.status === 206) return resp;
-      // Local 404 — fall back to CDN
+      console.warn(`[HF Hub] Local non-OK: ${resp.status} for ${localUrl.split('/').slice(-1)[0]}`);
       if (resp.status === 404) {
         console.log(`[HF Hub] Local miss, falling back to CDN: ${remoteUrl.split('/').slice(-1)[0]}`);
         return fetchWithRetry(remoteUrl, init);
       }
-    } catch {
-      // Local fetch failed entirely — fall back to CDN
+    } catch (err) {
+      console.error(`[HF Hub] Local fetch THREW for ${localUrl.split('/').slice(-1)[0]} ${rangeHeader}:`, err);
+      console.log(`[HF Hub] Falling back to CDN: ${remoteUrl}`);
       return fetchWithRetry(remoteUrl, init);
     }
   }
