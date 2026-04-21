@@ -613,72 +613,25 @@ loadBtn.addEventListener('click', async () => {
       console.log(`[Engine] Keeping BF16 weights native — halves VRAM usage`);
     }
 
-    // Mixed-precision GPTQ: dequant linear_attn weights to BF16 for hybrid models
-    // This prevents INT4 quantization noise from compounding in the SSM recurrence
+    // SSM dequant strategy: on-the-fly GPU dequant at inference time.
+    // Weights stay as Q4 on GPU (~12 GB), dequanted to a temp BF16 buffer
+    // per-projection during the forward pass. No CPU-side dequant needed.
     const dequantToBF16 = new Set<string>();
+    const maxDequantOverhead = 0;
     if (isQuantized) {
       const previewConfig = parseModelConfig(preview.config);
       if (previewConfig.isHybrid && previewConfig.layerTypes) {
         const ssmLayerCount = previewConfig.layerTypes.filter((t: string) => t === 'linear_attention').length;
-        const hiddenSize = previewConfig.hiddenSize ?? 4096;
-        const vocabSize = previewConfig.vocabSize ?? 32000;
-        // Net VRAM cost of dequanting SSM layers from INT4→BF16 (~3.5× expansion per projection)
-        const dequantOverheadBytes = ssmLayerCount * hiddenSize * hiddenSize * 6;
-
-        // Estimate available VRAM from GPU capabilities.
-        // WebGPU doesn't expose total VRAM, so use maxBufferSize as a proxy:
-        // 2 GB maxBuf → high-end (16-24 GB), 256 MB → low-end (4-8 GB)
-        const maxBuf = gpu!.maxBufferSize;
-        const estimatedVRAM = maxBuf >= 2 * 1024 * 1024 * 1024
-          ? 24 * 1024 * 1024 * 1024  // 2 GB maxBuf → assume 24 GB (RTX 4090, 3090, etc.)
-          : maxBuf >= 1024 * 1024 * 1024
-            ? 12 * 1024 * 1024 * 1024  // 1 GB maxBuf → assume 12 GB
-            : 8 * 1024 * 1024 * 1024;  // fallback → 8 GB
-
-        // Oversized tensors (embed/lm_head > maxBuf) are split into multiple
-        // GPU buffers — lossless, no VRAM savings. Total stays at full BF16 size.
-        const estimatedTotalVRAM = preview.totalBytes + dequantOverheadBytes;
-        const GPU_VRAM_BUDGET = estimatedVRAM * 0.85; // 85% — leave room for KV cache, scratch, OS
-
-        console.log(
-          `[Engine] SSM dequant estimate: model=${formatBytes(preview.totalBytes)}, `
-          + `dequantCost=+${formatBytes(dequantOverheadBytes)}, `
-          + `total=${formatBytes(estimatedTotalVRAM)}, budget=${formatBytes(GPU_VRAM_BUDGET)}`
-        );
-
-        if (estimatedTotalVRAM > GPU_VRAM_BUDGET) {
-          console.warn(`[Engine] SSM dequant would need ~${formatBytes(estimatedTotalVRAM)} VRAM (budget: ${formatBytes(GPU_VRAM_BUDGET)}) — skipping, relying on GPTQ calibration for SSM layers`);
-        } else {
-          // Add both possible prefixes (multimodal uses model.language_model.*, text-only uses model.*)
-          const projSuffixes = [
-            'linear_attn.in_proj_qkv', 'linear_attn.in_proj_a',
-            'linear_attn.in_proj_b', 'linear_attn.in_proj_z', 'linear_attn.out_proj',
-          ];
-          const prefixes = ['model.language_model.layers', 'model.layers'];
-          for (let l = 0; l < previewConfig.numLayers; l++) {
-            if (previewConfig.layerTypes[l] === 'linear_attention') {
-              for (const prefix of prefixes) {
-                for (const suffix of projSuffixes) {
-                  dequantToBF16.add(`${prefix}.${l}.${suffix}`);
-                }
-              }
-            }
-          }
-          if (dequantToBF16.size > 0) {
-            console.log(`[Engine] Mixed-precision GPTQ: ${dequantToBF16.size / 2} linear_attn projections → BF16 (${dequantToBF16.size} name variants)`);
-          }
-        }
+        console.log(`[Engine] Hybrid model: ${ssmLayerCount} SSM layers will use on-the-fly GPU dequant (Q4 → BF16) during inference`);
       }
     }
-
-    // Full load — download weights and upload to GPU
     currentModel = await loadModel(gpu.device, repo, (p) => {
       progressEl.textContent = p.message;
       if (p.overallProgress !== undefined) {
         const pct = Math.round(p.overallProgress * 100);
         setStatus(`Loading ${repo}... ${pct}%`);
       }
-    }, keepBF16, dequantToBF16);
+    }, keepBF16, dequantToBF16, maxDequantOverhead);
 
     // Note: don't resetToRemote() here — tokenizer still needs local cache
 

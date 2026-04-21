@@ -58,6 +58,7 @@ import groupNormWGSL from '../shaders/group_norm.wgsl?raw';
 import ssmStepWGSL from '../shaders/ssm_step.wgsl?raw';
 import l2normWGSL from '../shaders/l2norm.wgsl?raw';
 import hadamardWGSL from '../shaders/hadamard.wgsl?raw';
+import dequantQ4BF16WGSL from '../shaders/dequant_q4_bf16.wgsl?raw';
 
 // ── CPU embed helpers (BF16 → F32 decode) ──────────────────────────────
 const _cpuEmbedBuf = new ArrayBuffer(4);
@@ -370,6 +371,27 @@ export function createForwardPassEngine(
     ? createComputePipeline(device, elementwiseWGSL, 'decay_compute', 'decay') : null;
   const l2NormPipeline = isHybrid
     ? createComputePipeline(device, l2normWGSL, 'l2_normalize', 'l2-norm') : null;
+
+  // ── On-the-fly Q4 → BF16 dequant for SSM projections (hybrid + quantized) ──
+  const needsGpuDequant = isHybrid && config.isQuantized;
+  const dequantQ4Pipeline = needsGpuDequant
+    ? createComputePipeline(device, dequantQ4BF16WGSL, 'dequant_q4_to_bf16', 'dequant-q4-bf16')
+    : null;
+
+  // Temp buffer sized for the largest SSM projection's BF16 output.
+  // SSM projections: QKV [linQKVDim, H], A [linNVH, H], B [linNVH, H], Z [H, H], OutProj [H, outDim]
+  // BF16 output size = N * K/2 * 4 bytes (u32 per k-pair)
+  const dequantMaxN = needsGpuDequant
+    ? Math.max(linQKVDim, linNVH, H)
+    : 0;
+  const dequantMaxK = needsGpuDequant ? Math.max(H, linNKH * linGroupedVD) : 0;
+  const dequantTempBytes = dequantMaxN * Math.ceil(dequantMaxK / 2) * 4;
+  const dequantTempBuf = needsGpuDequant
+    ? createStorageBuffer(device, null, dequantTempBytes, 'dequant-temp-bf16', true)
+    : null;
+  if (needsGpuDequant) {
+    console.log(`[Engine] GPU dequant enabled: temp buffer ${(dequantTempBytes / 1024 / 1024).toFixed(1)} MB (maxN=${dequantMaxN}, maxK=${dequantMaxK})`);
+  }
 
   // ── Per-kernel timing infrastructure (optional) ─────────────────────
   // Uses WebGPU's optional `timestamp-query` feature to measure each compute
@@ -712,10 +734,35 @@ export function createForwardPassEngine(
   // Set of GPU buffers stored as BF16 (need matmul_bt_bf16 kernel)
   const bf16Set = weights.bf16Buffers ?? new Set<GPUBuffer>();
 
-  /** Dispatch f32/BF16/INT4/E8/INT8 matmul depending on weight type */
+  /** Dequant Q4 weights → temp BF16 buffer, then matmul with BF16 kernel.
+   *  Two dispatches per call: dequant compute + BF16 matmul. */
+  function dispatchDequantAndMatmul(
+    inputBuf: GPUBuffer,
+    q4: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer },
+    outputBuf: GPUBuffer, M: number, N: number, K: number, label: string,
+  ) {
+    const Khalf = Math.ceil(K / 2);
+    const dqParams = getCachedUniform(new Uint32Array([N, K, config.quantGroupSize, 0]), `${label}-dq-p`);
+    const dqBG = createBindGroup(device, dequantQ4Pipeline!, 0, [
+      { binding: 0, resource: { buffer: q4.qweight } },
+      { binding: 1, resource: { buffer: q4.scales } },
+      { binding: 2, resource: { buffer: q4.qzeros } },
+      { binding: 3, resource: { buffer: q4.g_idx } },
+      { binding: 4, resource: { buffer: dequantTempBuf! } },
+      { binding: 5, resource: { buffer: dqParams } },
+    ], `${label}-dequant`);
+    const totalThreads = N * Khalf;
+    bd(dequantQ4Pipeline!, [dqBG], [Math.ceil(totalThreads / 256)], `${label}-dequant`);
+
+    dispatchMatmulBTBF16(inputBuf, dequantTempBuf!, outputBuf, M, N, K, label);
+  }
+
+  /** Dispatch f32/BF16/INT4/E8/INT8 matmul depending on weight type.
+   *  When gpuDequant=true and weight is Q4, dequants to temp BF16 first. */
   function dispatchProjection(
     inputBuf: GPUBuffer, lw: LayerWeights, proj: string,
     outputBuf: GPUBuffer, M: number, N: number, K: number, label: string,
+    gpuDequant = false,
   ) {
     // Priority: E8 2-bit > INT8 > INT4 GPTQ > BF16 > f32
     const e8key = `${proj}_e8` as keyof LayerWeights;
@@ -735,7 +782,11 @@ export function createForwardPassEngine(
     const q4key = `${proj}_q4` as keyof LayerWeights;
     const q4 = lw[q4key] as { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean } | undefined;
     if (q4) {
-      dispatchMatmulQ4(inputBuf, q4, outputBuf, M, N, K, label);
+      if (gpuDequant && dequantQ4Pipeline && dequantTempBuf) {
+        dispatchDequantAndMatmul(inputBuf, q4, outputBuf, M, N, K, label);
+      } else {
+        dispatchMatmulQ4(inputBuf, q4, outputBuf, M, N, K, label);
+      }
     } else {
       const wkey = proj as keyof LayerWeights;
       const wBuf = lw[wkey] as GPUBuffer;
@@ -1397,7 +1448,7 @@ export function createForwardPassEngine(
           }
 
           // 1. Fused QKV projection
-          dispatchProjection(ssmInputBuf!, lw, 'linearInProjQKV', linQKVBuf!, 1, linQKVDim, H, `L${l}-lin-qkv`);
+          dispatchProjection(ssmInputBuf!, lw, 'linearInProjQKV', linQKVBuf!, 1, linQKVDim, H, `L${l}-lin-qkv`, needsGpuDequant);
           if (ssmT === seqLen - 1) await maybeAudit(l, linQKVBuf!, `L${l}-lin-qkv-out`, 1, linQKVDim);
 
         // Debug: raw QKV projection output (before conv1d) — first token only
@@ -1467,9 +1518,9 @@ export function createForwardPassEngine(
         // 4. Project A, B, Z (these use the ORIGINAL normed input, not conv output)
         // NOTE: in_proj_b output is num_v_heads (32), NOT num_k_heads (16)!
         // Option A: read from per-token slice ssmInputBuf instead of multi-token normedBuf.
-        dispatchProjection(ssmInputBuf!, lw, 'linearInProjA', linABuf!, 1, linNVH, H, `L${l}-lin-a`);
-        dispatchProjection(ssmInputBuf!, lw, 'linearInProjB', linBBuf!, 1, linNVH, H, `L${l}-lin-b`);
-        dispatchProjection(ssmInputBuf!, lw, 'linearInProjZ', linZBuf!, 1, H, H, `L${l}-lin-z`);
+        dispatchProjection(ssmInputBuf!, lw, 'linearInProjA', linABuf!, 1, linNVH, H, `L${l}-lin-a`, needsGpuDequant);
+        dispatchProjection(ssmInputBuf!, lw, 'linearInProjB', linBBuf!, 1, linNVH, H, `L${l}-lin-b`, needsGpuDequant);
+        dispatchProjection(ssmInputBuf!, lw, 'linearInProjZ', linZBuf!, 1, H, H, `L${l}-lin-z`, needsGpuDequant);
         if (ssmT === seqLen - 1) {
           await maybeAudit(l, linABuf!, `L${l}-lin-a-out`, 1, linNVH);
           await maybeAudit(l, linBBuf!, `L${l}-lin-b-out`, 1, linNVH);
@@ -1718,7 +1769,7 @@ export function createForwardPassEngine(
 
         // 9. Output projection → ssmOutBuf [1, H] (per-token scratch)
         const outDim = linNKH * linGroupedVD;
-        dispatchProjection(linOutBuf!, lw, 'linearOutProj', ssmOutBuf!, 1, H, outDim, `L${l}-lin-out`);
+        dispatchProjection(linOutBuf!, lw, 'linearOutProj', ssmOutBuf!, 1, H, outDim, `L${l}-lin-out`, needsGpuDequant);
         if (ssmT === seqLen - 1) await maybeAudit(l, ssmOutBuf!, `L${l}-lin-out-out`, 1, H);
 
         // Q8 out_proj debug readback (first token only)

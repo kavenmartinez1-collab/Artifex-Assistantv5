@@ -124,6 +124,8 @@ export async function loadModel(
   keepBF16 = false,
   /** GPTQ weight bases to dequant to BF16 (for mixed-precision SSM). E.g., 'model.layers.0.linear_attn.in_proj_qkv' */
   dequantToBF16?: Set<string>,
+  /** Max extra VRAM bytes dequant may add (BF16 overhead minus Q4 replaced). 0 = no dequant budget. */
+  maxDequantOverhead = 0,
 ): Promise<LoadedModel> {
   const startTime = performance.now();
 
@@ -176,10 +178,16 @@ export async function loadModel(
     qzeros?: { data: ArrayBuffer; shape: number[] };
   }>();
   const dequantSet = dequantToBF16 ?? new Set<string>();
+  let dequantDisabled = false;
+  let dequantedCount = 0;
   if (dequantSet.size > 0) {
     console.log(`[WeightLoader] Mixed-precision: ${dequantSet.size} projections will be dequanted to BF16`);
   }
   let bytesDownloadedTotal = 0;
+
+  const FLUSH_THRESHOLD = 512 * 1024 * 1024; // 512 MB
+  let bytesSinceFlush = 0;
+  let dequantOverheadUsed = 0;
 
   for (let shardIdx = 0; shardIdx < shards.length; shardIdx++) {
     const shard = shards[shardIdx];
@@ -560,14 +568,10 @@ export async function loadModel(
 
             const gpuBuffer = device.createBuffer({
               size: f32Data.byteLength,
-              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
               label: `${base}.weight`,
-              mappedAtCreation: true,
             });
-            new Uint8Array(gpuBuffer.getMappedRange()).set(
-              new Uint8Array(f32Data.buffer, f32Data.byteOffset, f32Data.byteLength)
-            );
-            gpuBuffer.unmap();
+            device.queue.writeBuffer(gpuBuffer, 0, f32Data.buffer as ArrayBuffer, f32Data.byteOffset, f32Data.byteLength);
 
             allTensors.set(`${base}.weight`, {
               name: `${base}.weight`, buffer: gpuBuffer, shape: [N_q8, K_q8],
@@ -575,62 +579,154 @@ export async function loadModel(
               elementCount: N_q8 * K_q8, isQuantized: false,
             });
             totalGPUBytes += f32Data.byteLength;
+            bytesSinceFlush += f32Data.byteLength;
             tensorsProcessed++;
             entry.delete(base);
+
+            if (bytesSinceFlush >= FLUSH_THRESHOLD) {
+              device.queue.submit([]);
+              await device.queue.onSubmittedWorkDone();
+              bytesSinceFlush = 0;
+            }
           }
           continue; // Skip normal GPU upload for Q8 tensors
         }
       }
 
-      // Mixed-precision: intercept GPTQ INT4 triplets that should be dequanted to BF16
-      if (isGPTQ && dequantSet.size > 0) {
+      // Mixed-precision: intercept GPTQ INT4 triplets that should be dequanted to BF16.
+      // If GPU OOM hits, disable dequant and fall back to INT4 for remaining layers.
+      if (isGPTQ && dequantSet.size > 0 && !dequantDisabled) {
         const suffix = name.endsWith('.qweight') ? '.qweight'
           : name.endsWith('.scales') ? '.scales'
           : name.endsWith('.qzeros') ? '.qzeros' : '';
         if (suffix) {
           const base = name.slice(0, -suffix.length);
           if (dequantSet.has(base)) {
-            // Accumulate raw CPU data for this part of the triplet
             const entry = dequantAccum.get(base) ?? {};
             const part = suffix.slice(1) as 'qweight' | 'scales' | 'qzeros';
             entry[part] = { data: rawData.slice(0), shape: tensorInfo.shape };
             dequantAccum.set(base, entry);
 
-            // Check if triplet is complete
             if (entry.qweight && entry.scales && entry.qzeros) {
-              // Dequant to BF16 and upload as a regular weight buffer
               const qw = new Int32Array(entry.qweight.data);
               const sc = new Uint16Array(entry.scales.data);
               const qz = new Int32Array(entry.qzeros.data);
-              // GPTQ layout: qweight is [K/8, N], scales is [K/gs, N]
-              const N = entry.qweight.shape[1]; // out_features
-              const K = entry.qweight.shape[0] * 8; // in_features (packed 8 per i32)
+              const N = entry.qweight.shape[1];
+              const K = entry.qweight.shape[0] * 8;
               const gs = config.quantization_config?.group_size ?? 128;
 
-              const bf16Data = dequantGPTQtoBF16(qw, sc, qz, K, N, gs);
+              const bf16Size = N * K * 2;
+              const q4Size = entry.qweight!.data.byteLength + entry.scales!.data.byteLength + entry.qzeros!.data.byteLength;
+              const nextOverhead = bf16Size - q4Size;
+              if (!dequantDisabled && dequantOverheadUsed + nextOverhead > maxDequantOverhead) {
+                console.warn(
+                  `[WeightLoader] Dequant overhead cap at ${base} (used: ${(dequantOverheadUsed / 1024 / 1024).toFixed(0)} MB, `
+                  + `cap: ${(maxDequantOverhead / 1024 / 1024).toFixed(0)} MB) — stopping dequant (${dequantedCount} projections done)`
+                );
+                dequantDisabled = true;
+              }
 
-              const gpuBuffer = device.createBuffer({
-                size: bf16Data.byteLength,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-                label: `${base}.weight`,
-                mappedAtCreation: true,
-              });
-              new Uint8Array(gpuBuffer.getMappedRange()).set(
-                new Uint8Array(bf16Data.buffer, bf16Data.byteOffset, bf16Data.byteLength)
-              );
-              gpuBuffer.unmap();
+              let dequantedOk = false;
+              if (!dequantDisabled) {
+                try {
+                  const bf16Data = dequantGPTQtoBF16(qw, sc, qz, K, N, gs);
 
-              // Store as a regular (non-quantized) BF16 weight
-              allTensors.set(`${base}.weight`, {
-                name: `${base}.weight`, buffer: gpuBuffer, shape: [N, K],
-                dtype: 'BF16', byteLength: bf16Data.byteLength,
-                elementCount: N * K, isQuantized: false,
-              });
-              totalGPUBytes += bf16Data.byteLength;
-              tensorsProcessed++;
-              dequantAccum.delete(base);
+                  device.pushErrorScope('out-of-memory');
+                  const gpuBuffer = device.createBuffer({
+                    size: bf16Data.byteLength,
+                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+                    label: `${base}.weight`,
+                  });
+                  device.queue.writeBuffer(gpuBuffer, 0, bf16Data.buffer as ArrayBuffer, bf16Data.byteOffset, bf16Data.byteLength);
+                  device.queue.submit([]);
+                  await device.queue.onSubmittedWorkDone();
+                  const oomError = await device.popErrorScope();
+
+                  if (oomError) {
+                    gpuBuffer.destroy();
+                    console.warn(
+                      `[WeightLoader] GPU OOM at ${base} (GPU: ${(totalGPUBytes / 1024 / 1024).toFixed(0)} MB)`
+                      + ` — stopping dequant (${dequantedCount} projections done)`
+                    );
+                    dequantDisabled = true;
+                  } else {
+                    allTensors.set(`${base}.weight`, {
+                      name: `${base}.weight`, buffer: gpuBuffer, shape: [N, K],
+                      dtype: 'BF16', byteLength: bf16Data.byteLength,
+                      elementCount: N * K, isQuantized: false,
+                    });
+                    totalGPUBytes += bf16Data.byteLength;
+                    bytesSinceFlush += bf16Data.byteLength;
+                    dequantOverheadUsed += nextOverhead;
+                    tensorsProcessed++;
+                    dequantedCount++;
+                    dequantAccum.delete(base);
+                    dequantedOk = true;
+
+                    if (bytesSinceFlush >= FLUSH_THRESHOLD) {
+                      device.queue.submit([]);
+                      await device.queue.onSubmittedWorkDone();
+                      bytesSinceFlush = 0;
+                    }
+                  }
+                } catch (e) {
+                  console.warn(
+                    `[WeightLoader] SSM dequant error at ${base} (GPU: ${(totalGPUBytes / 1024 / 1024).toFixed(0)} MB)`
+                    + ` — falling back to INT4 (${dequantedCount} projections dequanted)`
+                  );
+                  dequantDisabled = true;
+                }
+              }
+
+              if (!dequantedOk) {
+                const fallbackParts: Array<{ suffix: string; data: ArrayBuffer; shape: number[]; dtype: string }> = [
+                  { suffix: '.qweight', data: entry.qweight!.data, shape: entry.qweight!.shape, dtype: 'I32' },
+                  { suffix: '.scales', data: entry.scales!.data, shape: entry.scales!.shape, dtype: 'F16' },
+                  { suffix: '.qzeros', data: entry.qzeros!.data, shape: entry.qzeros!.shape, dtype: 'I32' },
+                ];
+                for (const fp of fallbackParts) {
+                  const fbName = `${base}${fp.suffix}`;
+                  const fbData = new Uint8Array(fp.data);
+                  const fbBuf = device.createBuffer({
+                    size: fbData.byteLength,
+                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+                    label: fbName,
+                  });
+                  device.queue.writeBuffer(fbBuf, 0, fbData.buffer as ArrayBuffer, fbData.byteOffset, fbData.byteLength);
+                  allTensors.set(fbName, {
+                    name: fbName, buffer: fbBuf, shape: fp.shape, dtype: fp.dtype,
+                    byteLength: fbData.byteLength,
+                    elementCount: fp.shape.reduce((a: number, b: number) => a * b, 1),
+                    isQuantized: true,
+                  });
+                  totalGPUBytes += fbData.byteLength;
+                }
+                tensorsProcessed++;
+                dequantAccum.delete(base);
+                for (const [accBase, accEntry] of dequantAccum) {
+                  for (const [accSuffix, accData] of Object.entries(accEntry) as Array<[string, { data: ArrayBuffer; shape: number[] }]>) {
+                    const accName = `${accBase}.${accSuffix}`;
+                    const accBytes = new Uint8Array(accData.data);
+                    const accBuf = device.createBuffer({
+                      size: accBytes.byteLength,
+                      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+                      label: accName,
+                    });
+                    device.queue.writeBuffer(accBuf, 0, accBytes.buffer as ArrayBuffer, accBytes.byteOffset, accBytes.byteLength);
+                    allTensors.set(accName, {
+                      name: accName, buffer: accBuf, shape: accData.shape,
+                      dtype: accSuffix === 'scales' ? 'F16' : 'I32',
+                      byteLength: accBytes.byteLength,
+                      elementCount: accData.shape.reduce((a: number, b: number) => a * b, 1),
+                      isQuantized: true,
+                    });
+                    totalGPUBytes += accBytes.byteLength;
+                  }
+                }
+                dequantAccum.clear();
+              }
             }
-            continue; // Skip normal GPU upload for this GPTQ tensor
+            continue;
           }
         }
       }
@@ -745,18 +841,14 @@ export async function loadModel(
         continue;
       }
 
-      // Create GPU buffer and upload
+      // Create GPU buffer and upload via writeBuffer (Dawn manages staging
+      // internally via a ring buffer, avoiding the 2x peak memory of mappedAtCreation)
       const gpuBuffer = device.createBuffer({
         size: gpuData.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
         label: name,
-        mappedAtCreation: true,
       });
-
-      new Uint8Array(gpuBuffer.getMappedRange()).set(
-        new Uint8Array(gpuData.buffer, gpuData.byteOffset, gpuData.byteLength)
-      );
-      gpuBuffer.unmap();
+      device.queue.writeBuffer(gpuBuffer, 0, gpuData.buffer as ArrayBuffer, gpuData.byteOffset, gpuData.byteLength);
 
       // ── VRAM audit (debug) ───────────────────────────────────────────
       // When __DEBUG_VRAM_AUDIT_PREFIXES__ is set on globalThis, read back the
@@ -810,19 +902,33 @@ export async function loadModel(
       });
 
       totalGPUBytes += gpuData.byteLength;
+      bytesSinceFlush += gpuData.byteLength;
       tensorsProcessed++;
+
+      if (bytesSinceFlush >= FLUSH_THRESHOLD) {
+        device.queue.submit([]);
+        await device.queue.onSubmittedWorkDone();
+        bytesSinceFlush = 0;
+      }
     }
 
-    // Flush GPU command queue between shards to release mappedAtCreation staging
-    // memory. Without this, UPLOAD-heap copies accumulate (~12 GB staging on top
-    // of ~12 GB final buffers = 24 GB peak), causing D3D12 CreateCommittedResource OOM.
+    // Final flush after each shard
     device.queue.submit([]);
     await device.queue.onSubmittedWorkDone();
+    bytesSinceFlush = 0;
 
     const t_upload_end = performance.now();
     console.log(
       `[Perf] Shard ${shardIdx + 1}/${shards.length}: process+upload ${(t_upload_end - t_upload_start).toFixed(0)}ms `
       + `(${header.tensors.size} tensors, GPU total: ${(totalGPUBytes / 1024 / 1024).toFixed(0)} MB)`
+    );
+  }
+
+  if (dequantedCount > 0) {
+    const totalSSM = dequantSet.size > 0 ? Math.floor(dequantSet.size / 10) : 0;
+    console.log(
+      `[WeightLoader] SSM dequant: ${dequantedCount} projections → BF16`
+      + (dequantDisabled ? ` (stopped early — GPU OOM after ${(totalGPUBytes / 1024 / 1024).toFixed(0)} MB)` : '')
     );
   }
 
