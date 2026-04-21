@@ -50,8 +50,9 @@ fn f32_to_bf16(v: f32) -> u32 {
 }
 
 @compute @workgroup_size(256)
-fn dequant_q4_to_bf16(@builtin(global_invocation_id) gid: vec3u) {
-  let thread_id = gid.x;
+fn dequant_q4_to_bf16(@builtin(global_invocation_id) gid: vec3u,
+                       @builtin(num_workgroups) nwg: vec3u) {
+  let thread_id = gid.x + gid.y * nwg.x * 256u;
   let K_half = params.K / 2u;
   let total = params.N * K_half;
   if (thread_id >= total) { return; }

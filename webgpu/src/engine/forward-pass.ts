@@ -751,8 +751,10 @@ export function createForwardPassEngine(
       { binding: 4, resource: { buffer: dequantTempBuf! } },
       { binding: 5, resource: { buffer: dqParams } },
     ], `${label}-dequant`);
-    const totalThreads = N * Khalf;
-    bd(dequantQ4Pipeline!, [dqBG], [Math.ceil(totalThreads / 256)], `${label}-dequant`);
+    const totalWGs = Math.ceil((N * Khalf) / 256);
+    const wgX = Math.min(totalWGs, 65535);
+    const wgY = Math.ceil(totalWGs / wgX);
+    bd(dequantQ4Pipeline!, [dqBG], [wgX, wgY], `${label}-dequant`);
 
     dispatchMatmulBTBF16(inputBuf, dequantTempBuf!, outputBuf, M, N, K, label);
   }
