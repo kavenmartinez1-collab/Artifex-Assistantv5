@@ -1,6 +1,21 @@
-FROM ./models/Qwen3.6-27B-UD-Q2_K_XL.gguf
+FROM qwen3.6-27b-q2kxl
 
-TEMPLATE {{ .Prompt }}
+TEMPLATE """{{- range .Messages }}
+{{- if eq .Role "system" }}<|im_start|>system
+{{ .Content }}<|im_end|>
+{{ end }}
+{{- if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ end }}
+{{- if eq .Role "assistant" }}<|im_start|>assistant
+{{ .Content }}<|im_end|>
+{{ end }}
+{{- end }}<|im_start|>assistant
+"""
+
+PARAMETER stop <|im_end|>
+PARAMETER stop <|endoftext|>
+PARAMETER stop <|im_start|>
 
 PARAMETER temperature 0.6
 PARAMETER top_p 0.95

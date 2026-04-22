@@ -597,10 +597,36 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
 
     try:
         resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 400 and b"does not support thinking" in (e.read()):
+            _log.info("Model %s: Ollama think not supported, retrying without", model)
+            payload.pop("think", None)
+            body = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                OLLAMA_CHAT_URL, data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                resp = urllib.request.urlopen(req, timeout=timeout)
+            except Exception as e2:
+                out_queue.put(("error", str(e2)))
+                out_queue.put(_SENTINEL)
+                return
+        else:
+            out_queue.put(("error", str(e)))
+            out_queue.put(_SENTINEL)
+            return
     except Exception as e:
         out_queue.put(("error", str(e)))
         out_queue.put(_SENTINEL)
         return
+
+    tf = ThinkFilter(
+        on_response=lambda t: out_queue.put(("content", t)),
+        on_thinking=lambda t: out_queue.put(("thinking", t)),
+        starts_in_think=False,
+    )
 
     try:
         for line in resp:
@@ -620,7 +646,10 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
 
             content = msg.get("content", "")
             if content:
-                out_queue.put(("content", content))
+                if thinking:
+                    out_queue.put(("content", content))
+                else:
+                    tf.feed(content)
 
             if chunk.get("done", False):
                 # Pass Ollama's done_reason through so the caller can render
@@ -635,6 +664,7 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
     except Exception as e:
         out_queue.put(("error", str(e)))
     finally:
+        tf.flush()
         resp.close()
         out_queue.put(_SENTINEL)
 
