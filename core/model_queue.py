@@ -9,7 +9,7 @@ Serializes inference requests so that:
 
 Usage:
     queue = ModelQueue()
-    result = await queue.submit("qwen3.5-27b-iq2xxs", generate_fn, *args)
+    result = await queue.submit("qwen3.6-27b-q2kxl", generate_fn, *args)
 """
 
 import asyncio

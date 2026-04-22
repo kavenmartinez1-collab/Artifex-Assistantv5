@@ -106,7 +106,7 @@ class ChatMessage(BaseModel):
     )
 
 class ChatCompletionRequest(BaseModel):
-    model: str = Field("qwen3.5:27b", example="qwen3.5:27b")
+    model: str = Field("qwen3.6:27b", example="qwen3.6:27b")
     messages: List[ChatMessage]
     max_tokens: Optional[int] = Field(None, ge=1, le=65536)
     temperature: Optional[float] = Field(0.7, ge=0.0, le=2.0)

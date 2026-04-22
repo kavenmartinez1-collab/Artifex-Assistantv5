@@ -231,7 +231,7 @@ launch.bat              # Windows — double-click desktop shortcut
 
 # API server with full options
 python main_api.py --backend ollama --gateway http://localhost:8080 --port 8000
-python main_api.py --backend transformers --model qwen3.5-27b-distilled --gateway http://localhost:8080
+python main_api.py --backend transformers --model qwen3.6-27b --gateway http://localhost:8080
 ```
 
 ### Step 5: Verify Everything Works
@@ -336,8 +336,8 @@ python main_api.py                              # Default: 127.0.0.1:8000, auto-
 python main_api.py --port 8080                  # Custom port
 python main_api.py --backend ollama             # Force Ollama backend
 python main_api.py --backend transformers       # Force Transformers backend
-python main_api.py --model qwen3.5-27b-distilled  # Select specific model (Transformers)
-python main_api.py --model qwen3.5:27b          # Select specific model (Ollama)
+python main_api.py --model qwen3.6-27b  # Select specific model (Transformers)
+python main_api.py --model qwen3.6:27b          # Select specific model (Ollama)
 python main_api.py --gateway http://localhost:8080  # Enable web search tools via gateway
 python main_api.py --reload                     # Auto-reload on code changes
 ```
@@ -349,7 +349,7 @@ python main_api.py --reload                     # Auto-reload on code changes
 python main_api.py --backend ollama --gateway http://localhost:8080 --port 8000
 
 # Transformers backend with web search and specific model
-python main_api.py --backend transformers --model qwen3.5-27b-distilled --gateway http://localhost:8080 --port 8000
+python main_api.py --backend transformers --model qwen3.6-27b --gateway http://localhost:8080 --port 8000
 ```
 
 ### CLI Flags
@@ -400,7 +400,7 @@ curl http://localhost:8000/v1/models
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3.5:27b",
+    "model": "qwen3.6:27b",
     "messages": [{"role": "user", "content": "Hello!"}],
     "max_tokens": 200,
     "temperature": 0.7,
@@ -411,7 +411,7 @@ curl http://localhost:8000/v1/chat/completions \
 curl -N http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3.5:27b",
+    "model": "qwen3.6:27b",
     "messages": [{"role": "user", "content": "Tell me a story"}],
     "stream": true
   }'
@@ -420,7 +420,7 @@ curl -N http://localhost:8000/v1/chat/completions \
 curl -N http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3.5:27b",
+    "model": "qwen3.6:27b",
     "messages": [
       {"role": "system", "content": "You have @search and @web_read tools. Use them for current info."},
       {"role": "user", "content": "What are the latest Python release notes?"}
@@ -1075,7 +1075,7 @@ python main_gui_qt.py                    # GUI (PyQt6 desktop — recommended)
 python main_gui.py                       # GUI (legacy FreeSimpleGUI)
 python main_api.py                       # API server (port 8000)
 python main_api.py --backend ollama      # API with Ollama backend
-python main_api.py --backend ollama --model qwen3.5-27b-iq2xxs --port 8000
+python main_api.py --backend ollama --model qwen3.6-27b-q2kxl --port 8000
 
 # ── Web gateway (separate terminal) ──
 python web-gateway/main.py               # Web search proxy (port 8080)
@@ -1092,7 +1092,7 @@ npx tsx server/dev-server.ts             # Dev server (port 3001)
 **Environment variables** (alternative to CLI flags):
 ```bash
 set ARTIFEX_BACKEND=ollama              # Windows
-set ARTIFEX_MODEL=qwen3.5-27b-iq2xxs
+set ARTIFEX_MODEL=qwen3.6-27b-q2kxl
 python main_api.py
 ```
 
