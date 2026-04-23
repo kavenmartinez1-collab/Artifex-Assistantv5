@@ -296,16 +296,14 @@ class TestMultimodalServiceVRAM:
         assert pipe_b.is_loaded()
 
         # Simulate VRAM pressure for third load
-        with patch("torch.cuda.is_available", return_value=True), \
-             patch("torch.cuda.get_device_properties") as mock_props, \
-             patch("torch.cuda.memory_allocated") as mock_alloc, \
+        fake_gpu = MagicMock()
+        fake_gpu.is_available = True
+        fake_gpu.total_gb = 12.0
+        fake_gpu.free_gb = 1.0  # only 1GB free, pipeline needs 2GB
+
+        with patch("core.device.gpu_info", fake_gpu), \
              patch("torch.cuda.empty_cache"), \
              patch("gc.collect"):
-
-            props = MagicMock()
-            props.total_memory = 12 * 1024**3  # 12GB total
-            mock_props.return_value = props
-            mock_alloc.return_value = 11 * 1024**3  # 11GB used, only 1GB free
 
             svc.load_pipeline("pipe-c", "/c")
 

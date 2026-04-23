@@ -370,6 +370,8 @@ def get_active_model_name():
     for name, p in MODELS.items():
         if p == path:
             return name
+    if path is None:
+        return None
     return os.path.basename(path)
 
 

@@ -63,6 +63,7 @@ def save_session(name, messages, session_map=None, metadata=None,
     state = {
         "name": name,
         "timestamp": timestamp,
+        "saved_at": time.time(),
         "message_count": len(saved_messages),
         "messages": saved_messages,
         "session_map": session_map or {},
@@ -147,13 +148,15 @@ def list_sessions(session_dir=None):
                 "path": path,
                 "filename": fname,
                 "timestamp": data.get("timestamp", ""),
+                "saved_at": data.get("saved_at", 0),
                 "message_count": data.get("message_count", 0),
                 "metadata": data.get("metadata", {}),
             })
         except (json.JSONDecodeError, OSError):
             continue
 
-    sessions.sort(key=lambda s: s["timestamp"], reverse=True)
+    sessions.sort(key=lambda s: (s.get("saved_at", 0), s["timestamp"]),
+                  reverse=True)
     return sessions
 
 
