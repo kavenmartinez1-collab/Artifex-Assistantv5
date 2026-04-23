@@ -127,9 +127,23 @@ export function registerAllHandlers(
       scanModels(projectRoot).catch(() => []),
       scanOllamaModels().catch(() => []),
     ]);
+
+    // llama.cpp models are defined in llama_cpp_config.json
+    let llamaCpp: string[] = [];
+    try {
+      const fs = await import('fs');
+      const configPath = path.join(projectRoot, 'llama_cpp_config.json');
+      if (fs.existsSync(configPath)) {
+        const raw = fs.readFileSync(configPath, 'utf-8');
+        const cfg = JSON.parse(raw);
+        llamaCpp = Object.keys(cfg.models || {});
+      }
+    } catch { /* config missing or malformed — no llama_cpp models */ }
+
     return {
       transformers: transformers.map((m) => m.name),
       ollama: ollama.map((m) => m.name),
+      llama_cpp: llamaCpp,
     };
   });
 

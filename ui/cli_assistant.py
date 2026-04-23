@@ -428,7 +428,7 @@ def run_assistant():
     print(f"  Commands: /workspace <path>, /kb search|add|list|show|remove, /refresh, /clear")
     print(f"  Session:  /save [name], /load [name|#], /sessions, /export [path]")
     print(f"  Pipeline: /mode <mode>, /attach <file>, /output <dir>")
-    print(f"  System:   /backend transformers|ollama, /ctx <num>, /health, /compile, /turboquant")
+    print(f"  System:   /backend transformers|ollama|llama_cpp, /ctx <num>, /health, /compile, /turboquant")
     print(f"  Type 'exit' to quit.{Style.RESET_ALL}\n")
 
     # Knowledge manager + workspace setup
@@ -592,9 +592,9 @@ def run_assistant():
                     backend = get_active_backend()
                     model = get_active_model_name()
                     print(f"{Fore.CYAN}  Backend: {backend}  Model: {model}")
-                    print(f"  Usage: /backend transformers|ollama{Style.RESET_ALL}\n")
+                    print(f"  Usage: /backend transformers|ollama|llama_cpp{Style.RESET_ALL}\n")
                 else:
-                    print(f"{Fore.YELLOW}  Unknown backend: {arg}. Use 'transformers' or 'ollama'.{Style.RESET_ALL}\n")
+                    print(f"{Fore.YELLOW}  Unknown backend: {arg}. Use 'transformers', 'ollama', or 'llama_cpp'.{Style.RESET_ALL}\n")
                 continue
 
             # /context command

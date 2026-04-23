@@ -65,7 +65,7 @@ _config_lock = threading.Lock()
 _active_model = None  # resolved lazily on first call
 
 # ===== BACKEND SWITCHING =====
-_active_backend = "transformers"  # "transformers" or "ollama"
+_active_backend = "transformers"  # "transformers", "ollama", or "llama_cpp"
 
 
 def get_active_backend():
@@ -78,12 +78,11 @@ def set_active_backend(name):
     global _active_backend
     need_refresh = False
     with _config_lock:
-        if name in ("transformers", "ollama"):
+        if name in ("transformers", "ollama", "llama_cpp"):
             _active_backend = name
             need_refresh = (name == "ollama" and not OLLAMA_MODELS)
         else:
             return False
-    # Ollama discovery does HTTP I/O — run outside the lock to avoid contention
     if need_refresh:
         refresh_ollama_models()
     return True
@@ -127,17 +126,23 @@ OLLAMA_CONFIG_PATH = os.path.join(BASE_DIR, "ollama_config.json")
 
 # Per-model Ollama settings (num_ctx, etc.) — persisted to ollama_config.json
 _ollama_model_config: dict = {}
+_ollama_config_mtime: float = 0.0
 
 
 def _load_ollama_config():
-    """Load per-model Ollama config from disk."""
-    global _ollama_model_config
-    if os.path.isfile(OLLAMA_CONFIG_PATH):
-        try:
-            with open(OLLAMA_CONFIG_PATH, "r", encoding="utf-8") as f:
-                _ollama_model_config = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            _ollama_model_config = {}
+    """Load per-model Ollama config from disk.  Re-reads when file mtime changes."""
+    global _ollama_model_config, _ollama_config_mtime
+    if not os.path.isfile(OLLAMA_CONFIG_PATH):
+        return _ollama_model_config
+    try:
+        mtime = os.path.getmtime(OLLAMA_CONFIG_PATH)
+        if mtime == _ollama_config_mtime and _ollama_model_config:
+            return _ollama_model_config
+        with open(OLLAMA_CONFIG_PATH, "r", encoding="utf-8") as f:
+            _ollama_model_config = json.load(f)
+        _ollama_config_mtime = mtime
+    except (json.JSONDecodeError, OSError):
+        _ollama_model_config = {}
     return _ollama_model_config
 
 
@@ -198,9 +203,7 @@ def get_ollama_model_config(model_name: str) -> dict:
     passing num_ctx to Ollama can trigger bugs where content returns empty.
     When not configured, returns empty dict so Ollama uses its own defaults.
     """
-    # Lazy load from disk on first access
-    if not _ollama_model_config:
-        _load_ollama_config()
+    _load_ollama_config()
 
     # Normalize model name (strip :latest suffix)
     normalized = model_name.rsplit(":latest", 1)[0] if model_name.endswith(":latest") else model_name
@@ -227,8 +230,7 @@ def set_ollama_model_config(model_name: str, config: dict, persist: bool = True)
         persist: Whether to save to disk immediately
     """
     global _ollama_model_config
-    if not _ollama_model_config:
-        _load_ollama_config()
+    _load_ollama_config()
 
     normalized = model_name.rsplit(":latest", 1)[0] if model_name.endswith(":latest") else model_name
     _ollama_model_config[normalized] = config
@@ -288,7 +290,50 @@ def refresh_ollama_models(retries=3, delay=1.0):
     return False, err
 
 
-# ===== MODEL SELECTION (both backends) =====
+# ===== LLAMA.CPP SERVER CONFIGURATION =====
+LLAMA_CPP_CONFIG_PATH = os.path.join(BASE_DIR, "llama_cpp_config.json")
+_llama_cpp_config: dict = {}
+_llama_cpp_config_mtime: float = 0.0
+
+
+def _load_llama_cpp_config():
+    """Load llama.cpp config from disk.  Re-reads when file mtime changes."""
+    global _llama_cpp_config, _llama_cpp_config_mtime
+    if not os.path.isfile(LLAMA_CPP_CONFIG_PATH):
+        return _llama_cpp_config
+    try:
+        mtime = os.path.getmtime(LLAMA_CPP_CONFIG_PATH)
+        if mtime == _llama_cpp_config_mtime and _llama_cpp_config:
+            return _llama_cpp_config
+        with open(LLAMA_CPP_CONFIG_PATH, "r", encoding="utf-8") as f:
+            _llama_cpp_config = json.load(f)
+        _llama_cpp_config_mtime = mtime
+    except (json.JSONDecodeError, OSError):
+        _llama_cpp_config = {}
+    return _llama_cpp_config
+
+
+def get_llama_cpp_models() -> dict:
+    """Get available llama.cpp models from config. Returns {name: config_dict}."""
+    cfg = _load_llama_cpp_config()
+    return cfg.get("models", {})
+
+
+def get_llama_cpp_model_config(model_name: str) -> dict:
+    """Get config for a specific llama.cpp model. Merges global defaults."""
+    cfg = _load_llama_cpp_config()
+    models = cfg.get("models", {})
+    if model_name not in models:
+        return {}
+    model_cfg = dict(models[model_name])
+    if "server_path" not in model_cfg:
+        model_cfg["server_path"] = cfg.get("server_path", "llama-server")
+    if "port" not in model_cfg:
+        model_cfg["port"] = cfg.get("default_port", 8081)
+    return model_cfg
+
+
+# ===== MODEL SELECTION (all backends) =====
 
 def get_active_model_path():
     """Get the currently selected transformers model's directory path."""
@@ -300,16 +345,20 @@ def get_active_model_path():
 
 
 def set_active_model(name):
-    """Switch active model by registry name. Works for both backends."""
+    """Switch active model by registry name. Works for all backends."""
     global _active_model
     with _config_lock:
         if _active_backend == "ollama":
             if name in OLLAMA_MODELS:
                 _active_model = name
                 return True
-            # Also accept raw model names not in cache
             _active_model = name
             return True
+        if _active_backend == "llama_cpp":
+            if name in get_llama_cpp_models():
+                _active_model = name
+                return True
+            return False
         if name in MODELS:
             _active_model = MODELS[name]
             return True
@@ -320,6 +369,8 @@ def get_active_model_name():
     """Get display name of the currently active model."""
     if _active_backend == "ollama":
         return get_active_ollama_model()
+    if _active_backend == "llama_cpp":
+        return get_active_llama_cpp_model()
     path = get_active_model_path()
     for name, p in MODELS.items():
         if p == path:
@@ -331,13 +382,22 @@ def get_active_ollama_model():
     """Get the active Ollama model name."""
     global _active_model
     if _active_model and isinstance(_active_model, str):
-        # If it looks like an Ollama model name (not a filesystem path)
         if not os.sep in _active_model and not _active_model.startswith("/"):
             return _active_model
-    # Default: first discovered model, or generic
     if OLLAMA_MODELS:
         return next(iter(OLLAMA_MODELS.keys()))
     return "qwen3.5:9b"
+
+
+def get_active_llama_cpp_model():
+    """Get the active llama.cpp model name."""
+    global _active_model
+    models = get_llama_cpp_models()
+    if _active_model and _active_model in models:
+        return _active_model
+    if models:
+        return next(iter(models.keys()))
+    return None
 
 
 def get_model_names():
@@ -346,6 +406,8 @@ def get_model_names():
         if not OLLAMA_MODELS:
             refresh_ollama_models()
         return list(OLLAMA_MODELS.keys())
+    if _active_backend == "llama_cpp":
+        return list(get_llama_cpp_models().keys())
     return list(MODELS.keys())
 
 # ===== QUANTIZATION =====

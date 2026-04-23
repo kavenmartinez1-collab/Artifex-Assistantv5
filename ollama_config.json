@@ -1,3 +1,6 @@
 {
-  "_comment": "Per-model Ollama settings. Only add num_ctx if Ollama's auto-detection is wrong for your setup. Example: \"qwen3.5:9b\": {\"num_ctx\": 8192}"
+  "_comment": "Per-model Ollama settings. num_ctx pins context size (bypasses auto-sizing). max_ctx caps it. kv_quant (f16/q8_0/q4_0) tells auto-sizing how large the KV cache is per token.",
+  "qwen3.6-27b-q2kxl": {
+    "kv_quant": "q8_0"
+  }
 }

@@ -101,7 +101,7 @@ export const SERVICE_DEFINITIONS: ServiceDefinition[] = [
     options: [
       { key: '--port', label: 'Port', type: 'number', default: '8000' },
       { key: '--backend', label: 'Backend', type: 'select', default: 'transformers',
-        choices: ['transformers', 'ollama'], envVar: 'ARTIFEX_BACKEND' },
+        choices: ['transformers', 'ollama', 'llama_cpp'], envVar: 'ARTIFEX_BACKEND' },
       { key: '--model', label: 'Model', type: 'model-select', default: '',
         envVar: 'ARTIFEX_MODEL', dependsOn: '--backend' },
       { key: '--gateway', label: 'Gateway URL', type: 'text', default: 'http://localhost:8080' },

@@ -22,7 +22,6 @@ webgpu/metrics.jsonl
 
 # ── Local data (NEVER commit — user-specific, large, or generated) ──
 models/*
-!models/.gitkeep
 sessions/*
 !sessions/.gitkeep
 output/*
@@ -77,6 +76,12 @@ coverage.xml
 # ── Docker build artifacts ──────────────────────────────────────────
 *.tar
 *.tar.gz
+
+# ── Machine-specific configs (contain local filesystem paths) ──────
+Modelfile
+Modelfile.*
+!Modelfile.example
+llama_cpp_config.json
 
 # ── Debug output and session notes (personal, not project code) ───
 SESSION-NOTES.md

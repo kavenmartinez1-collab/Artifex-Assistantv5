@@ -1,28 +1,31 @@
 """
-Auto-size num_ctx for Ollama requests based on prompt size and VRAM budget.
+Auto-size num_ctx for Ollama requests based on VRAM budget and model architecture.
 
 Strategy:
-  1. Estimate prompt tokens from messages (chars/3, conservative).
-  2. Pick smallest standard bucket (4K/8K/16K/32K/64K/131K) that fits prompt.
-  3. Cap by a model-specific ceiling derived from file_size / free_vram.
-  4. Allow per-model override in ollama_config.json:
+  1. Query total VRAM via nvidia-smi (cached — never changes at runtime).
+  2. Fetch model architecture from Ollama /api/show: layers, KV heads,
+     key/value dims, and attention interval (hybrid attention+SSM models).
+  3. Compute KV cache cost per context token from architecture.
+  4. Budget: total_vram − 2.5 GB reserve − model_loaded(file×1.3) = available for KV.
+  5. max_ctx = available / kv_per_token, rounded down to standard bucket.
+  6. Per-model override via ollama_config.json:
      - num_ctx:  fixed value — bypasses auto-sizing entirely
      - max_ctx:  upper bound for the auto-sized value
+     - kv_quant: KV cache quantization (f16/q8_0/q4_0) for sizing math
 
-Design notes:
-- Buckets (powers of 2) matter: Ollama reloads the model when num_ctx
-  changes between requests. Same-size-class requests stay in one bucket
-  and avoid reload thrash.
-- file_size/free_vram ratio is the safety heuristic — measurements on a
-  24 GB card showed KV-cache growth varies 8× across architectures (dense
-  text GQA vs vision), so a bytes-per-token formula would be unsafe.
-  The ratio-based cap is monotonic and conservative.
-- torch.cuda.mem_get_info() gives true free VRAM in-process, accounting
-  for display + other CUDA processes — no subprocess cost.
+Hybrid models (e.g. Qwen3.5/3.6):
+  full_attention_interval=4 means only every 4th layer has an attention KV
+  cache.  SSM layers (Mamba-2) have fixed-size state that doesn't scale with
+  context length.  The KV math accounts for this automatically.
+
+The 1.3× model overhead factor covers weight tensor padding, CUDA context,
+and compute buffers.  Empirical: Qwen3.5-27B Q4 (16.2 GB file) loads at
+~21 GB VRAM at 4K ctx on a 24 GB card.
 """
 
 import json
 import logging
+import subprocess
 import urllib.request
 import urllib.error
 
@@ -30,15 +33,23 @@ _log = logging.getLogger(__name__)
 
 OLLAMA_BASE = "http://localhost:11434"
 STANDARD_BUCKETS = [4096, 8192, 16384, 32768, 65536, 131072]
-SAFETY_FACTOR = 1.3
 MIN_CTX = 4096
+MODEL_OVERHEAD_FACTOR = 1.3
+SYSTEM_RESERVE_MB = 2560  # 2.5 GB for display compositor, other GPU processes
 
+_total_vram_mb: float | None = None
 _model_meta_cache: dict = {}
+
+_KV_QUANT_BYTES = {
+    "f16": 2.0,
+    "q8_0": 1.0625,   # 32 int8 + 1 f16 scale per block of 32
+    "q4_0": 0.5625,   # 16 int4-pairs + 1 f16 scale per block of 32
+}
 
 
 def estimate_prompt_tokens(messages) -> int:
-    """Rough upper bound on prompt tokens. chars/3 is conservative
-    (English ~4/tok, JSON/code denser ~3/tok)."""
+    """Rough upper bound on prompt tokens.  chars/3 is conservative
+    (English ~4 chars/tok, JSON/code denser ~3 chars/tok)."""
     total = 0
     for m in messages:
         content = m.get("content", "")
@@ -51,26 +62,33 @@ def estimate_prompt_tokens(messages) -> int:
     return total
 
 
-def _get_free_vram_gb() -> float:
-    """Free VRAM in GB via torch.cuda.mem_get_info. 0 if no GPU or unavailable."""
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            return 0.0
-        free_bytes, _total = torch.cuda.mem_get_info(0)
-        return free_bytes / (1024 ** 3)
-    except Exception:
-        return 0.0
+# ── VRAM detection ──────────────────────────────────────────────────────
 
+def _get_total_vram_mb() -> float:
+    """Total GPU VRAM in MiB via nvidia-smi.  Cached after first successful call."""
+    global _total_vram_mb
+    if _total_vram_mb is not None:
+        return _total_vram_mb
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            _total_vram_mb = float(result.stdout.strip().split("\n")[0])
+            _log.info("Detected total VRAM: %.0f MiB", _total_vram_mb)
+            return _total_vram_mb
+    except Exception as e:
+        _log.debug("nvidia-smi unavailable: %s", e)
+    _total_vram_mb = 0.0
+    return 0.0
+
+
+# ── Model metadata ──────────────────────────────────────────────────────
 
 def _parse_modelfile_num_ctx(parameters_text: str) -> int | None:
-    """Extract num_ctx from /api/show's 'parameters' text (whitespace-separated
-    'key value' pairs). Returns None if not set.
-
-    Ollama only honors an API-passed num_ctx cleanly when it's >= the Modelfile's
-    num_ctx. Passing a smaller value can get silently ignored or cause empty
-    responses. This is used as a floor in compute_safe_ctx.
-    """
+    """Extract num_ctx from Ollama's 'parameters' text block."""
     if not parameters_text:
         return None
     for line in parameters_text.splitlines():
@@ -84,8 +102,12 @@ def _parse_modelfile_num_ctx(parameters_text: str) -> int | None:
 
 
 def _get_model_meta(model: str) -> dict:
-    """Fetch and cache file_size_gb, trained_ctx, and modelfile_num_ctx.
-    Returns {} on error (callers must handle missing keys)."""
+    """Fetch and cache model metadata from Ollama /api/show and /api/tags.
+
+    Extracts: file_size_mb, trained_ctx, num_layers, num_kv_heads,
+    key_length, value_length, attn_layer_count (accounting for hybrid models),
+    and modelfile_num_ctx.
+    """
     if model in _model_meta_cache:
         return _model_meta_cache[model]
 
@@ -97,7 +119,7 @@ def _get_model_meta(model: str) -> dict:
         for m in tags.get("models", []):
             name = m.get("name", "")
             if name == model or name.startswith(model + ":"):
-                meta["file_size_gb"] = m.get("size", 0) / (1024 ** 3)
+                meta["file_size_mb"] = m.get("size", 0) / (1024 ** 2)
                 break
 
         req = urllib.request.Request(
@@ -108,75 +130,156 @@ def _get_model_meta(model: str) -> dict:
         )
         with urllib.request.urlopen(req, timeout=3) as resp:
             show = json.loads(resp.read())
-        for key, val in show.get("model_info", {}).items():
+
+        model_info = show.get("model_info", {})
+        full_attn_interval = None
+
+        for key, val in model_info.items():
             if key.endswith(".context_length"):
                 meta["trained_ctx"] = int(val)
-                break
+            elif key.endswith(".block_count"):
+                meta["num_layers"] = int(val)
+            elif key.endswith(".attention.head_count_kv"):
+                meta["num_kv_heads"] = int(val)
+            elif key.endswith(".attention.head_count"):
+                meta["num_heads"] = int(val)
+            elif key.endswith(".attention.key_length"):
+                meta["key_length"] = int(val)
+            elif key.endswith(".attention.value_length"):
+                meta["value_length"] = int(val)
+            elif key.endswith(".embedding_length"):
+                meta["embedding_length"] = int(val)
+            elif key.endswith(".full_attention_interval"):
+                full_attn_interval = int(val)
+
+        # How many layers actually have attention KV caches?
+        # Hybrid models (attention+SSM) only run attention every N layers.
+        num_layers = meta.get("num_layers", 0)
+        if full_attn_interval and full_attn_interval > 1 and num_layers:
+            meta["attn_layer_count"] = num_layers // full_attn_interval
+        else:
+            meta["attn_layer_count"] = num_layers
+
+        # Head dimensions: prefer explicit key_length/value_length,
+        # fall back to embedding_length / num_heads for pure transformers.
+        if "key_length" not in meta and "embedding_length" in meta and "num_heads" in meta:
+            dim = meta["embedding_length"] // meta["num_heads"]
+            meta["key_length"] = dim
+            meta["value_length"] = dim
+
         mf_ctx = _parse_modelfile_num_ctx(show.get("parameters", ""))
         if mf_ctx:
             meta["modelfile_num_ctx"] = mf_ctx
+
     except Exception as e:
-        _log.debug("ollama_ctx: could not fetch meta for %s: %s", model, e)
+        _log.debug("Could not fetch model meta for %s: %s", model, e)
 
     _model_meta_cache[model] = meta
+    _log.info("Model meta for %s: %s", model,
+              {k: v for k, v in meta.items() if k != "file_size_mb"})
     return meta
 
 
-def _heuristic_ceiling(model: str) -> int:
-    """Conservative ctx ceiling from loaded-VRAM / free-VRAM ratio.
+# ── KV cache math ───────────────────────────────────────────────────────
 
-    A model's loaded VRAM is ~1.3x its file size at minimal ctx (weights +
-    CUDA context + minimal KV + buffers). Using raw file_size as the ratio
-    was too permissive — e.g. qwen3.5:27B Q4 (16.2 GB file, 21.1 GB loaded
-    at 4K ctx on a 24 GB card) looked "safe at 8K" but measurement showed
-    Ollama silently spilled to CPU above 4K.
+def _kv_bytes_per_token(meta: dict, kv_quant: str = "f16") -> float | None:
+    """Bytes of KV cache per context token, derived from model architecture.
 
-    Thresholds also bake in worst-case KV growth observed across models
-    (qwen3-vl grew ~150 KB/ctx-token vs gemma4 ~18 KB/ctx-token).
+    For hybrid attention+SSM models, only attention layers contribute to
+    per-token KV cache growth.  SSM state is fixed-size and folded into
+    the model overhead factor.
+
+    Returns None when architecture info is missing.
     """
-    meta = _get_model_meta(model)
-    file_gb = meta.get("file_size_gb", 0.0)
-    free_gb = _get_free_vram_gb()
+    attn_layers = meta.get("attn_layer_count")
+    num_kv_heads = meta.get("num_kv_heads")
+    key_len = meta.get("key_length")
+    val_len = meta.get("value_length")
 
-    if not file_gb or not free_gb:
-        return 32768  # safe default when info unavailable
+    if not all((attn_layers, num_kv_heads, key_len)):
+        return None
 
-    effective_ratio = (file_gb * 1.3) / free_gb
-    if effective_ratio > 0.90:
-        return MIN_CTX     # barely fits — no room for ctx growth
-    if effective_ratio > 0.75:
+    if not val_len:
+        val_len = key_len
+
+    bytes_per_elem = _KV_QUANT_BYTES.get(kv_quant, 2.0)
+    return attn_layers * num_kv_heads * (key_len + val_len) * bytes_per_elem
+
+
+def _vram_max_ctx(model: str, kv_quant: str = "f16") -> int:
+    """Largest context bucket that fits in VRAM after model + system reserve."""
+    total_mb = _get_total_vram_mb()
+    if not total_mb:
         return 8192
-    if effective_ratio > 0.60:
-        return 16384
-    if effective_ratio > 0.40:
-        return 32768
-    return 65536
+
+    meta = _get_model_meta(model)
+    file_mb = meta.get("file_size_mb", 0)
+    if not file_mb:
+        return 8192
+
+    model_loaded_mb = file_mb * MODEL_OVERHEAD_FACTOR
+    available_mb = total_mb - SYSTEM_RESERVE_MB - model_loaded_mb
+
+    if available_mb <= 0:
+        _log.warning(
+            "Model %s (est. %.0f MiB loaded) exceeds VRAM budget "
+            "(%.0f MiB total − %.0f MiB reserve)",
+            model, model_loaded_mb, total_mb, SYSTEM_RESERVE_MB,
+        )
+        return MIN_CTX
+
+    kv_per_token = _kv_bytes_per_token(meta, kv_quant)
+    if not kv_per_token:
+        _log.debug("No architecture info for %s — falling back to 8K", model)
+        return 8192
+
+    kv_per_token_mb = kv_per_token / (1024 * 1024)
+    # 90% utilization — reserve 10% for compute buffers that scale with
+    # context (attention scratch, graph intermediates, allocator fragmentation).
+    max_tokens = int((available_mb * 0.90) / kv_per_token_mb)
+
+    _log.info(
+        "VRAM budget for %s: %.0f MiB total, −%.0f MiB reserve, "
+        "−%.0f MiB model ≈ %.0f MiB for KV → max ~%d tokens "
+        "(%.1f KB/tok, kv_quant=%s, attn_layers=%d/%d)",
+        model, total_mb, SYSTEM_RESERVE_MB, model_loaded_mb,
+        available_mb, max_tokens, kv_per_token / 1024, kv_quant,
+        meta.get("attn_layer_count", 0), meta.get("num_layers", 0),
+    )
+
+    for bucket in reversed(STANDARD_BUCKETS):
+        if bucket <= max_tokens:
+            return bucket
+    return MIN_CTX
 
 
-def compute_safe_ctx(model: str, estimated_tokens: int, config: dict | None = None) -> int:
+# ── Public API ──────────────────────────────────────────────────────────
+
+def compute_safe_ctx(model: str, estimated_tokens: int,
+                     config: dict | None = None) -> int:
     """Pick num_ctx for an Ollama request.
 
     Precedence:
-      1. config['num_ctx']   — fixed, bypass auto-sizing
-      2. config['max_ctx']   — upper bound for the auto-sized value
-      3. heuristic ceiling   — model_file / free_vram
+      1. config['num_ctx']   — fixed override, bypasses auto-sizing
+      2. config['max_ctx']   — upper bound for auto-sized value
+      3. VRAM budget         — from nvidia-smi + model architecture
 
-    Floor: the Modelfile's num_ctx (if any). Passing an API num_ctx below the
-    Modelfile value is what historically caused empty-content responses, since
-    Ollama may silently ignore the smaller value and reload at the Modelfile
-    default.
+    Floor: the Modelfile's num_ctx (passing a smaller value to the API
+    gets silently ignored by Ollama and can cause empty responses).
 
-    Always a standard bucket (>=4K), never above the model's trained ctx.
+    Always returns a standard bucket (>= 4K), never above trained ctx.
     """
     config = config or {}
 
     if "num_ctx" in config:
         return int(config["num_ctx"])
 
-    target = max(int(estimated_tokens * SAFETY_FACTOR), MIN_CTX)
+    kv_quant = config.get("kv_quant", "f16")
+
+    target = max(int(estimated_tokens * 1.3), MIN_CTX)
 
     meta = _get_model_meta(model)
-    ceiling = _heuristic_ceiling(model)
+    ceiling = _vram_max_ctx(model, kv_quant)
     if "trained_ctx" in meta:
         ceiling = min(ceiling, meta["trained_ctx"])
     if "max_ctx" in config:

@@ -23,7 +23,7 @@ All glory to **Jesus Christ**, through whom all things were made and in whom all
 
 ---
 
-Universal Local AI Hosting Platform. Run any AI model locally — text generation, image generation, 3D, vision, audio, music, video, and more. Supports HuggingFace Transformers and Ollama backends with automatic VRAM management, plus an experimental WebGPU browser-based inference engine.
+Universal Local AI Hosting Platform. Run any AI model locally — text generation, image generation, 3D, vision, audio, music, video, and more. Supports three inference backends (HuggingFace Transformers, Ollama, and llama.cpp) with automatic VRAM management, plus an experimental WebGPU browser-based inference engine.
 
 **Everything runs locally. All servers bind to 127.0.0.1 only. Nothing is exposed to the network.**
 
@@ -47,6 +47,7 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
   - [Web Tools in the API](#web-tools-in-the-api)
   - [Authentication](#authentication)
 - [Setting Up Ollama Backend](#setting-up-ollama-backend)
+- [Setting Up llama.cpp Backend](#setting-up-llamacpp-backend)
 - [Web Gateway (Secure Web Search)](#web-gateway-secure-web-search)
   - [Architecture](#architecture)
   - [Quick Start](#quick-start)
@@ -78,7 +79,7 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 ## Features
 
 - **Multi-modal inference** — 10 pipeline types: text, image, image editing, 3D mesh, vision, audio, speech recognition, music, video, embeddings
-- **Two backends** — HuggingFace Transformers (GPU-accelerated) and Ollama (pre-quantized models)
+- **Three backends** — HuggingFace Transformers (GPU-accelerated), Ollama (pre-quantized GGUF), and llama.cpp (custom forks, bleeding-edge quants)
 - **Automatic VRAM management** — GPU tier detection, NF4/INT8 quantization, KV cache budgeting
 - **Three interfaces** — CLI with agent tools and multimodal pipelines, PyQt6 GUI with inline media, OpenAI-compatible REST API with file management
 - **Agent tools** — shell execution, Python runner, web search, codebase analysis (grep, glob, architecture), file I/O, edit-in-place
@@ -306,7 +307,7 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 The PyQt6 GUI provides a production-grade desktop interface with full multimodal support:
 
 - **Model selector** — dropdown of all auto-discovered models
-- **Backend toggle** — switch between Transformers and Ollama
+- **Backend toggle** — switch between Transformers, Ollama, and llama.cpp
 - **Parameter controls** — temperature slider, max tokens, torch.compile, TurboQuant KV toggles
 - **10 pipeline modes** — Chat, Code, Image Gen, Image Edit, Vision, 3D, Audio TTS, Audio STT, Music Gen, Video Gen
 - **Drag-and-drop file input** — drop images, audio, video, documents onto the drop zone
@@ -336,6 +337,7 @@ python main_api.py                              # Default: 127.0.0.1:8000, auto-
 python main_api.py --port 8080                  # Custom port
 python main_api.py --backend ollama             # Force Ollama backend
 python main_api.py --backend transformers       # Force Transformers backend
+python main_api.py --backend llama_cpp          # Force llama.cpp backend (custom GGUF forks)
 python main_api.py --model qwen3.6-27b  # Select specific model (Transformers)
 python main_api.py --model qwen3.6:27b          # Select specific model (Ollama)
 python main_api.py --gateway http://localhost:8080  # Enable web search tools via gateway
@@ -358,8 +360,8 @@ python main_api.py --backend transformers --model qwen3.6-27b --gateway http://l
 |------|---------|-------------|
 | `--host` | `127.0.0.1` | Bind address (use `0.0.0.0` for network access) |
 | `--port` | `8000` | Server port |
-| `--backend` | auto-detect | `ollama` or `transformers` |
-| `--model` | auto-detect | Model name (folder name for transformers, Ollama name for ollama) |
+| `--backend` | auto-detect | `ollama`, `transformers`, or `llama_cpp` |
+| `--model` | auto-detect | Model name (folder name for transformers, Ollama name for ollama, config key for llama_cpp) |
 | `--gateway` | *(none)* | Web gateway URL for `@search`/`@web_read` tool execution |
 | `--reload` | off | Auto-reload on code changes (development) |
 
@@ -517,6 +519,81 @@ ollama pull codellama:7b         # Code Llama 7B
 ```
 
 All communication with Ollama stays on `localhost:11434` — nothing leaves your machine.
+
+---
+
+## Setting Up llama.cpp Backend
+
+The llama.cpp backend runs a `llama-server` process directly, giving you access to custom forks (e.g. TurboQuant) and bleeding-edge quantization formats that Ollama doesn't support yet. The engine manages the server lifecycle automatically — `load()` starts it, `unload()` kills it.
+
+### When to Use llama.cpp vs Ollama
+
+| | Ollama | llama.cpp |
+|---|---|---|
+| **Setup** | One binary, no build step | Build from source (CMake + CUDA) |
+| **Model format** | GGUF (standard quants) | GGUF (any quant, including custom forks) |
+| **Custom forks** | Not supported | Full support (TurboQuant, DFlash, etc.) |
+| **Context sizing** | Auto-managed | Configurable per-model in `llama_cpp_config.json` |
+| **Use case** | Daily driver, stable | Extended context, experimental quants |
+
+### Setup
+
+1. **Build or install llama-server** — either from [llama.cpp](https://github.com/ggerganov/llama.cpp) or a custom fork:
+
+```bash
+git clone https://github.com/ggerganov/llama.cpp.git
+cd llama.cpp
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-server -j
+```
+
+2. **Download a GGUF model** — any GGUF compatible with your llama-server build.
+
+3. **Configure** — copy the example config and set your paths:
+
+```bash
+cp llama_cpp_config.example.json llama_cpp_config.json
+# Edit llama_cpp_config.json — set server_path and model path
+```
+
+4. **Launch** — select `llama_cpp` as your backend:
+
+```bash
+python main_api.py --backend llama_cpp
+# Or in the CLI:
+/backend llama_cpp
+```
+
+The engine starts `llama-server` on the configured port, waits for it to become healthy, and streams via its native OpenAI-compatible API at `/v1/chat/completions`.
+
+### Configuration
+
+`llama_cpp_config.json` defines the server binary and per-model settings:
+
+```json
+{
+  "server_path": "llama-server",
+  "default_port": 8081,
+  "models": {
+    "my-model": {
+      "path": "/path/to/model.gguf",
+      "port": 8081,
+      "num_gpu_layers": 99,
+      "num_ctx": 32768,
+      "extra_flags": ["-fa", "on", "--jinja"]
+    }
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `server_path` | Path to `llama-server` binary (global default) |
+| `path` | Path to the GGUF model file |
+| `port` | Port for this model's server instance |
+| `num_gpu_layers` | GPU layers to offload (99 = all) |
+| `num_ctx` | Context window size (auto-sized from VRAM if omitted) |
+| `extra_flags` | Additional CLI flags passed to llama-server |
 
 ---
 
@@ -1047,7 +1124,7 @@ The Services panel shows each service with start/stop/restart buttons and **conf
 
 | Service | Configurable Options |
 |---------|---------------------|
-| **Python API Server** | Port, Backend (transformers/ollama), Model name, Gateway URL |
+| **Python API Server** | Port, Backend (transformers/ollama/llama_cpp), Model name, Gateway URL |
 | **Web Gateway** | Port |
 | **Vite / Dev Server** | Start/stop only |
 | **Ollama** | Start/stop only |
@@ -1075,7 +1152,7 @@ python main_gui_qt.py                    # GUI (PyQt6 desktop — recommended)
 python main_gui.py                       # GUI (legacy FreeSimpleGUI)
 python main_api.py                       # API server (port 8000)
 python main_api.py --backend ollama      # API with Ollama backend
-python main_api.py --backend ollama --model qwen3.6-27b-q4km --port 8000
+python main_api.py --backend ollama --model qwen3.6-27b-q2kxl --port 8000
 
 # ── Web gateway (separate terminal) ──
 python web-gateway/main.py               # Web search proxy (port 8080)
@@ -1092,7 +1169,7 @@ npx tsx server/dev-server.ts             # Dev server (port 3001)
 **Environment variables** (alternative to CLI flags):
 ```bash
 set ARTIFEX_BACKEND=ollama              # Windows
-set ARTIFEX_MODEL=qwen3.6-27b-q4km
+set ARTIFEX_MODEL=qwen3.6-27b-q2kxl
 python main_api.py
 ```
 
@@ -1140,6 +1217,9 @@ Artifex-Assistant-V5/
   setup_ollama.py          # Ollama setup helper (install, start, pull)
   download_model.py        # Model downloader (HuggingFace + Ollama)
   launch.bat               # Windows desktop launcher
+  Modelfile.example        # Ollama Modelfile template (copy to Modelfile, set your GGUF path)
+  llama_cpp_config.example.json  # llama.cpp backend config template (copy to llama_cpp_config.json)
+  ollama_config.json       # Per-model Ollama settings (KV quant, context overrides)
   Dockerfile               # CUDA Docker image (full profile)
   docker-compose.yml       # Docker Compose: web gateway (default) + full profile
   pyproject.toml           # Pytest configuration
@@ -1150,9 +1230,10 @@ Artifex-Assistant-V5/
   core/
     config.py              # GPU tier detection, model registry, modes, safety
     engine_base.py         # Abstract engine interface
-    engine_factory.py      # Backend factory (Transformers / Ollama)
+    engine_factory.py      # Backend factory (Transformers / Ollama / llama.cpp)
     engine_transformers.py # HuggingFace Transformers backend
     engine_ollama.py       # Ollama backend (localhost only)
+    engine_llama_cpp.py    # llama.cpp server backend (custom forks, TurboQuant)
     hardware.py            # GPU detection and VRAM management
     model_loader.py        # Model weight loading with quantization
     model_registry.py      # Model type detection and VRAM estimation

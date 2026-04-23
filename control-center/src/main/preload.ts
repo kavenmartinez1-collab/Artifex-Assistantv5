@@ -138,7 +138,7 @@ contextBridge.exposeInMainWorld('artifex', {
     return ipcRenderer.invoke('models:scan-ollama');
   },
 
-  listModelNamesByBackend: (): Promise<{ transformers: string[]; ollama: string[] }> => {
+  listModelNamesByBackend: (): Promise<{ transformers: string[]; ollama: string[]; llama_cpp: string[] }> => {
     return ipcRenderer.invoke('models:list-names');
   },
 

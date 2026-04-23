@@ -87,7 +87,7 @@ at load. Below is what works for each mode.</p>
 <h3>Chat / Code</h3>
 <p><b>Type:</b> Text LLM &mdash; works on either backend.</p>
 <ul>
-  <li><b>Ollama:</b> <code>qwen3.5:9b</code>, <code>qwen3.6-27b-q4km</code>,
+  <li><b>Ollama:</b> <code>qwen3.5:9b</code>, <code>qwen3.6-27b-q2kxl</code>,
       <code>gemma4</code>, <code>llama3.2</code></li>
   <li><b>Transformers:</b> any HF causal LM, e.g.
       <code>Qwen/Qwen2.5-7B-Instruct</code></li>
@@ -279,7 +279,7 @@ class ArtifexMainWindow(QMainWindow):
         be_layout = QHBoxLayout()
         be_layout.addWidget(QLabel("Engine:"))
         self._backend_combo = QComboBox()
-        self._backend_combo.addItems(["transformers", "ollama"])
+        self._backend_combo.addItems(["transformers", "ollama", "llama_cpp"])
         self._backend_combo.setCurrentText(get_active_backend())
         be_layout.addWidget(self._backend_combo)
         bg_layout.addLayout(be_layout)

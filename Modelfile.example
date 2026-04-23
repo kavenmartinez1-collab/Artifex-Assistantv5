@@ -1,4 +1,12 @@
-FROM qwen3.6-27b-q4km
+# Ollama Modelfile template for Artifex Assistant V5.
+# Copy this to 'Modelfile' and update the FROM path to your local GGUF.
+#
+# Usage:
+#   cp Modelfile.example Modelfile
+#   # Edit the FROM path below to point to your GGUF file
+#   ollama create my-model-name -f Modelfile
+
+FROM "/path/to/your/model.gguf"
 
 TEMPLATE """{{- range .Messages }}
 {{- if eq .Role "system" }}<|im_start|>system
@@ -20,4 +28,5 @@ PARAMETER stop <|im_start|>
 PARAMETER temperature 0.6
 PARAMETER top_p 0.95
 PARAMETER top_k 20
-PARAMETER num_ctx 32768
+PARAMETER num_ctx 8192
+PARAMETER num_gpu 65

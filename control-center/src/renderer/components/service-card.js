@@ -16,7 +16,7 @@ let serviceOptionDefs = {};
 const serviceConfigs = {};
 
 // Cache of model names by backend, populated lazily by model-select fields.
-// Shape: { transformers: ['name', ...], ollama: ['name', ...] }
+// Shape: { transformers: ['name', ...], ollama: ['name', ...], llama_cpp: ['name', ...] }
 let modelNamesByBackend = null;
 let modelNamesPromise = null;
 
@@ -41,7 +41,7 @@ function getModelNamesByBackend() {
     try {
       modelNamesByBackend = await window.artifex.listModelNamesByBackend();
     } catch {
-      modelNamesByBackend = { transformers: [], ollama: [] };
+      modelNamesByBackend = { transformers: [], ollama: [], llama_cpp: [] };
     }
     modelNamesPromise = null;
     return modelNamesByBackend;

@@ -156,7 +156,7 @@ class ArtifexGUI:
         model_frame = sg.Frame("Model & Backend", [
             [
                 sg.Text("Backend:", font=FONT_SMALL, text_color=dim, size=(7, 1)),
-                sg.Combo(["transformers", "ollama"], default_value=get_active_backend(),
+                sg.Combo(["transformers", "ollama", "llama_cpp"], default_value=get_active_backend(),
                          key="-BACKEND-SELECT-", size=(13, 1), font=FONT_SMALL,
                          readonly=True, background_color="#161a2b", text_color=accent,
                          enable_events=True),

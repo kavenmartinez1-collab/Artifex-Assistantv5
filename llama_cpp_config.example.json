@@ -1,0 +1,14 @@
+{
+  "_comment": "llama.cpp server config. Copy to llama_cpp_config.json and update paths for your system.",
+  "server_path": "llama-server",
+  "default_port": 8081,
+  "models": {
+    "example-model": {
+      "path": "/path/to/your/model.gguf",
+      "port": 8081,
+      "num_gpu_layers": 99,
+      "num_ctx": 32768,
+      "extra_flags": ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--jinja"]
+    }
+  }
+}

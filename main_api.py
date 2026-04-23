@@ -20,7 +20,7 @@ def main():
     parser.add_argument("--port", type=int, default=8000, help="Port (default: 8000)")
     parser.add_argument("--reload", action="store_true", help="Auto-reload on code changes")
     parser.add_argument("--backend", default=os.environ.get("ARTIFEX_BACKEND"),
-                        choices=["transformers", "ollama"],
+                        choices=["transformers", "ollama", "llama_cpp"],
                         help="Backend to use (default: auto-detect, or set ARTIFEX_BACKEND env var)")
     parser.add_argument("--model", default=os.environ.get("ARTIFEX_MODEL"),
                         help="Model name (or set ARTIFEX_MODEL env var)")

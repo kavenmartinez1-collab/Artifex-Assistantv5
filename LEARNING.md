@@ -12,7 +12,8 @@
 3. [Quantization — Fitting Big Models in Small GPUs](#3-quantization--fitting-big-models-in-small-gpus)
 4. [Backend #1: HuggingFace Transformers](#4-backend-1-huggingface-transformers)
 5. [Backend #2: Ollama](#5-backend-2-ollama)
-6. [Backend #3: The API Server (OpenAI-Compatible)](#6-backend-3-the-api-server-openai-compatible)
+    - [Backend #3: llama.cpp (Custom GGUF Forks)](#5b-backend-3-llamacpp-custom-gguf-forks)
+6. [Backend #4: The API Server (OpenAI-Compatible)](#6-backend-3-the-api-server-openai-compatible)
 7. [The Web Gateway — Safe Web Access for AI](#7-the-web-gateway--safe-web-access-for-ai)
 8. [Backend #4: WebGPU — Running Models in the Browser](#8-backend-4-webgpu--running-models-in-the-browser)
 9. [The GPU Compute Pipeline — Why Kernels Matter](#9-the-gpu-compute-pipeline--why-kernels-matter)
@@ -350,6 +351,39 @@ This means a single `.gguf` file contains everything needed to run the model —
 When you see `Ollama ready — model: qwen3.5:9b (GPU: 13 layers)`, that means Ollama split the model: 13 of the 28 layers run on the GPU, and the remaining 15 run on the CPU. This happens because 8 GB VRAM isn't enough for all layers. Ollama automatically decides how to split based on available memory.
 
 This is called **CPU offloading** — layers that don't fit on the GPU are computed on the CPU instead. It's slower but allows running models that wouldn't otherwise fit.
+
+---
+
+## 5b. Backend #3: llama.cpp (Custom GGUF Forks)
+
+### What it is
+
+**llama.cpp** is the C++ inference engine that Ollama is built on top of. When you run Ollama, it's actually running llama.cpp under the hood. So why would you use llama.cpp directly?
+
+Because Ollama bundles a specific version of llama.cpp and only supports the quantization formats that version understands. When researchers create new quantization methods (like TurboQuant's TQ3_4S format), there's always a gap between "the format exists" and "Ollama supports it." Running a custom llama.cpp fork lets you use those formats immediately.
+
+### How Artifex uses it
+
+Unlike Ollama (which runs as a persistent system service), the llama.cpp backend manages the server process directly:
+
+```
+Artifex starts → spawns llama-server → waits for /health → streams via /v1/chat/completions
+Artifex stops → kills llama-server process
+```
+
+The key insight: `llama-server` speaks the OpenAI API natively at `/v1/chat/completions`, so no message format conversion is needed. It uses the exact same streaming path as the Transformers backend.
+
+### When to use it
+
+The three-tier backend stack:
+
+1. **Ollama** — stable daily driver. Pre-built, auto-managed, reliable.
+2. **llama.cpp** — bleeding-edge quants and custom forks. Build from source, configure manually, get access to formats Ollama can't run yet.
+3. **Transformers** — escape hatch for non-GGUF features (vision, video, custom architectures).
+
+### Configuration
+
+Models are defined in `llama_cpp_config.json` with the GGUF path, server binary, port, context size, and extra flags. The engine auto-sizes context from VRAM if `num_ctx` is omitted, using the same VRAM detection as the Ollama backend.
 
 ---
 

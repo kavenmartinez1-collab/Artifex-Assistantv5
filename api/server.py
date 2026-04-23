@@ -195,6 +195,7 @@ def _make_sse_chunk(chat_id: str, model: str, delta: dict,
 # ── Ollama proxy helpers ───────────────────────────────────────────────
 
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+_ollama_no_think: set = set()
 
 
 def _convert_messages_for_ollama(messages):
@@ -429,6 +430,20 @@ def _resolve_model_for_request(requested, has_images: bool, backend: str) -> str
         _log.warning("Model '%s' not found, falling back to %s (smallest)", requested, smallest[0])
         return smallest[0]
 
+    if backend == "llama_cpp":
+        from core.config import get_llama_cpp_models
+        lcpp_models = get_llama_cpp_models()
+        if requested in lcpp_models:
+            return requested
+        available = sorted(lcpp_models.keys())
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{requested}' not in llama.cpp config. "
+                f"Available: {', '.join(available) if available else '(none — add models to llama_cpp_config.json)'}."
+            ),
+        )
+
     # Transformers
     if requested in MODELS:
         return requested
@@ -584,9 +599,10 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
         "model": model,
         "messages": ollama_messages,
         "stream": True,
-        "think": True,
         "options": ollama_options,
     }
+    if model not in _ollama_no_think:
+        payload["think"] = True
 
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -599,7 +615,8 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
         resp = urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         if e.code == 400 and b"does not support thinking" in (e.read()):
-            _log.info("Model %s: Ollama think not supported, retrying without", model)
+            _ollama_no_think.add(model)
+            _log.info("Model %s: think not supported, disabled for future requests", model)
             payload.pop("think", None)
             body = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(
@@ -742,6 +759,7 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                 daemon=True,
             )
         else:
+            # Both transformers and llama_cpp use BaseEngine.generate_streaming
             engine = _get_engine()
             thread = threading.Thread(
                 target=_stream_transformers_raw,
