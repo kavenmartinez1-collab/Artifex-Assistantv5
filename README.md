@@ -1075,7 +1075,7 @@ python main_gui_qt.py                    # GUI (PyQt6 desktop — recommended)
 python main_gui.py                       # GUI (legacy FreeSimpleGUI)
 python main_api.py                       # API server (port 8000)
 python main_api.py --backend ollama      # API with Ollama backend
-python main_api.py --backend ollama --model qwen3.6-27b-q2kxl --port 8000
+python main_api.py --backend ollama --model qwen3.6-27b-q4km --port 8000
 
 # ── Web gateway (separate terminal) ──
 python web-gateway/main.py               # Web search proxy (port 8080)
@@ -1092,7 +1092,7 @@ npx tsx server/dev-server.ts             # Dev server (port 3001)
 **Environment variables** (alternative to CLI flags):
 ```bash
 set ARTIFEX_BACKEND=ollama              # Windows
-set ARTIFEX_MODEL=qwen3.6-27b-q2kxl
+set ARTIFEX_MODEL=qwen3.6-27b-q4km
 python main_api.py
 ```
 

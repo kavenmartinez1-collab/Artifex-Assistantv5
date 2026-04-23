@@ -1,4 +1,4 @@
-FROM qwen3.6-27b-q2kxl
+FROM qwen3.6-27b-q4km
 
 TEMPLATE """{{- range .Messages }}
 {{- if eq .Role "system" }}<|im_start|>system
