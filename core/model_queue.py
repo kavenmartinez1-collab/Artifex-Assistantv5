@@ -40,7 +40,7 @@ class ModelQueue:
         self._lock = asyncio.Lock()
         self._current_model: str | None = None
         self._current_backend: str | None = None
-        self._transformers_unload_fn = None  # registered by api layer
+        self._engine_unload_fn = None  # registered by api layer
         self._stats = {
             "total_requests": 0,
             "model_switches": 0,
@@ -48,15 +48,16 @@ class ModelQueue:
         }
 
     def register_transformers_unload(self, fn):
-        """Register a callback to unload the transformers engine.
+        """Register a callback to unload the current engine.
+
+        Despite the legacy name, this callback is used for both
+        Transformers and llama.cpp engines — BaseEngine.unload() is
+        polymorphic (frees GPU memory or kills the server process).
 
         Called by the API layer at startup so model_queue doesn't need
         to import api.server directly.
-
-        Args:
-            fn: callable() that unloads the current transformers engine
         """
-        self._transformers_unload_fn = fn
+        self._engine_unload_fn = fn
 
     @property
     def current_model(self) -> str | None:
@@ -89,8 +90,8 @@ class ModelQueue:
 
             if self._current_backend == "ollama":
                 await self._unload_ollama(self._current_model)
-            elif self._current_backend == "transformers":
-                await self._unload_transformers()
+            elif self._current_backend in ("transformers", "llama_cpp"):
+                await self._unload_engine()
 
             # If backend changed, the engine needs to be recreated
             if self._current_backend != backend:
@@ -133,23 +134,25 @@ class ModelQueue:
         except Exception as e:
             _log.warning("Failed to unload Ollama model %s: %s", model, e)
 
-    async def _unload_transformers(self):
-        """Unload the transformers engine to free VRAM.
+    async def _unload_engine(self):
+        """Unload the current engine (Transformers or llama.cpp) to free VRAM.
 
         Uses a registered callback instead of directly importing api.server,
-        keeping core/ decoupled from the API layer.
+        keeping core/ decoupled from the API layer. The callback calls
+        BaseEngine.unload() which is polymorphic — TransformersEngine frees
+        GPU memory, LlamaCppEngine kills the llama-server process.
         """
-        if self._transformers_unload_fn is None:
-            _log.warning("No transformers unload callback registered — skipping")
+        if self._engine_unload_fn is None:
+            _log.warning("No engine unload callback registered — skipping")
             return
         try:
-            _log.info("Unloading transformers model...")
+            _log.info("Unloading %s engine...", self._current_backend)
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._transformers_unload_fn)
+            await loop.run_in_executor(None, self._engine_unload_fn)
             await asyncio.sleep(1)
-            _log.info("Transformers model unloaded")
+            _log.info("%s engine unloaded", self._current_backend)
         except Exception as e:
-            _log.warning("Failed to unload transformers: %s", e)
+            _log.warning("Failed to unload %s engine: %s", self._current_backend, e)
 
     async def unload_current(self):
         """Manually unload the current model (e.g. on shutdown)."""
@@ -157,8 +160,8 @@ class ModelQueue:
             if self._current_model:
                 if self._current_backend == "ollama":
                     await self._unload_ollama(self._current_model)
-                elif self._current_backend == "transformers":
-                    await self._unload_transformers()
+                elif self._current_backend in ("transformers", "llama_cpp"):
+                    await self._unload_engine()
                 self._current_model = None
                 self._current_backend = None
 
