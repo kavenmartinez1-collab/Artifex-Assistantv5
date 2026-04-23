@@ -198,11 +198,10 @@ async function renderSelectModel() {
   let models = [];
   if (window.artifex?.listQuantModels) {
     models = await window.artifex.listQuantModels();
-  } else {
-    // Fallback: show placeholder
-    models = [
-      { name: 'qwen3.5-9b', path: 'models/qwen3.5-9b', sizeGB: '19.0 GB', isQuantized: false },
-    ];
+  }
+  if (!models.length) {
+    stepContent.innerHTML = '<p class="hint">No models found. Download a model to the models/ directory first.</p>';
+    return;
   }
 
   const baseModels = models.filter(m => !m.isQuantized);

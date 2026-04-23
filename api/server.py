@@ -106,7 +106,7 @@ class ChatMessage(BaseModel):
     )
 
 class ChatCompletionRequest(BaseModel):
-    model: str = Field("qwen3.6:27b", example="qwen3.6:27b")
+    model: Optional[str] = Field(None, description="Model name, or omit for auto-selection")
     messages: List[ChatMessage]
     max_tokens: Optional[int] = Field(None, ge=1, le=65536)
     temperature: Optional[float] = Field(0.7, ge=0.0, le=2.0)
@@ -420,12 +420,22 @@ def _resolve_model_for_request(requested, has_images: bool, backend: str) -> str
         if requested in OLLAMA_MODELS:
             return requested
         # Model not found — fall back to smallest available model
+        if not OLLAMA_MODELS:
+            from core.model_discovery import get_model_names_for_backend
+            available = get_model_names_for_backend("ollama")
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Model '{requested}' not found and no Ollama models available. "
+                    f"Install one with: ollama pull <model>"
+                ),
+            )
         # For text requests, skip VLM models (they're optimized for vision)
-        candidates = OLLAMA_MODELS.items()
+        candidates = list(OLLAMA_MODELS.items())
         if not has_images:
-            candidates = [(n, i) for n, i in candidates if "vl" not in n.lower() and "vision" not in n.lower()]
-        if not candidates:
-            candidates = OLLAMA_MODELS.items()  # fallback if no text models
+            text_only = [(n, i) for n, i in candidates if "vl" not in n.lower() and "vision" not in n.lower()]
+            if text_only:
+                candidates = text_only
         smallest = min(candidates, key=lambda x: x[1].get("size", float("inf")))
         _log.warning("Model '%s' not found, falling back to %s (smallest)", requested, smallest[0])
         return smallest[0]
@@ -985,18 +995,33 @@ def create_app():
     # ─── Models ───────────────────────────────────────────────────────────
 
     @app.get("/v1/models")
-    async def list_models(request: Request):
+    async def list_models(request: Request, backend: str = None):
+        """List available models. Returns all backends by default, or filter with ?backend=ollama."""
         if not _check_auth(request):
             raise HTTPException(status_code=401, detail="Invalid API key")
-        models = get_model_names()
+        from core.model_discovery import discover_all, discover_by_backend
+        from core.config import get_active_model_name
+
+        if backend:
+            models = discover_by_backend(backend)
+        else:
+            models = discover_all()
+
+        active_model = get_active_model_name()
+        active_backend = get_active_backend()
+
         data = [
             {
-                "id": name,
+                "id": m["id"],
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "local",
+                "x_backend": m["backend"],
+                "x_capabilities": m.get("capabilities", ["text"]),
+                "x_size": m.get("size", 0),
+                "x_active": (m["id"] == active_model and m["backend"] == active_backend),
             }
-            for name in models
+            for m in models
         ]
         return {"object": "list", "data": data}
 

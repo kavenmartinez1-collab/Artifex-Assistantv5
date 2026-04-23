@@ -87,10 +87,9 @@ at load. Below is what works for each mode.</p>
 <h3>Chat / Code</h3>
 <p><b>Type:</b> Text LLM &mdash; works on either backend.</p>
 <ul>
-  <li><b>Ollama:</b> <code>qwen3.5:9b</code>, <code>qwen3.6-27b-q2kxl</code>,
-      <code>gemma4</code>, <code>llama3.2</code></li>
-  <li><b>Transformers:</b> any HF causal LM, e.g.
-      <code>Qwen/Qwen2.5-7B-Instruct</code></li>
+  <li><b>Ollama:</b> any text LLM installed via <code>ollama pull</code></li>
+  <li><b>llama.cpp:</b> any GGUF model configured in llama_cpp_config.json</li>
+  <li><b>Transformers:</b> any HF causal LM in the models/ directory</li>
 </ul>
 
 <h3>Vision</h3>

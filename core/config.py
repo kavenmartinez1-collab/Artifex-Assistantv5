@@ -19,14 +19,7 @@ PLATFORM_STRING = f"{platform.system()} ({platform.machine()})"
 
 # ===== PATHS =====
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_LOCAL_MODEL = os.path.join(BASE_DIR, "models", "qwen3.5-9b")
-_SHARED_MODEL = os.path.join(os.path.dirname(BASE_DIR), "Artifex-lite", "models", "qwen3.5-9b")
-_SHARED_MODEL_V3 = os.path.join(os.path.dirname(BASE_DIR), "artifex-lite-v3", "models", "qwen3.5-9b")
-MODEL_PATH = (
-    _LOCAL_MODEL if os.path.isdir(_LOCAL_MODEL)
-    else _SHARED_MODEL_V3 if os.path.isdir(_SHARED_MODEL_V3)
-    else _SHARED_MODEL
-)
+MODEL_PATH = None  # resolved lazily from MODELS dict on first access
 SESSION_DIR = os.path.join(BASE_DIR, "sessions")
 KNOWLEDGE_DIR = os.path.join(BASE_DIR, "knowledge")
 KNOWLEDGE_REFERENCE_DIR = os.path.join(KNOWLEDGE_DIR, "reference")
@@ -337,10 +330,12 @@ def get_llama_cpp_model_config(model_name: str) -> dict:
 
 def get_active_model_path():
     """Get the currently selected transformers model's directory path."""
-    global _active_model
+    global _active_model, MODEL_PATH
     with _config_lock:
         if _active_model is None:
-            _active_model = MODEL_PATH  # default
+            if MODEL_PATH is None and MODELS:
+                MODEL_PATH = next(iter(MODELS.values()))
+            _active_model = MODEL_PATH
         return _active_model
 
 
@@ -379,14 +374,14 @@ def get_active_model_name():
 
 
 def get_active_ollama_model():
-    """Get the active Ollama model name."""
+    """Get the active Ollama model name.  Returns None if no models available."""
     global _active_model
     if _active_model and isinstance(_active_model, str):
         if not os.sep in _active_model and not _active_model.startswith("/"):
             return _active_model
     if OLLAMA_MODELS:
         return next(iter(OLLAMA_MODELS.keys()))
-    return "qwen3.5:9b"
+    return None
 
 
 def get_active_llama_cpp_model():
@@ -402,13 +397,12 @@ def get_active_llama_cpp_model():
 
 def get_model_names():
     """Get list of available model names for current backend."""
-    if _active_backend == "ollama":
-        if not OLLAMA_MODELS:
-            refresh_ollama_models()
-        return list(OLLAMA_MODELS.keys())
-    if _active_backend == "llama_cpp":
-        return list(get_llama_cpp_models().keys())
-    return list(MODELS.keys())
+    from core.model_discovery import get_model_names_for_backend
+    names = get_model_names_for_backend(_active_backend)
+    if not names and _active_backend == "ollama":
+        refresh_ollama_models()
+        names = get_model_names_for_backend(_active_backend)
+    return names
 
 # ===== QUANTIZATION =====
 # Note: compute dtype (fp16 vs bf16) is determined at runtime by the GPU's

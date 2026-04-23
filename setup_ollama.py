@@ -3,8 +3,7 @@ Artifex Assistant V5 — Ollama setup helper.
 Checks Ollama installation, starts the server if needed, and pulls models.
 
 Usage:
-    python setup_ollama.py                     # Pull default model (qwen3.5:9b)
-    python setup_ollama.py qwen3.5:4b          # Pull a specific model
+    python setup_ollama.py qwen3.6:27b         # Pull a specific model
     python setup_ollama.py --list               # List installed models
     python setup_ollama.py --status             # Check server status
 """
@@ -21,7 +20,6 @@ import urllib.request
 import urllib.error
 
 OLLAMA_URL = "http://localhost:11434"
-DEFAULT_MODEL = "qwen3.5:9b"
 
 
 def find_ollama_binary():
@@ -114,8 +112,8 @@ def main():
         description="Artifex Assistant V5 — Ollama setup helper"
     )
     parser.add_argument(
-        "model", nargs="?", default=DEFAULT_MODEL,
-        help=f"Model to pull (default: {DEFAULT_MODEL})",
+        "model", nargs="?", default=None,
+        help="Model to pull (e.g. qwen3.6:27b). Required for first install.",
     )
     parser.add_argument(
         "--list", action="store_true",
@@ -150,6 +148,12 @@ def main():
     if args.list:
         list_models()
         return
+
+    if not args.model:
+        print("No model specified. Usage: python setup_ollama.py <model>")
+        print("Examples: qwen3.6:27b, qwen3.5:9b, llama3:8b")
+        print("Run --list to see installed models.")
+        sys.exit(1)
 
     pull_model(ollama_bin, args.model)
 
