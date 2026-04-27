@@ -106,10 +106,11 @@ def execute_web_tools(tools: list[dict], search_cache: list[dict]) -> str:
 
     for tool in tools:
         if tool["type"] == "search":
-            _log.info("Executing web search: %s", tool["query"])
+            _log.info("Executing web search via gateway: query='%s'", tool["query"])
             ok, data = gateway_post("/search", {"query": tool["query"], "max_results": 8})
             if ok:
                 sr = data.get("results", [])
+                _log.info("Search returned %d results for '%s'", len(sr), tool["query"])
                 # Update search cache for @web_read(N) references
                 search_cache.clear()
                 search_cache.extend(sr)
@@ -124,12 +125,13 @@ def execute_web_tools(tools: list[dict], search_cache: list[dict]) -> str:
                 lines.append("Use @web_read(N) to read the full page for result N.")
                 result = "\n".join(lines)
             else:
+                _log.warning("Search FAILED for '%s': %s", tool["query"], data)
                 result = f"Search failed: {data}"
             results.append(f"[Search results for: {tool['query']}]\n{result}")
 
         elif tool["type"] == "web_read":
             ref = tool["ref"]
-            _log.info("Executing web read: %s", ref)
+            _log.info("Executing web_read: ref='%s'", ref)
 
             url = ref
             if ref.isdigit():
@@ -149,12 +151,14 @@ def execute_web_tools(tools: list[dict], search_cache: list[dict]) -> str:
 
             ok, data = gateway_post("/fetch", {"url": url})
             if not ok:
+                _log.warning("web_read FAILED for %s: %s", url, data)
                 results.append(f"[Web page content]\nFetch failed: {data}")
                 continue
 
             text = data.get("text", "")
             title = data.get("title") or url
             warnings = data.get("warnings", [])
+            _log.info("web_read OK: %s — %d chars, title='%s'", url, len(text), title[:80])
 
             if not text:
                 results.append("[Web page content]\n(Page returned no readable text content.)")

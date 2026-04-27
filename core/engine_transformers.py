@@ -828,6 +828,11 @@ class TransformersEngine(BaseEngine):
     def is_loaded(self) -> bool:
         return self.model is not None
 
+    def get_context_size(self) -> int:
+        if self.model is not None:
+            return getattr(self.model.config, "max_position_embeddings", 0)
+        return 0
+
     def needs_reload(self) -> bool:
         return self._loaded_path != get_active_model_path()
 
@@ -973,7 +978,7 @@ class TransformersEngine(BaseEngine):
         gen_kwargs = dict(
             **inputs,
             streamer=streamer,
-            max_new_tokens=max_tokens,
+            max_new_tokens=max_tokens if max_tokens and max_tokens > 0 else 8192,
             temperature=temperature,
             do_sample=True,
             use_cache=True,

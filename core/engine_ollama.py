@@ -165,7 +165,7 @@ class OllamaEngine(BaseEngine):
         model_config = get_ollama_model_config(self.model_name)
 
         options = {
-            "num_predict": max_tokens,
+            "num_predict": max_tokens if max_tokens and max_tokens > 0 else -1,
             "temperature": temperature,
             "stop": STOP_STRINGS,
             "repeat_penalty": 1.15,

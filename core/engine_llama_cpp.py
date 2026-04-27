@@ -11,7 +11,9 @@ OpenAI-compatible API natively, so no message format conversion is needed.
 import json
 import logging
 import os
+import struct
 import subprocess
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -23,6 +25,85 @@ _log = logging.getLogger(__name__)
 
 HEALTH_TIMEOUT = 120  # seconds to wait for server startup (large models are slow)
 HEALTH_POLL_INTERVAL = 0.5
+
+_KV_QUANT_BPE = {
+    "f16": 2.0, "f32": 4.0,
+    "q8_0": 1.0625, "q4_0": 0.5625, "q4_1": 0.625,
+    "q5_0": 0.6875, "q5_1": 0.75,
+}
+
+
+def _read_gguf_kv_params(gguf_path: str) -> dict | None:
+    """Read KV-cache-relevant architecture params from a GGUF file header.
+
+    Returns dict with head_count, head_count_kv, key_dim, val_dim,
+    block_count — or None if the file can't be parsed.
+    """
+    all_wanted = {
+        "attention.head_count", "attention.head_count_kv",
+        "embedding_length", "block_count",
+        "attention.key_length", "attention.value_length",
+    }
+    found = {}
+    try:
+        with open(gguf_path, "rb") as f:
+            magic = struct.unpack("<I", f.read(4))[0]
+            if magic != 0x46554747:
+                return None
+            version = struct.unpack("<I", f.read(4))[0]
+            if version < 2:
+                return None
+            struct.unpack("<Q", f.read(8))  # tensor_count
+            kv_count = struct.unpack("<Q", f.read(8))[0]
+
+            def _str():
+                n = struct.unpack("<Q", f.read(8))[0]
+                return f.read(n).decode("utf-8")
+
+            def _val(t):
+                if t in (0, 7): return struct.unpack("<B", f.read(1))[0]
+                if t == 1:  return struct.unpack("<b", f.read(1))[0]
+                if t == 2:  return struct.unpack("<H", f.read(2))[0]
+                if t == 3:  return struct.unpack("<h", f.read(2))[0]
+                if t == 4:  return struct.unpack("<I", f.read(4))[0]
+                if t == 5:  return struct.unpack("<i", f.read(4))[0]
+                if t == 6:  return struct.unpack("<f", f.read(4))[0]
+                if t == 8:  return _str()
+                if t == 9:
+                    at = struct.unpack("<I", f.read(4))[0]
+                    n = struct.unpack("<Q", f.read(8))[0]
+                    return [_val(at) for _ in range(n)]
+                if t == 10: return struct.unpack("<Q", f.read(8))[0]
+                if t == 11: return struct.unpack("<q", f.read(8))[0]
+                if t == 12: return struct.unpack("<d", f.read(8))[0]
+                raise ValueError(t)
+
+            for _ in range(kv_count):
+                key = _str()
+                vtype = struct.unpack("<I", f.read(4))[0]
+                value = _val(vtype)
+                for suffix in all_wanted:
+                    if key.endswith(suffix):
+                        found[suffix] = value
+                        break
+                if len(found) == len(all_wanted):
+                    break
+    except Exception:
+        return None
+
+    if not all(k in found for k in ("attention.head_count", "embedding_length", "block_count")):
+        return None
+
+    hc = found["attention.head_count"]
+    default_dim = found["embedding_length"] / hc
+    key_dim = found.get("attention.key_length", default_dim)
+    return {
+        "head_count": hc,
+        "head_count_kv": found.get("attention.head_count_kv", hc),
+        "key_dim": key_dim,
+        "val_dim": found.get("attention.value_length", key_dim),
+        "block_count": found["block_count"],
+    }
 
 
 class LlamaCppEngine(BaseEngine):
@@ -55,6 +136,17 @@ class LlamaCppEngine(BaseEngine):
         except Exception:
             return False
 
+    def _get_kv_quant_bpe(self):
+        """(bpe_k, bpe_v) from -ctk/-ctv in extra_flags.  Defaults to f16."""
+        bpe_k = bpe_v = 2.0
+        flags = self.extra_flags
+        for i, flag in enumerate(flags):
+            if flag == "-ctk" and i + 1 < len(flags):
+                bpe_k = _KV_QUANT_BPE.get(flags[i + 1], 2.0)
+            elif flag == "-ctv" and i + 1 < len(flags):
+                bpe_v = _KV_QUANT_BPE.get(flags[i + 1], 2.0)
+        return bpe_k, bpe_v
+
     def _compute_num_ctx(self) -> int:
         if self._configured_num_ctx:
             return self._configured_num_ctx
@@ -73,10 +165,27 @@ class LlamaCppEngine(BaseEngine):
         available_mb = total_mb - SYSTEM_RESERVE_MB - model_loaded_mb
         if available_mb <= 0:
             return MIN_CTX
-        # Without architecture info from the GGUF, use a conservative
-        # 128 KB/token estimate (covers most dense transformer architectures).
-        # For hybrid or MoE models, set num_ctx explicitly in the config.
-        kv_per_token_mb = 128 / 1024
+
+        kv_per_token_mb = None
+        params = _read_gguf_kv_params(self.model_path)
+        if params:
+            bpe_k, bpe_v = self._get_kv_quant_bpe()
+            kv_bytes = (
+                params["block_count"] * params["head_count_kv"]
+                * (params["key_dim"] * bpe_k + params["val_dim"] * bpe_v)
+            )
+            kv_per_token_mb = kv_bytes / (1024 ** 2)
+            _log.info(
+                "GGUF KV sizing: %d layers × %d kv_heads × "
+                "(%.0f×%.3f + %.0f×%.3f) → %.4f MB/tok",
+                params["block_count"], params["head_count_kv"],
+                params["key_dim"], bpe_k, params["val_dim"], bpe_v,
+                kv_per_token_mb,
+            )
+
+        if kv_per_token_mb is None:
+            kv_per_token_mb = 128 / 1024
+
         max_tokens = int((available_mb * 0.90) / kv_per_token_mb)
         for bucket in reversed(STANDARD_BUCKETS):
             if bucket <= max_tokens:
@@ -85,6 +194,15 @@ class LlamaCppEngine(BaseEngine):
 
     def load(self, status_callback=None):
         if self._loaded and self._is_server_healthy():
+            return
+
+        # Another process (API server or GUI) may already have a healthy
+        # server on our port — adopt it instead of launching a duplicate.
+        if self._is_server_healthy():
+            self._loaded = True
+            _log.info("Adopting existing llama-server on port %d", self.port)
+            if status_callback:
+                status_callback(f"llama-server already running — {self.model_name}")
             return
 
         if not os.path.isfile(self.model_path):
@@ -106,6 +224,20 @@ class LlamaCppEngine(BaseEngine):
             "-c", str(self._num_ctx),
         ]
         cmd.extend(self.extra_flags)
+
+        # On Windows, mmap keeps the full GGUF mapped in virtual memory even
+        # with full GPU offload, eating commit charge (pagefile) for nothing.
+        # --no-mmap lets the loader read→transfer→free instead.
+        if sys.platform == "win32" and "--no-mmap" not in cmd:
+            params = _read_gguf_kv_params(self.model_path)
+            if params and self.num_gpu_layers >= params["block_count"]:
+                cmd.append("--no-mmap")
+                _log.info(
+                    "Auto-adding --no-mmap: Windows + full GPU offload "
+                    "(%d ngl >= %d layers)",
+                    self.num_gpu_layers, params["block_count"],
+                )
+
         _log.info("llama-server cmd: %s", " ".join(cmd))
 
         try:
@@ -162,7 +294,14 @@ class LlamaCppEngine(BaseEngine):
             status_callback("llama-server stopped.")
 
     def is_loaded(self) -> bool:
-        return self._loaded and (self._process is not None and self._process.poll() is None)
+        if not self._loaded:
+            return False
+        if self._process is not None:
+            return self._process.poll() is None
+        return self._is_server_healthy()
+
+    def get_context_size(self) -> int:
+        return self._num_ctx or self._configured_num_ctx or 0
 
     def needs_reload(self) -> bool:
         return False
@@ -196,9 +335,10 @@ class LlamaCppEngine(BaseEngine):
             "model": self.model_name,
             "messages": messages,
             "stream": True,
-            "max_tokens": max_tokens or 4096,
             "temperature": temperature,
         }
+        if max_tokens and max_tokens > 0:
+            payload["max_tokens"] = max_tokens
 
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(

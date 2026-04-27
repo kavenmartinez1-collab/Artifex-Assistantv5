@@ -123,23 +123,24 @@ def strip_think_blocks(text):
     return text.strip()
 
 
-def _truncate_repetition(text, min_phrase_len=40):
-    """Detect and truncate repeated phrases/blocks in model output.
+def _truncate_repetition(text, min_phrase_len=80):
+    """Detect and truncate when the model is stuck in a verbatim loop.
 
-    Finds the first phrase of at least `min_phrase_len` chars that repeats
-    and truncates the output to keep only the first occurrence.
+    Requires the same phrase (80+ chars) to appear at least 3 times.
+    Two occurrences is normal in structured output (JSON arrays, markdown
+    tables); three consecutive matches is a genuine repetition loop.
     """
-    if len(text) < min_phrase_len * 2:
+    if len(text) < min_phrase_len * 4:
         return text
 
-    # Slide a window looking for repeated blocks
-    for phrase_len in range(min_phrase_len, min(300, len(text) // 2) + 1, 10):
-        for start in range(0, len(text) - phrase_len * 2):
+    for phrase_len in range(min_phrase_len, min(500, len(text) // 3) + 1, 20):
+        for start in range(0, len(text) - phrase_len * 3):
             phrase = text[start:start + phrase_len]
-            # Look for this exact phrase later in the text
             second = text.find(phrase, start + phrase_len)
-            if second != -1:
-                # Found repetition — keep up to the start of the second occurrence
+            if second == -1:
+                continue
+            third = text.find(phrase, second + phrase_len)
+            if third != -1:
                 return text[:second].rstrip()
 
     return text
@@ -292,6 +293,41 @@ def compress_history(history, context_window):
         result.append(pinned_msg)
     result.append({"role": "user", "content": summary_text})
     result.extend(recent_messages)
+    return result
+
+
+def trim_messages_to_context(messages, max_input_tokens):
+    """Drop oldest middle messages so total tokens fit within a hard budget.
+
+    Keeps: system prompt (first message) + most recent 2 messages.
+    Falls back to truncating the last message content if it alone exceeds budget.
+    """
+    if max_input_tokens <= 0 or len(messages) <= 1:
+        return messages
+
+    est = lambda msgs: _count_tokens(msgs)
+
+    if est(messages) <= max_input_tokens:
+        return messages
+
+    system = messages[:1]
+    middle = list(messages[1:-2]) if len(messages) > 3 else []
+    tail = list(messages[-2:]) if len(messages) >= 2 else []
+
+    while middle and est(system + middle + tail) > max_input_tokens:
+        middle.pop(0)
+
+    result = system + middle + tail
+
+    if est(result) > max_input_tokens and len(result) >= 2:
+        last = dict(result[-1])
+        content = last.get("content", "")
+        overshoot = est(result) - max_input_tokens
+        chars_to_cut = overshoot * 4 + 200
+        if chars_to_cut < len(content):
+            last["content"] = content[:len(content) - chars_to_cut] + "\n[...trimmed...]"
+            result[-1] = last
+
     return result
 
 

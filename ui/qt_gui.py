@@ -409,6 +409,16 @@ class ArtifexMainWindow(QMainWindow):
         video_layout.addStretch()
         self._tabs.addTab(video_container, "Video")
 
+        # Logs tab — live log stream
+        self._log_view = QPlainTextEdit()
+        self._log_view.setReadOnly(True)
+        self._log_view.setMaximumBlockCount(2000)
+        self._log_view.setStyleSheet(
+            "font-family: Consolas; font-size: 9pt; background: #0a0a0a; color: #c8c8c8;"
+        )
+        self._tabs.addTab(self._log_view, "Logs")
+        self._install_log_handler()
+
         layout.addWidget(self._tabs, 1)
 
         # Action panel (suggested commands — hidden by default)
@@ -451,7 +461,7 @@ class ArtifexMainWindow(QMainWindow):
         ctrl_layout = QHBoxLayout()
 
         ctrl_layout.addWidget(QLabel("Tokens:"))
-        self._tokens_input = QLineEdit(str(MODES["ASSISTANT"].max_tokens))
+        self._tokens_input = QLineEdit("max")
         self._tokens_input.setMaximumWidth(60)
         ctrl_layout.addWidget(self._tokens_input)
 
@@ -555,6 +565,40 @@ class ArtifexMainWindow(QMainWindow):
         layout.addWidget(self._thinking_output)
 
         self._splitter.addWidget(thinking)
+
+    def _install_log_handler(self):
+        """Route Python logging into the Logs tab via a signal-safe handler."""
+        import logging
+        from PyQt6.QtCore import QObject, pyqtSignal
+
+        class _Emitter(QObject):
+            log_message = pyqtSignal(str)
+
+        emitter = _Emitter()
+        emitter.log_message.connect(self._append_log_line)
+        self._log_emitter = emitter
+
+        class _QtHandler(logging.Handler):
+            def __init__(self, sig):
+                super().__init__()
+                self._sig = sig
+
+            def emit(self, record):
+                try:
+                    self._sig.emit(self.format(record))
+                except RuntimeError:
+                    pass
+
+        handler = _QtHandler(emitter.log_message)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter(
+            fmt="[%(asctime)s %(levelname)s %(name)s] %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        logging.getLogger().addHandler(handler)
+
+    def _append_log_line(self, text: str):
+        self._log_view.appendPlainText(text)
 
     def _build_status_bar(self):
         self._status_bar = QStatusBar()
@@ -687,7 +731,7 @@ class ArtifexMainWindow(QMainWindow):
         set_context_profile(new)
         self._ctx_btn.setText(f"CTX: {new}")
         profile = get_context_profile()
-        self._tokens_input.setText(str(profile.max_output_tokens))
+        self._tokens_input.setText("max")
 
     def _on_help_choose_model(self):
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTextBrowser, QDialogButtonBox
@@ -767,7 +811,8 @@ class ArtifexMainWindow(QMainWindow):
                 self._set_status("Enter a prompt first")
             return
 
-        max_tokens = int(self._tokens_input.text() or "2048")
+        _tok_text = self._tokens_input.text().strip().lower()
+        max_tokens = -1 if _tok_text in ("max", "") else int(_tok_text)
         temperature = self._temp_slider.value() / 10.0
 
         # Voice Assistant with recording but no text — transcribe first
@@ -801,11 +846,15 @@ class ArtifexMainWindow(QMainWindow):
         self._update_system_prompt(mode)
 
         # Build active messages
-        from core.inference import build_active_messages
+        from core.inference import build_active_messages, trim_messages_to_context
         mode_cfg = MODES.get(mode.upper(), MODES["ASSISTANT"])
         _, active_msgs = build_active_messages(
             self.messages, mode_cfg.context_window
         )
+        if self.engine:
+            ctx = self.engine.get_context_size()
+            if ctx > 0:
+                active_msgs = trim_messages_to_context(active_msgs, int(ctx * 0.85))
 
         # Show user message in chat
         user_bubble = self._chat_view.add_bubble("user")
@@ -888,9 +937,10 @@ class ArtifexMainWindow(QMainWindow):
             files = self._drop_zone.attached_files
             if files:
                 try:
-                    max_tokens = int(self._tokens_input.text() or "512")
+                    _vt = self._tokens_input.text().strip().lower()
+                    max_tokens = -1 if _vt in ("max", "") else int(_vt)
                 except ValueError:
-                    max_tokens = 512
+                    max_tokens = -1
                 kwargs = {"image_path": files[0],
                           "prompt": prompt or "Describe what is happening in detail.",
                           "max_tokens": max_tokens}
@@ -1303,11 +1353,14 @@ class ArtifexMainWindow(QMainWindow):
             self.messages.append({"role": "user", "content": feedback_msg})
             self._update_system_prompt()
 
-            from core.inference import build_active_messages
+            from core.inference import build_active_messages, trim_messages_to_context
             mode_cfg = MODES["ASSISTANT"]
             _, active_msgs = build_active_messages(
                 self.messages, mode_cfg.context_window
             )
+            ctx = self.engine.get_context_size()
+            if ctx > 0:
+                active_msgs = trim_messages_to_context(active_msgs, int(ctx * 0.85))
 
             self._current_bubble = self._chat_view.add_bubble("assistant")
             self._current_bubble.add_text("")

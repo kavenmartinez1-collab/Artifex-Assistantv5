@@ -39,22 +39,28 @@ from urllib.parse import urljoin
 # ─────────────────────────────────────────────────────────────────────────────
 
 _gateway_available = None  # None = not checked, True/False = cached result
+_gateway_checked_at = 0.0
+_GATEWAY_CACHE_TTL = 30  # re-check every 30s if previously unavailable
 
 
 def _check_gateway():
-    """Check if the web gateway is reachable. Result is cached."""
-    global _gateway_available
-    if _gateway_available is not None:
-        return _gateway_available
+    """Check if the web gateway is reachable. Caches success permanently,
+    retries failures every 30s so a late-starting Docker container is found."""
+    global _gateway_available, _gateway_checked_at
+    if _gateway_available:
+        return True
     if not WEB_GATEWAY_URL:
-        _gateway_available = False
         return False
+    now = time.monotonic()
+    if _gateway_available is not None and now - _gateway_checked_at < _GATEWAY_CACHE_TTL:
+        return _gateway_available
     try:
         req = Request(f"{WEB_GATEWAY_URL}/health", method="GET")
         with urlopen(req, timeout=3) as resp:
             _gateway_available = resp.status == 200
     except Exception:
         _gateway_available = False
+    _gateway_checked_at = now
     return _gateway_available
 
 

@@ -28,7 +28,7 @@ from core.config import (
     MODES, get_active_backend, get_active_model_name, get_model_names,
 )
 from core.engine_factory import create_engine
-from core.inference import strip_think_blocks, ThinkFilter
+from core.inference import strip_think_blocks, ThinkFilter, trim_messages_to_context
 from core.model_queue import get_model_queue
 from core.health import run_health_check, format_health_report
 from core.logging_config import get_logger
@@ -484,8 +484,7 @@ def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options,
         ollama_options.update(options)
     if temperature is not None:
         ollama_options["temperature"] = temperature
-    if max_tokens is not None:
-        ollama_options["num_predict"] = max_tokens
+    ollama_options["num_predict"] = max_tokens if max_tokens and max_tokens > 0 else -1
 
     # Scale socket timeout with num_ctx. A 300s text default works for 8B
     # models on small prompts, but 27B 2-bit doing 17K-token prompt + 5K-gen
@@ -593,8 +592,7 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
         ollama_options.update(options)
     if temperature is not None:
         ollama_options["temperature"] = temperature
-    if max_tokens is not None:
-        ollama_options["num_predict"] = max_tokens
+    ollama_options["num_predict"] = max_tokens if max_tokens and max_tokens > 0 else -1
 
     # See _proxy_ollama_chat for rationale — same num_ctx-scaled timeout.
     timeout = max(timeout, min(1800, ollama_options["num_ctx"] // 30))
@@ -718,7 +716,7 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
 
     try:
         engine.generate_streaming(
-            messages, max_tokens=max_tokens or 4096,
+            messages, max_tokens=max_tokens if max_tokens and max_tokens > 0 else -1,
             temperature=temperature, on_token=on_token,
         )
         tf.flush()
@@ -764,6 +762,20 @@ def _inject_web_tool_prompt(messages: list):
         messages.insert(0, {"role": "system", "content": _WEB_TOOL_SYSTEM_PROMPT})
 
 
+def _get_context_budget(backend: str) -> int:
+    """Return input token budget for the current engine, or 0 if unknown."""
+    if backend == "ollama":
+        return 0
+    try:
+        engine = _get_engine()
+        ctx = engine.get_context_size()
+        if ctx > 0:
+            return int(ctx * 0.85)
+    except Exception:
+        pass
+    return 0
+
+
 # ── Unified streaming with optional tool execution ──────────────────────
 
 async def _stream_with_tools(messages: list, model: str, max_tokens: int,
@@ -779,9 +791,14 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
     last_finish_reason = "stop"  # Updated from engine usage events
 
     current_messages = list(messages)
+    msg_tokens_est = sum(len(m.get("content", "")) for m in current_messages) // 4
+
+    _log.info("[%s] web_tools=%s, backend=%s, %d messages (~%d tok), max_tokens=%s",
+              chat_id, use_web_tools, backend, len(current_messages), msg_tokens_est, max_tokens)
 
     if use_web_tools:
         _inject_web_tool_prompt(current_messages)
+        _log.info("[%s] Injected web tool system prompt", chat_id)
 
     round_count = 0
 
@@ -845,27 +862,37 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
         else:
             last_finish_reason = usage.get("finish_reason", "stop")
 
-        _log.info("Generation complete: %d chars, web_tools=%s, response='%s'",
-                   len(full_response), use_web_tools, full_response[:120])
+        _log.info("[%s] Round %d complete: %d chars, response='%s'",
+                   chat_id, round_count, len(full_response), full_response[:200])
 
         # ── Tool execution check ──────────────────────────────────────
         if not use_web_tools:
-            _log.info("web_tools disabled, skipping tool check")
+            _log.info("[%s] web_tools disabled — returning final response", chat_id)
             break
 
         tools = extract_web_tools(full_response)
         has_gw = gateway_available() if tools else False
-        _log.info("Tool check: %d tools found, gateway=%s", len(tools), has_gw)
+        _log.info("[%s] Tool extraction: found %d tool calls, gateway_up=%s",
+                  chat_id, len(tools), has_gw)
+        if tools:
+            for t in tools:
+                _log.info("[%s]   → %s: %s", chat_id, t.get("type"), t.get("query") or t.get("ref"))
 
         if not tools or not has_gw:
             if tools and not has_gw:
-                _log.warning("Model requested tools but web gateway unavailable")
+                _log.warning("[%s] Model emitted tool calls but web gateway unavailable — "
+                             "returning raw response", chat_id)
+            elif not tools and use_web_tools:
+                _log.info("[%s] Model did NOT emit any @search/@web_read calls despite "
+                          "web_tools=true — check system prompt compliance", chat_id)
             break
 
         round_count += 1
         if round_count > MAX_TOOL_ROUNDS:
             _log.warning("Max tool rounds (%d) reached — forcing answer", MAX_TOOL_ROUNDS)
-            # Force the model to synthesize an answer with what it has
+            budget = _get_context_budget(backend)
+            if budget > 0:
+                current_messages = trim_messages_to_context(current_messages, budget)
             current_messages.append({
                 "role": "system",
                 "content": (
@@ -903,7 +930,7 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
             t.join(timeout=10)
             break
 
-        _log.info("Tool round %d: %d tools detected", round_count, len(tools))
+        _log.info("[%s] Tool round %d: executing %d tools", chat_id, round_count, len(tools))
 
         # Notify client that tools are executing
         labels = tool_status_labels(tools)
@@ -914,16 +941,17 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
             tool_output = await loop.run_in_executor(
                 None, lambda: execute_web_tools(tools, search_cache)
             )
-            _log.info("Tool execution complete: %d chars of results", len(tool_output))
+            _log.info("[%s] Tool results: %d chars, preview='%s'",
+                      chat_id, len(tool_output), tool_output[:200])
         except Exception as e:
-            _log.error("Tool execution error: %s", e)
+            _log.error("[%s] Tool execution error: %s", chat_id, e)
             tool_output = f"Tool execution failed: {e}"
 
         # Signal client to reset for follow-up response
         yield f"data: {json.dumps({'x_tool_done': True})}\n\n"
-        _log.info("Starting follow-up generation with tool results")
 
         # Build follow-up messages with tool results
+        msg_count_before = len(current_messages)
         current_messages.append({"role": "assistant", "content": full_response})
         current_messages.append({
             "role": "user",
@@ -932,6 +960,18 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                 f"{tool_output}"
             ),
         })
+
+        # Trim to fit context window — drop oldest middle turns
+        budget = _get_context_budget(backend)
+        est_tokens = sum(len(m.get("content", "")) for m in current_messages) // 4
+        _log.info("[%s] Pre-trim: %d messages (~%d tok), ctx_budget=%d",
+                  chat_id, len(current_messages), est_tokens, budget)
+        if budget > 0:
+            current_messages = trim_messages_to_context(current_messages, budget)
+            new_est = sum(len(m.get("content", "")) for m in current_messages) // 4
+            if new_est < est_tokens:
+                _log.info("[%s] Trimmed: %d messages (~%d tok)", chat_id, len(current_messages), new_est)
+        _log.info("[%s] Starting follow-up round %d", chat_id, round_count + 1)
         # Loop continues with new generation round
 
     # ── Final events ──────────────────────────────────────────────────
@@ -1069,6 +1109,9 @@ def create_app():
         stream = body.stream
         use_web_tools = body.web_tools or False
         backend = get_active_backend()
+        _log.info("POST /v1/chat/completions: model=%s, web_tools=%s, stream=%s, "
+                  "backend=%s, %d messages",
+                  body.model, use_web_tools, stream, backend, len(messages))
 
         if not messages:
             raise HTTPException(status_code=400, detail="messages is required")
@@ -1098,7 +1141,7 @@ def create_app():
                             _get_engine()  # Load/reload transformers model
 
                         async for chunk in _stream_with_tools(
-                            messages, model, max_tokens or 4096, temperature,
+                            messages, model, max_tokens or -1, temperature,
                             body.options, use_web_tools, backend,
                         ):
                             yield chunk
@@ -1151,7 +1194,8 @@ def create_app():
             response = await loop.run_in_executor(
                 None,
                 lambda: engine.generate_streaming(
-                    messages, max_tokens=max_tokens or 4096,
+                    messages,
+                    max_tokens=max_tokens if max_tokens and max_tokens > 0 else -1,
                     temperature=temperature,
                 ),
             )

@@ -29,6 +29,10 @@ class BaseEngine(ABC):
     def periodic_cleanup(self):
         """Run lightweight cleanup between generations (e.g. VRAM GC)."""
 
+    def get_context_size(self) -> int:
+        """Max context window in tokens, or 0 if unknown."""
+        return 0
+
     @abstractmethod
     def count_tokens(self, text: str) -> int:
         """Count tokens in a string. Used for context budgeting."""

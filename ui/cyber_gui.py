@@ -24,6 +24,7 @@ from core.config import (
 from core.engine_factory import create_engine
 from core.inference import (
     ThinkFilter, compress_history, build_active_messages,
+    trim_messages_to_context,
     check_vram_pressure, vram_pressure_relief,
 )
 from core.prompts import build_assistant_prompt
@@ -237,7 +238,7 @@ class ArtifexGUI:
             ],
             [
                 sg.Text("Tokens:", text_color="#f9f871", font=FONT_SMALL),
-                sg.Input(str(MODES["ASSISTANT"].max_tokens), size=(5, 1), key="-TOKENS-",
+                sg.Input("max", size=(5, 1), key="-TOKENS-",
                          font=FONT_SMALL),
                 sg.Text("Temp:", text_color="#f9f871", font=FONT_SMALL),
                 sg.Slider((0.1, 1.5), 0.7, 0.1, orientation="h", size=(8, 12),
@@ -502,6 +503,10 @@ class ArtifexGUI:
 
             mode_cfg = MODES["ASSISTANT"]
             self.messages, active_messages = build_active_messages(self.messages, mode_cfg.context_window)
+            if self.engine:
+                ctx = self.engine.get_context_size()
+                if ctx > 0:
+                    active_messages = trim_messages_to_context(active_messages, int(ctx * 0.85))
 
             history_text = ""
             _display_cap = 4000  # per-message cap for GUI rendering only
@@ -593,6 +598,10 @@ class ArtifexGUI:
 
                 mode_cfg = MODES["ASSISTANT"]
                 self.messages, active_messages = build_active_messages(self.messages, mode_cfg.context_window)
+                if self.engine:
+                    ctx = self.engine.get_context_size()
+                    if ctx > 0:
+                        active_messages = trim_messages_to_context(active_messages, int(ctx * 0.85))
 
                 self.window["-OUTPUT-"].update("\nASSISTANT: ", append=True)
                 self.window["-THINKING-"].update("")
@@ -809,7 +818,8 @@ class ArtifexGUI:
                 self.busy = True
                 self.window["-STATUS-"].update("GENERATING...")
                 self.window["-PROMPT-"].update("")
-                max_tokens = int(values["-TOKENS-"])
+                _ct = str(values["-TOKENS-"]).strip().lower()
+                max_tokens = -1 if _ct in ("max", "") else int(_ct)
                 temp = values["-TEMP-"]
 
                 # Sync optimization toggles to config
