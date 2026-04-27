@@ -26,7 +26,7 @@ from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QFont
 from PyQt6.QtWidgets import (
     QFrame, QLabel, QVBoxLayout, QHBoxLayout, QWidget,
     QScrollArea, QPushButton, QSlider, QSizePolicy, QFileDialog,
-    QDialog,
+    QDialog, QPlainTextEdit,
 )
 
 
@@ -520,12 +520,15 @@ class ChatBubble(QFrame):
     audio/video as embedded player widgets.
     """
 
+    _MAX_LABEL_CHARS = 8192
+
     def __init__(self, role: str, parent=None):
         super().__init__(parent)
         self._role = role
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(8, 6, 8, 6)
         self._layout.setSpacing(4)
+        self._stream_widget = None
 
         # Role label
         role_label = QLabel(role.upper())
@@ -550,8 +553,15 @@ class ChatBubble(QFrame):
         bubble grows naturally to fit its wrapped content via the parent
         layout — no manual height calculation, no re-entrant signal storms,
         no internal viewport to fight the outer chat scroll area.
+
+        Very large text (>8KB) is truncated for display to avoid QLabel
+        word-wrap layout stalls.
         """
-        label = QLabel(text)
+        display = text
+        if len(text) > self._MAX_LABEL_CHARS:
+            remaining = len(text) - self._MAX_LABEL_CHARS
+            display = text[:self._MAX_LABEL_CHARS] + f"\n\n[...{remaining:,} more characters]"
+        label = QLabel(display)
         label.setWordWrap(True)
         label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
@@ -590,20 +600,68 @@ class ChatBubble(QFrame):
         return player
 
     def append_text(self, text: str):
-        """Append text to the last text label, or create one.
+        """Append text to the streaming content area.
 
-        QLabel doesn't have a streaming insert API like QTextCursor, but
-        for chat-scale text the O(n) re-set per batch is fine — we batch
-        tokens at 50ms via TokenBatcher, so this runs ~20 times per second
-        with a few hundred chars at most per call.
+        On first call, promotes the placeholder QLabel (from add_text(""))
+        to a read-only QPlainTextEdit that supports O(1) cursor-based
+        append — avoids the O(n^2) QLabel.setText(text()+new) relayout
+        that freezes the GUI on long responses (24K+ tokens).
         """
+        if self._stream_widget is not None:
+            cursor = self._stream_widget.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            cursor.insertText(text)
+            self._update_stream_height()
+            return
+
+        # First call: remove placeholder QLabel, create stream widget
         for i in range(self._layout.count() - 1, -1, -1):
             widget = self._layout.itemAt(i).widget()
             if isinstance(widget, QLabel) and widget.wordWrap():
-                widget.setText(widget.text() + text)
-                return
-        # No text label found — create one
-        self.add_text(text)
+                existing = widget.text()
+                self._layout.removeWidget(widget)
+                widget.deleteLater()
+                break
+        else:
+            existing = ""
+
+        edit = QPlainTextEdit()
+        edit.setReadOnly(True)
+        edit.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        edit.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        edit.setStyleSheet(
+            "background: transparent; border: none; "
+            "font-family: Consolas; font-size: 10pt;"
+        )
+        edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        edit.setMinimumHeight(30)
+        self._layout.addWidget(edit)
+        self._stream_widget = edit
+
+        if existing:
+            edit.setPlainText(existing)
+
+        cursor = edit.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.insertText(text)
+        self._update_stream_height()
+
+    def _update_stream_height(self):
+        """Resize stream widget to fit content without signal storms."""
+        if self._stream_widget is None:
+            return
+        doc = self._stream_widget.document()
+        margins = self._stream_widget.contentsMargins()
+        height = int(doc.size().height()) + margins.top() + margins.bottom()
+        height += self._stream_widget.frameWidth() * 2
+        self._stream_widget.setFixedHeight(max(30, height))
 
 
 # ── Chat View ────────────────────────────────────────────────────────────

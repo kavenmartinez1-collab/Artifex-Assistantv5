@@ -737,6 +737,33 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
         out_queue.put(_SENTINEL)
 
 
+_WEB_TOOL_SYSTEM_PROMPT = (
+    "You have access to web search tools. When answering questions that "
+    "would benefit from current or external information, use them:\n"
+    "- @search(\"query\") — web search. Returns numbered results.\n"
+    "- @web_read(N) — read full page for search result N.\n"
+    "- @web_read(\"url\") — read a specific URL.\n"
+    "Write tool calls on their own line. After using @search(), review "
+    "the results and use @web_read(N) to get details from the most "
+    "relevant pages. Then answer the question using what you found."
+)
+
+
+def _inject_web_tool_prompt(messages: list):
+    """Prepend web tool instructions to the conversation's system prompt.
+
+    If the first message is a system message, appends the tool instructions
+    to it. Otherwise inserts a new system message at the front.
+    """
+    if messages and messages[0].get("role") == "system":
+        messages[0] = dict(messages[0])
+        messages[0]["content"] = (
+            messages[0]["content"] + "\n\n" + _WEB_TOOL_SYSTEM_PROMPT
+        )
+    else:
+        messages.insert(0, {"role": "system", "content": _WEB_TOOL_SYSTEM_PROMPT})
+
+
 # ── Unified streaming with optional tool execution ──────────────────────
 
 async def _stream_with_tools(messages: list, model: str, max_tokens: int,
@@ -752,6 +779,10 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
     last_finish_reason = "stop"  # Updated from engine usage events
 
     current_messages = list(messages)
+
+    if use_web_tools:
+        _inject_web_tool_prompt(current_messages)
+
     round_count = 0
 
     while True:

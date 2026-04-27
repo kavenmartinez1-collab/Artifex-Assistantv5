@@ -247,6 +247,33 @@ def get_tool_output_limit(tool_type=None):
 _last_search_results = []
 
 
+def _extract_fenced_blocks(text, languages):
+    """Extract content from fenced code blocks using string scanning.
+
+    Safe for arbitrarily large input — O(n) with no regex backtracking.
+    """
+    blocks = []
+    pos = 0
+    while pos < len(text):
+        fence_start = text.find("```", pos)
+        if fence_start == -1:
+            break
+        line_end = text.find("\n", fence_start)
+        if line_end == -1:
+            break
+        tag = text[fence_start + 3:line_end].strip().lower()
+        if tag not in languages:
+            pos = fence_start + 3
+            continue
+        content_start = line_end + 1
+        close = text.find("```", content_start)
+        if close == -1:
+            break
+        blocks.append(text[content_start:close])
+        pos = close + 3
+    return blocks
+
+
 def extract_agent_actions(response):
     """
     Extract executable actions from an ASSISTANT mode response.
@@ -268,9 +295,8 @@ def extract_agent_actions(response):
     )
 
     # --- Shell code blocks (treat entire block as one command for powershell) ---
-    shell_blocks = re.findall(
-        r"```(?:bash|sh|shell|console|cmd|powershell|zsh)\s*\n(.*?)```",
-        response, re.DOTALL,
+    shell_blocks = _extract_fenced_blocks(
+        response, {"bash", "sh", "shell", "console", "cmd", "powershell", "zsh"},
     )
     for block in shell_blocks:
         block = block.strip()
@@ -303,10 +329,7 @@ def extract_agent_actions(response):
                     actions.append(AgentAction("shell", line, line))
 
     # --- Python code blocks ---
-    python_blocks = re.findall(
-        r"```(?:python|py)\s*\n(.*?)```",
-        response, re.DOTALL,
-    )
+    python_blocks = _extract_fenced_blocks(response, {"python", "py"})
     for block in python_blocks:
         code = block.strip()
         if not code:
@@ -395,11 +418,11 @@ def extract_agent_actions(response):
     #   exact text to replace
     #   NEW:
     #   replacement text
-    edit_blocks = re.findall(r"```edit\s*\n(.*?)```", response, re.DOTALL)
+    edit_blocks = _extract_fenced_blocks(response, {"edit"})
     for block in edit_blocks:
-        file_m = re.search(r"^FILE:\s*(.+)$", block, re.MULTILINE)
-        old_m = re.search(r"^OLD:\s*\n(.*?)\nNEW:", block, re.DOTALL | re.MULTILINE)
-        new_m = re.search(r"^NEW:\s*\n(.*?)$", block, re.DOTALL | re.MULTILINE)
+        file_m = re.search(r"^FILE:[ \t]*(.+)$", block, re.MULTILINE)
+        old_m = re.search(r"^OLD:[ \t]*\n(.*?)\nNEW:", block, re.DOTALL | re.MULTILINE)
+        new_m = re.search(r"^NEW:[ \t]*\n(.*?)$", block, re.DOTALL | re.MULTILINE)
         if not (file_m and old_m and new_m):
             continue
         path = file_m.group(1).strip()
