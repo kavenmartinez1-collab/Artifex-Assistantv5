@@ -28,6 +28,7 @@ from tools.agent_tools import (
     get_tool_output_limit,
     MAX_AGENT_ROUNDS,
 )
+from core.sandbox import check_policy, RiskLevel
 from tools.tool_cache import maybe_cache_output, clear_cache, SessionMap, update_session_map
 from core.resilience import engine_recovery, generate_with_recovery
 from core.session import save_session, load_session, list_sessions, find_session, auto_save, cleanup_web_quarantine
@@ -166,44 +167,90 @@ def _execute_action(action, km=None, smap=None):
 
 
 def offer_action_execution(actions, km=None, smap=None):
-    """After AI response, offer to execute detected actions."""
+    """After AI response, offer to execute detected actions.
+
+    Consults the sandbox policy engine to determine which actions can be
+    auto-executed and which require human confirmation.
+    """
     if not actions:
         return None
 
-    print(f"\n{Fore.YELLOW}  Detected actions:{Style.RESET_ALL}")
+    _RISK_ICON = {
+        RiskLevel.SAFE: f"{Fore.GREEN}SAFE",
+        RiskLevel.LOW: f"{Fore.GREEN}LOW",
+        RiskLevel.MEDIUM: f"{Fore.YELLOW}MED",
+        RiskLevel.HIGH: f"{Fore.RED}HIGH",
+        RiskLevel.CRITICAL: f"{Fore.RED}CRIT",
+    }
+
+    auto_indices = []
+    confirm_actions = []
+
     for i, action in enumerate(actions):
-        label = action.type.upper()
-        print(f"    {Fore.GREEN}{i+1}. [{label}] {Fore.WHITE}{action.display}")
-
-    print(
-        f"\n{Fore.YELLOW}  Run which? {Fore.WHITE}"
-        f"(1-{len(actions)}, 'a' for all, Enter to skip): ",
-        end="",
-    )
-    choice = input().strip().lower()
-
-    if not choice:
-        return None
+        decision = check_policy(action.type, action.content)
+        if not decision.allowed:
+            risk_str = _RISK_ICON.get(decision.risk_level, "?")
+            print(
+                f"    {Fore.RED}[BLOCKED] [{risk_str}{Fore.RED}] "
+                f"{action.display}: {decision.reason}{Style.RESET_ALL}"
+            )
+            continue
+        if not decision.requires_confirmation:
+            auto_indices.append(i)
+        else:
+            confirm_actions.append(i)
 
     outputs = []
-    indices = []
 
-    if choice == "a":
-        indices = list(range(len(actions)))
-    else:
-        for part in choice.replace(",", " ").split():
-            try:
-                idx = int(part) - 1
-                if 0 <= idx < len(actions):
-                    indices.append(idx)
-            except ValueError:
-                pass
+    if auto_indices:
+        print(f"\n{Fore.GREEN}  Auto-executing ({len(auto_indices)} policy-allowed):{Style.RESET_ALL}")
+        for idx in auto_indices:
+            action = actions[idx]
+            risk = check_policy(action.type, action.content).risk_level
+            risk_str = _RISK_ICON.get(risk, "?")
+            print(f"    {Fore.GREEN}> [{risk_str}{Fore.GREEN}] {action.display}{Style.RESET_ALL}")
+            output = _execute_action(action, km, smap)
+            if output is not None:
+                outputs.append(f"[{action.type} output] `{action.display}`:\n{output}")
 
-    for idx in indices:
-        output = _execute_action(actions[idx], km, smap)
-        if output is not None:
-            label = actions[idx].type
-            outputs.append(f"[{label} output] `{actions[idx].display}`:\n{output}")
+    if confirm_actions:
+        print(f"\n{Fore.YELLOW}  Actions needing confirmation:{Style.RESET_ALL}")
+        for display_num, idx in enumerate(confirm_actions, 1):
+            action = actions[idx]
+            risk = check_policy(action.type, action.content).risk_level
+            risk_str = _RISK_ICON.get(risk, "?")
+            label = action.type.upper()
+            print(
+                f"    {Fore.GREEN}{display_num}. [{risk_str}{Fore.GREEN}] "
+                f"[{label}] {Fore.WHITE}{action.display}"
+            )
+
+        print(
+            f"\n{Fore.YELLOW}  Run which? {Fore.WHITE}"
+            f"(1-{len(confirm_actions)}, 'a' for all, Enter to skip): ",
+            end="",
+        )
+        choice = input().strip().lower()
+
+        if choice:
+            indices = []
+            if choice == "a":
+                indices = list(range(len(confirm_actions)))
+            else:
+                for part in choice.replace(",", " ").split():
+                    try:
+                        num = int(part) - 1
+                        if 0 <= num < len(confirm_actions):
+                            indices.append(num)
+                    except ValueError:
+                        pass
+
+            for ci in indices:
+                idx = confirm_actions[ci]
+                output = _execute_action(actions[idx], km, smap)
+                if output is not None:
+                    label = actions[idx].type
+                    outputs.append(f"[{label} output] `{actions[idx].display}`:\n{output}")
 
     if outputs:
         return "\n\n".join(outputs)
