@@ -113,6 +113,8 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     options: Optional[dict] = None
     web_tools: Optional[bool] = False
+    grammar: Optional[str] = Field(None, description="GBNF grammar string for constrained generation (llama.cpp only)")
+    response_format: Optional[dict] = Field(None, description="Response format constraint, e.g. {\"type\": \"json_object\"} or {\"type\": \"json_schema\", \"json_schema\": {...}}")
 
 class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., example="A sunset over mountains")
@@ -166,6 +168,10 @@ class VoiceAssistantRequest(BaseModel):
 
 class EmbeddingRequest(BaseModel):
     input: List[str] = Field(..., example=["Hello world"])
+
+class TokenizeRequest(BaseModel):
+    text: Optional[str] = Field(None, description="Raw text to tokenize")
+    messages: Optional[List[ChatMessage]] = Field(None, description="Messages to tokenize (rendered via chat template)")
 
 
 # ── SSE helpers ──────────────────────────────────────────────────────────
@@ -697,8 +703,9 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
 # ── Transformers streaming ──────────────────────────────────────────────
 
 def _stream_transformers_raw(engine, messages, max_tokens, temperature,
-                             out_queue: queue.Queue):
-    """Stream from Transformers engine into a queue. Runs in a background thread.
+                             out_queue: queue.Queue,
+                             grammar=None, response_format=None):
+    """Stream from Transformers/llama.cpp engine into a queue. Runs in a background thread.
 
     Uses ThinkFilter to separate thinking from response content.
     Pushes same tuple format as _stream_ollama_raw.
@@ -718,6 +725,7 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
         engine.generate_streaming(
             messages, max_tokens=max_tokens if max_tokens and max_tokens > 0 else -1,
             temperature=temperature, on_token=on_token,
+            grammar=grammar, response_format=response_format,
         )
         tf.flush()
 
@@ -780,7 +788,8 @@ def _get_context_budget(backend: str) -> int:
 
 async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                              temperature: float, options: dict,
-                             use_web_tools: bool, backend: str):
+                             use_web_tools: bool, backend: str,
+                             grammar=None, response_format=None):
     """Full streaming generator with optional tool execution loop.
 
     Yields SSE events. Handles both Ollama and Transformers backends.
@@ -821,7 +830,8 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
             engine = _get_engine()
             thread = threading.Thread(
                 target=_stream_transformers_raw,
-                args=(engine, current_messages, max_tokens, temperature, q),
+                args=(engine, current_messages, max_tokens, temperature, q,
+                      grammar, response_format),
                 daemon=True,
             )
 
@@ -1096,6 +1106,29 @@ def create_app():
         ]
         return {"object": "list", "data": data}
 
+    # ─── Tokenize ────────────────────────────────────────────────────────
+
+    @app.post("/v1/tokenize")
+    async def tokenize(request: Request, body: TokenizeRequest):
+        """Count tokens in text or messages. Uses the active engine's tokenizer."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        if not body.text and not body.messages:
+            raise HTTPException(status_code=400, detail="Provide 'text' or 'messages'")
+
+        if body.messages:
+            text = "\n".join(
+                f"{m.role}: {m.content}" if isinstance(m.content, str)
+                else f"{m.role}: [multimodal]"
+                for m in body.messages
+            )
+        else:
+            text = body.text
+
+        engine = _get_engine()
+        count = engine.count_tokens(text)
+        return {"token_count": count, "text_length": len(text)}
+
     # ─── Chat Completions ─────────────────────────────────────────────────
 
     @app.post("/v1/chat/completions")
@@ -1143,6 +1176,8 @@ def create_app():
                         async for chunk in _stream_with_tools(
                             messages, model, max_tokens or -1, temperature,
                             body.options, use_web_tools, backend,
+                            grammar=body.grammar,
+                            response_format=body.response_format,
                         ):
                             yield chunk
                 except Exception as e:
@@ -1188,7 +1223,7 @@ def create_app():
                     _log.error("Ollama proxy error: %s", e)
                     raise HTTPException(status_code=502, detail=str(e))
 
-            # Transformers non-streaming
+            # Transformers / llama_cpp non-streaming
             engine = _get_engine()
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
@@ -1197,6 +1232,8 @@ def create_app():
                     messages,
                     max_tokens=max_tokens if max_tokens and max_tokens > 0 else -1,
                     temperature=temperature,
+                    grammar=body.grammar,
+                    response_format=body.response_format,
                 ),
             )
             response = strip_think_blocks(response) if response else ""

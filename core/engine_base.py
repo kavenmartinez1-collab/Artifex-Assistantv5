@@ -40,7 +40,8 @@ class BaseEngine(ABC):
     @abstractmethod
     def generate_streaming(self, messages, max_tokens, temperature,
                            on_token=None, on_complete=None,
-                           enable_thinking=True) -> str:
+                           enable_thinking=True,
+                           grammar=None, response_format=None) -> str:
         """Run streaming inference.
 
         Args:
@@ -50,6 +51,9 @@ class BaseEngine(ABC):
             on_token: callback(str) for each new chunk (raw, includes thinking)
             on_complete: callback(str) with final cleaned response
             enable_thinking: if True, model generates <think> reasoning blocks
+            grammar: GBNF grammar string for constrained output (llama.cpp)
+            response_format: dict like {"type": "json_object"} or
+                {"type": "json_schema", "json_schema": {...}}
 
         Returns:
             The final response string (thinking stripped).

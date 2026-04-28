@@ -834,6 +834,7 @@ class TransformersEngine(BaseEngine):
         return 0
 
     def needs_reload(self) -> bool:
+        """True when active model changed — in-process model must be swapped."""
         return self._loaded_path != get_active_model_path()
 
     def periodic_cleanup(self):
@@ -859,7 +860,8 @@ class TransformersEngine(BaseEngine):
 
     def generate_streaming(self, messages, max_tokens, temperature,
                            on_token=None, on_complete=None,
-                           enable_thinking=True) -> str:
+                           enable_thinking=True,
+                           grammar=None, response_format=None) -> str:
         """Run streaming inference on the local transformers model."""
         self.load()
 

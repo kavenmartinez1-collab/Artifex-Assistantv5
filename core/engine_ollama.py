@@ -136,6 +136,7 @@ class OllamaEngine(BaseEngine):
         return self._loaded
 
     def needs_reload(self) -> bool:
+        """Always False — Ollama is a persistent service; model switching is an API call."""
         return False
 
     def periodic_cleanup(self):
@@ -156,7 +157,8 @@ class OllamaEngine(BaseEngine):
 
     def generate_streaming(self, messages, max_tokens, temperature,
                            on_token=None, on_complete=None,
-                           enable_thinking=True) -> str:
+                           enable_thinking=True,
+                           grammar=None, response_format=None) -> str:
         """Stream a response from the Ollama /api/chat endpoint (localhost only)."""
         self.load()
 

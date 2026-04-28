@@ -23,7 +23,8 @@ from core.inference import _clean_response
 
 _log = logging.getLogger(__name__)
 
-HEALTH_TIMEOUT = 120  # seconds to wait for server startup (large models are slow)
+DEFAULT_HEALTH_TIMEOUT = 120
+HEALTH_TIMEOUT = int(os.environ.get("ARTIFEX_HEALTH_TIMEOUT", DEFAULT_HEALTH_TIMEOUT))
 HEALTH_POLL_INTERVAL = 0.5
 
 _KV_QUANT_BPE = {
@@ -117,6 +118,7 @@ class LlamaCppEngine(BaseEngine):
         self.extra_flags = list(model_config.get("extra_flags", []))
         self.server_path = model_config.get("server_path", "llama-server")
         self._configured_num_ctx = model_config.get("num_ctx")
+        self._health_timeout = model_config.get("health_timeout", HEALTH_TIMEOUT)
         self._num_ctx = None
         self._process = None
         self._loaded = False
@@ -250,8 +252,9 @@ class LlamaCppEngine(BaseEngine):
                 f"server_path in llama_cpp_config.json to the full path."
             )
 
+        timeout = self._health_timeout
         start = time.monotonic()
-        while time.monotonic() - start < HEALTH_TIMEOUT:
+        while time.monotonic() - start < timeout:
             if self._process.poll() is not None:
                 stderr = self._process.stderr.read().decode("utf-8", errors="replace")
                 raise RuntimeError(
@@ -273,7 +276,7 @@ class LlamaCppEngine(BaseEngine):
 
         self._kill_process()
         raise TimeoutError(
-            f"llama-server did not become healthy within {HEALTH_TIMEOUT}s. "
+            f"llama-server did not become healthy within {timeout}s. "
             f"Check that the model fits in VRAM and the GGUF is valid."
         )
 
@@ -304,6 +307,7 @@ class LlamaCppEngine(BaseEngine):
         return self._num_ctx or self._configured_num_ctx or 0
 
     def needs_reload(self) -> bool:
+        """Always False — model switching kills/restarts the server process."""
         return False
 
     def periodic_cleanup(self):
@@ -314,6 +318,21 @@ class LlamaCppEngine(BaseEngine):
     # =====================================================================
 
     def count_tokens(self, text: str) -> int:
+        if self._loaded:
+            try:
+                body = json.dumps({"content": text}).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{self._base_url}/tokenize",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read())
+                    tokens = data.get("tokens", [])
+                    return len(tokens)
+            except Exception:
+                pass
         return len(text) // 4
 
     # =====================================================================
@@ -322,7 +341,8 @@ class LlamaCppEngine(BaseEngine):
 
     def generate_streaming(self, messages, max_tokens, temperature,
                            on_token=None, on_complete=None,
-                           enable_thinking=True) -> str:
+                           enable_thinking=True,
+                           grammar=None, response_format=None) -> str:
         """Stream from llama-server's OpenAI-compatible /v1/chat/completions.
 
         Thinking is handled via <think> tags in the content stream (same as
@@ -331,14 +351,29 @@ class LlamaCppEngine(BaseEngine):
         self.load()
         self._last_gen_stats = {}
 
+        req_messages = list(messages)
+        if not enable_thinking and req_messages:
+            if req_messages[0].get("role") == "system":
+                content = req_messages[0].get("content", "")
+                if "/no_think" not in content:
+                    req_messages[0] = dict(req_messages[0])
+                    req_messages[0]["content"] = "/no_think\n" + content
+            else:
+                req_messages.insert(0, {"role": "system", "content": "/no_think"})
+
         payload = {
             "model": self.model_name,
-            "messages": messages,
+            "messages": req_messages,
             "stream": True,
             "temperature": temperature,
+            "cache_prompt": True,
         }
         if max_tokens and max_tokens > 0:
             payload["max_tokens"] = max_tokens
+        if grammar:
+            payload["grammar"] = grammar
+        if response_format:
+            payload["response_format"] = response_format
 
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(

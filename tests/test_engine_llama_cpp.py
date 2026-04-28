@@ -1,0 +1,277 @@
+"""Tests for llama.cpp engine — P1 features: grammar, cache_prompt, tokenize,
+enable_thinking, configurable health timeout.
+"""
+
+import json
+import os
+import unittest
+from unittest.mock import patch, MagicMock
+
+
+class TestHealthTimeoutConfig(unittest.TestCase):
+    """P1-T10: HEALTH_TIMEOUT is configurable via env var and per-model config."""
+
+    def test_default_timeout_is_120(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ARTIFEX_HEALTH_TIMEOUT", None)
+            import importlib
+            import core.engine_llama_cpp as mod
+            importlib.reload(mod)
+            self.assertEqual(mod.DEFAULT_HEALTH_TIMEOUT, 120)
+
+    def test_env_var_overrides_default(self):
+        with patch.dict(os.environ, {"ARTIFEX_HEALTH_TIMEOUT": "300"}):
+            import importlib
+            import core.engine_llama_cpp as mod
+            importlib.reload(mod)
+            self.assertEqual(mod.HEALTH_TIMEOUT, 300)
+
+    def test_per_model_config_overrides_module(self):
+        from core.engine_llama_cpp import LlamaCppEngine
+        engine = LlamaCppEngine("test", {
+            "path": "/fake/model.gguf",
+            "health_timeout": 240,
+        })
+        self.assertEqual(engine._health_timeout, 240)
+
+    def test_per_model_falls_back_to_module(self):
+        from core.engine_llama_cpp import LlamaCppEngine, HEALTH_TIMEOUT
+        engine = LlamaCppEngine("test", {"path": "/fake/model.gguf"})
+        self.assertEqual(engine._health_timeout, HEALTH_TIMEOUT)
+
+
+class TestGrammarPayload(unittest.TestCase):
+    """P1-T6: Grammar and response_format pass through to llama-server payload."""
+
+    def _make_engine(self):
+        from core.engine_llama_cpp import LlamaCppEngine
+        engine = LlamaCppEngine("test", {"path": "/fake/model.gguf"})
+        engine._loaded = True
+        engine._base_url = "http://localhost:8081"
+        engine._is_server_healthy = lambda: True
+        return engine
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_grammar_in_payload(self, mock_urlopen):
+        engine = self._make_engine()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.__iter__ = MagicMock(return_value=iter([
+            b'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]))
+        mock_urlopen.return_value = mock_resp
+
+        engine.generate_streaming(
+            [{"role": "user", "content": "test"}],
+            max_tokens=100, temperature=0.7,
+            grammar='root ::= "yes" | "no"',
+        )
+
+        call_args = mock_urlopen.call_args
+        req = call_args[0][0]
+        body = json.loads(req.data.decode())
+        self.assertEqual(body["grammar"], 'root ::= "yes" | "no"')
+        self.assertTrue(body["cache_prompt"])
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_response_format_in_payload(self, mock_urlopen):
+        engine = self._make_engine()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.__iter__ = MagicMock(return_value=iter([
+            b'data: {"choices":[{"delta":{"content":"{}"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]))
+        mock_urlopen.return_value = mock_resp
+
+        fmt = {"type": "json_object"}
+        engine.generate_streaming(
+            [{"role": "user", "content": "test"}],
+            max_tokens=100, temperature=0.7,
+            response_format=fmt,
+        )
+
+        call_args = mock_urlopen.call_args
+        req = call_args[0][0]
+        body = json.loads(req.data.decode())
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_no_grammar_when_none(self, mock_urlopen):
+        engine = self._make_engine()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.__iter__ = MagicMock(return_value=iter([
+            b'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]))
+        mock_urlopen.return_value = mock_resp
+
+        engine.generate_streaming(
+            [{"role": "user", "content": "test"}],
+            max_tokens=100, temperature=0.7,
+        )
+
+        call_args = mock_urlopen.call_args
+        req = call_args[0][0]
+        body = json.loads(req.data.decode())
+        self.assertNotIn("grammar", body)
+        self.assertNotIn("response_format", body)
+
+
+class TestEnableThinking(unittest.TestCase):
+    """P1-T9: enable_thinking=False injects /no_think into system message."""
+
+    def _make_engine(self):
+        from core.engine_llama_cpp import LlamaCppEngine
+        engine = LlamaCppEngine("test", {"path": "/fake/model.gguf"})
+        engine._loaded = True
+        engine._base_url = "http://localhost:8081"
+        engine._is_server_healthy = lambda: True
+        return engine
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_thinking_disabled_injects_no_think(self, mock_urlopen):
+        engine = self._make_engine()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.__iter__ = MagicMock(return_value=iter([
+            b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]))
+        mock_urlopen.return_value = mock_resp
+
+        engine.generate_streaming(
+            [{"role": "system", "content": "Be helpful."}, {"role": "user", "content": "hi"}],
+            max_tokens=100, temperature=0.7,
+            enable_thinking=False,
+        )
+
+        call_args = mock_urlopen.call_args
+        req = call_args[0][0]
+        body = json.loads(req.data.decode())
+        self.assertTrue(body["messages"][0]["content"].startswith("/no_think"))
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_thinking_disabled_without_system_message(self, mock_urlopen):
+        engine = self._make_engine()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.__iter__ = MagicMock(return_value=iter([
+            b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]))
+        mock_urlopen.return_value = mock_resp
+
+        engine.generate_streaming(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=100, temperature=0.7,
+            enable_thinking=False,
+        )
+
+        call_args = mock_urlopen.call_args
+        req = call_args[0][0]
+        body = json.loads(req.data.decode())
+        self.assertEqual(body["messages"][0]["role"], "system")
+        self.assertEqual(body["messages"][0]["content"], "/no_think")
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_thinking_enabled_no_injection(self, mock_urlopen):
+        engine = self._make_engine()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.__iter__ = MagicMock(return_value=iter([
+            b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]))
+        mock_urlopen.return_value = mock_resp
+
+        engine.generate_streaming(
+            [{"role": "system", "content": "Be helpful."}, {"role": "user", "content": "hi"}],
+            max_tokens=100, temperature=0.7,
+            enable_thinking=True,
+        )
+
+        call_args = mock_urlopen.call_args
+        req = call_args[0][0]
+        body = json.loads(req.data.decode())
+        self.assertEqual(body["messages"][0]["content"], "Be helpful.")
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_reasoning_content_wrapped_in_think_tags(self, mock_urlopen):
+        """When llama-server emits reasoning_content, on_token receives <think> tags."""
+        engine = self._make_engine()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.__iter__ = MagicMock(return_value=iter([
+            b'data: {"choices":[{"delta":{"reasoning_content":"hmm"},"finish_reason":null}]}\n',
+            b'data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]))
+        mock_urlopen.return_value = mock_resp
+
+        tokens = []
+        result = engine.generate_streaming(
+            [{"role": "user", "content": "test"}],
+            max_tokens=100, temperature=0.7,
+            on_token=lambda t: tokens.append(t),
+        )
+        raw = "".join(tokens)
+        self.assertIn("<think>", raw)
+        self.assertIn("hmm", raw)
+        self.assertIn("</think>", raw)
+        self.assertIn("answer", raw)
+        self.assertIn("answer", result)
+        self.assertNotIn("<think>", result)
+
+
+class TestCountTokens(unittest.TestCase):
+    """P1-T8: count_tokens uses llama-server /tokenize when available."""
+
+    def test_fallback_heuristic(self):
+        from core.engine_llama_cpp import LlamaCppEngine
+        engine = LlamaCppEngine("test", {"path": "/fake/model.gguf"})
+        self.assertEqual(engine.count_tokens("hello world test"), len("hello world test") // 4)
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_uses_server_tokenize(self, mock_urlopen):
+        from core.engine_llama_cpp import LlamaCppEngine
+        engine = LlamaCppEngine("test", {"path": "/fake/model.gguf"})
+        engine._loaded = True
+
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = json.dumps({"tokens": [1, 2, 3, 4, 5]}).encode()
+        mock_urlopen.return_value = mock_resp
+
+        count = engine.count_tokens("hello world test")
+        self.assertEqual(count, 5)
+
+
+class TestNeedsReloadDocumented(unittest.TestCase):
+    """P1-T11: needs_reload() has per-engine docstrings."""
+
+    def test_llama_cpp_docstring(self):
+        from core.engine_llama_cpp import LlamaCppEngine
+        self.assertIn("False", LlamaCppEngine.needs_reload.__doc__)
+
+    def test_ollama_docstring(self):
+        from core.engine_ollama import OllamaEngine
+        self.assertIn("False", OllamaEngine.needs_reload.__doc__)
+
+    def test_transformers_docstring(self):
+        from core.engine_transformers import TransformersEngine
+        self.assertIn("True", TransformersEngine.needs_reload.__doc__)
+
+
+if __name__ == "__main__":
+    unittest.main()
