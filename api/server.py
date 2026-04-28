@@ -1003,6 +1003,9 @@ def create_app():
             "Install with: pip install fastapi uvicorn"
         )
 
+    from core.sandbox import install_all_hooks
+    install_all_hooks()
+
     app = FastAPI(
         title="Artifex Assistant V5 API",
         version="5.0.0",

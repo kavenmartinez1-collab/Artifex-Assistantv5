@@ -28,7 +28,7 @@ from tools.agent_tools import (
     get_tool_output_limit,
     MAX_AGENT_ROUNDS,
 )
-from core.sandbox import check_policy, RiskLevel
+from core.sandbox import check_policy, RiskLevel, install_all_hooks
 from tools.tool_cache import maybe_cache_output, clear_cache, SessionMap, update_session_map
 from core.resilience import engine_recovery, generate_with_recovery
 from core.session import save_session, load_session, list_sessions, find_session, auto_save, cleanup_web_quarantine
@@ -457,6 +457,7 @@ def _handle_kb_command(args, km):
 
 def run_assistant():
     """Main ASSISTANT agent CLI loop."""
+    install_all_hooks()
     print(f"{Fore.CYAN}")
     print(f"  ▄▀▀▀▀▀▀▀▀▀▀▀▀▀▄")
     print(f"  █   │││ │││   █")
