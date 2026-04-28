@@ -6,11 +6,16 @@
 #  CUDA:  12.8+ (bundled with PyTorch)
 #  Python: 3.11+
 #
-#  Install torch from CUDA 12.8 index FIRST:
-#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-#  Then:
+#  Single-command install (torch wheel pulled from the cu128 index;
+#  Blackwell sm_120 first appears in torch 2.7):
 #    pip install -r requirements-rtx5060ti.txt
 # ─────────────────────────────────────────────────────────────────────
+
+# ── PyTorch (CUDA 12.8 wheels — Blackwell) ────────────────────────────
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
 
 # ── Core AI (pinned — no auto-updates) ────────────────────────────────
 transformers==5.3.0

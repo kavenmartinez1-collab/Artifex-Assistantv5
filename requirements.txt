@@ -3,22 +3,25 @@
 # ─────────────────────────────────────────────────────────────────────
 #
 #  All versions pinned to exact releases. No auto-updates.
-#  Install PyTorch with CUDA first (not listed here — GPU-specific):
 #
-#    RTX 30xx / 40xx:
-#      pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#  This file targets RTX 30xx / 40xx (CUDA 12.4 wheels). For Blackwell
+#  (RTX 50xx) you MUST use requirements-rtx5060ti.txt instead — it pins
+#  torch from the cu128 index, which is required for sm_120 support.
 #
-#    RTX 50xx (Blackwell):
-#      pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-#
-#  Then:
+#  Single-command install:
 #    pip install -r requirements.txt
 #
-#  For GPU-specific pinned versions (including torch), see:
-#    requirements-3060.txt       — RTX 3060 12 GB
-#    requirements-rtx4090.txt    — RTX 4090 24 GB
-#    requirements-rtx5060ti.txt  — RTX 5060 Ti 8 GB
+#  GPU-specific files (each is a complete reproducible install):
+#    requirements-3060.txt       — RTX 3060 12 GB     (cu124, torch 2.6.0)
+#    requirements-rtx4090.txt    — RTX 4090 24 GB     (cu124, torch 2.6.0)
+#    requirements-rtx5060ti.txt  — RTX 5060 Ti 8 GB   (cu128, torch 2.7.1)
 # ─────────────────────────────────────────────────────────────────────
+
+# ── PyTorch (CUDA 12.4 wheels — RTX 30xx / 40xx) ──────────────────────
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
 
 # ── Core AI ───────────────────────────────────────────────────────────
 transformers==5.3.0

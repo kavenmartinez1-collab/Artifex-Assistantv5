@@ -6,11 +6,15 @@
 #  CUDA:  12.4 (bundled with PyTorch — no separate CUDA toolkit needed)
 #  Python: 3.11.x
 #
-#  IMPORTANT: Do NOT install this file directly!
-#  Use setup_3060.bat — it installs torch from the correct index first,
-#  then installs these remaining dependencies.
-#
+#  Single-command install (torch wheel pulled from the cu124 index):
+#    pip install -r requirements-3060.txt
 # ─────────────────────────────────────────────────────────────────────
+
+# ── PyTorch (CUDA 12.4 wheels) ────────────────────────────────────────
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
 
 # ── Model loading / quantization (GPU-specific pins) ──────────────────
 transformers==5.2.0

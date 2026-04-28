@@ -6,15 +6,17 @@
 #  CUDA:  12.4 (bundled with PyTorch)
 #  Python: 3.11+
 #
-#  Install torch first:
-#    pip install torch --index-url https://download.pytorch.org/whl/cu124
-#  Then:
+#  Single-command install (torch wheel pulled from the cu124 index):
 #    pip install -r requirements-rtx4090.txt
 # ─────────────────────────────────────────────────────────────────────
 
-# ── Core AI (GPU-specific pins) ──────────────────────────────────────
+# ── PyTorch (CUDA 12.4 wheels) ────────────────────────────────────────
 --extra-index-url https://download.pytorch.org/whl/cu124
 torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+
+# ── Model loading / quantization ──────────────────────────────────────
 transformers==5.2.0
 bitsandbytes==0.49.1
 accelerate==1.12.0
