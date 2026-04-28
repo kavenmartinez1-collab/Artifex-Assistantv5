@@ -46,6 +46,13 @@ def main():
         import api.web_tools as wt
         wt.WEB_GATEWAY_URL = args.gateway
 
+    # Refuse to expose the API on the network without authentication
+    if args.host != "127.0.0.1" and not os.environ.get("ARTIFEX_API_KEY"):
+        print("ERROR: Binding to a non-localhost address requires ARTIFEX_API_KEY.")
+        print(f"  You requested --host {args.host}, which exposes the API on the network.")
+        print("  Set ARTIFEX_API_KEY=<your-secret> or use --host 127.0.0.1 (default).")
+        return
+
     try:
         import uvicorn
     except ImportError:

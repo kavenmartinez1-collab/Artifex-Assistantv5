@@ -67,10 +67,10 @@ def download_hf_model(repo, output):
                     print(f"GPU:   {gpu_gb:.0f} GB available — WARNING: may not fit!")
                 print(f"Note:  {est['notes']}")
         except Exception:
-            pass
+            pass  # VRAM estimate is informational ��� don't block the download
 
     except ImportError:
-        pass
+        pass  # torch not installed — skip GPU info
 
     print(f"\nDone. Model saved to: {output}")
 

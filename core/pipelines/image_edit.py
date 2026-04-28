@@ -80,7 +80,7 @@ class ImageEditPipeline(BasePipeline):
             try:
                 self.pipe.enable_xformers_memory_efficient_attention()
             except Exception:
-                pass
+                pass  # xformers is optional — falls back to default attention
         else:
             self.pipe = self.pipe.to("cuda")
 

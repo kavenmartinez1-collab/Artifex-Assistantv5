@@ -150,7 +150,7 @@ def _verify_4bit_packing(model) -> bool:
             if isinstance(module, Linear4bit):
                 return module.weight.shape[1] == 1
     except Exception:
-        pass
+        pass  # bnb not installed or no 4-bit layers — assume packed
     return True
 
 
@@ -979,7 +979,7 @@ class TransformersEngine(BaseEngine):
                     residual_length=128,
                 )
             except Exception:
-                pass
+                pass  # quanto optional — falls back to native cache
 
         effective_max = max_tokens if max_tokens and max_tokens > 0 else 8192
 

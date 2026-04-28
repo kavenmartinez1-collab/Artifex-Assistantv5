@@ -771,8 +771,8 @@ def _get_context_budget(backend: str) -> int:
         ctx = engine.get_context_size()
         if ctx > 0:
             return int(ctx * 0.85)
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("Could not query engine context size: %s", e)
     return 0
 
 

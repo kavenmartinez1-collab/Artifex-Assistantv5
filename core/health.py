@@ -36,6 +36,7 @@ def _check_cuda():
             "gpu_tier": GPU_TIER,
         }
     except Exception as e:
+        _log.debug("GPU health check failed: %s", e)
         return {"available": False, "reason": str(e)}
 
 
@@ -60,6 +61,7 @@ def _check_ollama():
         model_count = len(data.get("models", []))
         return {"reachable": True, "model_count": model_count}
     except Exception as e:
+        _log.debug("Ollama health check failed: %s", e)
         return {"reachable": False, "error": str(e)}
 
 
@@ -93,6 +95,7 @@ def _check_disk():
             "used_percent": round((usage.used / usage.total) * 100, 1),
         }
     except Exception as e:
+        _log.debug("Disk space check failed: %s", e)
         return {"error": str(e)}
 
 

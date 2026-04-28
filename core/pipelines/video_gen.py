@@ -85,7 +85,7 @@ class VideoGenerationPipeline(BasePipeline):
         try:
             self.pipe.enable_vae_slicing()
         except Exception:
-            pass
+            pass  # VAE slicing is optional — some pipelines don't support it
 
         self._model_path = model_path
 
