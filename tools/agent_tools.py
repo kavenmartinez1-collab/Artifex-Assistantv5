@@ -3,6 +3,7 @@ Artifex-Assistant v5 — General-purpose tool execution for ASSISTANT mode.
 Enables shell commands, Python execution, web search, file reading, and web page reading.
 """
 
+import logging
 import os
 import io
 import re
@@ -13,6 +14,8 @@ import subprocess
 import math
 import time
 import random
+
+_log = logging.getLogger(__name__)
 from collections import namedtuple
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
@@ -58,7 +61,8 @@ def _check_gateway():
         req = Request(f"{WEB_GATEWAY_URL}/health", method="GET")
         with urlopen(req, timeout=3) as resp:
             _gateway_available = resp.status == 200
-    except Exception:
+    except Exception as e:
+        _log.debug("Web gateway health check failed: %s", e)
         _gateway_available = False
     _gateway_checked_at = now
     return _gateway_available
@@ -506,13 +510,10 @@ def extract_agent_actions(response):
 
 
 def _check_dangerous(command):
-    """Check command against ASSISTANT dangerous patterns. Returns blocking message or None.
+    """Soft guard against obvious LLM hallucinations (rm -rf /, format c:, etc.).
 
-    Also detects bypass attempts via:
-    - Command substitution: $(cmd), `cmd`
-    - Quote splitting: r''m, r""m
-    - Variable expansion: $var used to reconstruct dangerous commands
-    - Eval/exec wrappers: eval "rm -rf /", bash -c "dangerous"
+    NOT a security boundary — commands that pass are executed via shell=True with
+    full filesystem access. Do not expose the LLM session to untrusted input.
     """
     cmd_lower = command.lower()
 
@@ -725,7 +726,8 @@ def _search_ddg_lite(query, max_results=8):
             return parser.results
         return None
 
-    except Exception:
+    except Exception as e:
+        _log.debug("DDG lite search failed: %s", e)
         return None
 
 
@@ -1124,8 +1126,8 @@ def _extract_pdf_text(pdf_bytes, max_pages=30):
         return "(PDF contained no extractable text — may be scanned/image-based.)"
     except ImportError:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("pypdf extraction failed: %s", e)
 
     # Fallback: PyPDF2 (older but commonly installed)
     try:
@@ -1144,8 +1146,8 @@ def _extract_pdf_text(pdf_bytes, max_pages=30):
         return "(PDF contained no extractable text — may be scanned/image-based.)"
     except ImportError:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("PyPDF2 extraction failed: %s", e)
 
     return None  # No PDF library available
 
@@ -1154,7 +1156,8 @@ def _extract_page_text_lxml(html_bytes, encoding="utf-8"):
     """Use lxml to parse HTML and extract clean text."""
     try:
         doc = lxml.html.fromstring(html_bytes)
-    except Exception:
+    except Exception as e:
+        _log.debug("lxml HTML parse failed, falling back to raw decode: %s", e)
         return html_bytes.decode(encoding, errors="replace")
 
     # Remove boilerplate tags
@@ -1623,8 +1626,8 @@ def run_grep(content):
                         results.append(f"{rel}:{lineno}: {line.rstrip()}")
                         if len(results) >= 100:
                             break
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("File grep skipped %s: %s", filepath, e)
         if len(results) >= 100:
             results.append("... (limit reached — refine your pattern)")
             break

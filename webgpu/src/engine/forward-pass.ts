@@ -1067,11 +1067,18 @@ export function createForwardPassEngine(
     bd(ropePipeline, [bg], [workgroupCount(totalPairs, 256)], label);
   }
 
+  // attention.wgsl uses var<workgroup> scores: array<f32, 3840> — hard ceiling
+  const MAX_ATTN_CACHE = 3840;
+
   function dispatchAttention(
     qBuf: GPUBuffer, kCacheBuf: GPUBuffer, vCacheBuf: GPUBuffer,
     outputBuf: GPUBuffer, newSeqLen: number, cacheLen: number,
     isCausal: boolean, posOffset: number, label: string,
   ) {
+    if (cacheLen > MAX_ATTN_CACHE) {
+      console.warn(`[attention] cacheLen ${cacheLen} exceeds workgroup limit ${MAX_ATTN_CACHE}, clamping`);
+      cacheLen = MAX_ATTN_CACHE;
+    }
     const paramData = new ArrayBuffer(32);
     const u32View = new Uint32Array(paramData);
     const f32View = new Float32Array(paramData);
@@ -1105,6 +1112,10 @@ export function createForwardPassEngine(
     signBitsK: GPUBuffer, normsK: GPUBuffer, residualNormsK: GPUBuffer,
     label: string,
   ) {
+    if (cacheLen > MAX_ATTN_CACHE) {
+      console.warn(`[attentionTQ] cacheLen ${cacheLen} exceeds workgroup limit ${MAX_ATTN_CACHE}, clamping`);
+      cacheLen = MAX_ATTN_CACHE;
+    }
     // Params: standard attention params + qjl_constant + sign_words_per_vec
     const paramData = new ArrayBuffer(48); // 10 fields * 4 bytes, padded to 48
     const u32View = new Uint32Array(paramData);
@@ -2367,6 +2378,9 @@ export function createForwardPassEngine(
   // ── KV Cache ───────────────────────────────────────────────────────
 
   function createKVCache(maxSeqLen: number, compressed = false): KVCache {
+    if (maxSeqLen > MAX_ATTN_CACHE) {
+      console.warn(`[KVCache] maxSeqLen ${maxSeqLen} exceeds attention workgroup limit ${MAX_ATTN_CACHE} — generation will clamp at ${MAX_ATTN_CACHE} tokens`);
+    }
     // For hybrid models, allocate SSM state for linear attention layers
     let ssmState: SSMState | undefined;
     if (config.isHybrid && config.layerTypes) {

@@ -1,8 +1,15 @@
 """
-Artifex Assistant V5 — GUI launcher.
-Usage:
-    python main_gui.py
+Artifex Assistant V5 — Legacy GUI launcher (DEPRECATED).
+Use main_gui_qt.py instead.
 """
+import warnings
+import sys
+
+warnings.warn(
+    "main_gui.py is deprecated — use main_gui_qt.py for the current GUI",
+    DeprecationWarning, stacklevel=1,
+)
+print("WARNING: main_gui.py is deprecated. Use main_gui_qt.py instead.", file=sys.stderr)
 
 # Enable faulthandler BEFORE any heavy imports so a C-level segfault in
 # torch / bitsandbytes / tcl / Qt produces a stack trace instead of just

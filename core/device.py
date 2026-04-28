@@ -14,7 +14,10 @@ Usage:
     gpu_info.compute_cap    # 12
 """
 
+import logging
 import threading
+
+_log = logging.getLogger(__name__)
 
 
 class GPUInfo:
@@ -68,8 +71,8 @@ class GPUInfo:
                 else:
                     self._tier = "ABUNDANT"
 
-            except Exception:
-                pass  # No GPU / torch not installed
+            except Exception as e:
+                _log.debug("GPU probe failed: %s", e)
             self._probed = True
 
     # ── Static properties (cached) ──────────────────────────────────────
@@ -132,7 +135,8 @@ class GPUInfo:
         try:
             import torch
             return torch.cuda.memory_allocated(0) / (1024 ** 3)
-        except Exception:
+        except Exception as e:
+            _log.debug("VRAM allocation query failed: %s", e)
             return 0.0
 
     @property

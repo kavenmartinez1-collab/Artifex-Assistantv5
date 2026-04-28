@@ -202,6 +202,30 @@ def _strip_html_basic(html: str) -> str:
     return text
 
 
+def _resolves_to_private(host: str) -> str | None:
+    """Resolve hostname and check if any resulting IP is private/loopback/reserved.
+
+    Returns a reason string if blocked, None if all resolved IPs are public.
+    Catches IP encoding tricks (octal, hex, decimal), IPv6, and DNS rebinding.
+    """
+    import socket
+    import ipaddress
+
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return None  # unresolvable — let the fetcher fail naturally
+
+    for family, _, _, _, sockaddr in infos:
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return f"Blocked: {host} resolves to private/reserved address {ip}"
+    return None
+
+
 def sanitize_url(url: str) -> tuple[bool, str]:
     """
     Validate a URL against security rules.
@@ -243,6 +267,12 @@ def sanitize_url(url: str) -> tuple[bool, str]:
     for pattern in BLOCKED_HOST_PATTERNS:
         if host.startswith(pattern):
             return False, f"Blocked private network address: {host}"
+
+    # Authoritative check: resolve hostname and verify all IPs are public.
+    # Catches IP encoding tricks, IPv6 loopback, and DNS rebinding.
+    private_reason = _resolves_to_private(host)
+    if private_reason:
+        return False, private_reason
 
     # Check TLD
     for tld in BLOCKED_TLDS:

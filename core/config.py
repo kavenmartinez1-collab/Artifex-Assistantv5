@@ -5,6 +5,7 @@ Supports runtime model/backend switching and context profile toggling.
 """
 
 import json
+import logging
 import os
 import platform
 import threading
@@ -12,6 +13,8 @@ import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
+
+_log = logging.getLogger(__name__)
 
 # ===== PLATFORM =====
 IS_WINDOWS = platform.system() == "Windows"
@@ -456,7 +459,8 @@ def _detect_gpu_tier() -> str:
         elif total_gb <= 20:
             return "COMFORTABLE"
         return "ABUNDANT"
-    except Exception:
+    except Exception as e:
+        _log.debug("GPU tier detection failed (defaulting to TIGHT): %s", e)
         return "TIGHT"
 
 
@@ -470,7 +474,8 @@ def get_gpu_count():
     try:
         import torch
         return torch.cuda.device_count() if torch.cuda.is_available() else 0
-    except Exception:
+    except Exception as e:
+        _log.debug("GPU count detection failed: %s", e)
         return 0
 
 def get_active_device():

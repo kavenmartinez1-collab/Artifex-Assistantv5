@@ -56,12 +56,17 @@ BLOCKED_HOSTS = {
     "169.254.169.254",                    # AWS/GCP metadata
 }
 
-# Blocked host patterns (substring match)
+# Blocked host patterns (fast-path prefix match — authoritative check is
+# _resolves_to_private in sanitizer.py which catches encoding tricks and IPv6)
 BLOCKED_HOST_PATTERNS = [
-    "10.0.",          # private ranges
-    "172.16.",
-    "172.17.",        # Docker bridge
-    "192.168.",
+    "10.",            # 10.0.0.0/8 private
+    "172.16.", "172.17.", "172.18.", "172.19.",  # 172.16.0.0/12 private
+    "172.20.", "172.21.", "172.22.", "172.23.",
+    "172.24.", "172.25.", "172.26.", "172.27.",
+    "172.28.", "172.29.", "172.30.", "172.31.",
+    "192.168.",       # 192.168.0.0/16 private
+    "169.254.",       # link-local
+    "100.64.",        # Carrier-Grade NAT (RFC 6598)
 ]
 
 # Allowed file extensions for downloads (empty = allow all)

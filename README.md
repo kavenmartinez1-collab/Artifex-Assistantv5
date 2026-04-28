@@ -1355,6 +1355,8 @@ Artifex-Assistant-V5/
   logs/                      # Application logs
 ```
 
+See [LEARNING.md](LEARNING.md) for a deep-dive walkthrough of the architecture, GPU compute pipelines, and custom WGSL kernel design.
+
 ---
 
 ## Configuration

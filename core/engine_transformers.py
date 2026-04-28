@@ -919,23 +919,26 @@ class TransformersEngine(BaseEngine):
         if _use_turboquant:
             try:
                 from core.turboquant_cache import wrap_cache_with_turboquant
-                # Create the model's native cache first (handles SSM state etc.)
+                _tq_log = logging.getLogger(__name__)
                 native_cache = None
                 cache_cls = getattr(model, '_get_cache', None)
                 if cache_cls:
                     native_cache = cache_cls()
+                    _tq_log.debug("TurboQuant: got cache from model._get_cache() → %s", type(native_cache).__name__)
                 if native_cache is None:
-                    # Let the model create it via its forward() default
+                    _tq_log.debug("TurboQuant: _get_cache unavailable, scanning class attributes")
                     for cls_name in dir(type(model)):
                         obj = getattr(type(model), cls_name, None)
                         if isinstance(obj, type) and 'Cache' in cls_name:
                             try:
                                 native_cache = obj(config=model.config)
+                                _tq_log.debug("TurboQuant: instantiated %s from model class", cls_name)
                                 break
-                            except Exception:
+                            except Exception as e:
+                                _tq_log.debug("TurboQuant: %s failed: %s", cls_name, e)
                                 continue
                 if native_cache is None:
-                    # Fallback: look in the model's module for its DynamicCache variant
+                    _tq_log.debug("TurboQuant: class scan failed, searching model module for DynamicCache variants")
                     model_module = type(model).__module__
                     import importlib
                     mod = importlib.import_module(model_module)
@@ -945,10 +948,13 @@ class TransformersEngine(BaseEngine):
                             if isinstance(cls, type):
                                 try:
                                     native_cache = cls(config=model.config)
+                                    _tq_log.debug("TurboQuant: instantiated %s from module", name)
                                     break
-                                except Exception:
+                                except Exception as e:
+                                    _tq_log.debug("TurboQuant: %s failed: %s", name, e)
                                     continue
                 if native_cache is None:
+                    _tq_log.info("TurboQuant: all discovery failed, falling back to generic DynamicCache")
                     from transformers.cache_utils import DynamicCache
                     native_cache = DynamicCache()
 
@@ -975,10 +981,12 @@ class TransformersEngine(BaseEngine):
             except Exception:
                 pass
 
+        effective_max = max_tokens if max_tokens and max_tokens > 0 else 8192
+
         gen_kwargs = dict(
             **inputs,
             streamer=streamer,
-            max_new_tokens=max_tokens if max_tokens and max_tokens > 0 else 8192,
+            max_new_tokens=effective_max,
             temperature=temperature,
             do_sample=True,
             use_cache=True,
@@ -1036,7 +1044,7 @@ class TransformersEngine(BaseEngine):
         # (EOS or StopStringCriteria both count as a natural stop). Uses the
         # real token count since max_new_tokens is measured in tokens, not
         # streamer chunks.
-        finish_reason = "length" if completion_tokens >= max_tokens else "stop"
+        finish_reason = "length" if completion_tokens >= effective_max else "stop"
 
         # Log throughput stats
         wall_time = t_end - t_start
