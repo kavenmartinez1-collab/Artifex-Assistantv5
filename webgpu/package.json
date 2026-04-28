@@ -7,7 +7,10 @@
     "dev": "concurrently \"vite\" \"tsx server/dev-server.ts\"",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "server": "tsx server/dev-server.ts"
+    "server": "tsx server/dev-server.ts",
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.8.1",

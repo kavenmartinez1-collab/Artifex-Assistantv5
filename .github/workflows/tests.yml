@@ -31,5 +31,21 @@ jobs:
       - name: Install pytest
         run: pip install pytest
 
-      - name: Run tests
+      - name: Run Python tests
         run: pytest
+
+      # ── WebGPU TypeScript type-checking ──────────────────────────────
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: webgpu/package-lock.json
+
+      - name: Install WebGPU dependencies
+        working-directory: webgpu
+        run: npm ci --ignore-scripts || npm install
+
+      - name: TypeScript strict type-check
+        working-directory: webgpu
+        run: npx tsc --noEmit
