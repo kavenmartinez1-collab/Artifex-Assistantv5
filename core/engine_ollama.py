@@ -1,12 +1,12 @@
 """
 Artifex Assistant V5 — Ollama engine.
-HTTP backend that talks to a locally running Ollama server for streaming generation.
-All communication stays on localhost — nothing goes over the internet.
-Ollama manages its own model lifecycle — this engine controls GPU layer placement
-to prevent spilling into shared VRAM on cards with limited memory.
+HTTP backend that talks to an Ollama server for streaming generation.
+Defaults to localhost:11434. Set ARTIFEX_OLLAMA_URL for remote servers
+(e.g. a Tailscale peer running Ollama on a headless GPU machine).
 """
 
 import json
+import os
 import urllib.request
 import urllib.error
 
@@ -14,8 +14,7 @@ from core.engine_base import BaseEngine
 from core.inference import STOP_STRINGS, _clean_response
 
 
-# Default Ollama endpoint — localhost only, never remote
-OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_BASE_URL = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
 
 
 def _detect_safe_num_gpu(model_size_gb=None):

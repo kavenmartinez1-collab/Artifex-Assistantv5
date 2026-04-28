@@ -55,7 +55,8 @@ def _classify_capabilities(name: str) -> list[str]:
 
 def _discover_ollama() -> list[dict]:
     try:
-        req = urllib.request.Request("http://localhost:11434/api/tags")
+        _ollama_url = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+        req = urllib.request.Request(f"{_ollama_url}/api/tags")
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read())
     except (urllib.error.URLError, OSError, json.JSONDecodeError):

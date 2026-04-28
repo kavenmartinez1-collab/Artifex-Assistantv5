@@ -19,7 +19,7 @@ import time
 import urllib.request
 import urllib.error
 
-OLLAMA_URL = "http://localhost:11434"
+OLLAMA_URL = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
 
 
 def find_ollama_binary():

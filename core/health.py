@@ -55,7 +55,9 @@ def _check_ollama():
     try:
         import urllib.request
         import json
-        req = urllib.request.Request("http://localhost:11434/api/tags")
+        import os
+        _ollama_url = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+        req = urllib.request.Request(f"{_ollama_url}/api/tags")
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read())
         model_count = len(data.get("models", []))

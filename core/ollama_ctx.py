@@ -25,13 +25,14 @@ and compute buffers.  Empirical: Qwen3.5-27B Q4 (16.2 GB file) loads at
 
 import json
 import logging
+import os
 import subprocess
 import urllib.request
 import urllib.error
 
 _log = logging.getLogger(__name__)
 
-OLLAMA_BASE = "http://localhost:11434"
+OLLAMA_BASE = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
 STANDARD_BUCKETS = [4096, 8192, 16384, 32768, 65536, 131072]
 MIN_CTX = 4096
 MODEL_OVERHEAD_FACTOR = 1.3

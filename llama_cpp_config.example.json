@@ -1,14 +1,29 @@
 {
-  "_comment": "llama.cpp server config. Copy to llama_cpp_config.json and update paths for your system.",
+  "_comment": "llama.cpp server config. Copy to llama_cpp_config.json and update paths.",
   "server_path": "llama-server",
   "default_port": 8081,
   "models": {
-    "example-model": {
-      "path": "/path/to/your/model.gguf",
-      "port": 8081,
+    "qwen3.6-27b-q4km": {
+      "_comment": "Standard Q4_K_M quant — good quality/speed balance, ~17GB VRAM",
+      "path": "/path/to/Qwen3.6-27B-Q4_K_M.gguf",
       "num_gpu_layers": 99,
       "num_ctx": 32768,
       "extra_flags": ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--jinja"]
+    },
+    "qwen3.6-27b-iq4xs": {
+      "_comment": "IQ4_XS quant — smaller (14GB), slight quality loss",
+      "path": "/path/to/Qwen3.6-27B-IQ4_XS.gguf",
+      "num_gpu_layers": 99,
+      "num_ctx": 16384,
+      "extra_flags": ["-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--jinja"]
+    },
+    "qwen3.6-27b-tq3": {
+      "_comment": "TurboQuant 3-bit — fits on 12GB cards with q4 KV cache",
+      "path": "/path/to/Qwen3.6-27B-TQ3_4S.gguf",
+      "num_gpu_layers": 99,
+      "num_ctx": 8192,
+      "health_timeout": 180,
+      "extra_flags": ["-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--jinja"]
     }
   }
 }

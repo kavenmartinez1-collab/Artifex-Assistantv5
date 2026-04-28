@@ -200,7 +200,8 @@ def _make_sse_chunk(chat_id: str, model: str, delta: dict,
 
 # ── Ollama proxy helpers ───────────────────────────────────────────────
 
-OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+from core.engine_ollama import OLLAMA_BASE_URL as _OLLAMA_BASE
+OLLAMA_CHAT_URL = f"{_OLLAMA_BASE}/api/chat"
 _ollama_no_think: set = set()
 
 

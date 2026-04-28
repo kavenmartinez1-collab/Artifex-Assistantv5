@@ -249,11 +249,12 @@ def _discover_ollama_models():
         (dict, error_str or None) — model_name -> {name, size, ...}
     """
     try:
-        req = urllib.request.Request("http://localhost:11434/api/tags")
+        _ollama_url = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+        req = urllib.request.Request(f"{_ollama_url}/api/tags")
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read())
     except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return {}, "Ollama not reachable at localhost:11434"
+        return {}, "Ollama not reachable"
 
     models = {}
     for m in data.get("models", []):

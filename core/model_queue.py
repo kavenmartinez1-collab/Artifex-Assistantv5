@@ -13,17 +13,18 @@ Usage:
 """
 
 import asyncio
+import json
 import logging
+import os
 import time
 import urllib.request
 import urllib.error
-import json
 from collections import deque
 from threading import Lock
 
 _log = logging.getLogger(__name__)
 
-OLLAMA_BASE = "http://localhost:11434"
+OLLAMA_BASE = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
 
 
 class ModelQueue:
