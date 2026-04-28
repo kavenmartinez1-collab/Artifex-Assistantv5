@@ -71,7 +71,7 @@ def _check_dependencies():
     """Check key package versions."""
     packages = [
         "torch", "transformers", "bitsandbytes", "accelerate",
-        "diffusers", "safetensors", "Pillow", "FreeSimpleGUI",
+        "diffusers", "safetensors", "Pillow", "PyQt6",
         "colorama", "psutil", "huggingface_hub", "scipy",
         "sentence_transformers", "faiss",
     ]

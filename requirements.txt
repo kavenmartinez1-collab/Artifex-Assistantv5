@@ -44,7 +44,6 @@ PyQt6-sip==13.11.1
 
 # ── Application ──────────────────────────────────────────────────────
 colorama==0.4.6
-FreeSimpleGUI==5.2.0.post1
 pyperclip==1.11.0
 psutil==7.2.2
 duckduckgo-search==8.1.1
