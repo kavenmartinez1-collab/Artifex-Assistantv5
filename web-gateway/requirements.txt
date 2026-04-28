@@ -1,6 +1,16 @@
-fastapi>=0.115.0
-uvicorn>=0.34.0
-httpx>=0.28.0
-trafilatura>=2.0.0
-slowapi>=0.1.9
-pydantic>=2.0
+# ─────────────────────────────────────────────────────────────────────
+#  Artifex Web Gateway — Pinned dependencies (supply-chain safe)
+# ─────────────────────────────────────────────────────────────────────
+#
+#  All versions pinned to exact releases so the Dockerfile build is
+#  reproducible. Versions match the main project's requirements.txt
+#  where they overlap (fastapi, uvicorn, httpx, slowapi) to avoid
+#  drift between the gateway container and the host app.
+# ─────────────────────────────────────────────────────────────────────
+
+fastapi==0.135.1
+uvicorn==0.42.0
+httpx==0.28.1
+trafilatura==2.0.0
+slowapi==0.1.9
+pydantic==2.12.5
