@@ -26,6 +26,7 @@ from tools.agent_tools import (
     run_agent_action,
     get_assistant_tools_prompt,
     get_tool_output_limit,
+    MAX_AGENT_ROUNDS,
 )
 from tools.tool_cache import maybe_cache_output, clear_cache, SessionMap, update_session_map
 from core.resilience import engine_recovery, generate_with_recovery
@@ -965,8 +966,9 @@ def run_assistant():
             actions = extract_agent_actions(response)
             tool_output = offer_action_execution(actions, km, session_map)
 
-            # If we ran actions, feed output back for analysis (loop for chained actions)
-            while tool_output:
+            # If we ran actions, feed output back for analysis (bounded loop)
+            agent_round = 0
+            while tool_output and agent_round < MAX_AGENT_ROUNDS:
                 truncated = _truncate(tool_output)
                 feedback_msg = (
                     "[TOOL OUTPUT — this is automated command output, not a human message]\n\n"
@@ -990,8 +992,12 @@ def run_assistant():
                     print(f"{Fore.CYAN}  [KB] {len(ai_kb)} entries from AI response{Style.RESET_ALL}")
 
                 # Check for more actions in followup
+                agent_round += 1
                 more_actions = extract_agent_actions(response)
                 tool_output = offer_action_execution(more_actions, km, session_map)
+
+            if agent_round >= MAX_AGENT_ROUNDS:
+                print(f"{Fore.YELLOW}  Agent loop limit reached ({MAX_AGENT_ROUNDS} rounds).{Style.RESET_ALL}")
 
             # Compress, cleanup, and auto-save
             history = compress_history(history, mode_cfg.context_window)

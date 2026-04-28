@@ -1712,6 +1712,83 @@ def run_edit_file(content):
     return True, f"Edited {fname}: {sign}{delta} chars. Change applied successfully."
 
 
+# ─── Git commit-per-edit (P3-T15) ──────────────────────────────────────────
+
+def _find_git_root(path: str) -> str | None:
+    """Walk up from path to find the .git directory. Returns repo root or None."""
+    d = os.path.abspath(path)
+    for _ in range(50):
+        if os.path.isdir(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def git_commit_edit(file_path: str, summary: str) -> tuple[bool, str]:
+    """Stage and commit a single file edit. Returns (success, message).
+
+    Only commits if the file is inside a git repo and has changes.
+    Commit message includes [agent] prefix for easy filtering.
+    """
+    repo = _find_git_root(file_path)
+    if not repo:
+        return False, "Not inside a git repository."
+    try:
+        subprocess.run(
+            ["git", "add", "--", os.path.abspath(file_path)],
+            cwd=repo, capture_output=True, text=True, timeout=10,
+        )
+        result = subprocess.run(
+            ["git", "commit", "-m", f"[agent] {summary}"],
+            cwd=repo, capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            short_sha = result.stdout.strip().split()[1] if result.stdout else "?"
+            return True, f"Committed: {short_sha}"
+        return False, result.stderr.strip() or "git commit failed"
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return False, str(e)
+
+
+def git_revert_last(file_path: str) -> tuple[bool, str]:
+    """Revert the last commit if it was an agent edit. Safety check: only
+    reverts commits with [agent] prefix in the message."""
+    repo = _find_git_root(file_path)
+    if not repo:
+        return False, "Not inside a git repository."
+    try:
+        log = subprocess.run(
+            ["git", "log", "-1", "--format=%s"],
+            cwd=repo, capture_output=True, text=True, timeout=10,
+        )
+        msg = log.stdout.strip()
+        if not msg.startswith("[agent]"):
+            return False, f"Last commit is not an agent edit: {msg!r}"
+        result = subprocess.run(
+            ["git", "revert", "--no-edit", "HEAD"],
+            cwd=repo, capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return True, "Reverted last agent commit."
+        return False, result.stderr.strip() or "git revert failed"
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return False, str(e)
+
+
+# ─── Agent loop config (P3-T16 / P3-T17) ──────────────────────────────────
+
+MAX_AGENT_ROUNDS = int(os.environ.get("ARTIFEX_MAX_AGENT_ROUNDS", "10"))
+AGENT_KEY = os.environ.get("ARTIFEX_AGENT_KEY", "")
+
+
+def agent_auto_exec_enabled() -> bool:
+    """True if auto-execution mode is unlocked (ARTIFEX_AGENT_KEY is set)."""
+    return bool(AGENT_KEY)
+
+
 def run_agent_action(action):
     """
     Dispatch an AgentAction to the appropriate executor.
