@@ -1076,8 +1076,12 @@ export function createForwardPassEngine(
     isCausal: boolean, posOffset: number, label: string,
   ) {
     if (cacheLen > MAX_ATTN_CACHE) {
-      console.warn(`[attention] cacheLen ${cacheLen} exceeds workgroup limit ${MAX_ATTN_CACHE}, clamping`);
-      cacheLen = MAX_ATTN_CACHE;
+      throw new Error(
+        `[attention] cacheLen ${cacheLen} exceeds workgroup limit ${MAX_ATTN_CACHE}. ` +
+        `Silent clamping would discard tokens and produce incorrect output. ` +
+        `Cap input + generation at ${MAX_ATTN_CACHE} tokens or rebuild attention.wgsl ` +
+        `with a larger var<workgroup> scores array.`,
+      );
     }
     const paramData = new ArrayBuffer(32);
     const u32View = new Uint32Array(paramData);
@@ -1113,8 +1117,12 @@ export function createForwardPassEngine(
     label: string,
   ) {
     if (cacheLen > MAX_ATTN_CACHE) {
-      console.warn(`[attentionTQ] cacheLen ${cacheLen} exceeds workgroup limit ${MAX_ATTN_CACHE}, clamping`);
-      cacheLen = MAX_ATTN_CACHE;
+      throw new Error(
+        `[attentionTQ] cacheLen ${cacheLen} exceeds workgroup limit ${MAX_ATTN_CACHE}. ` +
+        `Silent clamping would discard tokens and produce incorrect output. ` +
+        `Cap input + generation at ${MAX_ATTN_CACHE} tokens or rebuild attention_tq.wgsl ` +
+        `with a larger var<workgroup> scores array.`,
+      );
     }
     // Params: standard attention params + qjl_constant + sign_words_per_vec
     const paramData = new ArrayBuffer(48); // 10 fields * 4 bytes, padded to 48
@@ -2379,7 +2387,12 @@ export function createForwardPassEngine(
 
   function createKVCache(maxSeqLen: number, compressed = false): KVCache {
     if (maxSeqLen > MAX_ATTN_CACHE) {
-      console.warn(`[KVCache] maxSeqLen ${maxSeqLen} exceeds attention workgroup limit ${MAX_ATTN_CACHE} — generation will clamp at ${MAX_ATTN_CACHE} tokens`);
+      throw new Error(
+        `[KVCache] maxSeqLen ${maxSeqLen} exceeds attention workgroup limit ${MAX_ATTN_CACHE}. ` +
+        `Allocating a cache that the attention kernel cannot fully read would silently ` +
+        `discard tokens once generation passed ${MAX_ATTN_CACHE}. ` +
+        `Cap maxSeqLen at ${MAX_ATTN_CACHE} or rebuild attention.wgsl with a larger workgroup array.`,
+      );
     }
     // For hybrid models, allocate SSM state for linear attention layers
     let ssmState: SSMState | undefined;

@@ -107,31 +107,69 @@ def _get_allowed_roots() -> list[str]:
     return roots
 
 
-def is_path_within_sandbox(path: str) -> bool:
-    """Check if a path is within any allowed root directory."""
+def _resolve_path(path: str) -> str | None:
+    """Expand ~, make absolute, and resolve symlinks.
+
+    Returns None if the path can't be resolved. realpath follows symlinks so
+    a link inside the sandbox pointing to /etc/passwd resolves to /etc/passwd
+    and gets caught by both the deny list and the sandbox-root check.
+    Non-existent path components are kept verbatim, so this also works for
+    files we're about to create.
+    """
     try:
-        abs_path = os.path.abspath(os.path.expanduser(path))
+        expanded = os.path.expanduser(path)
+        return os.path.realpath(os.path.abspath(expanded))
     except (ValueError, OSError):
+        return None
+
+
+def _is_under_root(abs_path: str, root: str) -> bool:
+    """True iff abs_path == root or abs_path is a child of root.
+
+    Plain startswith() is wrong because /x/projEVIL starts with /x/proj.
+    Compare with a trailing separator (or exact equality) to avoid that.
+    """
+    if abs_path == root:
+        return True
+    return abs_path.startswith(root + os.sep)
+
+
+def is_path_within_sandbox(path: str) -> bool:
+    """Check if a path is within any allowed root directory.
+
+    Resolves symlinks before the check so a link inside the sandbox pointing
+    outside is caught. Uses an exact-or-child check rather than a raw prefix
+    match so /x/projEVIL doesn't slip past a /x/proj root.
+    """
+    abs_path = _resolve_path(path)
+    if abs_path is None:
         return False
 
     for root in _get_allowed_roots():
-        try:
-            os.path.relpath(abs_path, root)
-            if abs_path.startswith(root):
-                return True
-        except ValueError:
-            continue
+        resolved_root = os.path.realpath(root)
+        if _is_under_root(abs_path, resolved_root):
+            return True
     return False
 
 
 def check_path(path: str) -> str | None:
     """Full path check: deny list first, then sandbox roots.
 
-    Returns an error message if denied, None if allowed.
+    Returns an error message if denied, None if allowed. The deny list is
+    checked against both the raw input (so it catches obvious cases like
+    "/etc/passwd") and the symlink-resolved path (so it catches a sandboxed
+    symlink that points at a sensitive target).
     """
     deny_reason = is_path_denied(path)
     if deny_reason:
         return deny_reason
+
+    resolved = _resolve_path(path)
+    if resolved is not None and resolved != path:
+        deny_reason = is_path_denied(resolved)
+        if deny_reason:
+            return f"{deny_reason} (via symlink)"
+
     if not is_path_within_sandbox(path):
         return f"outside sandbox: {path}"
     return None

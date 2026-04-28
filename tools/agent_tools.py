@@ -23,6 +23,11 @@ from urllib.parse import urlencode
 
 from core.config import IS_WINDOWS, ASSISTANT_DANGEROUS_PATTERNS, WEB_GATEWAY_URL, GATEWAY_AUTH_TOKEN
 from core.hardware import sense_system
+from core.sandbox.proc_sandbox import (
+    MAX_COMMAND_TIMEOUT,
+    MAX_PYTHON_TIMEOUT,
+    scrub_env,
+)
 
 # HTML parsing: lxml for quality, stdlib HTMLParser always available as fallback
 from html.parser import HTMLParser
@@ -553,8 +558,13 @@ def _check_dangerous(command):
 
 
 def _get_clean_env():
-    """Get a clean environment for command execution."""
-    env = os.environ.copy()
+    """Get a clean environment for command execution.
+
+    Strips secrets via scrub_env() so child processes never see API keys,
+    cloud credentials, or the agent key. Then layers on the encoding hints
+    we actually want children to inherit.
+    """
+    env = scrub_env()
     env["PYTHONIOENCODING"] = "utf-8"
     if IS_WINDOWS:
         env["PYTHONUTF8"] = "1"
@@ -568,7 +578,11 @@ def run_shell_command(command, timeout=300, cwd=None):
     otherwise translates common patterns to PowerShell.
     On Linux/Mac: uses /bin/sh.
     Returns (success, output) tuple.
+
+    Timeout is capped at MAX_COMMAND_TIMEOUT from the sandbox so a misbehaving
+    caller can't pin a child process indefinitely.
     """
+    timeout = min(timeout, MAX_COMMAND_TIMEOUT)
     blocked = _check_dangerous(command)
     if blocked:
         return False, blocked
@@ -631,7 +645,10 @@ def run_python_snippet(code, timeout=30):
     Execute a Python code snippet using the venv's interpreter.
     Single-line: python -c. Multi-line: temp file.
     Returns (success, output) tuple.
+
+    Timeout is capped at MAX_PYTHON_TIMEOUT from the sandbox.
     """
+    timeout = min(timeout, MAX_PYTHON_TIMEOUT)
     blocked = _check_dangerous(code)
     if blocked:
         return False, blocked

@@ -165,5 +165,139 @@ class TestFsSandboxInstall(unittest.TestCase):
             self.assertEqual(d.matched_rule, "fs_sandbox")
 
 
+class TestPrefixCollision(unittest.TestCase):
+    """Sandbox roots must use exact-or-child match, not raw startswith.
+
+    Without a separator-aware check, /x/projEVIL passes a /x/proj root.
+    Tests patch _get_allowed_roots so the project dir + tempdir don't
+    accidentally cover both sides of the collision pair.
+    """
+
+    def test_prefix_collision_outside_sandbox(self):
+        if os.name == "nt":
+            real_root = "D:\\workspaces\\proj"
+            evil_file = "D:\\workspaces\\projEVIL\\secret.txt"
+        else:
+            real_root = "/workspaces/proj"
+            evil_file = "/workspaces/projEVIL/secret.txt"
+
+        with patch("core.sandbox.fs_sandbox._get_allowed_roots", return_value=[real_root]):
+            self.assertFalse(
+                is_path_within_sandbox(evil_file),
+                "Path /x/projEVIL/... must not match /x/proj sandbox root",
+            )
+
+    def test_exact_root_allowed(self):
+        if os.name == "nt":
+            real_root = "D:\\workspaces\\proj"
+        else:
+            real_root = "/workspaces/proj"
+        with patch("core.sandbox.fs_sandbox._get_allowed_roots", return_value=[real_root]):
+            self.assertTrue(is_path_within_sandbox(real_root))
+
+    def test_child_of_root_allowed(self):
+        if os.name == "nt":
+            real_root = "D:\\workspaces\\proj"
+            child = "D:\\workspaces\\proj\\src\\main.py"
+        else:
+            real_root = "/workspaces/proj"
+            child = "/workspaces/proj/src/main.py"
+        with patch("core.sandbox.fs_sandbox._get_allowed_roots", return_value=[real_root]):
+            self.assertTrue(is_path_within_sandbox(child))
+
+    def test_helper_separator_check(self):
+        """Direct unit test of the separator-aware comparison helper."""
+        from core.sandbox.fs_sandbox import _is_under_root
+        if os.name == "nt":
+            self.assertTrue(_is_under_root("D:\\proj", "D:\\proj"))
+            self.assertTrue(_is_under_root("D:\\proj\\src", "D:\\proj"))
+            self.assertFalse(_is_under_root("D:\\projEVIL", "D:\\proj"))
+            self.assertFalse(_is_under_root("D:\\projEVIL\\x", "D:\\proj"))
+        else:
+            self.assertTrue(_is_under_root("/proj", "/proj"))
+            self.assertTrue(_is_under_root("/proj/src", "/proj"))
+            self.assertFalse(_is_under_root("/projEVIL", "/proj"))
+            self.assertFalse(_is_under_root("/projEVIL/x", "/proj"))
+
+
+@unittest.skipUnless(
+    os.name != "nt" or hasattr(os, "symlink"),
+    "Symlink creation requires admin or Developer Mode on Windows; "
+    "skip if unavailable",
+)
+class TestSymlinkEscape(unittest.TestCase):
+    """Symlinks inside the sandbox pointing outside must not bypass the check.
+
+    If is_path_within_sandbox uses os.path.abspath instead of os.path.realpath,
+    a symlink at sandbox/sneaky → /etc/passwd reads as inside the sandbox even
+    though following the link reads /etc/passwd.
+    """
+
+    def _can_symlink(self, parent):
+        """Best-effort check; on Windows without privilege, os.symlink raises."""
+        try:
+            target = os.path.join(parent, "_t")
+            link = os.path.join(parent, "_l")
+            with open(target, "w") as f:
+                f.write("x")
+            os.symlink(target, link)
+            os.remove(link)
+            os.remove(target)
+            return True
+        except (OSError, NotImplementedError):
+            return False
+
+    def test_symlink_to_outside_path_blocked(self):
+        with tempfile.TemporaryDirectory() as parent:
+            sandbox_root = os.path.join(parent, "sbx")
+            outside_dir = os.path.join(parent, "outside")
+            os.makedirs(sandbox_root)
+            os.makedirs(outside_dir)
+
+            if not self._can_symlink(parent):
+                self.skipTest("symlink creation not available on this platform/config")
+
+            secret = os.path.join(outside_dir, "secret.txt")
+            with open(secret, "w") as f:
+                f.write("nope")
+
+            sneaky_link = os.path.join(sandbox_root, "sneaky")
+            os.symlink(secret, sneaky_link)
+
+            # Patch the allowed roots so only sandbox_root counts —
+            # without this, tempfile.gettempdir() (which is `parent`'s ancestor)
+            # would whitelist both directories.
+            with patch(
+                "core.sandbox.fs_sandbox._get_allowed_roots",
+                return_value=[sandbox_root],
+            ):
+                self.assertFalse(
+                    is_path_within_sandbox(sneaky_link),
+                    "symlink target outside sandbox must be rejected after realpath resolution",
+                )
+
+    def test_symlink_to_sensitive_path_caught_via_resolve(self):
+        """A sandbox symlink pointing at a deny-listed file must be caught."""
+        with tempfile.TemporaryDirectory() as parent:
+            sandbox_root = os.path.join(parent, "sbx")
+            os.makedirs(sandbox_root)
+
+            if not self._can_symlink(parent):
+                self.skipTest("symlink creation not available on this platform/config")
+
+            # Create a "fake credentials" file that matches a deny pattern.
+            fake_creds = os.path.join(parent, "credentials.json")
+            with open(fake_creds, "w") as f:
+                f.write("{}")
+
+            link = os.path.join(sandbox_root, "harmless.txt")
+            os.symlink(fake_creds, link)
+
+            with patch.dict(os.environ, {"ARTIFEX_SANDBOX_ROOTS": sandbox_root}):
+                reason = check_path(link)
+                self.assertIsNotNone(reason)
+                self.assertIn("symlink", reason.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

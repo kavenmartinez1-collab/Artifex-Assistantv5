@@ -27,6 +27,8 @@ from tools.agent_tools import (
     get_assistant_tools_prompt,
     get_tool_output_limit,
     MAX_AGENT_ROUNDS,
+    git_commit_edit,
+    git_revert_last,
 )
 from core.sandbox import check_policy, RiskLevel, install_all_hooks
 from tools.tool_cache import maybe_cache_output, clear_cache, SessionMap, update_session_map
@@ -125,20 +127,25 @@ def _truncate(text, limit=None):
 
 
 def _execute_action(action, km=None, smap=None):
-    """Execute an agent action with user confirmation."""
+    """Execute an agent action with user confirmation.
+
+    Returns (status, output) where status is True on success, False on failure,
+    and None if the user skipped. Output is the (possibly cached/summarized)
+    string fed back to the model, or None on skip.
+    """
     type_label = action.type.upper()
     print(f"\n{Fore.YELLOW}  [{type_label}] {Fore.WHITE}{action.display}")
     confirm = input(f"{Fore.YELLOW}  Execute? [y/N]: {Fore.WHITE}").strip().lower()
     if confirm not in ("y", "yes"):
         print(f"{Fore.YELLOW}  Skipped.{Style.RESET_ALL}")
-        return None
+        return None, None
 
     print(f"{Fore.CYAN}  Running...{Style.RESET_ALL}\n")
     success, output = run_agent_action(action)
 
     if not success:
         print(f"{Fore.RED}  ERROR: {output}{Style.RESET_ALL}")
-        return f"ERROR: {output}"
+        return False, f"ERROR: {output}"
 
     # Show FULL output to the user (they see everything on screen)
     print(f"{Fore.YELLOW}  --- Output ---{Style.RESET_ALL}")
@@ -161,9 +168,60 @@ def _execute_action(action, km=None, smap=None):
         cached = maybe_cache_output(action.type, action.display, output)
         if cached != output:
             print(f"{Fore.CYAN}  [CACHED] Large output saved to disk — summary sent to model{Style.RESET_ALL}")
-        return cached
+        return True, cached
 
-    return "(no output — command completed successfully)"
+    return True, "(no output — command completed successfully)"
+
+
+def _edit_path_from_content(content: str) -> str | None:
+    """Extract the target path from an edit_file action's content."""
+    parts = content.split("\x00", 1)
+    if not parts:
+        return None
+    path = parts[0].strip()
+    return path or None
+
+
+def _on_action_complete(action, status, pending_edits):
+    """Auto-commit successful edits, auto-revert prior edits on a failed run.
+
+    pending_edits is mutated in-place. The shape of the rollback is:
+      edit_file succeeds → commit it, push file path onto pending_edits
+      python/shell fails → revert each pending edit in reverse order
+
+    Reverting only on python/shell failures (not, say, glob/grep) keeps the
+    behavior aligned with the task acceptance criterion: "agent breaks a
+    passing test → automatic rollback." Reverts stop at the first failure
+    so a partially reverted state is visible to the user.
+    """
+    if status is None:
+        return  # skipped — leave state untouched
+
+    if action.type == "edit_file" and status is True:
+        path = _edit_path_from_content(action.content)
+        if not path:
+            return
+        ok, msg = git_commit_edit(path, action.display)
+        if ok:
+            pending_edits.append(path)
+            print(f"{Fore.CYAN}  [git] {msg}{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.YELLOW}  [git] commit skipped: {msg}{Style.RESET_ALL}")
+        return
+
+    if action.type in ("python", "shell") and status is False and pending_edits:
+        print(
+            f"{Fore.YELLOW}  Run failed — reverting "
+            f"{len(pending_edits)} agent commit(s) from this round.{Style.RESET_ALL}"
+        )
+        for path in reversed(pending_edits):
+            ok, msg = git_revert_last(path)
+            if ok:
+                print(f"{Fore.CYAN}  [git] {msg}{Style.RESET_ALL}")
+            else:
+                print(f"{Fore.YELLOW}  [git] revert stopped: {msg}{Style.RESET_ALL}")
+                break
+        pending_edits.clear()
 
 
 def offer_action_execution(actions, km=None, smap=None):
@@ -201,6 +259,8 @@ def offer_action_execution(actions, km=None, smap=None):
             confirm_actions.append(i)
 
     outputs = []
+    # Track agent commits made this round for auto-revert on test failure (P3-T15).
+    pending_edits: list[str] = []
 
     if auto_indices:
         print(f"\n{Fore.GREEN}  Auto-executing ({len(auto_indices)} policy-allowed):{Style.RESET_ALL}")
@@ -209,7 +269,8 @@ def offer_action_execution(actions, km=None, smap=None):
             risk = check_policy(action.type, action.content).risk_level
             risk_str = _RISK_ICON.get(risk, "?")
             print(f"    {Fore.GREEN}> [{risk_str}{Fore.GREEN}] {action.display}{Style.RESET_ALL}")
-            output = _execute_action(action, km, smap)
+            status, output = _execute_action(action, km, smap)
+            _on_action_complete(action, status, pending_edits)
             if output is not None:
                 outputs.append(f"[{action.type} output] `{action.display}`:\n{output}")
 
@@ -247,10 +308,12 @@ def offer_action_execution(actions, km=None, smap=None):
 
             for ci in indices:
                 idx = confirm_actions[ci]
-                output = _execute_action(actions[idx], km, smap)
+                action = actions[idx]
+                status, output = _execute_action(action, km, smap)
+                _on_action_complete(action, status, pending_edits)
                 if output is not None:
-                    label = actions[idx].type
-                    outputs.append(f"[{label} output] `{actions[idx].display}`:\n{output}")
+                    label = action.type
+                    outputs.append(f"[{label} output] `{action.display}`:\n{output}")
 
     if outputs:
         return "\n\n".join(outputs)
