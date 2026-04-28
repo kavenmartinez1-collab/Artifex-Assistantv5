@@ -67,6 +67,10 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
   - [Environment Variables](#environment-variables)
   - [Context Profiles](#context-profiles)
   - [Modes](#modes)
+- [Sandbox — Autonomous Execution Safety](#sandbox--autonomous-execution-safety)
+  - [Policy Levels](#policy-levels)
+  - [Sandbox Environment Variables](#sandbox-environment-variables)
+  - [Sandbox Components](#sandbox-components)
 - [Security](#security)
 - [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
@@ -1372,6 +1376,23 @@ See [LEARNING.md](LEARNING.md) for a deep-dive walkthrough of the architecture, 
 | `WEB_GATEWAY_URL` | *(none)* | Web gateway URL for CLI/GUI (e.g., `http://localhost:8080`). For the API server, use `--gateway` flag instead. Auto-set in Docker full profile. |
 | `GATEWAY_AUTH_TOKEN` | *(none)* | Optional shared secret for web gateway authentication. When set, all gateway requests must include a matching `X-Gateway-Token` header. The `/health` endpoint is always open (for Docker healthchecks). Leave unset to disable (default). |
 | `HF_TOKEN` | *(none)* | HuggingFace auth token for gated models (Qwen3.5, etc.). Enter in the WebGPU UI sidebar or set via browser localStorage. |
+| `ARTIFEX_OLLAMA_URL` | `http://localhost:11434` | Ollama server URL. Set to a remote IP for cross-machine inference (e.g., Tailscale). |
+| `ARTIFEX_POLICY` | `strict` | Agent sandbox policy level: `strict`, `moderate`, `permissive`, or `auto`. See [Sandbox](#sandbox--autonomous-execution-safety). |
+| `ARTIFEX_AGENT_KEY` | *(none)* | Required to use `ARTIFEX_POLICY=auto`. Without it, auto falls back to strict. |
+| `ARTIFEX_MAX_AGENT_ROUNDS` | `10` | Max consecutive agent loop iterations before forced stop. |
+| `ARTIFEX_DRY_RUN` | *(off)* | Set to `1` to evaluate actions without executing (log-only mode). |
+| `ARTIFEX_CAPABILITIES` | *(all)* | Comma-separated action types to allow (e.g., `read_file,glob,grep` for read-only). Empty = all. |
+| `ARTIFEX_EGRESS_MODE` | `open` | Network egress control: `open`, `allowlist`, or `denylist`. |
+| `ARTIFEX_EGRESS_ALLOW` | *(none)* | Comma-separated allowed domains (for `allowlist` mode). |
+| `ARTIFEX_EGRESS_DENY` | *(none)* | Comma-separated blocked domains (for `denylist` mode). |
+| `ARTIFEX_HEALTH_TIMEOUT` | `120` | Seconds to wait for llama-server health check. |
+| `ARTIFEX_MAX_CMD_TIMEOUT` | `300` | Max seconds for agent shell command execution. |
+| `ARTIFEX_GATE_INTERVAL` | `5` | Pause for human review every N agent rounds (0 = disabled). |
+| `ARTIFEX_GATE_MAX_ACTIONS` | `25` | Max total actions per session before mandatory pause. |
+| `ARTIFEX_GATE_RISK_BUDGET` | `15` | Cumulative risk points before pause (SAFE=0, LOW=1, MED=2, HIGH=4, CRIT=8). |
+| `ARTIFEX_SANDBOX_ROOTS` | *(project + temp)* | Additional allowed directories for the filesystem sandbox (path-separated). |
+| `ARTIFEX_SANDBOX_DENY` | *(none)* | Additional denied path patterns for the filesystem sandbox (path-separated). |
+| `ARTIFEX_RATCHET_EXTRA` | *(none)* | Additional protected paths the agent cannot modify (path-separated). |
 
 > **Note on environment variables in PowerShell:** Use `$env:VAR = "value"` syntax (not `set VAR=value` which is CMD-only). For the API server, the `--gateway` flag avoids env var hassles entirely.
 
@@ -1390,6 +1411,52 @@ Switch profiles in the CLI with `/context STANDARD` or `/context HIGH`.
 |------|-------------|------------|----------|----------|
 | ASSISTANT | 0.7 | 2048-4096 (by tier) | Enabled | General conversation and tool use |
 | CODE | 0.2 | 4096-8192 (by tier) | Enabled | Code generation and analysis |
+
+---
+
+## Sandbox — Autonomous Execution Safety
+
+The sandbox subsystem (`core/sandbox/`) is a 12-module defense-in-depth stack that controls what the agent can do when it auto-executes actions. It sits between the model's proposed actions and the actual execution, enforcing policy, auditing, and safety checks.
+
+### Policy Levels
+
+| Level | Behavior | When to use |
+|-------|----------|-------------|
+| **strict** (default) | Every action requires human confirmation | Normal interactive use — existing behavior |
+| **moderate** | Read-only actions (glob, grep, read_file) auto-execute; writes and shell need confirmation | Recommended for daily use — saves clicks on safe reads |
+| **permissive** | Up to MEDIUM risk auto-executes (including edits and Python); only shell and downloads need confirmation | Trusted tasks where you want speed |
+| **auto** | Everything auto-executes (requires `ARTIFEX_AGENT_KEY`) | Fully autonomous agent runs — use with gates and audit |
+
+Set via `ARTIFEX_POLICY` in your `.env` file.
+
+### Sandbox Environment Variables
+
+For a typical development setup, add these to your `.env`:
+
+```env
+ARTIFEX_POLICY=moderate
+ARTIFEX_MAX_AGENT_ROUNDS=10
+```
+
+Everything else has safe defaults. See the full [Environment Variables](#environment-variables) table for all options.
+
+### Sandbox Components
+
+| Module | What it does |
+|--------|-------------|
+| **Policy engine** | Central gatekeeper. Classifies actions by risk (SAFE/LOW/MEDIUM/HIGH/CRITICAL) and evaluates against policy level. |
+| **Filesystem sandbox** | Restricts file access to the project directory and temp. Blocks `.ssh`, `.env`, credentials, etc. |
+| **Subprocess sandbox** | Blocks dangerous commands (netcat, sudo, base64 decode, crontab, etc.). Scrubs secrets from child process environment. |
+| **Capabilities** | Per-session action type permissions. Restrict to `read_file,glob,grep` for read-only agent runs. |
+| **Audit log** | Append-only JSONL log of every action with timestamps, risk levels, and outcomes. Stored in `sessions/audit/`. |
+| **Dry-run mode** | Set `ARTIFEX_DRY_RUN=1` to log what the agent *would* do without executing anything. |
+| **Human gates** | Configurable pause checkpoints: every N rounds, after N total actions, or when cumulative risk exceeds a budget. |
+| **Output validator** | Detects prompt injection and obfuscation in model output before execution (ChatML tokens, role manipulation, hex payloads, etc.). |
+| **Egress policy** | Controls which URLs/domains the agent can access. Open by default; switch to allowlist or denylist mode. |
+| **Self-modification ratchet** | Prevents the agent from editing sandbox code, config, CI workflows, or `.env` files. |
+| **Circuit breakers** | Trips on high error rates, repeated identical actions, or rate-limit violations. Auto-resets after cooldown. |
+
+All hooks install automatically at startup. In strict mode (default), behavior is identical to pre-sandbox — the hooks classify and log but all actions still prompt for confirmation.
 
 ---
 
@@ -1417,7 +1484,7 @@ Switch profiles in the CLI with `/context STANDARD` or `/context HIGH`.
 ## Testing
 
 ```bash
-# Run the full test suite (110 tests)
+# Run the full test suite (440 tests)
 python -m pytest
 
 # Verbose with short tracebacks
@@ -1434,6 +1501,20 @@ python -m pytest tests/test_resilience.py -v      # OOM recovery
 python -m pytest tests/test_health.py -v          # Health checks
 python -m pytest tests/test_model_registry.py -v  # Model type detection
 python -m pytest tests/test_tool_cache.py -v      # Cache and SessionMap
+
+# Sandbox tests (184 tests)
+python -m pytest tests/test_sandbox_policy.py -v          # Policy engine
+python -m pytest tests/test_sandbox_fs.py -v              # Filesystem sandbox
+python -m pytest tests/test_sandbox_proc.py -v            # Subprocess sandbox
+python -m pytest tests/test_sandbox_capabilities.py -v    # Capability permissions
+python -m pytest tests/test_sandbox_audit.py -v           # Audit log + replay
+python -m pytest tests/test_sandbox_dry_run.py -v         # Dry-run mode
+python -m pytest tests/test_sandbox_human_gate.py -v      # Human gates
+python -m pytest tests/test_sandbox_output_validator.py -v # Output validation
+python -m pytest tests/test_sandbox_egress.py -v          # Network egress policy
+python -m pytest tests/test_sandbox_ratchet.py -v         # Self-modification ratchet
+python -m pytest tests/test_sandbox_circuit_breaker.py -v # Circuit breakers
+python -m pytest tests/test_sandbox_integration.py -v     # Full stack integration
 
 # WebGPU type-check
 cd webgpu && npx tsc --noEmit

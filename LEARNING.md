@@ -25,6 +25,7 @@
 15. [The Multimodal Service Layer](#15-the-multimodal-service-layer)
 16. [Gemma 4 Integration — A Different Architecture](#16-gemma-4-integration--a-different-architecture)
 17. [Glossary](#17-glossary)
+18. [The Sandbox — Making Agent Execution Safe](#18-the-sandbox--making-agent-execution-safe)
 
 ---
 
@@ -1612,6 +1613,167 @@ Track script category of recent tokens. Apply escalating penalty when rapid Lati
 **Key insight from research**: Fix the SSM drift first (#1 + #3), and the lm_head quantization error becomes tolerable because hidden states stay in the calibrated distribution. Fix the logits (#2), and remaining drift doesn't surface as Chinese tokens. Both root causes must be addressed for stable 500+ token generation.
 
 **References**: MambaQuant (Pierro et al., 2024), Quamba2 (2024), StreamingLLM / Attention Sinks (Xiao et al., 2023), DeltaNet (Yang et al., 2024).
+
+---
+
+## 18. The Sandbox — Making Agent Execution Safe
+
+### The problem
+
+Artifex's ASSISTANT mode is an **agent loop**: the model proposes actions (shell commands, file edits, Python snippets, web fetches), and Artifex executes them. This is powerful — the AI can actually do things on your computer — but it's dangerous. The model's output is influenced by:
+
+- **User input** — you might paste something you copied from the internet.
+- **Web content** — pages fetched via `@web_read` can contain adversarial text.
+- **Model hallucinations** — sometimes the model just generates something wrong.
+
+Without guardrails, the agent could `rm -rf /`, read your SSH keys, exfiltrate data to a URL, or modify its own safety code to remove the checks. The sandbox prevents all of this.
+
+### Defense in depth
+
+The sandbox isn't one check — it's **12 independent layers**, each catching a different class of mistake. This is the principle of **defense in depth**: even if one layer has a bug, the others still protect you.
+
+Here's the execution flow for every action the model proposes:
+
+```
+Model proposes action
+  │
+  ▼
+Output Validator ─── catches prompt injection in the action content
+  │                  (ChatML tokens, "ignore previous instructions", etc.)
+  ▼
+Filesystem Sandbox ── blocks access to .ssh, .env, credentials, /etc/shadow
+  │
+  ▼
+Subprocess Sandbox ── blocks netcat, sudo, base64 decode, crontab, etc.
+  │                   Scrubs AWS_ACCESS_KEY_ID, GH_TOKEN, etc. from child env
+  ▼
+Self-Mod Ratchet ──── blocks writes to core/sandbox/, .github/workflows/, .env
+  │
+  ▼
+Egress Policy ─────── checks URLs against allowlist/denylist
+  │
+  ▼
+Capabilities ──────── checks if this session has permission for this action type
+  │
+  ▼
+Policy Engine ─────── classifies risk (SAFE→CRITICAL), checks policy level
+  │                   STRICT: always confirm. MODERATE: auto-run reads.
+  ▼
+Human Gate ────────── pauses every N rounds or when risk budget exhausted
+  │
+  ▼
+Circuit Breaker ───── trips if error rate >50%, same action repeated 3x,
+  │                   or >30 actions per minute
+  ▼
+Audit Log ─────────── records everything to sessions/audit/<id>.jsonl
+  │
+  ▼
+Execute (or Dry Run if ARTIFEX_DRY_RUN=1)
+```
+
+Every layer is a **policy hook** — a function that receives the action type, content, and risk level, and returns either "I don't care" (None) or a decision (allow/deny). The first hook to return a decision wins. This means the output validator runs before the filesystem sandbox, which runs before the subprocess sandbox, and so on. Order matters.
+
+### Risk classification
+
+Every action gets a risk level:
+
+| Risk | Value | Examples |
+|------|-------|---------|
+| **SAFE** | 0 | `@read_file`, `@glob`, `@grep`, `@find_symbol` |
+| **LOW** | 1 | `@search`, `@web_read` |
+| **MEDIUM** | 2 | `@edit_file`, Python snippets |
+| **HIGH** | 3 | Shell commands (most), `@download` |
+| **CRITICAL** | 4 | `rm -rf`, `git push --force`, `DROP TABLE`, `sudo` |
+
+Shell commands are special — they start at HIGH but get reclassified based on content. `ls -la` drops to SAFE. `rm -rf /tmp` escalates to CRITICAL. This content analysis happens in `classify_shell_risk()`.
+
+### Policy levels
+
+The policy level determines which risk levels auto-execute vs. require confirmation:
+
+- **strict** — Everything prompts. This is the default and matches pre-sandbox behavior.
+- **moderate** — SAFE auto-executes (the model can read files without asking you). Everything else prompts.
+- **permissive** — Up to MEDIUM auto-executes (reads + edits + Python). Only HIGH and CRITICAL prompt.
+- **auto** — Everything auto-executes. Requires `ARTIFEX_AGENT_KEY` to be set as a deliberate opt-in.
+
+### The hook pattern
+
+All 12 modules follow the same pattern:
+
+```python
+from core.sandbox.policy import register_policy_hook, PolicyDecision, RiskLevel
+
+def _my_hook(action_type: str, content: str, risk: RiskLevel):
+    if something_bad(content):
+        return PolicyDecision(
+            allowed=False,
+            requires_confirmation=False,
+            risk_level=RiskLevel.CRITICAL,
+            reason="blocked: explanation",
+            matched_rule="my_hook",
+        )
+    return None  # I don't care, let the next hook decide
+
+def install():
+    register_policy_hook(_my_hook)
+```
+
+Returning `None` means "I have no opinion, defer to the next hook." Returning a `PolicyDecision` overrides everything — no further hooks are checked. This is why hook order matters.
+
+### The audit log
+
+Every action is recorded in `sessions/audit/<session_id>.jsonl`, one JSON object per line:
+
+```json
+{"timestamp": 1714234567.89, "session_id": "abc-123", "round_num": 3,
+ "action_type": "shell", "content_preview": "ls -la",
+ "risk_level": "SAFE", "policy_decision": "allowed",
+ "matched_rule": "auto_moderate", "outcome": "success", "error": ""}
+```
+
+This is append-only — the agent can't modify or delete audit entries (the ratchet protects the sandbox directory). You can replay an audit log to see exactly what an agent session did and whether today's policy would have allowed it.
+
+### Human gates and circuit breakers
+
+Even with auto-execution, the agent doesn't run forever unsupervised:
+
+- **Human gates** pause after every 5 rounds (configurable), after 25 total actions, or when cumulative risk points exceed 15. Risk points: SAFE=0, LOW=1, MEDIUM=2, HIGH=4, CRITICAL=8. After a pause, the human acknowledges and the budget resets.
+- **Circuit breakers** trip if >50% of recent actions fail (the model is stuck), the same action repeats 3 times (infinite loop), or actions-per-minute exceeds 30 (runaway). A tripped breaker stops execution and auto-resets after 60 seconds.
+
+### Environment scrubbing
+
+When the agent runs a shell command or Python snippet, the subprocess sandbox **strips secrets from the environment**. The child process never sees `AWS_ACCESS_KEY_ID`, `GH_TOKEN`, `GITHUB_TOKEN`, `ARTIFEX_AGENT_KEY`, `DATABASE_URL`, or anything prefixed with `SECRET_` or `PRIVATE_KEY_`. This prevents accidental exfiltration even if the model generates a `curl` command.
+
+### The self-modification ratchet
+
+The ratchet is a one-way lock. Once installed, the agent cannot:
+
+- Edit anything in `core/sandbox/` (the sandbox itself).
+- Edit `core/config.py`, `.github/workflows/`, `pyproject.toml`, or `.env`.
+- Redirect shell output to protected paths (`echo hack > .env`).
+
+The ratchet only blocks **writes**. The agent can still **read** sandbox code (it needs to understand the codebase to help you). Only a human restart with different env vars can change what's protected.
+
+### Putting it all together
+
+At startup, `install_all_hooks()` registers all 12 hooks in the correct order. The CLI agent loop calls `check_policy(action_type, content)` for every action the model proposes. The result tells the CLI whether to auto-execute, prompt for confirmation, or block entirely.
+
+```python
+from core.sandbox import install_all_hooks, check_policy
+
+install_all_hooks()  # once at startup
+
+# For each model-proposed action:
+decision = check_policy("shell", "ls -la")
+if not decision.allowed:
+    print(f"BLOCKED: {decision.reason}")
+elif decision.requires_confirmation:
+    # show the user and ask
+else:
+    # auto-execute
+```
+
+The beauty of this design is that **every new safety feature is just another hook**. If you want to add IP geolocation checking, token budget limits, or anything else — you write a function that returns `PolicyDecision` or `None`, and register it. The existing hooks don't need to change.
 
 ---
 
