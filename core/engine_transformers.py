@@ -37,12 +37,13 @@ from core.config import (
 )
 from core.inference import STOP_STRINGS, _clean_response
 
-# Model types that require AutoModelForMultimodalLM instead of AutoModelForCausalLM.
-# Exact matches checked first, then prefix matching as fallback for future variants.
+# Model types that historically required AutoModelForMultimodalLM (Gemma 4
+# family). Image-text-to-text models (Qwen-VL, LLaVA, etc.) are now resolved
+# via the transformers auto-mapping registry so we don't have to maintain
+# a per-family allowlist.
 _MULTIMODAL_MODEL_TYPES = {
     "gemma3n", "gemma3n_text", "gemma3n_vision", "gemma3n_audio",
 }
-# Prefixes: any model_type starting with these is treated as multimodal
 _MULTIMODAL_MODEL_PREFIXES = ("gemma3n", "gemma4", "gemma_4")
 
 
@@ -58,30 +59,65 @@ def _detect_model_type_from_config(model_path: str):
     return None
 
 
-def _is_multimodal_model(model_type: str) -> bool:
-    """Check if a model_type indicates a multimodal model.
+def _is_image_text_to_text(model_type: str) -> bool:
+    """True if model_type is registered for AutoModelForImageTextToText.
 
-    Uses exact set match first, then prefix matching for future variants
-    (e.g. gemma4_xxx, gemma3n_xxx).
+    Covers Qwen-VL (qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe), LLaVA,
+    InternVL, MiniCPM-V, Pixtral, etc. — anything transformers itself maps
+    to image→text. Reading from the live registry means new VL families
+    work without code changes here.
     """
+    if not model_type:
+        return False
+    try:
+        from transformers.models.auto.modeling_auto import (
+            MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES,
+        )
+    except ImportError:
+        return False
+    return model_type in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
+
+
+def _is_multimodal_model(model_type: str) -> bool:
+    """Check if a model_type needs a multimodal AutoModel + AutoProcessor.
+
+    Returns True for image-text-to-text models (registry lookup) AND for
+    the Gemma 4 / 3n family which uses AutoModelForMultimodalLM.
+    """
+    if not model_type:
+        return False
+    if _is_image_text_to_text(model_type):
+        return True
+    if model_type in _MULTIMODAL_MODEL_TYPES:
+        return True
+    model_type_lower = model_type.lower()
+    return any(model_type_lower.startswith(p) for p in _MULTIMODAL_MODEL_PREFIXES)
+
+
+def _matches_gemma_multimodal(model_type: str) -> bool:
+    """True for the Gemma 4 / 3n family (vision + audio multimodal)."""
     if not model_type:
         return False
     if model_type in _MULTIMODAL_MODEL_TYPES:
         return True
-    # Prefix matching catches future naming variants
-    model_type_lower = model_type.lower()
-    return any(model_type_lower.startswith(p) for p in _MULTIMODAL_MODEL_PREFIXES)
+    return any(model_type.lower().startswith(p) for p in _MULTIMODAL_MODEL_PREFIXES)
 
 
 def _get_auto_model_class(model_path: str):
     """Return the appropriate AutoModel class for a given model.
 
-    Gemma 4 (model_type gemma3n*, gemma4*) requires AutoModelForMultimodalLM.
-    All other models use AutoModelForCausalLM.
-    Requires transformers >= 5.5.0 for multimodal support.
+    Resolution order:
+      1. Gemma 4 / 3n family → AutoModelForMultimodalLM (vision + audio)
+      2. Anything registered for image-text-to-text (Qwen-VL, LLaVA,
+         InternVL, etc.) → AutoModelForImageTextToText
+      3. Everything else → AutoModelForCausalLM
+
+    Step 2 reads the live transformers registry, so new VL families work
+    without code changes here.
     """
     model_type = _detect_model_type_from_config(model_path)
-    if _is_multimodal_model(model_type):
+
+    if _matches_gemma_multimodal(model_type):
         try:
             from transformers import AutoModelForMultimodalLM
             return AutoModelForMultimodalLM
@@ -90,6 +126,17 @@ def _get_auto_model_class(model_path: str):
                 "AutoModelForMultimodalLM not available (needs transformers >= 5.5.0). "
                 "Falling back to AutoModelForCausalLM for %s.", model_type
             )
+
+    if _is_image_text_to_text(model_type):
+        try:
+            from transformers import AutoModelForImageTextToText
+            return AutoModelForImageTextToText
+        except ImportError:
+            logging.getLogger(__name__).warning(
+                "AutoModelForImageTextToText not available; falling back for %s.",
+                model_type,
+            )
+
     return AutoModelForCausalLM
 
 # Suppress harmless warnings
