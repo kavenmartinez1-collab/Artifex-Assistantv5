@@ -3,7 +3,7 @@ import * as path from 'path';
 import { ServiceManager } from './services/service-manager';
 import { LogStore } from './logs/log-store';
 import { loadConfig, updateConfig } from './state/persistence';
-import { scanModels, scanOllamaModels, deleteModel, deleteOllamaModel } from './models/model-scanner';
+import { scanModels, scanOllamaModels, scanLlamaCppModels, deleteModel, deleteOllamaModel, setNoCacheMarker } from './models/model-scanner';
 import {
   isDockerInstalled,
   listContainers,
@@ -111,12 +111,23 @@ export function registerAllHandlers(
     return scanOllamaModels();
   });
 
+  ipcMain.handle('models:scan-llama-cpp', async () => {
+    return scanLlamaCppModels(projectRoot);
+  });
+
   ipcMain.handle('models:delete', async (_event, modelPath: string) => {
     return deleteModel(modelPath);
   });
 
   ipcMain.handle('models:delete-ollama', async (_event, name: string) => {
     return deleteOllamaModel(name);
+  });
+
+  // Toggle the per-model NF4 cache opt-out marker. When enabled, also
+  // deletes the existing -nf4-cached sibling so disk is reclaimed
+  // immediately. Returns the new cache state for the renderer.
+  ipcMain.handle('models:set-no-cache', async (_event, modelPath: string, enabled: boolean) => {
+    return setNoCacheMarker(modelPath, enabled);
   });
 
   // Used by service-card to populate the model dropdown when a backend

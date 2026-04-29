@@ -138,6 +138,10 @@ contextBridge.exposeInMainWorld('artifex', {
     return ipcRenderer.invoke('models:scan-ollama');
   },
 
+  scanLlamaCppModels: (): Promise<unknown[]> => {
+    return ipcRenderer.invoke('models:scan-llama-cpp');
+  },
+
   listModelNamesByBackend: (): Promise<{ transformers: string[]; ollama: string[]; llama_cpp: string[] }> => {
     return ipcRenderer.invoke('models:list-names');
   },
@@ -148,6 +152,18 @@ contextBridge.exposeInMainWorld('artifex', {
 
   deleteOllamaModel: (name: string): Promise<void> => {
     return ipcRenderer.invoke('models:delete-ollama', name);
+  },
+
+  setNoCache: (
+    modelPath: string,
+    enabled: boolean,
+  ): Promise<{
+    noCache: boolean;
+    cachePath: string | null;
+    cacheSizeBytes: number;
+    cacheSizeFormatted: string;
+  }> => {
+    return ipcRenderer.invoke('models:set-no-cache', modelPath, enabled);
   },
 
   // ── Docker Management ──

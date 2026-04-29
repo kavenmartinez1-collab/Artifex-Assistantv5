@@ -5,7 +5,7 @@ import * as path from 'path';
 export interface ModelInfo {
   name: string;           // directory name
   path: string;           // full path
-  sizeBytes: number;      // total on disk
+  sizeBytes: number;      // total on disk (model dir only, not cache)
   sizeFormatted: string;  // "5.74 GB"
   modelType: string;      // from config
   hiddenSize: number;
@@ -18,6 +18,13 @@ export interface ModelInfo {
   groupSize: number | null;
   mixedPrecision: boolean;
   shardCount: number;
+  // NF4 cache state — set by the Python engine on first slow-path load.
+  // Tied to a sibling directory `<name>-nf4-cached/`. The `.no_cache`
+  // marker is the user-controllable opt-out (Control Center checkbox).
+  cachePath: string | null;       // absolute path to cache dir, or null
+  cacheSizeBytes: number;         // 0 if no cache present
+  cacheSizeFormatted: string;     // "0 B" when none
+  noCache: boolean;               // true when `.no_cache` marker present
   source: 'transformers'; // distinguishes from Ollama models in the UI
 }
 
@@ -31,6 +38,21 @@ export interface OllamaModelInfo {
   format: string;          // e.g. "gguf"
   modifiedAt: string;
   source: 'ollama';
+}
+
+export interface LlamaCppModelInfo {
+  name: string;            // config key, e.g. "qwen3.6-27b-tq3_4s"
+  ggufPath: string;        // absolute path to the .gguf file
+  sizeBytes: number;       // GGUF size on disk; 0 if not stat'able
+  sizeFormatted: string;
+  port: number;
+  numCtx: number | null;   // null when auto-sized from VRAM
+  numGpuLayers: number;
+  serverPath: string;      // resolved llama-server binary
+  hasMmproj: boolean;      // true if `--mmproj <...>` is in extra_flags
+  flagsSummary: string[];  // condensed extra_flags for display
+  ggufMissing: boolean;    // true if the GGUF doesn't exist on disk
+  source: 'llama_cpp';
 }
 
 function formatBytes(bytes: number): string {
@@ -133,6 +155,9 @@ async function parseConfig(configPath: string): Promise<{
   return defaults;
 }
 
+const NF4_CACHE_SUFFIX = '-nf4-cached';
+const NO_CACHE_MARKER = '.no_cache';
+
 export async function scanModels(projectRoot: string): Promise<ModelInfo[]> {
   const modelsDir = path.join(projectRoot, 'models');
 
@@ -143,12 +168,23 @@ export async function scanModels(projectRoot: string): Promise<ModelInfo[]> {
   }
 
   const entries = await fsp.readdir(modelsDir, { withFileTypes: true });
+  // First pass: build a set of all directory names so we can look up
+  // each model's `<name>-nf4-cached` sibling without re-stat'ing.
+  const dirNames = new Set<string>();
+  for (const entry of entries) {
+    if (entry.isDirectory()) dirNames.add(entry.name);
+  }
+
   const models: ModelInfo[] = [];
 
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     // Skip hidden directories like .cache
     if (entry.name.startsWith('.')) continue;
+    // Skip NF4 cache directories — they're not user-facing models, just
+    // a speedup artifact owned by the Python engine. Surfacing them as
+    // separate cards confuses users (they look like duplicate models).
+    if (entry.name.endsWith(NF4_CACHE_SUFFIX)) continue;
 
     const modelPath = path.join(modelsDir, entry.name);
     const configPath = path.join(modelPath, 'config.json');
@@ -156,6 +192,18 @@ export async function scanModels(projectRoot: string): Promise<ModelInfo[]> {
     const cfg = await parseConfig(configPath);
     const sizeBytes = await getDirSize(modelPath);
     const shardCount = await countShards(modelPath);
+
+    // Cache state: a sibling `<name>-nf4-cached` may or may not exist.
+    // The `.no_cache` marker lives in the source directory and gates
+    // future cache writes by the Python engine.
+    const cacheName = entry.name + NF4_CACHE_SUFFIX;
+    let cachePath: string | null = null;
+    let cacheSizeBytes = 0;
+    if (dirNames.has(cacheName)) {
+      cachePath = path.join(modelsDir, cacheName);
+      cacheSizeBytes = await getDirSize(cachePath);
+    }
+    const noCache = await fileExists(path.join(modelPath, NO_CACHE_MARKER));
 
     models.push({
       name: entry.name,
@@ -173,6 +221,10 @@ export async function scanModels(projectRoot: string): Promise<ModelInfo[]> {
       groupSize: cfg.groupSize,
       mixedPrecision: cfg.mixedPrecision,
       shardCount,
+      cachePath,
+      cacheSizeBytes,
+      cacheSizeFormatted: formatBytes(cacheSizeBytes),
+      noCache,
       source: 'transformers',
     });
   }
@@ -181,6 +233,74 @@ export async function scanModels(projectRoot: string): Promise<ModelInfo[]> {
   models.sort((a, b) => b.sizeBytes - a.sizeBytes);
 
   return models;
+}
+
+async function fileExists(p: string): Promise<boolean> {
+  try {
+    await fsp.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Toggle the `.no_cache` marker on a transformers model directory.
+ *
+ * When `enabled` is true: writes the marker AND deletes the existing
+ * `<name>-nf4-cached` sibling (if any) so the user actually reclaims
+ * disk. The Python engine will skip future cache writes for this model.
+ *
+ * When `enabled` is false: removes the marker. The cache will regenerate
+ * on the next slow-path load.
+ *
+ * Returns the new cache state so the renderer can update the card
+ * without re-scanning everything.
+ */
+export async function setNoCacheMarker(
+  modelPath: string,
+  enabled: boolean,
+): Promise<{ noCache: boolean; cachePath: string | null; cacheSizeBytes: number; cacheSizeFormatted: string }> {
+  // Safety: must be inside a models/ directory, must be a directory itself.
+  const resolved = path.resolve(modelPath);
+  const parentDir = path.basename(path.dirname(resolved));
+  if (parentDir !== 'models') {
+    throw new Error(`Safety check failed: "${resolved}" is not inside a models/ directory`);
+  }
+  const stat = await fsp.stat(resolved).catch(() => null);
+  if (!stat || !stat.isDirectory()) {
+    throw new Error(`Not a model directory: "${resolved}"`);
+  }
+
+  const markerPath = path.join(resolved, NO_CACHE_MARKER);
+  const cachePath = resolved + NF4_CACHE_SUFFIX;
+
+  if (enabled) {
+    // Idempotent write — `wx` would error if it already existed, but
+    // we want to be safe to call repeatedly without surprising the user.
+    await fsp.writeFile(markerPath, '', 'utf-8');
+    // Also reclaim disk by removing the existing cache directory.
+    // rm with force:true is a no-op if the path doesn't exist.
+    await fsp.rm(cachePath, { recursive: true, force: true });
+    return {
+      noCache: true,
+      cachePath: null,
+      cacheSizeBytes: 0,
+      cacheSizeFormatted: formatBytes(0),
+    };
+  }
+
+  // Disable: remove the marker only — leave the cache alone (it'll
+  // be regenerated naturally on the next slow-path load).
+  await fsp.rm(markerPath, { force: true });
+  const exists = await fileExists(cachePath);
+  const cacheSizeBytes = exists ? await getDirSize(cachePath) : 0;
+  return {
+    noCache: false,
+    cachePath: exists ? cachePath : null,
+    cacheSizeBytes,
+    cacheSizeFormatted: formatBytes(cacheSizeBytes),
+  };
 }
 
 /**
@@ -286,6 +406,120 @@ export async function deleteOllamaModel(name: string): Promise<void> {
     req.write(body);
     req.end();
   });
+}
+
+/**
+ * Discover models declared in `llama_cpp_config.json` at the project root.
+ *
+ * Unlike Ollama (HTTP daemon) or Transformers (HF directories under
+ * `models/`), llama.cpp models are explicitly declared in the project's
+ * config — paths can live anywhere on disk. We just stat each declared
+ * GGUF and surface its launch settings. Returns [] if the config is
+ * missing or unparseable.
+ */
+export async function scanLlamaCppModels(projectRoot: string): Promise<LlamaCppModelInfo[]> {
+  const configPath = path.join(projectRoot, 'llama_cpp_config.json');
+  let raw: string;
+  try {
+    raw = await fsp.readFile(configPath, 'utf-8');
+  } catch {
+    return [];
+  }
+
+  let cfg: {
+    server_path?: string;
+    default_port?: number;
+    models?: Record<string, {
+      path?: string;
+      port?: number;
+      num_ctx?: number;
+      num_gpu_layers?: number;
+      server_path?: string;
+      extra_flags?: string[];
+    }>;
+  };
+  try {
+    cfg = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+
+  const defaultServerPath = cfg.server_path || 'llama-server';
+  const defaultPort = cfg.default_port || 8081;
+  const models = cfg.models || {};
+  const out: LlamaCppModelInfo[] = [];
+
+  for (const [name, m] of Object.entries(models)) {
+    const ggufPath = m.path || '';
+    const flags = m.extra_flags || [];
+    const hasMmproj = flags.some((f) => f === '--mmproj');
+    let sizeBytes = 0;
+    let ggufMissing = true;
+    if (ggufPath) {
+      try {
+        const stat = await fsp.stat(ggufPath);
+        sizeBytes = stat.size;
+        ggufMissing = false;
+      } catch {
+        // Leave defaults — surfaced as `ggufMissing: true` in the card
+      }
+    }
+
+    out.push({
+      name,
+      ggufPath,
+      sizeBytes,
+      sizeFormatted: formatBytes(sizeBytes),
+      port: m.port || defaultPort,
+      numCtx: typeof m.num_ctx === 'number' ? m.num_ctx : null,
+      numGpuLayers: typeof m.num_gpu_layers === 'number' ? m.num_gpu_layers : 99,
+      serverPath: m.server_path || defaultServerPath,
+      hasMmproj,
+      flagsSummary: condenseFlags(flags),
+      ggufMissing,
+      source: 'llama_cpp',
+    });
+  }
+
+  // Sort by size descending; missing GGUFs (size 0) sink to the bottom
+  // so the user notices them.
+  out.sort((a, b) => b.sizeBytes - a.sizeBytes);
+  return out;
+}
+
+/**
+ * Compress llama-server's verbose `extra_flags` array into a short list of
+ * human-readable badges for the model card. e.g.
+ *   ["-fa", "on", "-ctk", "q8_0", "--jinja"] → ["FA on", "KV q8_0", "jinja"]
+ */
+function condenseFlags(flags: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i];
+    const next = flags[i + 1];
+    if (f === '-fa' && next) {
+      out.push(`FA ${next}`);
+      i++;
+    } else if (f === '-ctk' && next) {
+      out.push(`KV ${next}`);
+      i++;
+      // Skip a matching -ctv so we don't double-report when both are equal
+      if (flags[i + 1] === '-ctv' && flags[i + 2] === next) i += 2;
+    } else if (f === '-ctv' && next) {
+      out.push(`KV-V ${next}`);
+      i++;
+    } else if (f === '--jinja') {
+      out.push('jinja');
+    } else if (f === '--mmproj') {
+      // mmproj surfaces separately as a vision badge; skip its arg here
+      i++;
+    } else if (f.startsWith('--') || f.startsWith('-')) {
+      // Unknown flag — show as-is, swallow its arg if there's one
+      out.push(f);
+      if (next && !next.startsWith('-')) i++;
+    }
+  }
+  return out;
 }
 
 export async function deleteModel(modelPath: string): Promise<void> {
