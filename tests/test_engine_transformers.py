@@ -118,3 +118,95 @@ class TestAutoModelDispatch:
 
     def test_no_config_falls_back_to_causal_lm(self):
         assert self._resolve(None) == "AutoModelForCausalLM"
+
+
+class TestMultimodalMessageConversion:
+    """OpenAI image_url → processor format conversion.
+
+    Regression for the case where Qwen3-VL's apply_chat_template returned a
+    plain string (not a tokenized BatchFeature) because it didn't recognize
+    image_url-shaped content, then crashed with `'str' object has no attribute 'to'`.
+    """
+
+    @staticmethod
+    def _make_data_url():
+        import base64, io
+        from PIL import Image
+        img = Image.new("RGB", (8, 8), color="blue")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    def test_decode_data_url_returns_pil_image(self):
+        from PIL import Image
+        from core.engine_transformers import _decode_image_url
+        result = _decode_image_url(self._make_data_url())
+        assert isinstance(result, Image.Image)
+        assert result.size == (8, 8)
+
+    def test_decode_http_url_passes_through(self):
+        from core.engine_transformers import _decode_image_url
+        url = "https://example.com/x.jpg"
+        assert _decode_image_url(url) == url
+
+    def test_decode_garbage_returns_none(self):
+        from core.engine_transformers import _decode_image_url
+        assert _decode_image_url("nope") is None
+        assert _decode_image_url("") is None
+
+    def test_decode_malformed_base64_returns_none(self):
+        from core.engine_transformers import _decode_image_url
+        # Header says base64 but payload is junk
+        assert _decode_image_url("data:image/png;base64,notbase64!!") is None
+
+    def test_convert_image_url_to_image(self):
+        from PIL import Image
+        from core.engine_transformers import _convert_openai_messages_for_processor
+        msgs = [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": self._make_data_url()}},
+                {"type": "text", "text": "describe"},
+            ],
+        }]
+        converted = _convert_openai_messages_for_processor(msgs)
+        items = converted[0]["content"]
+        assert items[0]["type"] == "image"
+        assert isinstance(items[0]["image"], Image.Image)
+        assert items[1] == {"type": "text", "text": "describe"}
+
+    def test_convert_text_only_passthrough(self):
+        from core.engine_transformers import _convert_openai_messages_for_processor
+        msgs = [{"role": "user", "content": "hello"}]
+        assert _convert_openai_messages_for_processor(msgs) == msgs
+
+    def test_convert_drops_unparseable_image(self):
+        from core.engine_transformers import _convert_openai_messages_for_processor
+        msgs = [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "not a url"}},
+                {"type": "text", "text": "x"},
+            ],
+        }]
+        converted = _convert_openai_messages_for_processor(msgs)
+        # The unparseable image is dropped; the text remains
+        assert converted[0]["content"] == [{"type": "text", "text": "x"}]
+
+    def test_extract_images_pulls_pil_objects(self):
+        from PIL import Image
+        from core.engine_transformers import (
+            _convert_openai_messages_for_processor, _extract_processor_images,
+        )
+        msgs = [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": self._make_data_url()}},
+                {"type": "image_url", "image_url": {"url": self._make_data_url()}},
+                {"type": "text", "text": "x"},
+            ],
+        }]
+        converted = _convert_openai_messages_for_processor(msgs)
+        images = _extract_processor_images(converted)
+        assert len(images) == 2
+        assert all(isinstance(i, Image.Image) for i in images)

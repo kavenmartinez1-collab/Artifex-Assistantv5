@@ -184,6 +184,91 @@ def _patch_config_json(model_path: str):
         )
 
 
+def _decode_image_url(url: str):
+    """Resolve an OpenAI-style image_url to something a VL processor accepts.
+
+    data:image/...;base64,... → PIL.Image
+    http(s)://... → URL string (the processor downloads it itself)
+    file://... or other → URL string (processor handles or rejects)
+    Anything that fails to decode returns None and is dropped from the message.
+    """
+    if not url:
+        return None
+    if url.startswith(("http://", "https://", "file://")):
+        return url
+    if url.startswith("data:"):
+        try:
+            import base64 as _b64
+            import io as _io
+            from PIL import Image
+            header, _, payload = url.partition(",")
+            if not payload:
+                return None
+            if ";base64" in header.lower():
+                raw = _b64.b64decode(payload)
+            else:
+                from urllib.parse import unquote
+                raw = unquote(payload).encode("latin-1")
+            return Image.open(_io.BytesIO(raw)).convert("RGB")
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Skipping malformed image data URL: %s", e
+            )
+            return None
+    return None
+
+
+def _convert_openai_messages_for_processor(messages):
+    """Translate OpenAI multimodal messages to the shape VL processors expect.
+
+    OpenAI:    {"type": "image_url", "image_url": {"url": "data:..."}}
+    Processor: {"type": "image", "image": <PIL.Image | url-string>}
+
+    Text-only messages and already-converted messages pass through untouched.
+    Items that fail to decode are dropped rather than crashing the request.
+    """
+    out = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            out.append(msg)
+            continue
+
+        new_content = []
+        for item in content:
+            if not isinstance(item, dict):
+                new_content.append(item)
+                continue
+            t = item.get("type")
+            if t == "image_url":
+                url = (item.get("image_url") or {}).get("url", "")
+                resolved = _decode_image_url(url)
+                if resolved is not None:
+                    new_content.append({"type": "image", "image": resolved})
+            else:
+                new_content.append(item)
+
+        new_msg = dict(msg)
+        new_msg["content"] = new_content
+        out.append(new_msg)
+    return out
+
+
+def _extract_processor_images(messages):
+    """Collect image objects (PIL or URL strings) from converted messages."""
+    images = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "image":
+                img = item.get("image")
+                if img is not None:
+                    images.append(img)
+    return images
+
+
 def _verify_4bit_packing(model) -> bool:
     """Return True if Linear4bit weights were correctly packed.
 
@@ -893,6 +978,67 @@ class TransformersEngine(BaseEngine):
             torch.cuda.ipc_collect()
 
     # =========================================================================
+    # INPUT TOKENIZATION (text + multimodal)
+    # =========================================================================
+
+    def _build_inputs_for_messages(self, messages, enable_thinking):
+        """Tokenize a chat-completions message list for the loaded model.
+
+        Three paths:
+          1. No processor (text-only model) → tokenizer.apply_chat_template.
+          2. Processor + unified call works → use it (Gemma 4 path).
+          3. Unified call returns a string (VL processors that don't
+             handle image_url content via the chat template directly) →
+             two-step Qwen-VL idiom: render text via apply_chat_template
+             with tokenize=False, then call the processor with text +
+             images to produce the BatchFeature.
+        """
+        if self.processor is None:
+            return self._apply_template(
+                self.tokenizer, messages, enable_thinking, tokenize=True,
+            )
+
+        converted = _convert_openai_messages_for_processor(messages)
+
+        # Try the unified path first — works for Gemma 4 and any VL
+        # processor whose chat template handles image content directly.
+        try:
+            unified = self._apply_template(
+                self.processor, converted, enable_thinking, tokenize=True,
+            )
+            if not isinstance(unified, str):
+                return unified
+        except Exception as e:
+            logging.getLogger(__name__).debug(
+                "Unified processor template failed (%s); using two-step path.", e
+            )
+
+        # Two-step: text via template, then text+images via processor.
+        text = self._apply_template(
+            self.processor, converted, enable_thinking, tokenize=False,
+        )
+        images = _extract_processor_images(converted)
+        kwargs = {"text": [text], "return_tensors": "pt", "padding": True}
+        if images:
+            kwargs["images"] = images
+        return self.processor(**kwargs)
+
+    @staticmethod
+    def _apply_template(template_source, messages, enable_thinking, *, tokenize):
+        """Wrap apply_chat_template, gracefully handling templates that
+        don't accept enable_thinking (Gemma 4, LLaVA, etc.)."""
+        common = {"add_generation_prompt": True, "tokenize": tokenize}
+        if tokenize:
+            common["return_tensors"] = "pt"
+            common["return_dict"] = True
+        try:
+            return template_source.apply_chat_template(
+                messages, enable_thinking=enable_thinking, **common,
+            )
+        except TypeError:
+            return template_source.apply_chat_template(messages, **common)
+
+    # =========================================================================
     # BaseEngine — TOKEN COUNTING
     # =========================================================================
 
@@ -920,15 +1066,8 @@ class TransformersEngine(BaseEngine):
         if _inf._tokenizer is None:
             _inf._tokenizer = tokenizer
 
-        # Use processor for multimodal models (Gemma 4), tokenizer otherwise
-        template_source = self.processor if self.processor is not None else tokenizer
-
-        inputs = template_source.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            enable_thinking=enable_thinking,
-            return_tensors="pt",
-            return_dict=True,
+        inputs = self._build_inputs_for_messages(
+            messages, enable_thinking
         ).to(model.device)
 
         # Real prompt token count — input_ids is (batch, seq_len).
