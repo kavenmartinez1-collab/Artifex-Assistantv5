@@ -297,6 +297,20 @@ When you use the Transformers backend:
 
 The first time you load a model, bitsandbytes quantizes every weight from FP16 to NF4. This takes 2-5 minutes. Artifex saves the quantized weights to a cache directory (`models/qwen3.5-9b-nf4-cached/`) so subsequent loads are instant. This is the "fast path" in `engine_transformers.py`.
 
+### Vision-Language on this backend (and why the pixel cap exists)
+
+The transformers backend doubles as our **escape hatch for VL** — Ollama can serve image VLMs but lags on video and on newer model families, so anything VL-heavy lands here. Three things had to fall into place for it to work end-to-end:
+
+1. **Model class routing.** Standard text models load via `AutoModelForCausalLM`, but VL configs (Qwen-VL, LLaVA, etc.) need `AutoModelForImageTextToText`; Gemma 4 needs `AutoModelForMultimodalLM`. `_resolve_vlm_class()` reads `config.json` and picks the right class so the model's vision tower actually loads. Pick the wrong class and you silently get a text-only stub that ignores the images.
+2. **Message-format conversion.** The OpenAI Chat API gives us `{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "..."}}, {"type": "text", "text": "..."}]}`. The processor wants PIL images alongside the prompt. `_decode_image_url()` turns data URLs into PIL via base64, leaves HTTP URLs as strings (the processor fetches them), and drops anything malformed. `generate_streaming` then routes the image+prompt through the processor instead of the plain tokenizer.
+3. **Sampler dispatch at temperature 0.** With VL inputs the sampling kernel can produce NaNs at `temperature=0` because logits-over-zero divides badly. Routing `temperature == 0` to greedy decoding (`do_sample=False`) avoids it and matches the spec users expect ("temp 0 = deterministic").
+
+**The SDPA scratch trap.** Once VL is wired up the next thing that bites is memory. Vision tokens scale with image *area* — a 4K screenshot at native resolution can become 30K+ tokens through Qwen-VL's patch embedder. SDPA's attention scratch is `O(N²)` in sequence length, and on Windows + Ampere it falls back to a fp32 math kernel that's even worse. A 4 MP screenshot that "should" fit 24 GiB easily ends up trying to allocate ~22 GiB just for attention workspace and OOMs.
+
+The fix is not "buy more VRAM" — it's **cap pixels at the source**. `_resize_to_pixel_cap()` LANCZOS-downscales any PIL image to ≤ `ARTIFEX_VL_MAX_PIXELS` (default `1280*28*28` ≈ 1.0 MP, the same "balanced" preset Qwen ships with). HTTP URLs bypass because we don't fetch them. The cap is one env var so you can trade quality for headroom without a code change.
+
+**Lesson.** When you wire up a new modality, three layers all have to agree: model class (does the vision tower load?), message format (does the processor get PIL or strings?), and input shape (does the attention math fit in VRAM?). Skip any one and the model silently degrades — you'll get text-only answers, garbled tokens, or an OOM that looks like a load-time bug but is really a per-prompt one.
+
 ---
 
 ## 5. Backend #2: Ollama
@@ -385,6 +399,27 @@ The three-tier backend stack:
 ### Configuration
 
 Models are defined in `llama_cpp_config.json` with the GGUF path, server binary, port, context size, and extra flags. The engine auto-sizes context from VRAM if `num_ctx` is omitted, using the same VRAM detection as the Ollama backend.
+
+### Why custom forks exist — the TurboQuant story
+
+The clearest example of "why bother with a fork" is TurboQuant. The full algorithm comes from a Google paper (PolarQuant + QJL, ICLR 2026) and originally targeted **KV-cache compression** — squeezing the attention key/value tensors during inference. A separate research line then asked: what if we use the same rotation-and-quantize trick on the *weights* themselves? That produces formats called `TQ3_1S` and `TQ3_4S`, where the "TQ3" means "TurboQuant 3-bit" and the trailing letters identify the codebook variant.
+
+`TQ3_4S` weighs in around 3.4 bits-per-weight on a 27B model — about 13 GiB on disk for something that's ~52 GiB at fp16. That's competitive with `Q3_K_S` at slightly smaller sizes and similar perplexity, with a different speed/quality trade-off. The catch: the dequantization kernel is new code. Stock llama.cpp doesn't have it. Ollama, which bundles a specific llama.cpp snapshot, doesn't have it. The GGUF will simply fail to load — `unknown quant type` — until the runtime knows how to unpack it.
+
+That's what the **turbo-tan/llama.cpp-tq3** fork is for. It's a *runtime-only* fork — it adds the inference path for `TQ3_*S` weights but deliberately does not ship the quantization tooling that produces them. End users download pre-quantized GGUFs (e.g. from HuggingFace) and run them; they don't generate them. This split keeps the fork small and focused: it tracks upstream closely on everything except the TQ3 dequant code.
+
+The general pattern is: **new quant format → research paper → reference implementation in a fork → eventual upstream merge → eventual Ollama bundle update**. Running the fork directly lets you skip the last two waits, which can be six months or more.
+
+### Vision via mmproj — one model, two GGUFs
+
+Vision-language models in the GGUF world ship as **two separate files**: the language-model weights (the big GGUF) and a "multimodal projector" (a small `mmproj.gguf`). The split exists because the two pieces are architecturally different:
+
+- The **language model** is a stack of transformer layers operating on token embeddings — same as any text-only LLM. Quantize it aggressively, run it on the GPU, no surprises.
+- The **multimodal projector** is a small network (often just a linear or two-layer MLP) that takes vision-encoder outputs (e.g. patch embeddings from a ViT) and projects them into the LM's embedding space, so they look like just more tokens to the language layers downstream. The vision encoder itself usually stays at higher precision because it's tiny relative to the LM and quantizing it costs more than it saves.
+
+`llama-server` wires the two together with `--mmproj <path-to-mmproj.gguf>`. At inference time, when an image is in the message, the server runs the image through the vision encoder + projector to produce a sequence of embeddings, prepends them to the text tokens, and runs the result through the (quantized) LM. From the OpenAI-API caller's perspective it's one model that happens to accept `image_url` content blocks. From the disk's perspective it's two GGUFs in the same directory.
+
+A practical implication: if you only download the main GGUF and skip the mmproj, the server starts up fine and serves text — but every image request will silently produce text-only output (the vision tokens never arrive). Always check both files are downloaded and the `--mmproj` flag is present in `extra_flags` before assuming a VL model is broken.
 
 ---
 

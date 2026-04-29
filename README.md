@@ -540,9 +540,27 @@ The llama.cpp backend runs a `llama-server` process directly, giving you access 
 | **Context sizing** | Auto-managed | Configurable per-model in `llama_cpp_config.json` |
 | **Use case** | Daily driver, stable | Extended context, experimental quants |
 
-### Setup
+### Build prerequisites
 
-1. **Build or install llama-server** — either from [llama.cpp](https://github.com/ggerganov/llama.cpp) or a custom fork:
+| Requirement | Tested version | Notes |
+|---|---|---|
+| **CUDA toolkit** | 12.2 (V12.2.140) | Any 12.x should work. `nvcc` must be on `PATH` so CMake can find it. |
+| **C++ compiler** | MSVC 2022 (Build Tools) on Windows; `build-essential` / `gcc 11+` on Linux | Required by `cmake --build`. |
+| **CMake** | 3.14+ | Bundled with VS 2022 Build Tools, or install standalone. |
+| **Git** | any recent | For cloning the source. |
+| **Python + huggingface_hub CLI** | only for downloading GGUFs | `pip install -U "huggingface_hub[cli]"` |
+
+GPU compute capability matters when you build with a hand-tuned `CMAKE_CUDA_ARCHITECTURES`. The defaults work fine, but for reference:
+
+| GPU family | Cards | `CMAKE_CUDA_ARCHITECTURES` |
+|---|---|---|
+| Ampere | RTX 3060 / 3060 Ti / 3070 / 3080 / 3090 | `86` |
+| Ada Lovelace | RTX 4060 / 4070 / 4080 / 4090 | `89` |
+| Blackwell | RTX 5060 / 5070 / 5080 / 5090 | `120` |
+
+### Path A — Stock upstream llama.cpp (standard quants)
+
+Use this for `Q4_K_M`, `IQ4_XS`, `Q8_0`, and any other quant format upstream supports. Will **not** load TQ3 weights — see Path B for those.
 
 ```bash
 git clone https://github.com/ggerganov/llama.cpp.git
@@ -551,16 +569,49 @@ cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target llama-server -j
 ```
 
-2. **Download a GGUF model** — any GGUF compatible with your llama-server build.
+The binary lands at `./build/bin/llama-server` (or `.exe` on Windows). Note the absolute path — you'll wire it into `llama_cpp_config.json` as `server_path` below.
 
-3. **Configure** — copy the example config and set your paths:
+Then download any GGUF compatible with stock llama.cpp, e.g.:
+
+```bash
+huggingface-cli download bartowski/Qwen3-32B-GGUF Qwen3-32B-Q4_K_M.gguf \
+  --local-dir ./models
+```
+
+### Path B — TurboQuant TQ3 fork (TQ3_1S / TQ3_4S quants)
+
+Use this when you want the `TQ3_4S` / `TQ3_1S` weight formats — extremely compact (3.4 BPW for TQ3_4S) with quality competitive against Q3_K_S at 11–13 GiB for a 27B model. **Not loadable by stock llama.cpp or Ollama.** The fork is runtime-only; quantization tooling is intentionally not public, so you download pre-quantized weights rather than generate them.
+
+```bash
+git clone https://github.com/turbo-tan/llama.cpp-tq3.git
+cd llama.cpp-tq3
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-server -j
+```
+
+The binary lands at `./build/bin/llama-server` (or `.exe` on Windows). The fork ships an `x64-linux-cuda-ampere-release` CMake preset for sm_86; Ada/Blackwell users can copy it and swap `CMAKE_CUDA_ARCHITECTURES` to their card's value (table above), or just use the simple build command, which works on every supported arch.
+
+Then download a TQ3 model **and** its vision projector — the same HuggingFace repo ships both:
+
+```bash
+huggingface-cli download YTan2000/Qwen3.6-27B-TQ3_4S \
+  --local-dir ./models/qwen3.6-27b-tq3_4s
+```
+
+That pulls `Qwen3.6-27B-TQ3_4S.gguf` (the weights, ~13 GB) plus `mmproj.gguf` (the multimodal projector — wire it via `--mmproj` to give the llama.cpp tier image-input support).
+
+> **Why a fork?** Upstream llama.cpp doesn't recognize `TQ3_*S` weight formats. The turbo-tan/llama.cpp-tq3 runtime fork adds the dequant/inference path for them; without the fork the GGUF won't load. See [LEARNING.md §5b](LEARNING.md) for the TurboQuant story.
+
+### Configure and launch
+
+Whichever build path you took, point Artifex at the binary and model:
 
 ```bash
 cp llama_cpp_config.example.json llama_cpp_config.json
-# Edit llama_cpp_config.json — set server_path and model path
+# Edit llama_cpp_config.json — fill in server_path and model paths.
 ```
 
-4. **Launch** — select `llama_cpp` as your backend:
+Then start Artifex with `llama_cpp` selected:
 
 ```bash
 python main_api.py --backend llama_cpp
@@ -568,23 +619,38 @@ python main_api.py --backend llama_cpp
 /backend llama_cpp
 ```
 
-The engine starts `llama-server` on the configured port, waits for it to become healthy, and streams via its native OpenAI-compatible API at `/v1/chat/completions`.
+The engine starts `llama-server` on the configured port, waits for it to become healthy, and streams via the server's native OpenAI-compatible API at `/v1/chat/completions`.
 
 ### Configuration
 
-`llama_cpp_config.json` defines the server binary and per-model settings:
+`llama_cpp_config.json` defines the server binary and per-model settings. Below is an annotated example showing both a standard-quant entry and a TQ3 + vision entry side-by-side:
 
-```json
+```jsonc
 {
-  "server_path": "llama-server",
+  "server_path": "/absolute/path/to/llama.cpp/build/bin/llama-server",
   "default_port": 8081,
   "models": {
-    "my-model": {
-      "path": "/path/to/model.gguf",
+    // Standard quant — loads on stock upstream llama.cpp
+    "qwen3.6-27b-q4km": {
+      "path": "/path/to/Qwen3.6-27B-Q4_K_M.gguf",
       "port": 8081,
       "num_gpu_layers": 99,
       "num_ctx": 32768,
-      "extra_flags": ["-fa", "on", "--jinja"]
+      "extra_flags": ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--jinja"]
+    },
+    // TQ3 quant + vision — requires the turbo-tan/llama.cpp-tq3 fork
+    "qwen3.6-27b-tq3_4s": {
+      "path": "/path/to/qwen3.6-27b-tq3_4s/Qwen3.6-27B-TQ3_4S.gguf",
+      "port": 8082,
+      "num_gpu_layers": 99,
+      "num_ctx": 32768,
+      "health_timeout": 180,
+      "extra_flags": [
+        "-fa", "on",
+        "-ctk", "q8_0", "-ctv", "q8_0",
+        "--jinja",
+        "--mmproj", "/path/to/qwen3.6-27b-tq3_4s/mmproj.gguf"
+      ]
     }
   }
 }
@@ -592,12 +658,13 @@ The engine starts `llama-server` on the configured port, waits for it to become 
 
 | Field | Description |
 |-------|-------------|
-| `server_path` | Path to `llama-server` binary (global default) |
+| `server_path` | Path to `llama-server` binary (global default; per-model overrides allowed) |
 | `path` | Path to the GGUF model file |
-| `port` | Port for this model's server instance |
+| `port` | Port for this model's server instance — use distinct ports per model so they don't collide |
 | `num_gpu_layers` | GPU layers to offload (99 = all) |
 | `num_ctx` | Context window size (auto-sized from VRAM if omitted) |
-| `extra_flags` | Additional CLI flags passed to llama-server |
+| `health_timeout` | Seconds to wait for `/health` to return OK after spawn (default 120; raise for large quants on slow disks) |
+| `extra_flags` | Additional CLI flags passed to llama-server. Common ones: `-fa on` (Flash Attention), `-ctk/-ctv` (KV-cache quant), `--jinja` (Jinja chat templates), `--mmproj <path>` (vision projector for VL models) |
 
 ---
 
@@ -894,6 +961,7 @@ The Vision pipeline (`core/pipelines/vision.py`) auto-detects the input type by 
 - Works with **any standard HuggingFace VLM** that ships an `AutoProcessor`: LLaVA, Qwen2-VL, Qwen2.5-VL, Qwen3-VL, Llama-3.2-Vision, Phi-3.5-Vision, InternVL, MiniCPM-V, Pixtral, SmolVLM, and more.
 - `_resolve_vlm_class()` reads `config.json` and picks the right Auto class (`AutoModelForImageTextToText`, `AutoModelForMultimodalLM` for Gemma-4, falling back to `AutoModelForVision2Seq` / `AutoModelForCausalLM`).
 - Single forward pass on the image + prompt. Returns a text description.
+- **Pixel cap** for the transformers backend: PIL-decoded inputs (data URLs, drag-and-drop) are downscaled to ≤ ~1.0 MP (`1280*28*28`) with LANCZOS before reaching the processor. A multi-MP screenshot otherwise produces tens of thousands of vision tokens and blows SDPA's attention scratch (~22 GiB on a 24 GB card). Override with `ARTIFEX_VL_MAX_PIXELS=<int>` if you need finer detail and have headroom. HTTP/HTTPS URLs bypass the cap (the processor fetches them itself).
 
 **Video mode** (`.mp4`, `.avi`, `.webm`, `.mov`, `.mkv`, `.m4v`, `.flv`, `.wmv`):
 
@@ -1393,6 +1461,7 @@ See [LEARNING.md](LEARNING.md) for a deep-dive walkthrough of the architecture, 
 | `ARTIFEX_SANDBOX_ROOTS` | *(project + temp)* | Additional allowed directories for the filesystem sandbox (path-separated). |
 | `ARTIFEX_SANDBOX_DENY` | *(none)* | Additional denied path patterns for the filesystem sandbox (path-separated). |
 | `ARTIFEX_RATCHET_EXTRA` | *(none)* | Additional protected paths the agent cannot modify (path-separated). |
+| `ARTIFEX_VL_MAX_PIXELS` | `1003520` (`1280*28*28`) | Per-image pixel cap for the transformers VL path. PIL/data-URL inputs above the cap are LANCZOS-downscaled before the processor sees them, keeping vision-token counts (and SDPA attention scratch) bounded. HTTP URLs bypass. Set higher only if you have VRAM headroom. |
 
 > **Note on environment variables in PowerShell:** Use `$env:VAR = "value"` syntax (not `set VAR=value` which is CMD-only). For the API server, the `--gateway` flag avoids env var hassles entirely.
 
