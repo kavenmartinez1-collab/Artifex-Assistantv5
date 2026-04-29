@@ -212,6 +212,83 @@ class TestMultimodalMessageConversion:
         assert all(isinstance(i, Image.Image) for i in images)
 
 
+class TestVisionPixelCap:
+    """Vision input must be downscaled to a pixel cap before the processor sees it.
+
+    Regression for OOM on multi-megapixel screenshots producing thousands of
+    vision tokens, which blew SDPA's attention scratch (~22 GiB).
+    """
+
+    @staticmethod
+    def _make_data_url(w, h):
+        import base64, io
+        from PIL import Image
+        img = Image.new("RGB", (w, h), color="red")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    def test_default_cap_is_one_mp(self):
+        from core.engine_transformers import _DEFAULT_VL_MAX_PIXELS
+        # Qwen-VL's balanced setting: 1280 * 28 * 28 ≈ 1.0 MP
+        assert _DEFAULT_VL_MAX_PIXELS == 1280 * 28 * 28
+
+    def test_image_under_cap_is_untouched(self):
+        from PIL import Image
+        from core.engine_transformers import _resize_to_pixel_cap
+        img = Image.new("RGB", (200, 200))
+        out = _resize_to_pixel_cap(img, max_pixels=100_000)
+        assert out is img  # short-circuits when already small enough
+
+    def test_image_over_cap_is_resized(self):
+        from PIL import Image
+        from core.engine_transformers import _resize_to_pixel_cap
+        img = Image.new("RGB", (4000, 3000))  # 12 MP
+        cap = 1_000_000
+        out = _resize_to_pixel_cap(img, max_pixels=cap)
+        # New dimensions must satisfy the cap and preserve aspect ratio
+        new_w, new_h = out.size
+        assert new_w * new_h <= cap
+        # Aspect ratio preserved within rounding
+        original_ratio = 4000 / 3000
+        new_ratio = new_w / new_h
+        assert abs(original_ratio - new_ratio) < 0.01
+
+    def test_decode_resizes_oversized_data_url(self):
+        from core.engine_transformers import _decode_image_url, _DEFAULT_VL_MAX_PIXELS
+        url = self._make_data_url(2000, 2000)  # 4 MP
+        from PIL import Image
+        result = _decode_image_url(url)
+        assert isinstance(result, Image.Image)
+        assert result.size[0] * result.size[1] <= _DEFAULT_VL_MAX_PIXELS
+
+    def test_env_var_override(self):
+        import os
+        from unittest.mock import patch
+        from core.engine_transformers import _vl_max_pixels
+        with patch.dict(os.environ, {"ARTIFEX_VL_MAX_PIXELS": "262144"}):
+            assert _vl_max_pixels() == 262144
+
+    def test_env_var_invalid_falls_back_to_default(self):
+        import os
+        from unittest.mock import patch
+        from core.engine_transformers import _vl_max_pixels, _DEFAULT_VL_MAX_PIXELS
+        with patch.dict(os.environ, {"ARTIFEX_VL_MAX_PIXELS": "not_a_number"}):
+            assert _vl_max_pixels() == _DEFAULT_VL_MAX_PIXELS
+
+    def test_env_var_zero_falls_back_to_default(self):
+        import os
+        from unittest.mock import patch
+        from core.engine_transformers import _vl_max_pixels, _DEFAULT_VL_MAX_PIXELS
+        with patch.dict(os.environ, {"ARTIFEX_VL_MAX_PIXELS": "0"}):
+            assert _vl_max_pixels() == _DEFAULT_VL_MAX_PIXELS
+
+    def test_http_urls_bypass_resize(self):
+        from core.engine_transformers import _decode_image_url
+        # URL-form images aren't fetched by us; the processor handles them
+        assert _decode_image_url("https://example.com/big.jpg") == "https://example.com/big.jpg"
+
+
 class TestTemperatureGreedyDispatch:
     """temperature=0 → do_sample=False (greedy); temperature>0 → sampling.
 
@@ -249,3 +326,77 @@ class TestTemperatureGreedyDispatch:
     def test_high_temperature_samples(self):
         kw = self._build_kwargs(2.0)
         assert kw == {"do_sample": True, "temperature": 2.0}
+
+
+class TestNoCacheMarker:
+    """`.no_cache` in a model directory makes _save_quantized_cache a no-op.
+
+    Without this opt-out, every slow-path load regenerates the
+    `<model>-nf4-cached` sibling — defeating any attempt to reclaim disk
+    by deleting the cache. The Control Center "Skip NF4 cache" checkbox
+    drops the marker; this test pins the engine-side honoring of it.
+    """
+
+    def _make_engine(self):
+        """Build a minimally-instantiated engine with mocked save targets."""
+        from unittest.mock import MagicMock
+        from core.engine_transformers import TransformersEngine
+        engine = TransformersEngine.__new__(TransformersEngine)
+        engine.model = MagicMock()
+        engine.tokenizer = MagicMock()
+        # _save_quantized_cache calls _detect_gpu_tier when no marker is set,
+        # to record metadata. Stub it for the no-marker path.
+        engine._detect_gpu_tier = MagicMock(return_value={
+            "tier": "ABUNDANT",
+            "quantize_lm_head": False,
+            "total_gb": 24.0,
+        })
+        return engine
+
+    def test_marker_present_skips_save(self, tmp_path):
+        engine = self._make_engine()
+        source = tmp_path / "my-model"
+        source.mkdir()
+        (source / ".no_cache").write_text("")  # marker
+
+        quantized = str(source) + "-nf4-cached"
+        engine._save_quantized_cache(quantized)
+
+        engine.model.save_pretrained.assert_not_called()
+        engine.tokenizer.save_pretrained.assert_not_called()
+        # Cache directory should not have been written either
+        import os
+        assert not os.path.exists(quantized)
+
+    def test_marker_absent_proceeds_with_save(self, tmp_path):
+        engine = self._make_engine()
+        source = tmp_path / "my-model"
+        source.mkdir()  # no marker
+
+        quantized = str(source) + "-nf4-cached"
+        # save_pretrained is mocked, so the path doesn't actually need to exist
+        # for it to be called — we just need the directory to exist for the
+        # _quant_meta.json write at the end.
+        import os
+        os.makedirs(quantized, exist_ok=True)
+
+        engine._save_quantized_cache(quantized)
+
+        engine.model.save_pretrained.assert_called_once_with(quantized)
+        engine.tokenizer.save_pretrained.assert_called_once_with(quantized)
+
+    def test_status_callback_announces_skip(self, tmp_path):
+        engine = self._make_engine()
+        source = tmp_path / "my-model"
+        source.mkdir()
+        (source / ".no_cache").write_text("")
+
+        messages = []
+        engine._save_quantized_cache(
+            str(source) + "-nf4-cached",
+            status_callback=messages.append,
+        )
+
+        # User should see a clear "skipped" message — not silent
+        assert any(".no_cache" in m for m in messages)
+        engine.model.save_pretrained.assert_not_called()

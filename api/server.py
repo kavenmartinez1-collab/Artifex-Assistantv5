@@ -20,7 +20,7 @@ import time
 import uuid
 import urllib.request
 import urllib.error
-from typing import List, Optional, Union
+from typing import List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -115,6 +115,17 @@ class ChatCompletionRequest(BaseModel):
     web_tools: Optional[bool] = False
     grammar: Optional[str] = Field(None, description="GBNF grammar string for constrained generation (llama.cpp only)")
     response_format: Optional[dict] = Field(None, description="Response format constraint, e.g. {\"type\": \"json_object\"} or {\"type\": \"json_schema\", \"json_schema\": {...}}")
+    backend: Optional[Literal["ollama", "transformers", "llama_cpp"]] = Field(
+        None,
+        description=(
+            "Backend override for this single request. When set, the model "
+            "queue switches to this backend (unloading the previous one) "
+            "before serving. When omitted, the backend is inferred from "
+            "`model` if possible, else falls back to the server-wide active "
+            "backend. This enables per-stage model switching within one "
+            "task without restarting the server."
+        ),
+    )
 
 class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., example="A sunset over mountains")
@@ -139,6 +150,16 @@ class VisionAnalyzeRequest(BaseModel):
     # name in models/ or an HF repo id; for Ollama it's a tag like
     # "qwen3-vl:8b-instruct". When omitted, the active model is used.
     model: Optional[str] = None
+    # Per-request backend override. `llama_cpp` is rejected here because
+    # llama.cpp has no vision pipeline in this codebase — vision goes
+    # through Ollama (image VLMs) or transformers (full VL family + video).
+    backend: Optional[Literal["ollama", "transformers"]] = Field(
+        None,
+        description=(
+            "Backend override. Omit to infer from `model` or fall back to "
+            "the active backend. llama_cpp is not supported on this endpoint."
+        ),
+    )
 
 class AudioSpeechRequest(BaseModel):
     text: str = Field(..., example="Hello, how are you?")
@@ -341,6 +362,43 @@ def _is_auto_sentinel(name) -> bool:
     if name is None:
         return True
     return str(name).strip().lower() in _AUTO_MODEL_SENTINELS
+
+
+def _infer_backend_from_model(name) -> str | None:
+    """Look up which backend hosts a given model name.
+
+    Returns the backend id ("ollama", "llama_cpp", "transformers") if the
+    name matches an installed/configured model, else None. Sentinel names
+    return None — let the caller fall back to the active backend.
+
+    Probe order is "cheapest first, most-likely first": Ollama's tag list
+    is an in-memory dict, llama.cpp is a small JSON config, and the
+    transformers MODELS map is also in memory. If a name appears under
+    multiple backends, the first hit wins (Ollama → llama.cpp → transformers).
+    Callers wanting a specific backend should set request.backend explicitly.
+    """
+    if _is_auto_sentinel(name):
+        return None
+
+    from core.config import (
+        MODELS, OLLAMA_MODELS, get_llama_cpp_models, refresh_ollama_models,
+    )
+
+    if name in OLLAMA_MODELS:
+        return "ollama"
+    # Refresh once in case it was just pulled — same pattern as
+    # _resolve_model_for_request uses for explicit names.
+    refresh_ollama_models()
+    if name in OLLAMA_MODELS:
+        return "ollama"
+
+    if name in get_llama_cpp_models():
+        return "llama_cpp"
+
+    if name in MODELS:
+        return "transformers"
+
+    return None
 
 
 def _pick_vision_model(backend: str) -> str | None:
@@ -1145,7 +1203,11 @@ def create_app():
         temperature = body.temperature
         stream = body.stream
         use_web_tools = body.web_tools or False
-        backend = get_active_backend()
+        backend = (
+            body.backend
+            or _infer_backend_from_model(body.model)
+            or get_active_backend()
+        )
         _log.info("POST /v1/chat/completions: model=%s, web_tools=%s, stream=%s, "
                   "backend=%s, %d messages",
                   body.model, use_web_tools, stream, backend, len(messages))
@@ -1500,7 +1562,19 @@ def create_app():
                 detail="Provide either file_id or image_base64",
             )
 
-        backend = get_active_backend()
+        backend = (
+            body.backend
+            or _infer_backend_from_model(body.model)
+            or get_active_backend()
+        )
+        if backend == "llama_cpp":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "llama_cpp backend has no vision pipeline. Use 'ollama' "
+                    "or 'transformers' for /v1/vision/analyze."
+                ),
+            )
         # Vision endpoint always implies a multimodal request, so the
         # resolver picks a vision-capable model regardless of body.model.
         requested_model = _resolve_model_for_request(body.model, has_images=True, backend=backend)

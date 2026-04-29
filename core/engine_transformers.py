@@ -184,13 +184,70 @@ def _patch_config_json(model_path: str):
         )
 
 
+# Cap on vision-input pixel count. A multi-megapixel screenshot can produce
+# tens of thousands of vision tokens, which blows SDPA's attention scratch
+# (and even more so when SDPA falls back to its fp32 math kernel). The
+# default — 1280 * 28 * 28 ≈ 1.0 MP — matches Qwen-VL's "balanced" setting
+# and keeps vision sequences under ~1.3K tokens. Override with
+# ARTIFEX_VL_MAX_PIXELS=<int> to trade quality for VRAM headroom.
+_DEFAULT_VL_MAX_PIXELS = 1280 * 28 * 28
+
+
+def _vl_max_pixels() -> int:
+    raw = os.environ.get("ARTIFEX_VL_MAX_PIXELS")
+    if not raw:
+        return _DEFAULT_VL_MAX_PIXELS
+    try:
+        n = int(raw)
+        return n if n > 0 else _DEFAULT_VL_MAX_PIXELS
+    except ValueError:
+        return _DEFAULT_VL_MAX_PIXELS
+
+
+def _resize_to_pixel_cap(img, max_pixels: int):
+    """Downscale `img` so width*height ≤ max_pixels, preserving aspect ratio.
+
+    Returns the original image untouched when it's already under the cap.
+    Uses LANCZOS for quality on screenshots / photos.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return img
+    try:
+        w, h = img.size
+    except Exception:
+        return img
+    if w <= 0 or h <= 0 or w * h <= max_pixels:
+        return img
+    ratio = (max_pixels / (w * h)) ** 0.5
+    new_w = max(1, int(w * ratio))
+    new_h = max(1, int(h * ratio))
+    try:
+        resized = img.resize((new_w, new_h), Image.LANCZOS)
+        logging.getLogger(__name__).info(
+            "Resized vision input %dx%d → %dx%d (cap=%d px)",
+            w, h, new_w, new_h, max_pixels,
+        )
+        return resized
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "Image resize failed (%s); using original.", e
+        )
+        return img
+
+
 def _decode_image_url(url: str):
     """Resolve an OpenAI-style image_url to something a VL processor accepts.
 
-    data:image/...;base64,... → PIL.Image
+    data:image/...;base64,... → PIL.Image (resized if it exceeds the cap)
     http(s)://... → URL string (the processor downloads it itself)
     file://... or other → URL string (processor handles or rejects)
     Anything that fails to decode returns None and is dropped from the message.
+
+    PIL images are resized to ≤ ARTIFEX_VL_MAX_PIXELS to keep vision-token
+    counts (and therefore attention memory) bounded. URL-form images bypass
+    the cap because we don't fetch them ourselves.
     """
     if not url:
         return None
@@ -209,7 +266,8 @@ def _decode_image_url(url: str):
             else:
                 from urllib.parse import unquote
                 raw = unquote(payload).encode("latin-1")
-            return Image.open(_io.BytesIO(raw)).convert("RGB")
+            img = Image.open(_io.BytesIO(raw)).convert("RGB")
+            return _resize_to_pixel_cap(img, _vl_max_pixels())
         except Exception as e:
             logging.getLogger(__name__).warning(
                 "Skipping malformed image data URL: %s", e
@@ -396,8 +454,33 @@ class TransformersEngine(BaseEngine):
         return max_mem if max_mem else None
 
     def _save_quantized_cache(self, quantized_path, status_callback=None):
-        """Save quantized weights to disk for fast future loads."""
+        """Save quantized weights to disk for fast future loads.
+
+        Honors a per-model opt-out: a `.no_cache` file in the source model
+        directory (typically dropped by the Control Center "Skip NF4 cache"
+        toggle) makes this a no-op. Without this marker the cache would
+        regenerate on the next slow-path load even after the user manually
+        deleted the `-nf4-cached` sibling.
+        """
         from datetime import datetime
+
+        # Derive the source directory from the cache target — they only
+        # differ by the "-nf4-cached" suffix established at line ~562 of
+        # `load()`. Marker check is best-effort: if the path doesn't end
+        # with the expected suffix, we just proceed with the save.
+        suffix = "-nf4-cached"
+        if quantized_path.endswith(suffix):
+            source_path = quantized_path[: -len(suffix)]
+            if os.path.isfile(os.path.join(source_path, ".no_cache")):
+                if status_callback:
+                    status_callback(
+                        ".no_cache marker present — skipping NF4 cache write."
+                    )
+                logging.getLogger(__name__).info(
+                    "Skipping NF4 cache for %s (.no_cache marker present)",
+                    source_path,
+                )
+                return
 
         if status_callback:
             status_callback("Caching quantized weights to disk (one-time)...")
