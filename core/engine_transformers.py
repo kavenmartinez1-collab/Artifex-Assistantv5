@@ -1171,18 +1171,25 @@ class TransformersEngine(BaseEngine):
 
         effective_max = max_tokens if max_tokens and max_tokens > 0 else 8192
 
+        # temperature=0 means greedy decoding. transformers v5 rejects
+        # temperature<=0 with do_sample=True (TemperatureLogitsWarper would
+        # divide by zero), so route the two cases explicitly: positive
+        # temperature → sampling, zero/None → do_sample=False (argmax).
+        sampling = temperature is not None and temperature > 0
+
         gen_kwargs = dict(
             **inputs,
             streamer=streamer,
             max_new_tokens=effective_max,
-            temperature=temperature,
-            do_sample=True,
+            do_sample=sampling,
             use_cache=True,
             repetition_penalty=1.15,
             eos_token_id=list(eos_ids) if eos_ids else tokenizer.eos_token_id,
             pad_token_id=pad_id,
             stopping_criteria=StoppingCriteriaList([stop_criteria]),
         )
+        if sampling:
+            gen_kwargs["temperature"] = temperature
         if past_kv is not None:
             gen_kwargs["past_key_values"] = past_kv
 

@@ -210,3 +210,42 @@ class TestMultimodalMessageConversion:
         images = _extract_processor_images(converted)
         assert len(images) == 2
         assert all(isinstance(i, Image.Image) for i in images)
+
+
+class TestTemperatureGreedyDispatch:
+    """temperature=0 → do_sample=False (greedy); temperature>0 → sampling.
+
+    Regression for transformers v5 raising
+      `temperature` (=0.0) has to be a strictly positive float
+    when generate_streaming forwarded temperature=0 with do_sample=True.
+    """
+
+    @staticmethod
+    def _build_kwargs(temperature):
+        """Mirror the dispatch logic in generate_streaming."""
+        sampling = temperature is not None and temperature > 0
+        kwargs = {"do_sample": sampling}
+        if sampling:
+            kwargs["temperature"] = temperature
+        return kwargs
+
+    def test_zero_temperature_is_greedy(self):
+        kw = self._build_kwargs(0.0)
+        assert kw == {"do_sample": False}
+        assert "temperature" not in kw
+
+    def test_negative_temperature_is_greedy(self):
+        kw = self._build_kwargs(-0.5)
+        assert kw == {"do_sample": False}
+
+    def test_none_temperature_is_greedy(self):
+        kw = self._build_kwargs(None)
+        assert kw == {"do_sample": False}
+
+    def test_positive_temperature_samples(self):
+        kw = self._build_kwargs(0.7)
+        assert kw == {"do_sample": True, "temperature": 0.7}
+
+    def test_high_temperature_samples(self):
+        kw = self._build_kwargs(2.0)
+        assert kw == {"do_sample": True, "temperature": 2.0}
