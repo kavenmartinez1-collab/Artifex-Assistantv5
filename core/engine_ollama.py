@@ -20,36 +20,36 @@ OLLAMA_BASE_URL = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434")
 def _detect_safe_num_gpu(model_size_gb=None):
     """Calculate how many GPU layers Ollama can use without spilling into shared VRAM.
 
-    Strategy: reserve ~1.5 GB for KV cache + OS overhead, give the rest to model layers.
-    Ollama models are typically 30-80 layers. We estimate layer size from model total.
-
-    Returns:
-        int: number of GPU layers, or -1 if VRAM is abundant (>= 20 GB).
+    Returns -1 (full offload) only when the model clearly fits in VRAM with
+    headroom for KV cache and compute buffers.  Otherwise returns a safe
+    layer count for partial offload.
     """
     try:
         import torch
         if not torch.cuda.is_available():
-            return 0  # no GPU — CPU only
+            return 0
 
         total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
     except Exception:
         return 0
 
-    # Abundant VRAM — let Ollama use everything
-    if total_gb >= 20:
+    model_loaded_gb = (model_size_gb or 5) * 1.3
+
+    # Full offload: model fits with >=15% headroom for KV + compute buffers
+    if total_gb >= 20 and model_loaded_gb < total_gb * 0.85:
         return -1
 
-    # Reserve headroom for KV cache, CUDA context, OS, and generation buffers.
+    # Partial offload: budget VRAM for layers + KV cache + overhead
     if total_gb <= 10:
-        usable_gb = total_gb * 0.70 - 1.5  # ~4.1 GB usable on 8 GB card
+        usable_gb = total_gb * 0.70 - 1.5
+    elif total_gb <= 16:
+        usable_gb = total_gb * 0.75 - 1.5
     else:
-        usable_gb = total_gb * 0.75 - 1.5  # ~7.5 GB usable on 12 GB card
+        usable_gb = total_gb * 0.80 - 2.0
 
     if usable_gb <= 0:
         return 0
 
-    # Estimate: typical GGUF Q4 models use ~0.15-0.20 GB per layer (7-9B),
-    # ~0.25-0.35 GB per layer for larger models.
     gb_per_layer = 0.18 if (model_size_gb or 5) <= 6 else 0.30
     safe_layers = int(usable_gb / gb_per_layer)
 
@@ -162,7 +162,7 @@ class OllamaEngine(BaseEngine):
         self.load()
 
         from core.config import get_ollama_model_config
-        from core.ollama_ctx import compute_safe_ctx, estimate_prompt_tokens
+        from core.ollama_ctx import compute_safe_ctx, estimate_prompt_tokens, should_disable_mmap
         model_config = get_ollama_model_config(self.model_name)
 
         options = {
@@ -177,6 +177,9 @@ class OllamaEngine(BaseEngine):
 
         if self._num_gpu is not None:
             options["num_gpu"] = self._num_gpu
+
+        if should_disable_mmap(self.model_name, model_config):
+            options["use_mmap"] = False
 
         payload = {
             "model": self.model_name,

@@ -188,7 +188,7 @@ class ArtifexMainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Artifex Assistant V5")
         self.setMinimumSize(1200, 800)
-        self.resize(1400, 900)
+        self.resize(1400, 1050)
 
         # State
         self.engine = None
@@ -419,6 +419,7 @@ class ArtifexMainWindow(QMainWindow):
         self._tabs.addTab(self._log_view, "Logs")
         self._install_log_handler()
 
+        self._tabs.setMinimumHeight(400)
         layout.addWidget(self._tabs, 1)
 
         # Action panel (suggested commands — hidden by default)
@@ -453,7 +454,7 @@ class ArtifexMainWindow(QMainWindow):
 
         self._prompt_input = QPlainTextEdit()
         self._prompt_input.setPlaceholderText("Enter your message...")
-        self._prompt_input.setMaximumHeight(100)
+        self._prompt_input.setMaximumHeight(70)
         self._prompt_input.setFont(QFont("Consolas", 11))
         input_layout.addWidget(self._prompt_input)
 

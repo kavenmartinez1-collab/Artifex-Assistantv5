@@ -1,6 +1,16 @@
 {
-  "_comment": "Per-model Ollama settings. num_ctx pins context size (bypasses auto-sizing). max_ctx caps it. kv_quant (f16/q8_0/q4_0) tells auto-sizing how large the KV cache is per token.",
+  "_comment": "Per-model Ollama settings. num_ctx pins context size (bypasses auto-sizing). max_ctx caps it. kv_quant (f16/q8_0/q4_0) tells auto-sizing how large the KV cache is per token. use_mmap (true/false) overrides auto mmap detection (Windows auto-disables mmap when GPU present to avoid pagefile OOM).",
+  "gemma4": {
+    "max_ctx": 32768
+  },
+  "qwen3.6-hauhau-balanced": {
+    "kv_quant": "q8_0"
+  },
   "qwen3.6-27b-q2kxl": {
     "kv_quant": "q8_0"
+  },
+  "huihui_ai/Qwen3.6-abliterated:27b": {
+    "kv_quant": "q8_0",
+    "num_kv_heads": 4
   }
 }

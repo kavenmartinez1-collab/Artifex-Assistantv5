@@ -654,12 +654,37 @@ class ChatBubble(QFrame):
         self._update_stream_height()
 
     def _update_stream_height(self):
-        """Resize stream widget to fit content without signal storms."""
+        """Resize stream widget to fit content without signal storms.
+
+        QPlainTextDocumentLayout defers full layout, so document().size()
+        often underreports height.  Instead, estimate visual line count
+        from text content and the monospace character grid.
+        """
         if self._stream_widget is None:
             return
+        text = self._stream_widget.toPlainText()
+        if not text:
+            self._stream_widget.setFixedHeight(30)
+            return
+
+        fm = self._stream_widget.fontMetrics()
+        vw = self._stream_widget.viewport().width()
+        if vw <= 0:
+            vw = self._stream_widget.width() - 20
+        if vw <= 0:
+            vw = 600
+
+        char_width = fm.averageCharWidth() or 8
+        chars_per_line = max(1, vw // char_width)
+
+        visual_lines = 0
+        for paragraph in text.split('\n'):
+            visual_lines += max(1, -(-len(paragraph) // chars_per_line))
+
         doc = self._stream_widget.document()
         margins = self._stream_widget.contentsMargins()
-        height = int(doc.size().height()) + margins.top() + margins.bottom()
+        height = int(visual_lines * fm.lineSpacing() + 2 * doc.documentMargin())
+        height += margins.top() + margins.bottom()
         height += self._stream_widget.frameWidth() * 2
         self._stream_widget.setFixedHeight(max(30, height))
 
@@ -684,7 +709,7 @@ class ChatView(QScrollArea):
         self._container_layout = QVBoxLayout(self._container)
         self._container_layout.setContentsMargins(4, 4, 4, 4)
         self._container_layout.setSpacing(2)
-        self._container_layout.addStretch()  # Push bubbles to top
+        self._container_layout.addStretch()
 
         self.setWidget(self._container)
         self._bubbles: list[ChatBubble] = []

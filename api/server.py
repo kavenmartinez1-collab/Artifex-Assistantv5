@@ -535,7 +535,7 @@ def _resolve_model_for_request(requested, has_images: bool, backend: str) -> str
 def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options, timeout):
     """Forward a request to Ollama's /api/chat and return an OpenAI-format response."""
     from core.config import get_ollama_model_config
-    from core.ollama_ctx import compute_safe_ctx, estimate_prompt_tokens
+    from core.ollama_ctx import compute_safe_ctx, estimate_prompt_tokens, should_disable_mmap
 
     model_config = get_ollama_model_config(model)
     ollama_options = {}
@@ -543,13 +543,23 @@ def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options,
     # Auto-size num_ctx from prompt + VRAM budget. Per-model config can pin
     # num_ctx outright or set a max_ctx ceiling (see core/ollama_ctx.py).
     est_tokens = estimate_prompt_tokens(ollama_messages)
-    ollama_options["num_ctx"] = compute_safe_ctx(model, est_tokens, model_config)
+    safe_ctx = compute_safe_ctx(model, est_tokens, model_config)
+    ollama_options["num_ctx"] = safe_ctx
 
     if options:
         ollama_options.update(options)
+        if "num_ctx" in options and int(options["num_ctx"]) > safe_ctx:
+            _log.warning(
+                "Client requested num_ctx=%s for %s, capping to VRAM-safe %d",
+                options["num_ctx"], model, safe_ctx,
+            )
+            ollama_options["num_ctx"] = safe_ctx
     if temperature is not None:
         ollama_options["temperature"] = temperature
     ollama_options["num_predict"] = max_tokens if max_tokens and max_tokens > 0 else -1
+
+    if should_disable_mmap(model, model_config):
+        ollama_options["use_mmap"] = False
 
     # Scale socket timeout with num_ctx. A 300s text default works for 8B
     # models on small prompts, but 27B 2-bit doing 17K-token prompt + 5K-gen
@@ -644,20 +654,30 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
         _SENTINEL           — marks end of stream
     """
     from core.config import get_ollama_model_config
-    from core.ollama_ctx import compute_safe_ctx, estimate_prompt_tokens
+    from core.ollama_ctx import compute_safe_ctx, estimate_prompt_tokens, should_disable_mmap
 
     model_config = get_ollama_model_config(model)
     ollama_options = {}
 
     # Auto-size num_ctx from prompt + VRAM budget.
     est_tokens = estimate_prompt_tokens(ollama_messages)
-    ollama_options["num_ctx"] = compute_safe_ctx(model, est_tokens, model_config)
+    safe_ctx = compute_safe_ctx(model, est_tokens, model_config)
+    ollama_options["num_ctx"] = safe_ctx
 
     if options:
         ollama_options.update(options)
+        if "num_ctx" in options and int(options["num_ctx"]) > safe_ctx:
+            _log.warning(
+                "Client requested num_ctx=%s for %s, capping to VRAM-safe %d",
+                options["num_ctx"], model, safe_ctx,
+            )
+            ollama_options["num_ctx"] = safe_ctx
     if temperature is not None:
         ollama_options["temperature"] = temperature
     ollama_options["num_predict"] = max_tokens if max_tokens and max_tokens > 0 else -1
+
+    if should_disable_mmap(model, model_config):
+        ollama_options["use_mmap"] = False
 
     # See _proxy_ollama_chat for rationale — same num_ctx-scaled timeout.
     timeout = max(timeout, min(1800, ollama_options["num_ctx"] // 30))

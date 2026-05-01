@@ -9,9 +9,10 @@ Strategy:
   4. Budget: total_vram − 2.5 GB reserve − model_loaded(file×1.3) = available for KV.
   5. max_ctx = available / kv_per_token, rounded down to standard bucket.
   6. Per-model override via ollama_config.json:
-     - num_ctx:  fixed value — bypasses auto-sizing entirely
-     - max_ctx:  upper bound for the auto-sized value
-     - kv_quant: KV cache quantization (f16/q8_0/q4_0) for sizing math
+     - num_ctx:      fixed value — bypasses auto-sizing entirely
+     - max_ctx:      upper bound for the auto-sized value
+     - kv_quant:     KV cache quantization (f16/q8_0/q4_0) for sizing math
+     - num_kv_heads: override GQA head count when GGUF metadata is missing
 
 Hybrid models (e.g. Qwen3.5/3.6):
   full_attention_interval=4 means only every 4th layer has an attention KV
@@ -27,6 +28,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import urllib.request
 import urllib.error
 
@@ -86,6 +88,25 @@ def _get_total_vram_mb() -> float:
     return 0.0
 
 
+def _get_free_vram_mb() -> float:
+    """Current free GPU VRAM in MiB via nvidia-smi.
+
+    Unlike _get_total_vram_mb(), NOT cached — free VRAM changes as
+    processes allocate/release memory.  Called once per sizing decision.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return float(result.stdout.strip().split("\n")[0])
+    except Exception as e:
+        _log.debug("nvidia-smi free query failed: %s", e)
+    return 0.0
+
+
 # ── Model metadata ──────────────────────────────────────────────────────
 
 def _parse_modelfile_num_ctx(parameters_text: str) -> int | None:
@@ -100,6 +121,17 @@ def _parse_modelfile_num_ctx(parameters_text: str) -> int | None:
             except ValueError:
                 return None
     return None
+
+
+_SUFFIX_TO_FIELD = {
+    ".context_length": "trained_ctx",
+    ".block_count": "num_layers",
+    ".attention.head_count_kv": "num_kv_heads",
+    ".attention.head_count": "num_heads",
+    ".attention.key_length": "key_length",
+    ".attention.value_length": "value_length",
+    ".embedding_length": "embedding_length",
+}
 
 
 def _get_model_meta(model: str) -> dict:
@@ -135,23 +167,29 @@ def _get_model_meta(model: str) -> dict:
         model_info = show.get("model_info", {})
         full_attn_interval = None
 
+        # Multimodal models (Gemma 4, etc.) expose sub-component keys
+        # (e.g. ".vision.block_count") that share suffixes with the main
+        # text model.  Pick the shortest matching key per suffix — the
+        # main model key is always shorter than sub-component keys.
+        suffix_winners: dict[str, tuple[str, int]] = {}
         for key, val in model_info.items():
-            if key.endswith(".context_length"):
-                meta["trained_ctx"] = int(val)
-            elif key.endswith(".block_count"):
-                meta["num_layers"] = int(val)
-            elif key.endswith(".attention.head_count_kv"):
-                meta["num_kv_heads"] = int(val)
-            elif key.endswith(".attention.head_count"):
-                meta["num_heads"] = int(val)
-            elif key.endswith(".attention.key_length"):
-                meta["key_length"] = int(val)
-            elif key.endswith(".attention.value_length"):
-                meta["value_length"] = int(val)
-            elif key.endswith(".embedding_length"):
-                meta["embedding_length"] = int(val)
-            elif key.endswith(".full_attention_interval"):
-                full_attn_interval = int(val)
+            if val is None:
+                continue
+            if key.endswith(".full_attention_interval"):
+                if full_attn_interval is None or len(key) < full_attn_interval[1]:
+                    full_attn_interval = (int(val), len(key))
+                continue
+            for suffix, field in _SUFFIX_TO_FIELD.items():
+                if key.endswith(suffix):
+                    if suffix not in suffix_winners or len(key) < len(suffix_winners[suffix][0]):
+                        suffix_winners[suffix] = (key, int(val))
+                    break
+
+        for suffix, (_key, val) in suffix_winners.items():
+            meta[_SUFFIX_TO_FIELD[suffix]] = val
+
+        if full_attn_interval is not None:
+            full_attn_interval = full_attn_interval[0]
 
         # How many layers actually have attention KV caches?
         # Hybrid models (attention+SSM) only run attention every N layers.
@@ -183,7 +221,8 @@ def _get_model_meta(model: str) -> dict:
 
 # ── KV cache math ───────────────────────────────────────────────────────
 
-def _kv_bytes_per_token(meta: dict, kv_quant: str = "f16") -> float | None:
+def _kv_bytes_per_token(meta: dict, kv_quant: str = "f16",
+                        kv_heads_override: int | None = None) -> float | None:
     """Bytes of KV cache per context token, derived from model architecture.
 
     For hybrid attention+SSM models, only attention layers contribute to
@@ -193,7 +232,9 @@ def _kv_bytes_per_token(meta: dict, kv_quant: str = "f16") -> float | None:
     Returns None when architecture info is missing.
     """
     attn_layers = meta.get("attn_layer_count")
-    num_kv_heads = meta.get("num_kv_heads")
+    num_kv_heads = (kv_heads_override
+                    or meta.get("num_kv_heads")
+                    or meta.get("num_heads"))
     key_len = meta.get("key_length")
     val_len = meta.get("value_length")
 
@@ -207,7 +248,8 @@ def _kv_bytes_per_token(meta: dict, kv_quant: str = "f16") -> float | None:
     return attn_layers * num_kv_heads * (key_len + val_len) * bytes_per_elem
 
 
-def _vram_max_ctx(model: str, kv_quant: str = "f16") -> int:
+def _vram_max_ctx(model: str, kv_quant: str = "f16",
+                  kv_heads_override: int | None = None) -> int:
     """Largest context bucket that fits in VRAM after model + system reserve."""
     total_mb = _get_total_vram_mb()
     if not total_mb:
@@ -229,7 +271,7 @@ def _vram_max_ctx(model: str, kv_quant: str = "f16") -> int:
         )
         return MIN_CTX
 
-    kv_per_token = _kv_bytes_per_token(meta, kv_quant)
+    kv_per_token = _kv_bytes_per_token(meta, kv_quant, kv_heads_override)
     if not kv_per_token:
         _log.debug("No architecture info for %s — falling back to 8K", model)
         return 8192
@@ -239,11 +281,31 @@ def _vram_max_ctx(model: str, kv_quant: str = "f16") -> int:
     # context (attention scratch, graph intermediates, allocator fragmentation).
     max_tokens = int((available_mb * 0.90) / kv_per_token_mb)
 
+    free_mb = _get_free_vram_mb()
+    if free_mb > 0:
+        free_available = free_mb - model_loaded_mb
+        if free_available > 0:
+            free_max = int((free_available * 0.90) / kv_per_token_mb)
+            if free_max < max_tokens:
+                _log.info(
+                    "VRAM ceiling: free=%.0f MiB → max %d tokens "
+                    "(down from %d based on total VRAM)",
+                    free_mb, free_max, max_tokens,
+                )
+                max_tokens = free_max
+        else:
+            _log.warning(
+                "Free VRAM (%.0f MiB) may not fit model %s "
+                "(est. %.0f MiB loaded) — clamping to min ctx",
+                free_mb, model, model_loaded_mb,
+            )
+            max_tokens = 0
+
     _log.info(
-        "VRAM budget for %s: %.0f MiB total, −%.0f MiB reserve, "
+        "VRAM budget for %s: %.0f MiB total (%.0f MiB free), −%.0f MiB reserve, "
         "−%.0f MiB model ≈ %.0f MiB for KV → max ~%d tokens "
         "(%.1f KB/tok, kv_quant=%s, attn_layers=%d/%d)",
-        model, total_mb, SYSTEM_RESERVE_MB, model_loaded_mb,
+        model, total_mb, free_mb, SYSTEM_RESERVE_MB, model_loaded_mb,
         available_mb, max_tokens, kv_per_token / 1024, kv_quant,
         meta.get("attn_layer_count", 0), meta.get("num_layers", 0),
     )
@@ -275,12 +337,13 @@ def compute_safe_ctx(model: str, estimated_tokens: int,
     if "num_ctx" in config:
         return int(config["num_ctx"])
 
-    kv_quant = config.get("kv_quant", "f16")
+    kv_quant = config.get("kv_quant", os.environ.get("OLLAMA_KV_CACHE_TYPE", "f16"))
+    kv_heads = config.get("num_kv_heads")
 
     target = max(int(estimated_tokens * 1.3), MIN_CTX)
 
     meta = _get_model_meta(model)
-    ceiling = _vram_max_ctx(model, kv_quant)
+    ceiling = _vram_max_ctx(model, kv_quant, kv_heads)
     if "trained_ctx" in meta:
         ceiling = min(ceiling, meta["trained_ctx"])
     if "max_ctx" in config:
@@ -294,3 +357,41 @@ def compute_safe_ctx(model: str, estimated_tokens: int,
         if bucket >= target and bucket >= floor:
             return min(bucket, ceiling)
     return min(STANDARD_BUCKETS[-1], ceiling)
+
+
+def should_disable_mmap(model: str | None = None,
+                        model_config: dict | None = None) -> bool:
+    """Whether to pass use_mmap=false to Ollama.
+
+    On Windows, mmap backs GGUF files with pagefile commit charge even when
+    weights are fully offloaded to GPU — can exhaust the pagefile and OOM.
+    Only auto-disabled when the model fits entirely in VRAM (full offload
+    viable).  For partial offload, CPU-resident layers need accessible
+    weights and disabling mmap would just shift the allocation pressure
+    to system RAM instead.
+
+    Per-model override: set "use_mmap": true/false in ollama_config.json.
+    """
+    if model_config and "use_mmap" in model_config:
+        return not model_config["use_mmap"]
+    if sys.platform != "win32":
+        return False
+
+    total_vram = _get_total_vram_mb()
+    if total_vram <= 0:
+        return False
+
+    if model:
+        meta = _get_model_meta(model)
+        file_mb = meta.get("file_size_mb", 0)
+        if file_mb > 0:
+            loaded_mb = file_mb * MODEL_OVERHEAD_FACTOR
+            if loaded_mb > total_vram * 0.85:
+                _log.info(
+                    "Keeping mmap for %s: loaded estimate %.0f MiB "
+                    "exceeds 85%% of %.0f MiB VRAM — partial offload path",
+                    model, loaded_mb, total_vram,
+                )
+                return False
+
+    return True

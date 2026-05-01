@@ -79,8 +79,8 @@ class ModelQueue:
         Handles unloading the old model for both Ollama and Transformers.
         """
         needs_switch = (
-            (self._current_model and model != self._current_model)
-            or (self._current_backend and backend != self._current_backend)
+            self._current_model != model
+            or self._current_backend != backend
         )
 
         if needs_switch:
