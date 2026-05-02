@@ -6,6 +6,7 @@ Defaults to localhost:11434. Set ARTIFEX_OLLAMA_URL for remote servers
 """
 
 import json
+import logging
 import os
 import urllib.request
 import urllib.error
@@ -14,6 +15,7 @@ from core.engine_base import BaseEngine
 from core.inference import STOP_STRINGS, _clean_response
 
 
+_log = logging.getLogger(__name__)
 OLLAMA_BASE_URL = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
 
 
@@ -33,10 +35,13 @@ def _detect_safe_num_gpu(model_size_gb=None):
     except Exception:
         return 0
 
-    model_loaded_gb = (model_size_gb or 5) * 1.3
+    model_loaded_gb = (model_size_gb or 5) * 1.1
 
-    # Full offload: model fits with >=15% headroom for KV + compute buffers
-    if total_gb >= 20 and model_loaded_gb < total_gb * 0.85:
+    # Full offload when the model fits with headroom for KV cache.
+    # Ollama's own loader uses ~1.05–1.1x overhead — anything more conservative
+    # forces partial offload and CPU-side layers, which tanks throughput
+    # (observed 5 tok/s at 26% CPU vs 35 tok/s at full GPU offload).
+    if total_gb >= 20 and model_loaded_gb < total_gb * 0.92:
         return -1
 
     # Partial offload: budget VRAM for layers + KV cache + overhead
@@ -171,6 +176,7 @@ class OllamaEngine(BaseEngine):
             "stop": STOP_STRINGS,
             "repeat_penalty": 1.15,
             "repeat_last_n": 128,
+            "num_batch": 1024,
         }
         est_tokens = estimate_prompt_tokens(messages)
         options["num_ctx"] = compute_safe_ctx(self.model_name, est_tokens, model_config)
@@ -186,6 +192,7 @@ class OllamaEngine(BaseEngine):
             "messages": messages,
             "stream": True,
             "options": options,
+            "keep_alive": "24h",
         }
 
         payload["think"] = bool(enable_thinking) and self._thinking_supported
@@ -203,6 +210,11 @@ class OllamaEngine(BaseEngine):
         in_thinking = False
 
         try:
+            import time as _time
+            _t0 = _time.perf_counter()
+            _first_token_t = None
+            _token_count = 0
+
             with urllib.request.urlopen(req, timeout=300) as resp:
                 for line in resp:
                     line = line.strip()
@@ -234,6 +246,9 @@ class OllamaEngine(BaseEngine):
                                 on_token("</think>")
                             in_thinking = False
                         full_response += content
+                        _token_count += 1
+                        if _first_token_t is None:
+                            _first_token_t = _time.perf_counter()
                         if on_token:
                             on_token(content)
 
@@ -241,6 +256,17 @@ class OllamaEngine(BaseEngine):
                         if in_thinking:
                             if on_token:
                                 on_token("</think>")
+                        _elapsed = _time.perf_counter() - _t0
+                        _gen_time = _time.perf_counter() - _first_token_t if _first_token_t else 0
+                        _ttft = (_first_token_t - _t0) if _first_token_t else 0
+                        _tps = _token_count / _gen_time if _gen_time > 0 else 0
+                        _log.info(
+                            "Ollama stream done: %d chunks in %.1fs "
+                            "(TTFT=%.2fs, gen=%.1fs, ~%.1f tok/s) "
+                            "num_ctx=%s num_batch=%s",
+                            _token_count, _elapsed, _ttft, _gen_time, _tps,
+                            options.get("num_ctx"), options.get("num_batch"),
+                        )
                         break
 
         except urllib.error.HTTPError as e:

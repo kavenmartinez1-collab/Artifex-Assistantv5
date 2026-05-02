@@ -529,6 +529,10 @@ class ChatBubble(QFrame):
         self._layout.setContentsMargins(8, 6, 8, 6)
         self._layout.setSpacing(4)
         self._stream_widget = None
+        self._stream_text_len = 0
+        self._stream_newlines = 0
+        self._stream_last_line_chars = 0
+        self._last_height_update_at_chars = 0
 
         # Role label
         role_label = QLabel(role.upper())
@@ -611,7 +615,8 @@ class ChatBubble(QFrame):
             cursor = self._stream_widget.textCursor()
             cursor.movePosition(cursor.MoveOperation.End)
             cursor.insertText(text)
-            self._update_stream_height()
+            self._track_appended(text)
+            self._maybe_update_stream_height()
             return
 
         # First call: remove placeholder QLabel, create stream widget
@@ -647,23 +652,40 @@ class ChatBubble(QFrame):
 
         if existing:
             edit.setPlainText(existing)
+            self._track_appended(existing)
 
         cursor = edit.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         cursor.insertText(text)
-        self._update_stream_height()
+        self._track_appended(text)
+        self._maybe_update_stream_height()
+
+    def _track_appended(self, text: str):
+        """Maintain incremental counters so we can size the stream widget
+        without rescanning the full document on every append (was O(n²) and
+        starved the worker thread of GIL during long generations)."""
+        for ch in text:
+            if ch == '\n':
+                self._stream_newlines += 1
+                self._stream_last_line_chars = 0
+            else:
+                self._stream_last_line_chars += 1
+        self._stream_text_len += len(text)
+
+    def _maybe_update_stream_height(self):
+        """Throttle height updates so we don't recompute on every batch.
+        500-char gating keeps GUI responsive without holding the GIL during
+        streaming."""
+        if self._stream_text_len - self._last_height_update_at_chars >= 500:
+            self._update_stream_height()
+            self._last_height_update_at_chars = self._stream_text_len
 
     def _update_stream_height(self):
-        """Resize stream widget to fit content without signal storms.
-
-        QPlainTextDocumentLayout defers full layout, so document().size()
-        often underreports height.  Instead, estimate visual line count
-        from text content and the monospace character grid.
-        """
+        """Resize stream widget from incrementally tracked counters — O(1)
+        regardless of total response length."""
         if self._stream_widget is None:
             return
-        text = self._stream_widget.toPlainText()
-        if not text:
+        if self._stream_text_len == 0:
             self._stream_widget.setFixedHeight(30)
             return
 
@@ -677,9 +699,20 @@ class ChatBubble(QFrame):
         char_width = fm.averageCharWidth() or 8
         chars_per_line = max(1, vw // char_width)
 
-        visual_lines = 0
-        for paragraph in text.split('\n'):
-            visual_lines += max(1, -(-len(paragraph) // chars_per_line))
+        # Approximate visual line count from newlines + wrapped chars on the
+        # current paragraph.  Earlier paragraphs are approximated by their
+        # average chars-per-line; close enough for sizing, avoids O(n) split.
+        avg_chars_per_paragraph = (
+            (self._stream_text_len - self._stream_last_line_chars)
+            / max(1, self._stream_newlines)
+            if self._stream_newlines else 0
+        )
+        wrapped_earlier = (
+            self._stream_newlines
+            * max(1, -(-int(avg_chars_per_paragraph) // chars_per_line))
+        )
+        wrapped_current = max(1, -(-self._stream_last_line_chars // chars_per_line))
+        visual_lines = wrapped_earlier + wrapped_current
 
         doc = self._stream_widget.document()
         margins = self._stream_widget.contentsMargins()

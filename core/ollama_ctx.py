@@ -19,9 +19,9 @@ Hybrid models (e.g. Qwen3.5/3.6):
   cache.  SSM layers (Mamba-2) have fixed-size state that doesn't scale with
   context length.  The KV math accounts for this automatically.
 
-The 1.3× model overhead factor covers weight tensor padding, CUDA context,
-and compute buffers.  Empirical: Qwen3.5-27B Q4 (16.2 GB file) loads at
-~21 GB VRAM at 4K ctx on a 24 GB card.
+The 1.1× model overhead factor covers weight tensor padding, CUDA context,
+and compute buffers.  Empirical: Qwen3.6-27B Q4_K_M (16.2 GB file) loads
+at ~17–18 GB VRAM at minimal ctx on a 24 GB card.
 """
 
 import json
@@ -37,7 +37,7 @@ _log = logging.getLogger(__name__)
 OLLAMA_BASE = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
 STANDARD_BUCKETS = [4096, 8192, 16384, 32768, 65536, 131072]
 MIN_CTX = 4096
-MODEL_OVERHEAD_FACTOR = 1.3
+MODEL_OVERHEAD_FACTOR = 1.1
 SYSTEM_RESERVE_MB = 2560  # 2.5 GB for display compositor, other GPU processes
 
 _total_vram_mb: float | None = None
@@ -283,7 +283,12 @@ def _vram_max_ctx(model: str, kv_quant: str = "f16",
 
     free_mb = _get_free_vram_mb()
     if free_mb > 0:
-        free_available = free_mb - model_loaded_mb
+        if free_mb > model_loaded_mb:
+            # Model not yet loaded — subtract its size from free VRAM.
+            free_available = free_mb - model_loaded_mb
+        else:
+            # Model likely already loaded — free VRAM is what's left for KV.
+            free_available = free_mb - SYSTEM_RESERVE_MB
         if free_available > 0:
             free_max = int((free_available * 0.90) / kv_per_token_mb)
             if free_max < max_tokens:
@@ -293,13 +298,6 @@ def _vram_max_ctx(model: str, kv_quant: str = "f16",
                     free_mb, free_max, max_tokens,
                 )
                 max_tokens = free_max
-        else:
-            _log.warning(
-                "Free VRAM (%.0f MiB) may not fit model %s "
-                "(est. %.0f MiB loaded) — clamping to min ctx",
-                free_mb, model, model_loaded_mb,
-            )
-            max_tokens = 0
 
     _log.info(
         "VRAM budget for %s: %.0f MiB total (%.0f MiB free), −%.0f MiB reserve, "

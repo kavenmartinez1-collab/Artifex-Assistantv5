@@ -11,6 +11,7 @@
   },
   "huihui_ai/Qwen3.6-abliterated:27b": {
     "kv_quant": "q8_0",
-    "num_kv_heads": 4
+    "num_kv_heads": 4,
+    "num_ctx": 8192
   }
 }
