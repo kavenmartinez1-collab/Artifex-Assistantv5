@@ -1050,12 +1050,18 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
             ),
         })
 
-        # Trim to fit context window — drop oldest middle turns
+        # Compact then trim to fit context window
+        from core.inference import auto_compact_if_needed
         budget = _get_context_budget(backend)
         est_tokens = sum(len(m.get("content", "")) for m in current_messages) // 4
         _log.info("[%s] Pre-trim: %d messages (~%d tok), ctx_budget=%d",
                   chat_id, len(current_messages), est_tokens, budget)
         if budget > 0:
+            current_messages, compacted = auto_compact_if_needed(
+                current_messages, budget, context_window=15
+            )
+            if compacted:
+                _log.info("[%s] Auto-compacted to %d messages", chat_id, len(current_messages))
             current_messages = trim_messages_to_context(current_messages, budget)
             new_est = sum(len(m.get("content", "")) for m in current_messages) // 4
             if new_est < est_tokens:

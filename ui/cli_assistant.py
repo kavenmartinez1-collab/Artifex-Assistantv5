@@ -18,7 +18,8 @@ from core.config import (
     get_ollama_model_config, set_ollama_model_config, get_active_ollama_model,
 )
 from core.engine_factory import create_engine
-from core.inference import ThinkFilter, compress_history, build_active_messages
+from core.inference import (ThinkFilter, compress_history,
+                            build_active_messages, auto_compact_if_needed)
 from core.prompts import build_assistant_prompt
 from core.knowledge import KnowledgeManager
 from tools.agent_tools import (
@@ -1060,8 +1061,19 @@ def run_assistant():
                 session_map.set_task(user_input)
                 _first_message = False
 
-            # Token-aware sliding window
-            history, active_messages = build_active_messages(history, mode_cfg.context_window)
+            # Auto-compact if approaching engine context limit
+            ctx = engine.get_context_size() if engine else 0
+            if ctx > 0:
+                history, compacted = auto_compact_if_needed(
+                    history, ctx, mode_cfg.context_window
+                )
+                if compacted:
+                    print(f"{Fore.CYAN}  [Compacted] {len(history)} messages kept{Style.RESET_ALL}")
+
+            # Token-aware sliding window (engine-context-aware)
+            history, active_messages = build_active_messages(
+                history, mode_cfg.context_window, engine_ctx=ctx
+            )
 
             # Stream response (thinking filtered out)
             response = _stream_response(engine, active_messages, mode_cfg)

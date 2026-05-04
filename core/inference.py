@@ -5,9 +5,12 @@ compression, thinking block handling, VRAM pressure management.
 """
 
 import gc
+import logging
 import re
 
 import torch
+
+_log = logging.getLogger(__name__)
 
 
 # Strings that indicate the model is faking a new conversational turn.
@@ -217,7 +220,8 @@ def _count_tokens(messages, tokenizer=None):
     return sum(len(m.get("content", "")) for m in messages) // 4
 
 
-def build_active_messages(history, context_window, max_history_tokens=None):
+def build_active_messages(history, context_window, max_history_tokens=None,
+                          engine_ctx=0):
     """Build the active message list for the next generation call.
 
     Uses max_total_input_tokens as a HARD CAP on everything sent to the model.
@@ -226,6 +230,9 @@ def build_active_messages(history, context_window, max_history_tokens=None):
         history: full history list (system prompt at index 0)
         context_window: max number of recent messages to consider
         max_history_tokens: override for history token cap
+        engine_ctx: engine's reported context size in tokens (e.g. 131072).
+            When > 0, scales budget and window to use the engine's real
+            capacity instead of the profile caps.
 
     Returns:
         (updated_history, active_messages)
@@ -235,11 +242,15 @@ def build_active_messages(history, context_window, max_history_tokens=None):
 
     system_tokens = _count_tokens([history[0]])
 
-    total_cap = profile.max_total_input_tokens
-    history_budget = max_history_tokens or max(total_cap - system_tokens, 200)
-
-    if max_history_tokens is None:
-        history_budget = min(history_budget, profile.max_history_tokens)
+    if engine_ctx > 0:
+        total_cap = int(engine_ctx * 0.70)
+        history_budget = max_history_tokens or max(total_cap - system_tokens, 200)
+        context_window = min(max(history_budget // 500, context_window), 200)
+    else:
+        total_cap = profile.max_total_input_tokens
+        history_budget = max_history_tokens or max(total_cap - system_tokens, 200)
+        if max_history_tokens is None:
+            history_budget = min(history_budget, profile.max_history_tokens)
 
     active = [history[0]] + history[1:][-context_window:]
 
@@ -255,6 +266,32 @@ def build_active_messages(history, context_window, max_history_tokens=None):
 
     active = [compressed[0]] + compressed[1:][-2:]
     return compressed, active
+
+
+def auto_compact_if_needed(messages, engine_ctx, context_window, threshold=0.60):
+    """Auto-compact conversation when token count approaches engine context.
+
+    Triggers at threshold (default 60%) of engine_ctx. Compresses old
+    messages into key-point summaries while keeping recent ones intact.
+
+    Returns:
+        (messages, compacted: bool)
+    """
+    if engine_ctx <= 0 or len(messages) <= 4:
+        return messages, False
+
+    token_count = _count_tokens(messages)
+    limit = int(engine_ctx * threshold)
+
+    if token_count <= limit:
+        return messages, False
+
+    scaled_window = min(max(limit // 500, context_window), 200)
+    compacted = compress_history(messages, scaled_window)
+    new_count = _count_tokens(compacted)
+    _log.info("Auto-compacted: %d tok -> %d tok (%d -> %d messages)",
+              token_count, new_count, len(messages), len(compacted))
+    return compacted, True
 
 
 def compress_history(history, context_window):

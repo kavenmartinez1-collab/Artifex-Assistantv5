@@ -204,6 +204,7 @@ class ArtifexMainWindow(QMainWindow):
         # (Windows exit code 0xC0000409) via PyQt6's __fastfail handler.
         self._current_action_worker = None
         self._pending_actions = []
+        self._pending_tool_outputs = []
         self._current_bubble = None
         self._output_dir = os.path.join(BASE_DIR, "output")
 
@@ -846,16 +847,28 @@ class ArtifexMainWindow(QMainWindow):
         # Update system prompt
         self._update_system_prompt(mode)
 
-        # Build active messages
-        from core.inference import build_active_messages, trim_messages_to_context
+        # Build active messages — scale to engine's real context size
+        from core.inference import (build_active_messages,
+                                    trim_messages_to_context,
+                                    auto_compact_if_needed)
         mode_cfg = MODES.get(mode.upper(), MODES["ASSISTANT"])
+        ctx = self.engine.get_context_size() if self.engine else 0
+
+        # Auto-compact history before building active messages
+        if ctx > 0:
+            self.messages, compacted = auto_compact_if_needed(
+                self.messages, ctx, mode_cfg.context_window
+            )
+            if compacted:
+                self._set_status(
+                    f"Context compacted: {len(self.messages)} messages kept"
+                )
+
         _, active_msgs = build_active_messages(
-            self.messages, mode_cfg.context_window
+            self.messages, mode_cfg.context_window, engine_ctx=ctx
         )
-        if self.engine:
-            ctx = self.engine.get_context_size()
-            if ctx > 0:
-                active_msgs = trim_messages_to_context(active_msgs, int(ctx * 0.85))
+        if ctx > 0:
+            active_msgs = trim_messages_to_context(active_msgs, int(ctx * 0.85))
 
         # Show user message in chat
         user_bubble = self._chat_view.add_bubble("user")
@@ -1322,64 +1335,84 @@ class ArtifexMainWindow(QMainWindow):
         worker.start()
 
     def _on_action_worker_done(self):
-        """Release the action worker after its QThread finishes naturally."""
+        """All actions done — batch outputs into one message and generate."""
         worker = self._current_action_worker
         if worker is not None:
             worker.deleteLater()
             self._current_action_worker = None
 
+        outputs = self._pending_tool_outputs
+        self._pending_tool_outputs = []
+
+        if not outputs or not self.engine or not self.engine.is_loaded():
+            return
+
+        parts = []
+        for display, text in outputs:
+            parts.append(f"=== {display} ===\n{text}")
+        combined = "\n\n".join(parts)
+
+        feedback_msg = (
+            "[TOOL OUTPUT — this is automated command output, not a human message]\n\n"
+            f"{combined}\n\n"
+            "Analyze the output above and tell the user what you found."
+        )
+        self.messages.append({"role": "user", "content": feedback_msg})
+        self._update_system_prompt()
+
+        from core.inference import (build_active_messages,
+                                    trim_messages_to_context,
+                                    auto_compact_if_needed)
+        mode_cfg = MODES["ASSISTANT"]
+        ctx = self.engine.get_context_size()
+
+        if ctx > 0:
+            self.messages, compacted = auto_compact_if_needed(
+                self.messages, ctx, mode_cfg.context_window
+            )
+            if compacted:
+                self._set_status(
+                    f"Context compacted: {len(self.messages)} messages kept"
+                )
+
+        _, active_msgs = build_active_messages(
+            self.messages, mode_cfg.context_window, engine_ctx=ctx
+        )
+        if ctx > 0:
+            active_msgs = trim_messages_to_context(active_msgs, int(ctx * 0.85))
+
+        self._current_bubble = self._chat_view.add_bubble("assistant")
+        self._current_bubble.add_text("")
+
+        worker = GenerationWorker(
+            self.engine, active_msgs, mode_cfg.max_tokens,
+            mode_cfg.temperature,
+            enable_thinking=mode_cfg.enable_thinking,
+            cancel_event=self._cancel_event,
+        )
+        worker.response_received.connect(self._response_batcher.add)
+        worker.thinking_received.connect(self._thinking_batcher.add)
+        worker.status_changed.connect(self._set_status)
+        worker.finished.connect(self._on_generation_finished)
+        worker.error.connect(self._on_generation_error)
+        self._current_worker = worker
+        self._busy = True
+        self._execute_btn.setText("CANCEL")
+        worker.start()
+
     def _on_action_output(self, display, output):
-        """Display action output and feed it back to AI for analysis."""
+        """Display action output and accumulate for batched generation."""
         bubble = self._chat_view.add_bubble("assistant")
         bubble.add_text(f"[Action: {display}]\n{output}")
         self._chat_view.scroll_to_bottom()
 
-        # Process through knowledge manager
         if self.km and output:
             self.km.process_tool_result("shell", display, output)
             update_session_map(self.session_map, "shell", display, output)
 
-        # Feed output back to AI for analysis (matches old GUI behavior)
-        if self.engine and output and self.engine.is_loaded():
-            truncated = output
-            limit = get_tool_output_limit()
-            if len(truncated) > limit:
-                truncated = truncated[:limit] + "\n[...truncated...]"
-
-            feedback_msg = (
-                "[TOOL OUTPUT — this is automated command output, not a human message]\n\n"
-                f"{truncated}\n\n"
-                "Analyze the output above and tell the user what you found."
-            )
-            self.messages.append({"role": "user", "content": feedback_msg})
-            self._update_system_prompt()
-
-            from core.inference import build_active_messages, trim_messages_to_context
-            mode_cfg = MODES["ASSISTANT"]
-            _, active_msgs = build_active_messages(
-                self.messages, mode_cfg.context_window
-            )
-            ctx = self.engine.get_context_size()
-            if ctx > 0:
-                active_msgs = trim_messages_to_context(active_msgs, int(ctx * 0.85))
-
-            self._current_bubble = self._chat_view.add_bubble("assistant")
-            self._current_bubble.add_text("")
-
-            worker = GenerationWorker(
-                self.engine, active_msgs, mode_cfg.max_tokens,
-                mode_cfg.temperature,
-                enable_thinking=mode_cfg.enable_thinking,
-                cancel_event=self._cancel_event,
-            )
-            worker.response_received.connect(self._response_batcher.add)
-            worker.thinking_received.connect(self._thinking_batcher.add)
-            worker.status_changed.connect(self._set_status)
-            worker.finished.connect(self._on_generation_finished)
-            worker.error.connect(self._on_generation_error)
-            self._current_worker = worker
-            self._busy = True
-            self._execute_btn.setText("CANCEL")
+        limit = get_tool_output_limit()
+        truncated = output if len(output) <= limit else output[:limit] + "\n[...truncated...]"
+        self._pending_tool_outputs.append((display, truncated))
             worker.start()
 
     # ═══════════════════════════════════════════════════════════════════
