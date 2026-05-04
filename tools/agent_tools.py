@@ -943,10 +943,12 @@ def run_read_file(content):
     fname = os.path.basename(filepath)
     header = f"File: {fname} (chunk {chunk_num}/{total_chunks}, lines {start_line}-{end_line} of {total_lines})"
 
-    result = [header, "---", chunk_text, "---"]
+    result = [header]
 
     if chunk_num < total_chunks:
-        result.append(f'Use @read_file("{filepath}", chunk={chunk_num + 1}) for the next chunk.')
+        result.append(f'[Next: @read_file("{filepath}", chunk={chunk_num + 1})]')
+
+    result.extend(["---", chunk_text, "---"])
 
     return True, "\n".join(result)
 
@@ -1331,7 +1333,8 @@ def run_web_read(ref):
                 header += f"\n[Security warnings: {'; '.join(warnings)}]"
 
             if len(text) > _WEB_READ_TRUNCATE:
-                text = text[:_WEB_READ_TRUNCATE] + "\n\n[...page truncated. Key content above.]"
+                text = text[:_WEB_READ_TRUNCATE]
+                return True, f"{header}\n[Truncated — content is partial.]\n{text}"
 
             return True, f"{header}\n{text}"
         else:
@@ -1386,7 +1389,8 @@ def run_web_read(ref):
             )
 
         if len(text) > _WEB_READ_TRUNCATE:
-            text = text[:_WEB_READ_TRUNCATE] + "\n\n[...PDF truncated at 3500 chars. Use @download to save full PDF locally.]"
+            text = text[:_WEB_READ_TRUNCATE]
+            return True, f"{header}\n[PDF truncated. Use @download to save full PDF locally.]\n{text}"
 
         return True, f"{header}\n{text}"
 
@@ -1403,7 +1407,8 @@ def run_web_read(ref):
     header = f"Source: {title or url}\nURL: {url}\n---"
 
     if len(text) > _WEB_READ_TRUNCATE:
-        text = text[:_WEB_READ_TRUNCATE] + "\n\n[...page truncated at 3500 chars. Key content above.]"
+        text = text[:_WEB_READ_TRUNCATE]
+        return True, f"{header}\n[Page truncated. Content is partial.]\n{text}"
 
     return True, f"{header}\n{text}"
 

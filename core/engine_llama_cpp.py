@@ -386,63 +386,78 @@ class LlamaCppEngine(BaseEngine):
         full_text = ""
         in_thinking = False
 
-        try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
-                for raw_line in resp:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    for raw_line in resp:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
 
-                    choices = chunk.get("choices", [])
-                    if not choices:
-                        continue
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            continue
 
-                    delta = choices[0].get("delta", {})
+                        delta = choices[0].get("delta", {})
 
-                    reasoning = delta.get("reasoning_content", "")
-                    if reasoning:
-                        if not in_thinking:
-                            in_thinking = True
-                            full_text += "<think>"
+                        reasoning = delta.get("reasoning_content", "")
+                        if reasoning:
+                            if not in_thinking:
+                                in_thinking = True
+                                full_text += "<think>"
+                                if on_token:
+                                    on_token("<think>")
+                            full_text += reasoning
                             if on_token:
-                                on_token("<think>")
-                        full_text += reasoning
-                        if on_token:
-                            on_token(reasoning)
-                        continue
+                                on_token(reasoning)
+                            continue
 
-                    content = delta.get("content", "")
-                    if content:
-                        if in_thinking:
-                            in_thinking = False
-                            full_text += "</think>"
+                        content = delta.get("content", "")
+                        if content:
+                            if in_thinking:
+                                in_thinking = False
+                                full_text += "</think>"
+                                if on_token:
+                                    on_token("</think>")
+                            full_text += content
                             if on_token:
-                                on_token("</think>")
-                        full_text += content
-                        if on_token:
-                            on_token(content)
+                                on_token(content)
 
-                    finish = choices[0].get("finish_reason")
-                    if finish:
-                        self._last_gen_stats["finish_reason"] = finish
+                        finish = choices[0].get("finish_reason")
+                        if finish:
+                            self._last_gen_stats["finish_reason"] = finish
 
-                    usage = chunk.get("usage")
-                    if usage:
-                        self._last_gen_stats["prompt_tokens"] = usage.get("prompt_tokens", 0)
-                        self._last_gen_stats["completion_tokens"] = usage.get("completion_tokens", 0)
+                        usage = chunk.get("usage")
+                        if usage:
+                            self._last_gen_stats["prompt_tokens"] = usage.get("prompt_tokens", 0)
+                            self._last_gen_stats["completion_tokens"] = usage.get("completion_tokens", 0)
 
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"llama-server error ({e.code}): {error_body}")
-        except urllib.error.URLError as e:
-            raise ConnectionError(f"Lost connection to llama-server: {e}")
+                break  # success — exit retry loop
+
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"llama-server error ({e.code}): {error_body}")
+            except (urllib.error.URLError, ConnectionResetError, OSError) as e:
+                if attempt < max_retries - 1 and self._is_server_healthy():
+                    _log.warning("Connection lost mid-request, retrying: %s", e)
+                    time.sleep(2)
+                    full_text = ""
+                    in_thinking = False
+                    continue
+                if self._is_server_healthy():
+                    raise ConnectionError(f"Lost connection to llama-server: {e}")
+                raise ConnectionError(
+                    "llama-server is not responding — it may have crashed (OOM). "
+                    "Restart with a smaller context or check VRAM usage."
+                )
 
         if in_thinking:
             full_text += "</think>"

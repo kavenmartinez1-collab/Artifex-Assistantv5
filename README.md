@@ -580,6 +580,8 @@ huggingface-cli download bartowski/Qwen3-32B-GGUF Qwen3-32B-Q4_K_M.gguf \
 
 ### Path B — TurboQuant TQ3 fork (TQ3_1S / TQ3_4S quants)
 
+> **Deprecation warning (2026-05):** TQ3_4S (`<4 BPW`) degrades significantly at extended context lengths (32K+). Output becomes garbled/repetitive as context fills. **Q4_K_M is the quality floor for production workloads.** This path is preserved for reference only — use Path A with Q4_K_M or higher for anything that matters.
+
 Use this when you want the `TQ3_4S` / `TQ3_1S` weight formats — extremely compact (3.4 BPW for TQ3_4S) with quality competitive against Q3_K_S at 11–13 GiB for a 27B model. **Not loadable by stock llama.cpp or Ollama.** The fork is runtime-only; quantization tooling is intentionally not public, so you download pre-quantized weights rather than generate them.
 
 ```bash
@@ -623,33 +625,45 @@ The engine starts `llama-server` on the configured port, waits for it to become 
 
 ### Configuration
 
-`llama_cpp_config.json` defines the server binary and per-model settings. Below is an annotated example showing both a standard-quant entry and a TQ3 + vision entry side-by-side:
+`llama_cpp_config.json` defines the server binary and per-model settings. Below is an annotated example showing a 256K extended-context entry and an 8K speculative-decoding entry with vision:
 
 ```jsonc
 {
   "server_path": "/absolute/path/to/llama.cpp/build/bin/llama-server",
   "default_port": 8081,
   "models": {
-    // Standard quant — loads on stock upstream llama.cpp
-    "qwen3.6-27b-q4km": {
+    // 256K context — max context, no spec-dec. ~22 GB VRAM on RTX 4090.
+    // Use for RAG, agent pipelines, and coding tasks.
+    "qwen3.6-27b-256k": {
       "path": "/path/to/Qwen3.6-27B-Q4_K_M.gguf",
-      "port": 8081,
       "num_gpu_layers": 99,
-      "num_ctx": 32768,
-      "extra_flags": ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--jinja"]
+      "num_ctx": 262144,
+      "extra_flags": [
+        "-fa", "on",
+        "-ctk", "q4_0", "-ctv", "q4_0",
+        "--jinja",
+        "--reasoning-format", "deepseek",
+        "--cache-reuse", "1024",
+        "--metrics"
+      ]
     },
-    // TQ3 quant + vision — requires the turbo-tan/llama.cpp-tq3 fork
-    "qwen3.6-27b-tq3_4s": {
-      "path": "/path/to/qwen3.6-27b-tq3_4s/Qwen3.6-27B-TQ3_4S.gguf",
-      "port": 8082,
+    // 8K context + speculative decoding — 43/67 tok/s mean/peak.
+    // Fast chat with vision support. ~22 GB VRAM.
+    "qwen3.6-27b-8k-specd": {
+      "path": "/path/to/Qwen3.6-27B-Q4_K_M.gguf",
       "num_gpu_layers": 99,
-      "num_ctx": 32768,
-      "health_timeout": 180,
+      "num_ctx": 8192,
       "extra_flags": [
         "-fa", "on",
         "-ctk", "q8_0", "-ctv", "q8_0",
+        "-md", "/path/to/Qwen3.5-4B-Q4_K_M.gguf",
+        "-ngld", "99", "-cd", "4096",
+        "--draft-max", "16", "--draft-min", "4", "--draft-p-min", "0.5",
         "--jinja",
-        "--mmproj", "/path/to/qwen3.6-27b-tq3_4s/mmproj.gguf"
+        "--reasoning-format", "deepseek",
+        "--cache-reuse", "256",
+        "--metrics",
+        "--mmproj", "/path/to/mmproj-F16.gguf"
       ]
     }
   }
@@ -664,7 +678,37 @@ The engine starts `llama-server` on the configured port, waits for it to become 
 | `num_gpu_layers` | GPU layers to offload (99 = all) |
 | `num_ctx` | Context window size (auto-sized from VRAM if omitted) |
 | `health_timeout` | Seconds to wait for `/health` to return OK after spawn (default 120; raise for large quants on slow disks) |
-| `extra_flags` | Additional CLI flags passed to llama-server. Common ones: `-fa on` (Flash Attention), `-ctk/-ctv` (KV-cache quant), `--jinja` (Jinja chat templates), `--mmproj <path>` (vision projector for VL models) |
+| `extra_flags` | Additional CLI flags passed to llama-server (see table below) |
+
+#### Extra flags reference
+
+| Flag | Purpose |
+|------|---------|
+| `-fa on` | Flash Attention — required for KV-cache quantization and large contexts |
+| `-ctk <type>` / `-ctv <type>` | KV-cache key/value quantization (`q4_0` for extended context, `q8_0` for quality) |
+| `--jinja` | Enable Jinja chat templates (required for Qwen models) |
+| `--reasoning-format deepseek` | Splits thinking tokens into a separate `reasoning_content` SSE field |
+| `--cache-reuse <n>` | Reuse prompt cache prefix up to `n` tokens between requests |
+| `--metrics` | Expose Prometheus-compatible metrics at `/metrics` |
+| `-md <path>` | Speculative decoding draft model GGUF (must share the same vocabulary) |
+| `-ngld <n>` | GPU layers for draft model (99 = all) |
+| `-cd <n>` | Draft model context size |
+| `--draft-max <n>` | Max draft tokens per speculative batch |
+| `--draft-min <n>` / `--draft-p-min <f>` | Min draft tokens / min acceptance probability |
+| `--mmproj <path>` | Vision projector GGUF for multimodal (VL) models |
+
+#### VRAM budget notes (RTX 4090 24 GB)
+
+| Config | Model quant | KV quant | Context | Spec-dec | VRAM usage |
+|--------|-------------|----------|---------|----------|------------|
+| 256K | Q4_K_M (16.8 GB) | q4_0 | 262144 | No | ~22 GB |
+| 8K + spec-dec | Q4_K_M (16.8 GB) | q8_0 | 8192 | Qwen3.5-4B | ~22 GB |
+
+> **Warning:** Unsloth Dynamic quants (UD-Q4_K_XL, 17.6 GB) are 0.8 GB larger than plain Q4_K_M. Combined with Windows WDDM overhead (~0.4 GB), this causes VRAM spill on 24 GB cards at 256K context. Use plain Q4_K_M for VRAM-tight configs.
+
+#### Connection resilience
+
+The engine retries once on transient connection drops (`ConnectionResetError`, socket timeouts). If the server has crashed (fails `/health` check), it reports a clear OOM message instead of a raw socket error. This is important for production pipelines where llama-server may be under heavy load.
 
 ---
 
@@ -1629,6 +1673,13 @@ cd webgpu && npm run dev
 - Check health: `curl http://localhost:8080/health`
 - If SearXNG shows "unreachable", wait 15-20 seconds for it to initialize
 - Without the gateway, Artifex falls back to direct DuckDuckGo search automatically
+
+### llama-server crashes or "Connection forcibly closed"
+- `ConnectionResetError [WinError 10054]` means llama-server dropped the connection — usually an OOM crash
+- Check VRAM: 256K context with UD-Q4_K_XL (17.6 GB) overflows 24 GB cards. Switch to Q4_K_M (16.8 GB)
+- For heavy tool-call pipelines, use the 8K-specd config — 256K has only 1 KV slot and no headroom for concurrent requests
+- The engine retries once automatically; if the server is truly down, you'll get a clear "llama-server is not responding" error
+- If your computer freezes: VRAM overallocation causes Windows WDDM to virtual-swap GPU memory, locking the desktop compositor. Kill the llama-server process (`taskkill /f /im llama-server.exe`) from Task Manager
 
 ### Windows Firewall popup
 - All servers default to `127.0.0.1` — you should NOT see a firewall prompt

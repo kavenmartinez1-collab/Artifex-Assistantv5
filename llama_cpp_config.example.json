@@ -1,29 +1,40 @@
 {
   "_comment": "llama.cpp server config. Copy to llama_cpp_config.json and update paths.",
-  "server_path": "llama-server",
+  "server_path": "/path/to/llama-mainline/llama.cpp/build/bin/llama-server",
   "default_port": 8081,
   "models": {
-    "qwen3.6-27b-q4km": {
-      "_comment": "Standard Q4_K_M quant — good quality/speed balance, ~17GB VRAM",
-      "path": "/path/to/Qwen3.6-27B-Q4_K_M.gguf",
+    "qwen3.6-27b-256k": {
+      "_comment": "C3-256K: max context, no spec-dec. ~22 GB VRAM, 38 tok/s mean. Use for RAG/agent/coding.",
+      "path": "/path/to/Qwen3.6-27B-UD-Q4_K_XL.gguf",
       "num_gpu_layers": 99,
-      "num_ctx": 32768,
-      "extra_flags": ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--jinja"]
+      "num_ctx": 262144,
+      "extra_flags": [
+        "-fa", "on",
+        "-ctk", "q4_0", "-ctv", "q4_0",
+        "--jinja",
+        "--reasoning-format", "deepseek",
+        "--cache-reuse", "1024",
+        "--metrics",
+        "--mmproj", "/path/to/mmproj-F16.gguf"
+      ]
     },
-    "qwen3.6-27b-iq4xs": {
-      "_comment": "IQ4_XS quant — smaller (14GB), slight quality loss",
-      "path": "/path/to/Qwen3.6-27B-IQ4_XS.gguf",
-      "num_gpu_layers": 99,
-      "num_ctx": 16384,
-      "extra_flags": ["-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--jinja"]
-    },
-    "qwen3.6-27b-tq3": {
-      "_comment": "TurboQuant 3-bit — fits on 12GB cards with q4 KV cache",
-      "path": "/path/to/Qwen3.6-27B-TQ3_4S.gguf",
+    "qwen3.6-27b-8k-specd": {
+      "_comment": "C1-agg: 8K ctx + Qwen3.5-4B spec-dec. ~22 GB VRAM, 43/67 tok/s mean/peak. Fast chat.",
+      "path": "/path/to/Qwen3.6-27B-UD-Q4_K_XL.gguf",
       "num_gpu_layers": 99,
       "num_ctx": 8192,
-      "health_timeout": 180,
-      "extra_flags": ["-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--jinja"]
+      "extra_flags": [
+        "-fa", "on",
+        "-ctk", "q8_0", "-ctv", "q8_0",
+        "-md", "/path/to/Qwen3.5-4B-Q4_K_M.gguf",
+        "-ngld", "99", "-cd", "4096",
+        "--draft-max", "16", "--draft-min", "4", "--draft-p-min", "0.5",
+        "--jinja",
+        "--reasoning-format", "deepseek",
+        "--cache-reuse", "256",
+        "--metrics",
+        "--mmproj", "/path/to/mmproj-F16.gguf"
+      ]
     }
   }
 }

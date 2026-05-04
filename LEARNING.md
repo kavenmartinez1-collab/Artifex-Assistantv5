@@ -12,7 +12,7 @@
 3. [Quantization — Fitting Big Models in Small GPUs](#3-quantization--fitting-big-models-in-small-gpus)
 4. [Backend #1: HuggingFace Transformers](#4-backend-1-huggingface-transformers)
 5. [Backend #2: Ollama](#5-backend-2-ollama)
-    - [Backend #3: llama.cpp (Custom GGUF Forks)](#5b-backend-3-llamacpp-custom-gguf-forks)
+    - [Backend #3: llama.cpp (Custom GGUF Forks)](#5b-backend-3-llamacpp-custom-gguf-forks) — includes hybrid architecture, speculative decoding, connection resilience, VRAM lessons
 6. [Backend #4: The API Server (OpenAI-Compatible)](#6-backend-3-the-api-server-openai-compatible)
 7. [The Web Gateway — Safe Web Access for AI](#7-the-web-gateway--safe-web-access-for-ai)
 8. [Backend #4: WebGPU — Running Models in the Browser](#8-backend-4-webgpu--running-models-in-the-browser)
@@ -420,6 +420,61 @@ Vision-language models in the GGUF world ship as **two separate files**: the lan
 `llama-server` wires the two together with `--mmproj <path-to-mmproj.gguf>`. At inference time, when an image is in the message, the server runs the image through the vision encoder + projector to produce a sequence of embeddings, prepends them to the text tokens, and runs the result through the (quantized) LM. From the OpenAI-API caller's perspective it's one model that happens to accept `image_url` content blocks. From the disk's perspective it's two GGUFs in the same directory.
 
 A practical implication: if you only download the main GGUF and skip the mmproj, the server starts up fine and serves text — but every image request will silently produce text-only output (the vision tokens never arrive). Always check both files are downloaded and the `--mmproj` flag is present in `extra_flags` before assuming a VL model is broken.
+
+### Qwen3.6-27B — hybrid memory architecture
+
+Qwen3.6-27B is not a standard transformer. It uses a **hybrid** design:
+
+- **48 layers** are **Gated DeltaNet** (recurrent) — these maintain a fixed-size state regardless of context length. Think of them like an RNN that compresses everything it has seen into a constant-size memory.
+- **16 layers** are **Gated Attention** (traditional) — these are the standard key/value attention layers that scale with context. They appear at every 4th position (layers 3, 7, 11, ..., 63).
+
+What this means for VRAM: the KV cache only grows with context for 16 out of 64 layers. At 256K context with q4_0 quantized KV, the attention layers use about `16 × 2 × 4096 × 262144 × 0.5625 bytes ≈ 9.4 GB`. The recurrent layers use a constant ~0.5 GB regardless of context. This is why a 27B model can fit 256K context in 22 GB total VRAM — a standard 27B transformer would need 4x more KV cache.
+
+llama.cpp handles this via `llama_memory_hybrid`, which creates separate `mem_attn` (for the 16 attention layers) and `mem_recr` (for the 48 DeltaNet layers). You don't need to configure anything — it reads the architecture from the GGUF metadata.
+
+### Speculative decoding — same-vocab drafting
+
+Speculative decoding uses a small "draft" model to generate candidate tokens quickly, then the big model verifies them in a single forward pass (parallel verification is cheaper than sequential generation). The result: you get the big model's quality at 2-4x the speed.
+
+The critical constraint: **the draft model must share the same vocabulary/tokenizer** as the target. If token ID 5021 means "hello" to the target but "world" to the draft, verified tokens will be wrong. For Qwen3.6-27B, the correct draft is Qwen3.5-4B (same tokenizer family). Cross-vocab drafts (like ik_llama.cpp + Qwen3-1.7B) produce correct free-text but corrupt structured output (JSON, tool calls) because the token boundaries don't align.
+
+Key flags for speculative decoding in llama-server:
+```
+-md /path/to/draft.gguf   # draft model
+-ngld 99                   # GPU layers for draft
+-cd 4096                   # draft context size
+--draft-max 16             # max speculative tokens per batch
+--draft-min 4              # min before checking acceptance
+--draft-p-min 0.5          # acceptance probability threshold
+```
+
+Observed throughput on RTX 4090: 43 tok/s mean, 67 tok/s peak (8K context, Q4_K_M target + Q4_K_M draft).
+
+### Thinking mode — `--reasoning-format deepseek`
+
+Qwen3.6 supports a "thinking" mode where it reasons in `<think>...</think>` blocks before answering. This is activated by a system prompt instruction, not a special token toggle. When you pass `--reasoning-format deepseek` to llama-server, thinking tokens get split into a separate `reasoning_content` field in the SSE stream (same format DeepSeek uses). The Artifex engine reassembles this into `<think>` blocks transparently.
+
+### Connection resilience
+
+The engine wraps its streaming HTTP request in a retry loop (2 attempts). On socket-level errors (`ConnectionResetError`, `OSError`), it checks if the server is still healthy via `/health`:
+- If healthy → retries once (transient network glitch)
+- If unhealthy → raises a clear error: "llama-server is not responding — it may have crashed (OOM)"
+
+This matters for production pipelines: heavy tool-call workflows generate many sequential inference requests. If the server runs out of VRAM (only 1 KV slot at 256K context), it crashes, and the pipeline gets a clean error instead of an opaque `[WinError 10054]`.
+
+### VRAM lessons learned (RTX 4090, 24 GB)
+
+1. **UD-Q4_K_XL vs Q4_K_M**: Unsloth Dynamic 2.0 quants upcast attention layers to Q6_K/Q8_0. Disk size is 17.6 GB vs 16.8 GB, but VRAM difference is larger because the upcasted layers are the ones loaded onto GPU. On 256K context this 0.8 GB is the difference between fitting and spilling.
+
+2. **Windows WDDM overhead**: ~0.4-0.9 GB of VRAM is consumed by the display compositor on Windows (not present on Linux). Combined with UD-Q4_K_XL, total headroom loss is ~1.2 GB vs Linux Q4_K_M baselines.
+
+3. **VRAM overallocation = system freeze**: When llama-server allocates more VRAM than available, Windows WDDM tries to virtual-swap GPU memory. This locks the desktop compositor. The system appears frozen for minutes. Fix: ensure model + KV cache fits within `24 GB - 0.9 GB WDDM = 23.1 GB` usable.
+
+4. **Q4_K_M is the quality floor**: TQ3_4S (< 4 BPW) degrades at extended context — output becomes garbled/repetitive. Q4_K_M (4.5 BPW) maintains quality through the full 256K window.
+
+### Agent tool response formatting
+
+When a local LLM processes tool responses (from `@read_file`, `@web_read`, etc.), pagination and truncation hints are placed **at the top** of the response, right after the header and before the content body. This ensures the LLM sees navigation instructions first (e.g., "Next: @read_file(..., chunk=2)") before processing potentially large content that might push the hint past its attention window.
 
 ---
 
