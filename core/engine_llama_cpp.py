@@ -19,7 +19,7 @@ import urllib.request
 import urllib.error
 
 from core.engine_base import BaseEngine
-from core.inference import _clean_response
+from core.inference import _clean_response, strip_think_blocks
 
 _log = logging.getLogger(__name__)
 
@@ -342,7 +342,8 @@ class LlamaCppEngine(BaseEngine):
     def generate_streaming(self, messages, max_tokens, temperature,
                            on_token=None, on_complete=None,
                            enable_thinking=True,
-                           grammar=None, response_format=None) -> str:
+                           grammar=None, response_format=None,
+                           raw_output=False) -> str:
         """Stream from llama-server's OpenAI-compatible /v1/chat/completions.
 
         Thinking is handled via <think> tags in the content stream (same as
@@ -462,7 +463,10 @@ class LlamaCppEngine(BaseEngine):
         if in_thinking:
             full_text += "</think>"
 
-        clean = _clean_response(full_text)
+        if raw_output:
+            clean = strip_think_blocks(full_text)
+        else:
+            clean = _clean_response(full_text)
         if on_complete:
             on_complete(clean)
         return clean

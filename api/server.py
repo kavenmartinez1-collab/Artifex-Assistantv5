@@ -805,6 +805,7 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
             messages, max_tokens=max_tokens if max_tokens and max_tokens > 0 else -1,
             temperature=temperature, on_token=on_token,
             grammar=grammar, response_format=response_format,
+            raw_output=True,
         )
         tf.flush()
 
@@ -1326,9 +1327,10 @@ def create_app():
                     temperature=temperature,
                     grammar=body.grammar,
                     response_format=body.response_format,
+                    raw_output=True,
                 ),
             )
-            response = strip_think_blocks(response) if response else ""
+            response = response or ""
 
             # Real token counts + finish_reason from engine stats
             stats = getattr(engine, "_last_gen_stats", None) or {}

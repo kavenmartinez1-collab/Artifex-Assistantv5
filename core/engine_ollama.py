@@ -12,7 +12,7 @@ import urllib.request
 import urllib.error
 
 from core.engine_base import BaseEngine
-from core.inference import STOP_STRINGS, _clean_response
+from core.inference import STOP_STRINGS, _clean_response, strip_think_blocks
 
 
 _log = logging.getLogger(__name__)
@@ -162,7 +162,8 @@ class OllamaEngine(BaseEngine):
     def generate_streaming(self, messages, max_tokens, temperature,
                            on_token=None, on_complete=None,
                            enable_thinking=True,
-                           grammar=None, response_format=None) -> str:
+                           grammar=None, response_format=None,
+                           raw_output=False) -> str:
         """Stream a response from the Ollama /api/chat endpoint (localhost only)."""
         self.load()
 
@@ -290,7 +291,10 @@ class OllamaEngine(BaseEngine):
         if not full_response.strip() and thinking_response.strip():
             full_response = thinking_response
 
-        clean_response = _clean_response(full_response)
+        if raw_output:
+            clean_response = strip_think_blocks(full_response)
+        else:
+            clean_response = _clean_response(full_response)
 
         if on_complete:
             on_complete(clean_response)

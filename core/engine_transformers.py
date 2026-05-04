@@ -35,7 +35,7 @@ from core.config import (
     BNB_CONFIG, get_active_model_path,
     get_torch_compile, get_turboquant_kv,
 )
-from core.inference import STOP_STRINGS, _clean_response
+from core.inference import STOP_STRINGS, _clean_response, strip_think_blocks
 
 # Model types that historically required AutoModelForMultimodalLM (Gemma 4
 # family). Image-text-to-text models (Qwen-VL, LLaVA, etc.) are now resolved
@@ -1137,7 +1137,8 @@ class TransformersEngine(BaseEngine):
     def generate_streaming(self, messages, max_tokens, temperature,
                            on_token=None, on_complete=None,
                            enable_thinking=True,
-                           grammar=None, response_format=None) -> str:
+                           grammar=None, response_format=None,
+                           raw_output=False) -> str:
         """Run streaming inference on the local transformers model."""
         self.load()
 
@@ -1367,7 +1368,10 @@ class TransformersEngine(BaseEngine):
         if gen_error[0] is not None:
             raise gen_error[0]
 
-        clean_response = _clean_response(full_response)
+        if raw_output:
+            clean_response = strip_think_blocks(full_response)
+        else:
+            clean_response = _clean_response(full_response)
 
         if on_complete:
             on_complete(clean_response)
