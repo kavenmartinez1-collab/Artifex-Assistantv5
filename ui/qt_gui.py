@@ -1413,7 +1413,6 @@ class ArtifexMainWindow(QMainWindow):
         limit = get_tool_output_limit()
         truncated = output if len(output) <= limit else output[:limit] + "\n[...truncated...]"
         self._pending_tool_outputs.append((display, truncated))
-            worker.start()
 
     # ═══════════════════════════════════════════════════════════════════
     # UTILITY
