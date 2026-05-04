@@ -4,34 +4,33 @@
   "default_port": 8081,
   "models": {
     "qwen3.6-27b-256k": {
-      "_comment": "C3-256K: max context, no spec-dec. ~22 GB VRAM, 38 tok/s mean. Use for RAG/agent/coding.",
-      "path": "/path/to/Qwen3.6-27B-UD-Q4_K_XL.gguf",
+      "_comment": "C3-256K: max context, q4_0 KV, no spec-dec. ~22 GB VRAM. No --cache-reuse (breaks hybrid DeltaNet state).",
+      "path": "/path/to/Qwen3.6-27B-Q4_K_M.gguf",
       "num_gpu_layers": 99,
       "num_ctx": 262144,
       "extra_flags": [
         "-fa", "on",
         "-ctk", "q4_0", "-ctv", "q4_0",
+        "--swa-full",
         "--jinja",
         "--reasoning-format", "deepseek",
-        "--cache-reuse", "1024",
-        "--metrics",
-        "--mmproj", "/path/to/mmproj-F16.gguf"
+        "--metrics"
       ]
     },
     "qwen3.6-27b-8k-specd": {
-      "_comment": "C1-agg: 8K ctx + Qwen3.5-4B spec-dec. ~22 GB VRAM, 43/67 tok/s mean/peak. Fast chat.",
-      "path": "/path/to/Qwen3.6-27B-UD-Q4_K_XL.gguf",
+      "_comment": "C1-agg: 8K ctx + Qwen3.5-4B spec-dec. ~22 GB VRAM, 43/67 tok/s mean/peak. Fast chat + vision.",
+      "path": "/path/to/Qwen3.6-27B-Q4_K_M.gguf",
       "num_gpu_layers": 99,
       "num_ctx": 8192,
       "extra_flags": [
         "-fa", "on",
         "-ctk", "q8_0", "-ctv", "q8_0",
+        "--swa-full",
         "-md", "/path/to/Qwen3.5-4B-Q4_K_M.gguf",
         "-ngld", "99", "-cd", "4096",
         "--draft-max", "16", "--draft-min", "4", "--draft-p-min", "0.5",
         "--jinja",
         "--reasoning-format", "deepseek",
-        "--cache-reuse", "256",
         "--metrics",
         "--mmproj", "/path/to/mmproj-F16.gguf"
       ]

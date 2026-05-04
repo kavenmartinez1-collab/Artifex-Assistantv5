@@ -472,6 +472,26 @@ This matters for production pipelines: heavy tool-call workflows generate many s
 
 4. **Q4_K_M is the quality floor**: TQ3_4S (< 4 BPW) degrades at extended context — output becomes garbled/repetitive. Q4_K_M (4.5 BPW) maintains quality through the full 256K window.
 
+### The `--cache-reuse` trap (hybrid models)
+
+**Critical discovery (2026-05):** garbled/interleaved output from Qwen3.6-27B was NOT caused by KV cache quantization. [llama.cpp #21385](https://github.com/ggml-org/llama.cpp/issues/21385) confirmed that q4_0 KV is **completely lossless** on hybrid models (BLEU 1.000 vs f16) because only 16/64 layers use KV cache.
+
+The real culprit was `--cache-reuse`. The DeltaNet recurrent state is fundamentally different from a KV cache — it's a compressed summary of ALL previous tokens. Unlike KV cache entries (which can be truncated to any position), the recurrent state cannot be split at an arbitrary boundary. When `--cache-reuse` tries to reuse a prefix, the recurrent layers "remember" the full prior context while the attention layers only have the reused prefix in their KV cache. This produces the signature failure: **two text streams interleaved character-by-character** — one from the recurrent layers' stale state, one from the attention layers' current state.
+
+Multiple issues confirm this is a known architectural limitation, not a bug: [#18497](https://github.com/ggml-org/llama.cpp/issues/18497), [#19794](https://github.com/ggml-org/llama.cpp/issues/19794), [#20225](https://github.com/ggml-org/llama.cpp/issues/20225), [#21831](https://github.com/ggml-org/llama.cpp/issues/21831). The fix: remove `--cache-reuse` and add `--swa-full` (which correctly handles SWA/hybrid prompt caching via [PR #21749](https://github.com/ggml-org/llama.cpp/pull/21749)).
+
+### Context compaction for large-context engines
+
+When the llama.cpp engine reports a large context size (e.g., 262144 for 256K), the Artifex context manager scales its behavior accordingly:
+
+- **Sliding window** scales from 15 messages (profile default) to up to 200 messages
+- **History budget** scales to 70% of engine context (183K tokens at 256K)
+- **Auto-compaction** triggers at 60% (157K tokens) — compresses old messages into key-point summaries
+- **Hard trim** at 85% (222K tokens) drops the oldest middle messages
+- **Tool batching** — multiple tool results from one model response are combined into a single user message, preventing duplicate reads and back-to-back assistant messages
+
+Without these adaptations, the 10K-14K profile caps designed for transformers would aggressively compress conversations that the engine can easily handle.
+
 ### Agent tool response formatting
 
 When a local LLM processes tool responses (from `@read_file`, `@web_read`, etc.), pagination and truncation hints are placed **at the top** of the response, right after the header and before the content body. This ensures the LLM sees navigation instructions first (e.g., "Next: @read_file(..., chunk=2)") before processing potentially large content that might push the hint past its attention window.

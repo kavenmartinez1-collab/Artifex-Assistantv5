@@ -696,6 +696,9 @@ The engine starts `llama-server` on the configured port, waits for it to become 
 | `--draft-max <n>` | Max draft tokens per speculative batch |
 | `--draft-min <n>` / `--draft-p-min <f>` | Min draft tokens / min acceptance probability |
 | `--mmproj <path>` | Vision projector GGUF for multimodal (VL) models |
+| `--swa-full` | Use full-size SWA cache — required for hybrid models (Qwen3.6) to avoid recurrent state desync |
+
+> **Do NOT use `--cache-reuse` with hybrid DeltaNet/Attention models** (Qwen3.5, Qwen3.6). The DeltaNet recurrent state is a compressed summary of all prior tokens and cannot be split at an arbitrary boundary. `--cache-reuse` causes the recurrent layers to use stale state while the attention layers have current KV data, producing garbled interleaved output. See [llama.cpp #18497](https://github.com/ggml-org/llama.cpp/issues/18497), [#20225](https://github.com/ggml-org/llama.cpp/issues/20225).
 
 #### VRAM budget notes (RTX 4090 24 GB)
 
