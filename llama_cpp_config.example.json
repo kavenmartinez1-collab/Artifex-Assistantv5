@@ -12,6 +12,7 @@
         "-fa", "on",
         "-ctk", "q4_0", "-ctv", "q4_0",
         "--swa-full",
+        "-np", "1",
         "--jinja",
         "--reasoning-format", "deepseek",
         "--metrics"
@@ -26,6 +27,7 @@
         "-fa", "on",
         "-ctk", "q8_0", "-ctv", "q8_0",
         "--swa-full",
+        "-np", "1",
         "-md", "/path/to/Qwen3.5-4B-Q4_K_M.gguf",
         "-ngld", "99", "-cd", "4096",
         "--draft-max", "16", "--draft-min", "4", "--draft-p-min", "0.5",

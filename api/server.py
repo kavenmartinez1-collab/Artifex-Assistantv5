@@ -1225,8 +1225,10 @@ def create_app():
         if not _check_auth(request):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
+        _DEFAULT_MAX_TOKENS = 16384
+
         messages = [m.model_dump() for m in body.messages]
-        max_tokens = body.max_tokens
+        max_tokens = body.max_tokens or _DEFAULT_MAX_TOKENS
         temperature = body.temperature
         stream = body.stream
         use_web_tools = body.web_tools or False
@@ -1267,7 +1269,7 @@ def create_app():
                             _get_engine()  # Load/reload transformers model
 
                         async for chunk in _stream_with_tools(
-                            messages, model, max_tokens or -1, temperature,
+                            messages, model, max_tokens, temperature,
                             body.options, use_web_tools, backend,
                             grammar=body.grammar,
                             response_format=body.response_format,
@@ -1323,7 +1325,7 @@ def create_app():
                 None,
                 lambda: engine.generate_streaming(
                     messages,
-                    max_tokens=max_tokens if max_tokens and max_tokens > 0 else -1,
+                    max_tokens=max_tokens,
                     temperature=temperature,
                     grammar=body.grammar,
                     response_format=body.response_format,
