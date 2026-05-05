@@ -108,7 +108,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = Field(None, description="Model name, or omit for auto-selection")
     messages: List[ChatMessage]
-    max_tokens: Optional[int] = Field(None, ge=1, le=65536)
+    max_tokens: Optional[int] = Field(None, ge=1)
     temperature: Optional[float] = Field(0.7, ge=0.0, le=2.0)
     stream: Optional[bool] = False
     options: Optional[dict] = None
@@ -1229,7 +1229,7 @@ def create_app():
         if not _check_auth(request):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
-        _DEFAULT_MAX_TOKENS = 16384
+        _DEFAULT_MAX_TOKENS = 32768
 
         messages = [m.model_dump() for m in body.messages]
         max_tokens = body.max_tokens or _DEFAULT_MAX_TOKENS
