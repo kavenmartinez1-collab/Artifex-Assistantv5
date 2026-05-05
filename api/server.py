@@ -783,7 +783,8 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
 
 def _stream_transformers_raw(engine, messages, max_tokens, temperature,
                              out_queue: queue.Queue,
-                             grammar=None, response_format=None):
+                             grammar=None, response_format=None,
+                             enable_thinking=True):
     """Stream from Transformers/llama.cpp engine into a queue. Runs in a background thread.
 
     Uses ThinkFilter to separate thinking from response content.
@@ -806,6 +807,7 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
             temperature=temperature, on_token=on_token,
             grammar=grammar, response_format=response_format,
             raw_output=True,
+            enable_thinking=enable_thinking,
         )
         tf.flush()
 
@@ -869,7 +871,8 @@ def _get_context_budget(backend: str) -> int:
 async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                              temperature: float, options: dict,
                              use_web_tools: bool, backend: str,
-                             grammar=None, response_format=None):
+                             grammar=None, response_format=None,
+                             enable_thinking=True):
     """Full streaming generator with optional tool execution loop.
 
     Yields SSE events. Handles both Ollama and Transformers backends.
@@ -911,7 +914,7 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
             thread = threading.Thread(
                 target=_stream_transformers_raw,
                 args=(engine, current_messages, max_tokens, temperature, q,
-                      grammar, response_format),
+                      grammar, response_format, enable_thinking),
                 daemon=True,
             )
 
@@ -1004,7 +1007,8 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                 engine = _get_engine()
                 t = threading.Thread(
                     target=_stream_transformers_raw,
-                    args=(engine, current_messages, max_tokens, temperature, q_final),
+                    args=(engine, current_messages, max_tokens, temperature, q_final,
+                          grammar, response_format, enable_thinking),
                     daemon=True,
                 )
             t.start()
@@ -1232,6 +1236,8 @@ def create_app():
         temperature = body.temperature
         stream = body.stream
         use_web_tools = body.web_tools or False
+        options = body.options or {}
+        enable_thinking = options.get("think", True)
         backend = (
             body.backend
             or _infer_backend_from_model(body.model)
@@ -1270,9 +1276,10 @@ def create_app():
 
                         async for chunk in _stream_with_tools(
                             messages, model, max_tokens, temperature,
-                            body.options, use_web_tools, backend,
+                            options, use_web_tools, backend,
                             grammar=body.grammar,
                             response_format=body.response_format,
+                            enable_thinking=enable_thinking,
                         ):
                             yield chunk
                 except Exception as e:
@@ -1330,6 +1337,7 @@ def create_app():
                     grammar=body.grammar,
                     response_format=body.response_format,
                     raw_output=True,
+                    enable_thinking=enable_thinking,
                 ),
             )
             response = response or ""
