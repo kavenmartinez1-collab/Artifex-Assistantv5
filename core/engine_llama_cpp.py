@@ -369,6 +369,8 @@ class LlamaCppEngine(BaseEngine):
             "temperature": temperature,
             "cache_prompt": True,
         }
+        if not enable_thinking:
+            payload["reasoning_format"] = "none"
         if max_tokens and max_tokens > 0:
             payload["max_tokens"] = max_tokens
         if grammar:

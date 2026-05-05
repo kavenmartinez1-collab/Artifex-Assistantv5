@@ -548,7 +548,6 @@ def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options,
 
     if options:
         ollama_options.update(options)
-        ollama_options.pop("think", None)
         if "num_ctx" in options and int(options["num_ctx"]) > safe_ctx:
             _log.warning(
                 "Client requested num_ctx=%s for %s, capping to VRAM-safe %d",
@@ -667,7 +666,6 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
 
     if options:
         ollama_options.update(options)
-        ollama_options.pop("think", None)
         if "num_ctx" in options and int(options["num_ctx"]) > safe_ctx:
             _log.warning(
                 "Client requested num_ctx=%s for %s, capping to VRAM-safe %d",
