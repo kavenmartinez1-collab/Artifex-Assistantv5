@@ -38,12 +38,14 @@ def _read_gguf_kv_params(gguf_path: str) -> dict | None:
     """Read KV-cache-relevant architecture params from a GGUF file header.
 
     Returns dict with head_count, head_count_kv, key_dim, val_dim,
-    block_count — or None if the file can't be parsed.
+    block_count, and attn_layer_count (for hybrid models) — or None if
+    the file can't be parsed.
     """
     all_wanted = {
         "attention.head_count", "attention.head_count_kv",
         "embedding_length", "block_count",
         "attention.key_length", "attention.value_length",
+        "full_attention_interval",
     }
     found = {}
     try:
@@ -98,12 +100,22 @@ def _read_gguf_kv_params(gguf_path: str) -> dict | None:
     hc = found["attention.head_count"]
     default_dim = found["embedding_length"] / hc
     key_dim = found.get("attention.key_length", default_dim)
+    block_count = found["block_count"]
+    full_attention_interval = found.get("full_attention_interval", 1)
+
+    if full_attention_interval > 1:
+        attn_layer_count = block_count // full_attention_interval
+    else:
+        attn_layer_count = block_count
+
     return {
         "head_count": hc,
         "head_count_kv": found.get("attention.head_count_kv", hc),
         "key_dim": key_dim,
         "val_dim": found.get("attention.value_length", key_dim),
-        "block_count": found["block_count"],
+        "block_count": block_count,
+        "attn_layer_count": attn_layer_count,
+        "full_attention_interval": full_attention_interval,
     }
 
 
@@ -149,6 +161,14 @@ class LlamaCppEngine(BaseEngine):
                 bpe_v = _KV_QUANT_BPE.get(flags[i + 1], 2.0)
         return bpe_k, bpe_v
 
+    def _get_kv_quant_str(self) -> str:
+        """KV quant type name from -ctk in extra_flags. Defaults to 'f16'."""
+        flags = self.extra_flags
+        for i, flag in enumerate(flags):
+            if flag == "-ctk" and i + 1 < len(flags):
+                return flags[i + 1]
+        return "f16"
+
     def _compute_num_ctx(self) -> int:
         if self._configured_num_ctx:
             return self._configured_num_ctx
@@ -172,15 +192,17 @@ class LlamaCppEngine(BaseEngine):
         params = _read_gguf_kv_params(self.model_path)
         if params:
             bpe_k, bpe_v = self._get_kv_quant_bpe()
+            attn_layers = params["attn_layer_count"]
             kv_bytes = (
-                params["block_count"] * params["head_count_kv"]
+                attn_layers * params["head_count_kv"]
                 * (params["key_dim"] * bpe_k + params["val_dim"] * bpe_v)
             )
             kv_per_token_mb = kv_bytes / (1024 ** 2)
             _log.info(
-                "GGUF KV sizing: %d layers × %d kv_heads × "
+                "GGUF KV sizing: %d attn_layers (of %d total, interval=%d) × %d kv_heads × "
                 "(%.0f×%.3f + %.0f×%.3f) → %.4f MB/tok",
-                params["block_count"], params["head_count_kv"],
+                attn_layers, params["block_count"], params["full_attention_interval"],
+                params["head_count_kv"],
                 params["key_dim"], bpe_k, params["val_dim"], bpe_v,
                 kv_per_token_mb,
             )
@@ -211,6 +233,30 @@ class LlamaCppEngine(BaseEngine):
             raise FileNotFoundError(f"Model GGUF not found: {self.model_path}")
 
         self._num_ctx = self._compute_num_ctx()
+
+        # ── VRAM-ready gate: prevent crash loop from WDDM reclaim latency ──
+        from core.gpu_pool import get_pool
+        pool = get_pool()
+        kv_quant_str = self._get_kv_quant_str()
+        allocation = pool.estimate_allocation_mb(
+            self.model_path, self._num_ctx, kv_quant=kv_quant_str,
+        )
+        needed_mb = (
+            allocation["model_weight_mb"]
+            + allocation["kv_cache_mb"]
+            + allocation["compute_buffer_mb"]
+        )
+        _log.info(
+            "VRAM gate: need %.0f MB free (weight=%.0f + kv=%.0f + compute=%.0f)",
+            needed_mb, allocation["model_weight_mb"],
+            allocation["kv_cache_mb"], allocation["compute_buffer_mb"],
+        )
+        if not pool.wait_for_vram(needed_mb, device_index=0):
+            raise RuntimeError(
+                f"VRAM not available: need {needed_mb:.0f} MB free on GPU 0. "
+                f"Previous process may still be releasing memory. "
+                f"Try again in a few seconds or reduce context size."
+            )
 
         if status_callback:
             status_callback(

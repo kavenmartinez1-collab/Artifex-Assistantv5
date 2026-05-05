@@ -1257,6 +1257,27 @@ def create_app():
         has_images = _messages_have_images(messages)
         model = _resolve_model_for_request(body.model, has_images, backend)
 
+        # ── Request resource estimation (pre-routing diagnostics) ─────
+        from core.request_estimator import estimate_request_requirements
+        model_config = None
+        if backend == "llama_cpp":
+            from core.config import get_llama_cpp_model_config
+            model_config = get_llama_cpp_model_config(model)
+        req_estimate = estimate_request_requirements(
+            messages, max_tokens,
+            web_tools=use_web_tools,
+            enable_thinking=enable_thinking,
+            model_config=model_config,
+        )
+        if model_config and model_config.get("num_ctx"):
+            configured_ctx = model_config["num_ctx"]
+            if req_estimate.total_context_needed > configured_ctx:
+                _log.warning(
+                    "Request may exceed context: estimated %d tokens needed, "
+                    "server configured for %d (model=%s)",
+                    req_estimate.total_context_needed, configured_ctx, model,
+                )
+
         # ── Streaming path (both backends) ────────────────────────────
         # Model queue serializes requests and handles model/backend switching
         # for both Ollama and Transformers. No more 503 rejections — requests
