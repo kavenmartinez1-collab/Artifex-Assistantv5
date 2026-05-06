@@ -234,9 +234,11 @@ class LlamaCppEngine(BaseEngine):
 
         self._num_ctx = self._compute_num_ctx()
 
-        # ── VRAM-ready gate: prevent crash loop from WDDM reclaim latency ──
+        # ── Flush stale CUDA state + VRAM gate ──
         from core.gpu_pool import get_pool
         pool = get_pool()
+        pool.flush_gpu(device_index=0, kill_server=True)
+
         kv_quant_str = self._get_kv_quant_str()
         allocation = pool.estimate_allocation_mb(
             self.model_path, self._num_ctx, kv_quant=kv_quant_str,

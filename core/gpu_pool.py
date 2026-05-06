@@ -21,6 +21,7 @@ import logging
 import os
 import struct
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -326,6 +327,81 @@ class GPUPool:
                 if dev.index == device_index:
                     return dev
         return None
+
+    # ── CUDA Context Flush ──────────────────────────────────────────────
+
+    def flush_gpu(self, device_index: int = 0, kill_server: bool = True) -> bool:
+        """Reset the CUDA primary context to clear stale driver state.
+
+        Call this before launching llama-server when the previous process
+        died uncleanly.  Resets the CUDA context via the driver API
+        (cuDevicePrimaryCtxReset), which forces the driver to release all
+        resources and start fresh — fixes the transient segfaults caused
+        by corrupted CUDA state after crashes.
+
+        Args:
+            device_index: GPU to reset.
+            kill_server: If True, kill any lingering llama-server processes first.
+
+        Returns:
+            True if flush succeeded (or was unnecessary), False on error.
+        """
+        if kill_server:
+            self._kill_stale_servers()
+
+        try:
+            import ctypes
+            if sys.platform == "win32":
+                cuda = ctypes.CDLL("nvcuda.dll")
+            else:
+                cuda = ctypes.CDLL("libcuda.so.1")
+
+            ret = cuda.cuInit(0)
+            if ret != 0:
+                _log.warning("flush_gpu: cuInit failed (code %d)", ret)
+                return False
+
+            device = ctypes.c_int()
+            ret = cuda.cuDeviceGet(ctypes.byref(device), device_index)
+            if ret != 0:
+                _log.warning("flush_gpu: cuDeviceGet(%d) failed (code %d)",
+                             device_index, ret)
+                return False
+
+            ret = cuda.cuDevicePrimaryCtxReset_v2(device)
+            if ret != 0:
+                _log.warning("flush_gpu: cuDevicePrimaryCtxReset failed (code %d)", ret)
+                return False
+
+            _log.info("flush_gpu: CUDA primary context reset on device %d", device_index)
+            return True
+
+        except OSError as e:
+            _log.warning("flush_gpu: CUDA driver library not found: %s", e)
+            return False
+        except Exception as e:
+            _log.error("flush_gpu: unexpected error: %s", e)
+            return False
+
+    def _kill_stale_servers(self):
+        """Kill any lingering llama-server processes."""
+        try:
+            if sys.platform == "win32":
+                result = subprocess.run(
+                    ["taskkill", "/F", "/IM", "llama-server.exe"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    _log.info("flush_gpu: killed stale llama-server process(es)")
+                    time.sleep(1)
+            else:
+                subprocess.run(
+                    ["pkill", "-f", "llama-server"],
+                    capture_output=True, timeout=5,
+                )
+                time.sleep(1)
+        except Exception as e:
+            _log.debug("flush_gpu: no stale servers to kill (%s)", e)
 
     # ── VRAM-Ready Gate (crash-recovery fix) ───────────────────────────
 
