@@ -8,6 +8,10 @@ import { loadConfig, saveConfig, updateConfig } from './state/persistence';
 import { ClusterClient, WorkerInfo } from './cluster/ws-client';
 import { ClusterTimeSeries } from './cluster/cluster-state';
 
+// Prevent Chromium's GPU process from grabbing CUDA resources —
+// llama-server needs exclusive access to the device.
+app.disableHardwareAcceleration();
+
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let serviceManager: ServiceManager;
