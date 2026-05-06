@@ -297,6 +297,10 @@ class LlamaCppEngine(BaseEngine):
             while time.monotonic() - start < timeout:
                 if self._process.poll() is not None:
                     stderr = self._process.stderr.read().decode("utf-8", errors="replace")
+                    _log.error(
+                        "llama-server full stderr (attempt %d, code %d):\n%s",
+                        attempt + 1, self._process.returncode, stderr,
+                    )
                     if attempt < max_launch_attempts - 1:
                         _log.warning(
                             "llama-server crashed on startup (attempt %d/%d, "
@@ -311,7 +315,7 @@ class LlamaCppEngine(BaseEngine):
                         break
                     raise RuntimeError(
                         f"llama-server exited with code {self._process.returncode}:\n"
-                        f"{stderr[-1000:]}"
+                        f"{stderr[-4000:]}"
                     )
                 if self._is_server_healthy():
                     self._loaded = True
