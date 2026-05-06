@@ -234,10 +234,9 @@ class LlamaCppEngine(BaseEngine):
 
         self._num_ctx = self._compute_num_ctx()
 
-        # ── Flush stale CUDA state + VRAM gate ──
+        # ── VRAM gate (flush only on retry after crash) ──
         from core.gpu_pool import get_pool
         pool = get_pool()
-        pool.flush_gpu(device_index=0, kill_server=True)
 
         kv_quant_str = self._get_kv_quant_str()
         allocation = pool.estimate_allocation_mb(
@@ -319,6 +318,8 @@ class LlamaCppEngine(BaseEngine):
                             self._process.returncode, launch_retry_delay,
                         )
                         self._process = None
+                        _log.info("Flushing CUDA context before retry...")
+                        pool.flush_gpu(device_index=0, kill_server=False)
                         time.sleep(launch_retry_delay)
                         pool.wait_for_vram(needed_mb, device_index=0, timeout=10)
                         launch_failed = True
