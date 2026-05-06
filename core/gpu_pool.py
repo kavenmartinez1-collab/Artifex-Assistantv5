@@ -45,7 +45,8 @@ KV_QUANT_BPE = {
 
 MODEL_OVERHEAD_FACTOR = 1.0     # GGUF file size ≈ GPU weight (embeddings/vocab offloaded to CPU)
 COMPUTE_BUFFER_MB = 1000        # Flat estimate for llama.cpp compute buffers
-SYSTEM_RESERVE_MB = 2048        # Windows WDDM + compositor + misc
+SYSTEM_RESERVE_MB = 2048        # Static fallback reserve when the live baseline can't be measured
+VRAM_BASELINE_FLOOR_MB = 1500   # Lower bound for the live baseline, even on a quiet system
 NVIDIA_SMI_TIMEOUT = 5          # seconds
 
 DEFAULT_VRAM_WAIT_TIMEOUT = 30  # seconds
@@ -214,6 +215,7 @@ class GPUPool:
         self._lock = threading.Lock()
         self._devices: list[GPUDevice] = []
         self._nvidia_smi_available: Optional[bool] = None
+        self._baseline_used_mb: Optional[float] = None
         self._initialized = True
         # Initial enumeration
         self._enumerate_devices()
@@ -327,6 +329,54 @@ class GPUPool:
                 if dev.index == device_index:
                     return dev
         return None
+
+    # ── Live VRAM Baseline ─────────────────────────────────────────────
+
+    def measure_baseline(self, device_index: int = 0, force: bool = False) -> float:
+        """Measure how much VRAM other processes are holding right now.
+
+        This replaces the static SYSTEM_RESERVE_MB constant when computing
+        allocation estimates: Windows DWM, browsers, Electron apps, and any
+        other GPU-accelerated software each grab a slice the moment they
+        start, and the static 2 GB assumption under-counts on a typical
+        Windows desktop running Chrome and a few apps.
+
+        Cached after first measurement. Pass force=True to refresh after a
+        wait_for_vram timeout — that's the signal the previous estimate was
+        wrong about how much the system was holding.
+
+        Returns the measured value, floored at VRAM_BASELINE_FLOOR_MB.
+        Falls back to VRAM_BASELINE_FLOOR_MB when nvidia-smi is unavailable.
+
+        Caller's contract: call this when no Artifex-managed engine is
+        currently loaded, otherwise the measurement includes our own
+        allocation and over-counts.
+        """
+        if not force:
+            with self._lock:
+                cached = self._baseline_used_mb
+            if cached is not None:
+                return cached
+
+        dev = self.refresh_device(device_index)
+        if dev is None:
+            baseline = float(VRAM_BASELINE_FLOOR_MB)
+            _log.warning(
+                "measure_baseline: device %d unreachable, using floor %.0f MB",
+                device_index, baseline,
+            )
+        else:
+            measured = dev.memory_used_mb
+            baseline = max(measured, float(VRAM_BASELINE_FLOOR_MB))
+            _log.info(
+                "measure_baseline: GPU %d holds %.0f MB across other processes "
+                "(floor: %d MB → using %.0f MB as reserve)",
+                device_index, measured, VRAM_BASELINE_FLOOR_MB, baseline,
+            )
+
+        with self._lock:
+            self._baseline_used_mb = baseline
+        return baseline
 
     # ── CUDA Context Flush ──────────────────────────────────────────────
 
@@ -465,6 +515,9 @@ class GPUPool:
                 _log.error("wait_for_vram: TIMEOUT after %d polls — "
                            "only %.0f MB free (need %.0f MB) on GPU %d",
                            iteration, free_mb, needed_mb, device_index)
+                # Refresh the cached baseline so the next allocation estimate
+                # reflects whatever's actually holding VRAM right now.
+                self.measure_baseline(device_index=device_index, force=True)
                 return False
 
             _log.debug("wait_for_vram: poll %d — %.0f MB free / %.0f MB needed "
@@ -500,11 +553,15 @@ class GPUPool:
             Dict with component breakdown and total_mb.
             Returns a conservative estimate if GGUF can't be read.
         """
+        # Live baseline replaces the static SYSTEM_RESERVE_MB when measurable.
+        # max() floors at the static value so we never under-reserve.
+        reserve_mb = max(float(SYSTEM_RESERVE_MB), self.measure_baseline())
+
         result = {
             "model_weight_mb": 0.0,
             "kv_cache_mb": 0.0,
             "compute_buffer_mb": COMPUTE_BUFFER_MB,
-            "system_reserve_mb": SYSTEM_RESERVE_MB,
+            "system_reserve_mb": reserve_mb,
             "total_mb": 0.0,
             "estimation_method": "exact",
         }

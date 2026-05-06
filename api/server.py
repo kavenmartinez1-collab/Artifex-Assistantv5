@@ -52,7 +52,15 @@ if not _api_key:
     _log.warning("ARTIFEX_API_KEY not set — API authentication is DISABLED")
 
 
-def _get_engine():
+def _get_engine(ctx_tier: int | None = None):
+    """Get or create the active engine.
+
+    Args:
+        ctx_tier: For llama_cpp only — sets the launch ctx for the next
+            load() so the server starts with a tier sized for the actual
+            request rather than the model's max ctx.  Ignored for engines
+            that don't expose set_target_tier (Ollama, Transformers).
+    """
     global _engine
     with _engine_lock:
         if _engine is None or not _engine.is_loaded():
@@ -61,6 +69,8 @@ def _get_engine():
             if get_active_backend() == "ollama":
                 refresh_ollama_models()
             _engine = create_engine()
+            if ctx_tier and hasattr(_engine, "set_target_tier"):
+                _engine.set_target_tier(ctx_tier)
             _engine.load(status_callback=lambda msg: _log.info(msg))
         return _engine
 
@@ -1278,6 +1288,24 @@ def create_app():
                     req_estimate.total_context_needed, configured_ctx, model,
                 )
 
+        # ── Pick ctx tier for llama_cpp launch ────────────────────────
+        # The tier is a small bucket sized for the actual request, much
+        # smaller than the model's max ctx — saves several GB of KV cache
+        # on every request that doesn't need a 256K window.  None for other
+        # backends; the queue and engine ignore it there.
+        ctx_tier: int | None = None
+        if backend == "llama_cpp" and model_config:
+            from core.engine_llama_cpp import pick_ctx_tier
+            ctx_tier = pick_ctx_tier(
+                req_estimate.total_context_needed,
+                max_cap=model_config.get("num_ctx"),
+            )
+            _log.info(
+                "Picked ctx tier %d for %s (need=%d, cap=%s)",
+                ctx_tier, model, req_estimate.total_context_needed,
+                model_config.get("num_ctx"),
+            )
+
         # ── Streaming path (both backends) ────────────────────────────
         # Model queue serializes requests and handles model/backend switching
         # for both Ollama and Transformers. No more 503 rejections — requests
@@ -1288,12 +1316,12 @@ def create_app():
                 mq = get_model_queue()
                 try:
                     async with mq._lock:
-                        await mq.switch_if_needed(model, backend)
+                        await mq.switch_if_needed(model, backend, ctx_tier=ctx_tier)
 
                         if backend == "ollama":
                             _get_engine()  # Verify Ollama is reachable
                         else:
-                            _get_engine()  # Load/reload transformers model
+                            _get_engine(ctx_tier=ctx_tier)  # Load engine at tier
 
                         async for chunk in _stream_with_tools(
                             messages, model, max_tokens, temperature,
@@ -1319,7 +1347,7 @@ def create_app():
         # ── Non-streaming path (both backends via model queue) ────────
         mq = get_model_queue()
         async with mq._lock:
-            await mq.switch_if_needed(model, backend)
+            await mq.switch_if_needed(model, backend, ctx_tier=ctx_tier)
 
             if backend == "ollama":
                 try:
@@ -1347,7 +1375,7 @@ def create_app():
                     raise HTTPException(status_code=502, detail=str(e))
 
             # Transformers / llama_cpp non-streaming
-            engine = _get_engine()
+            engine = _get_engine(ctx_tier=ctx_tier)
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,

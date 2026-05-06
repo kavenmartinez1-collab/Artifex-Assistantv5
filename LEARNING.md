@@ -12,7 +12,7 @@
 3. [Quantization — Fitting Big Models in Small GPUs](#3-quantization--fitting-big-models-in-small-gpus)
 4. [Backend #1: HuggingFace Transformers](#4-backend-1-huggingface-transformers)
 5. [Backend #2: Ollama](#5-backend-2-ollama)
-    - [Backend #3: llama.cpp (Custom GGUF Forks)](#5b-backend-3-llamacpp-custom-gguf-forks) — includes hybrid architecture, speculative decoding, connection resilience, VRAM lessons, GPU resource pool, per-request context estimation
+    - [Backend #3: llama.cpp (Custom GGUF Forks)](#5b-backend-3-llamacpp-custom-gguf-forks) — includes hybrid architecture, speculative decoding, connection resilience, VRAM lessons, GPU resource pool, per-request context estimation, tier-aware launch context, live VRAM baseline
 6. [Backend #4: The API Server (OpenAI-Compatible)](#6-backend-3-the-api-server-openai-compatible)
 7. [The Web Gateway — Safe Web Access for AI](#7-the-web-gateway--safe-web-access-for-ai)
 8. [Backend #4: WebGPU — Running Models in the Browser](#8-backend-4-webgpu--running-models-in-the-browser)
@@ -512,7 +512,27 @@ Before routing a request to the engine, `estimate_request_requirements()` comput
 - **Web tools buffer** — if `web_tools=true`, reserves ~8000 extra tokens for 3 rounds of search results + web reads
 - **Thinking overhead** — notes that reasoning may consume ~80% of the completion budget
 
-These are summed with a 1.2x safety margin and snapped to a standard context bucket: 4096, 8192, 16384, 32768, 65536, 131072, or 262144. The API logs this per-request and warns when the estimated need exceeds the configured server context. This is the foundation for future dynamic context allocation — launching the server with only as much context as the request actually needs, rather than always using the maximum 256K.
+These are summed with a 1.2x safety margin and snapped to a standard context bucket: 4096, 8192, 16384, 32768, 65536, 131072, or 262144. The API logs this per-request and warns when the estimated need exceeds the configured server context.
+
+### Tier-Aware Launch Context (`core/engine_llama_cpp.py`)
+
+The estimator's bucket isn't just diagnostic anymore — the engine actually launches at a small bucket sized for the request, not always at the model's max context. This is the single biggest VRAM win on tight cards.
+
+The mechanism has four moving parts:
+
+1. **Discrete tiers** — `CTX_TIERS = (32_000, 64_000, 128_000, 256_000)`. KV cost on a 27B Q4_K_M with q4_0 KV is roughly 576 / 1152 / 2304 / 4608 MB respectively. A request that only needs 36K of context costs **576 MB of KV** instead of the 4608 MB it would cost at the full 256K config. That's a ~4 GB swing on every short request — the difference between "fits" and "VRAM gate timeout" on a 24 GB card with Windows holding 3+ GB.
+
+2. **Picker with snap-up margin** — `pick_ctx_tier(needed, max_cap)` adds `TIER_HEADROOM_TOK = 8000` to the requirement, then returns the smallest tier that's at least that big. The headroom buffers in-flight context growth (tool rounds, follow-up turns) so we don't relaunch on every turn. The cap is the model's configured `num_ctx` from `llama_cpp_config.json` — semantically that field is now an **upper bound**, not a launch value.
+
+3. **Relaunch on tier change** — llama-server's `-c` flag is fixed at process start; you can't grow it without restarting. The model queue's switch key now includes the tier, so a request that needs to move from 64K to 128K triggers an unload + reload at the new size. Costs ~15 seconds, happens at most three times per growing session (32→64→128→256), zero times for typical short workloads.
+
+4. **Idle shrink** — `model_queue.IDLE_SHRINK_SEC = 600`. After 10 minutes of no requests, the engine releases its VRAM so other GPU work (other AI loads, games, browsers) can use it. The next request rebuilds at whatever tier it needs. The shrink runs in a lazy-started asyncio task that holds the queue lock while unloading, so it never races a request.
+
+The math behind why finer tiers (4) are right for tight VRAM rather than fewer tiers (2): with two tiers, a 50K-need request would snap to a 256K bucket and waste 3.5 GB of KV cache. With four tiers it lands at 64K and uses 1.1 GB. On a 24 GB card already losing 3+ GB to Windows, that headroom is the difference between fitting and timing out. The trade is more relaunches, but grow-only behavior within a session keeps thrashing in check.
+
+### Live VRAM Baseline (`core/gpu_pool.py`)
+
+The static `SYSTEM_RESERVE_MB = 2048` was an under-estimate on a typical Windows desktop — DWM, browsers, Electron apps, and other GPU-accelerated software routinely hold 3+ GB before any of our code runs. The pool now measures the actual baseline at runtime via `measure_baseline()` (queries `memory.used` from nvidia-smi), floors it at `VRAM_BASELINE_FLOOR_MB = 1500` so a momentarily quiet system can't fool us into under-reserving, and uses `max(SYSTEM_RESERVE_MB, baseline)` in `estimate_allocation_mb`. The cached value is force-refreshed when `wait_for_vram` times out — that's the diagnostic signal that our world model was wrong about what the system was holding. The static constant survives as a floor, not the source of truth.
 
 ### Context compaction for large-context engines
 

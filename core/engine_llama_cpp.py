@@ -33,6 +33,54 @@ _KV_QUANT_BPE = {
     "q5_0": 0.6875, "q5_1": 0.75,
 }
 
+# ── Context tier configuration ─────────────────────────────────────────
+# Discrete launch-context buckets for llama-server.  Smaller tiers reserve
+# much less KV cache but require relaunch when context grows past the tier;
+# finer tiers are right for tight-VRAM cards where wasted KV is the binding
+# constraint.  On a 24 GB card with q4_0 KV on a 27B model, the cost per
+# tier is roughly 576 / 1152 / 2304 / 4608 MB.
+CTX_TIERS = (32_000, 64_000, 128_000, 256_000)
+
+# Snap-up margin: when the request need is within this many tokens of the
+# next tier, choose the next tier.  Buffers in-flight context growth from
+# tool rounds and follow-up turns within a session.
+TIER_HEADROOM_TOK = 8_000
+
+# Pressure margin used while a tier is live: if the next request would
+# bring the engine within this many tokens of its tier cap, the request
+# router should grow to the next tier instead of risking mid-stream
+# overflow.  Looser than the snap-up margin because the engine is already
+# carrying a session's worth of context that may itself grow.
+ACTIVE_TIER_PRESSURE_TOK = 12_000
+
+
+def pick_ctx_tier(needed_tokens: int, max_cap: int | None = None) -> int:
+    """Pick the smallest CTX_TIERS bucket that fits needed_tokens with
+    TIER_HEADROOM_TOK of headroom, optionally capped at max_cap.
+
+    Returns the largest selectable tier when the need exceeds even that;
+    the VRAM gate downstream handles the truly-too-big case.
+
+    Args:
+        needed_tokens: Estimated total context (prompt + completion + buffers).
+        max_cap: Optional ceiling — never returns a tier above this (typically
+                 model_config['num_ctx'] from llama_cpp_config.json).
+
+    Returns:
+        A tier from CTX_TIERS (or the cap-snapped equivalent).
+    """
+    target = max(0, int(needed_tokens)) + TIER_HEADROOM_TOK
+    candidates = CTX_TIERS
+    if max_cap and max_cap > 0:
+        capped = tuple(t for t in CTX_TIERS if t <= max_cap)
+        # Keep at least one tier — degenerate caps below the smallest tier
+        # are clamped to that tier so callers always get a usable value.
+        candidates = capped or (CTX_TIERS[0],)
+    for tier in candidates:
+        if tier >= target:
+            return tier
+    return candidates[-1]
+
 
 def _read_gguf_kv_params(gguf_path: str) -> dict | None:
     """Read KV-cache-relevant architecture params from a GGUF file header.
@@ -129,13 +177,39 @@ class LlamaCppEngine(BaseEngine):
         self.num_gpu_layers = model_config.get("num_gpu_layers", 99)
         self.extra_flags = list(model_config.get("extra_flags", []))
         self.server_path = model_config.get("server_path", "llama-server")
+        # Cap from config — the engine will never launch above this, even if
+        # set_target_tier is called with a larger value.  Semantics changed
+        # with tier-aware launch: this is the upper bound, not the value.
         self._configured_num_ctx = model_config.get("num_ctx")
         self._health_timeout = model_config.get("health_timeout", HEALTH_TIMEOUT)
+        # Tier-driven launch ctx, set by set_target_tier() before load().
+        # When None, _compute_num_ctx falls back to the configured cap or the
+        # legacy VRAM-fit heuristic.
+        self._target_ctx: int | None = None
         self._num_ctx = None
         self._process = None
         self._loaded = False
         self._base_url = f"http://localhost:{self.port}"
         self._last_gen_stats = {}
+
+    def set_target_tier(self, tier: int) -> None:
+        """Set the launch ctx for the next load(), capped at the configured cap.
+
+        Called by the request router (api/server.py) before engine.load() so
+        the engine launches with a ctx sized for the actual workload instead
+        of the model's max context.  Has no effect on a currently-loaded
+        engine; a relaunch (unload + load) is required for the change to
+        take effect — the queue handles that on a tier change.
+        """
+        if not isinstance(tier, int) or tier <= 0:
+            return
+        if self._configured_num_ctx and tier > self._configured_num_ctx:
+            tier = self._configured_num_ctx
+        self._target_ctx = tier
+
+    def current_tier(self) -> int:
+        """The live engine's loaded ctx, or 0 if unloaded."""
+        return self._num_ctx or 0
 
     # =====================================================================
     # BaseEngine — LIFECYCLE
@@ -170,6 +244,10 @@ class LlamaCppEngine(BaseEngine):
         return "f16"
 
     def _compute_num_ctx(self) -> int:
+        # Tier picker takes priority — set by request router via set_target_tier
+        if self._target_ctx:
+            return self._target_ctx
+        # Configured cap from llama_cpp_config.json — legacy default
         if self._configured_num_ctx:
             return self._configured_num_ctx
         from core.ollama_ctx import (
