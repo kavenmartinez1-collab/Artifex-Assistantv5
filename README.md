@@ -84,7 +84,7 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 
 - **Multi-modal inference** — 10 pipeline types: text, image, image editing, 3D mesh, vision, audio, speech recognition, music, video, embeddings
 - **Three backends** — HuggingFace Transformers (GPU-accelerated), Ollama (pre-quantized GGUF), and llama.cpp (custom forks, bleeding-edge quants)
-- **Automatic VRAM management** — GPU tier detection, NF4/INT8 quantization, KV cache budgeting
+- **Automatic VRAM management** — GPU resource pool with nvidia-smi monitoring, CUDA context flush, VRAM-ready gating (prevents crash loops from WDDM reclaim latency), per-request context estimation, hybrid-model-aware KV sizing, multi-GPU device selection, plus GPU tier detection, NF4/INT8 quantization, and KV cache budgeting
 - **Three interfaces** — CLI with agent tools and multimodal pipelines, PyQt6 GUI with inline media, OpenAI-compatible REST API with file management
 - **Agent tools** — shell execution, Python runner, web search, codebase analysis (grep, glob, architecture), file I/O, edit-in-place
 - **RAG knowledge base** — per-workspace knowledge entries with lifecycle classification, action keys, loop detection
@@ -1353,6 +1353,8 @@ Artifex-Assistant-V5/
     engine_transformers.py # HuggingFace Transformers backend
     engine_ollama.py       # Ollama backend (localhost only)
     engine_llama_cpp.py    # llama.cpp server backend (custom forks, TurboQuant)
+    gpu_pool.py            # GPU resource pool — device enumeration, VRAM monitoring, CUDA flush, allocation gating, multi-GPU selection
+    request_estimator.py   # Per-request context estimation — token counting, web tools budget, context bucket selection, KV VRAM forecasting
     hardware.py            # GPU detection and VRAM management
     model_loader.py        # Model weight loading with quantization
     model_registry.py      # Model type detection and VRAM estimation
@@ -1682,6 +1684,8 @@ cd webgpu && npm run dev
 - Check VRAM: 256K context with UD-Q4_K_XL (17.6 GB) overflows 24 GB cards. Switch to Q4_K_M (16.8 GB)
 - For heavy tool-call pipelines, use the 8K-specd config — 256K has only 1 KV slot and no headroom for concurrent requests
 - The engine retries once automatically; if the server is truly down, you'll get a clear "llama-server is not responding" error
+- **Crash-loop protection**: The GPU resource pool (`core/gpu_pool.py`) automatically flushes stale CUDA contexts (`cuDevicePrimaryCtxReset`), kills orphaned llama-server processes, and polls nvidia-smi for free VRAM before allowing a relaunch. After an unclean server death, Windows WDDM takes 2-5 seconds to reclaim VRAM — the VRAM gate waits for this automatically instead of crash-looping
+- **Startup retry**: If the server segfaults during model loading (exit code `0xC0000005` — common after unclean CUDA shutdowns), the engine retries once with a 3-second backoff and VRAM re-check
 - If your computer freezes: VRAM overallocation causes Windows WDDM to virtual-swap GPU memory, locking the desktop compositor. Kill the llama-server process (`taskkill /f /im llama-server.exe`) from Task Manager
 
 ### Windows Firewall popup

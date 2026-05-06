@@ -12,7 +12,7 @@
 3. [Quantization — Fitting Big Models in Small GPUs](#3-quantization--fitting-big-models-in-small-gpus)
 4. [Backend #1: HuggingFace Transformers](#4-backend-1-huggingface-transformers)
 5. [Backend #2: Ollama](#5-backend-2-ollama)
-    - [Backend #3: llama.cpp (Custom GGUF Forks)](#5b-backend-3-llamacpp-custom-gguf-forks) — includes hybrid architecture, speculative decoding, connection resilience, VRAM lessons
+    - [Backend #3: llama.cpp (Custom GGUF Forks)](#5b-backend-3-llamacpp-custom-gguf-forks) — includes hybrid architecture, speculative decoding, connection resilience, VRAM lessons, GPU resource pool, per-request context estimation
 6. [Backend #4: The API Server (OpenAI-Compatible)](#6-backend-3-the-api-server-openai-compatible)
 7. [The Web Gateway — Safe Web Access for AI](#7-the-web-gateway--safe-web-access-for-ai)
 8. [Backend #4: WebGPU — Running Models in the Browser](#8-backend-4-webgpu--running-models-in-the-browser)
@@ -479,6 +479,40 @@ This matters for production pipelines: heavy tool-call workflows generate many s
 The real culprit was `--cache-reuse`. The DeltaNet recurrent state is fundamentally different from a KV cache — it's a compressed summary of ALL previous tokens. Unlike KV cache entries (which can be truncated to any position), the recurrent state cannot be split at an arbitrary boundary. When `--cache-reuse` tries to reuse a prefix, the recurrent layers "remember" the full prior context while the attention layers only have the reused prefix in their KV cache. This produces the signature failure: **two text streams interleaved character-by-character** — one from the recurrent layers' stale state, one from the attention layers' current state.
 
 Multiple issues confirm this is a known architectural limitation, not a bug: [#18497](https://github.com/ggml-org/llama.cpp/issues/18497), [#19794](https://github.com/ggml-org/llama.cpp/issues/19794), [#20225](https://github.com/ggml-org/llama.cpp/issues/20225), [#21831](https://github.com/ggml-org/llama.cpp/issues/21831). The fix: remove `--cache-reuse` and add `--swa-full` (which correctly handles SWA/hybrid prompt caching via [PR #21749](https://github.com/ggml-org/llama.cpp/pull/21749)).
+
+### GPU Resource Pool and VRAM Gating (`core/gpu_pool.py`)
+
+When llama-server crashes (OOM, CUDA error, or unclean shutdown), Windows WDDM takes 2-5 seconds to reclaim the VRAM from the dead process. If the API immediately tries to restart the server, the allocation fails because the GPU still reports the old memory as "used." This creates a **crash loop**: launch → fail → launch → fail → repeat for every queued request.
+
+The GPU Resource Pool solves this with three mechanisms:
+
+1. **CUDA context flush** — Before any launch, `flush_gpu()` calls the CUDA driver API (`cuDevicePrimaryCtxReset`) via ctypes to reset the primary CUDA context on the target device. This clears corrupted driver state left behind by crashed processes, preventing the transient `0xC0000005` segfaults that otherwise occur ~25% of the time after unclean shutdowns. It also kills any orphaned llama-server processes via `taskkill`.
+
+2. **VRAM-ready gate** — `wait_for_vram()` polls nvidia-smi in a loop (default: 30s timeout, 1.5s interval) until the target GPU reports enough free memory for the model + KV cache + compute buffers. The estimate comes from `estimate_allocation_mb()` which reads the GGUF header to get exact architecture parameters (head count, KV heads, key/value dimensions, layer count) and accounts for hybrid models like Qwen3.6 where only a fraction of layers use attention KV cache (`full_attention_interval`).
+
+3. **Startup retry** — If the server segfaults during model loading (common after CUDA context corruption), the engine waits 3 seconds, re-runs the VRAM gate, and tries once more. If both attempts fail, the error is surfaced to the caller.
+
+The pool also provides `find_best_device()` for multi-GPU routing — it enumerates all GPUs via nvidia-smi and picks the one with the most free VRAM that exceeds the allocation estimate. This is the foundation for future multi-GPU dispatch.
+
+**Key numbers (Qwen3.6-27B Q4_K_M on RTX 4090 24 GB):**
+| Component | Estimated | Actual (llama.cpp) |
+|-----------|-----------|-------------------|
+| Model weights | 16,038 MB | 15,345 MB |
+| KV cache (256K, q4_0, 16 attn layers) | 4,608 MB | 4,757 MB |
+| Compute buffers | 1,000 MB | 836 MB |
+| **Total** | **21,646 MB** | **20,938 MB** |
+| System free after load | ~1,250 MB | ~1,950 MB |
+
+### Per-Request Context Estimation (`core/request_estimator.py`)
+
+Before routing a request to the engine, `estimate_request_requirements()` computes how much context the request will actually need:
+
+- **Prompt tokens** — chars / 4 heuristic plus 1000 tokens per image for multimodal
+- **Completion budget** — the `max_tokens` value from the request
+- **Web tools buffer** — if `web_tools=true`, reserves ~8000 extra tokens for 3 rounds of search results + web reads
+- **Thinking overhead** — notes that reasoning may consume ~80% of the completion budget
+
+These are summed with a 1.2x safety margin and snapped to a standard context bucket: 4096, 8192, 16384, 32768, 65536, 131072, or 262144. The API logs this per-request and warns when the estimated need exceeds the configured server context. This is the foundation for future dynamic context allocation — launching the server with only as much context as the request actually needs, rather than always using the maximum 256K.
 
 ### Context compaction for large-context engines
 
