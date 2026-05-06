@@ -234,7 +234,7 @@ class LlamaCppEngine(BaseEngine):
 
         self._num_ctx = self._compute_num_ctx()
 
-        # ── VRAM gate (flush only on retry after crash) ──
+        # ── VRAM gate ──
         from core.gpu_pool import get_pool
         pool = get_pool()
 
@@ -274,23 +274,10 @@ class LlamaCppEngine(BaseEngine):
         ]
         cmd.extend(self.extra_flags)
 
-        # On Windows, mmap keeps the full GGUF mapped in virtual memory even
-        # with full GPU offload, eating commit charge (pagefile) for nothing.
-        # --no-mmap lets the loader read→transfer→free instead.
-        if sys.platform == "win32" and "--no-mmap" not in cmd:
-            params = _read_gguf_kv_params(self.model_path)
-            if params and self.num_gpu_layers >= params["block_count"]:
-                cmd.append("--no-mmap")
-                _log.info(
-                    "Auto-adding --no-mmap: Windows + full GPU offload "
-                    "(%d ngl >= %d layers)",
-                    self.num_gpu_layers, params["block_count"],
-                )
-
         _log.info("llama-server cmd: %s", " ".join(cmd))
 
         max_launch_attempts = 2
-        launch_retry_delay = 3.0
+        launch_retry_delay = 5.0
 
         for attempt in range(max_launch_attempts):
             try:
@@ -318,8 +305,6 @@ class LlamaCppEngine(BaseEngine):
                             self._process.returncode, launch_retry_delay,
                         )
                         self._process = None
-                        _log.info("Flushing CUDA context before retry...")
-                        pool.flush_gpu(device_index=0, kill_server=False)
                         time.sleep(launch_retry_delay)
                         pool.wait_for_vram(needed_mb, device_index=0, timeout=10)
                         launch_failed = True
