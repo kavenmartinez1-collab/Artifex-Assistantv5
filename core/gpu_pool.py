@@ -42,7 +42,7 @@ KV_QUANT_BPE = {
 
 # ── Constants ──────────────────────────────────────────────────────────
 
-MODEL_OVERHEAD_FACTOR = 1.1     # Weight file -> GPU memory multiplier
+MODEL_OVERHEAD_FACTOR = 1.0     # GGUF file size ≈ GPU weight (embeddings/vocab offloaded to CPU)
 COMPUTE_BUFFER_MB = 1000        # Flat estimate for llama.cpp compute buffers
 SYSTEM_RESERVE_MB = 2048        # Windows WDDM + compositor + misc
 NVIDIA_SMI_TIMEOUT = 5          # seconds
