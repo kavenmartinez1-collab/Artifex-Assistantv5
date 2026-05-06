@@ -288,43 +288,64 @@ class LlamaCppEngine(BaseEngine):
 
         _log.info("llama-server cmd: %s", " ".join(cmd))
 
-        try:
-            self._process = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            )
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"'{self.server_path}' not found. Install llama.cpp or set "
-                f"server_path in llama_cpp_config.json to the full path."
-            )
+        max_launch_attempts = 2
+        launch_retry_delay = 3.0
 
-        timeout = self._health_timeout
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            if self._process.poll() is not None:
-                stderr = self._process.stderr.read().decode("utf-8", errors="replace")
-                raise RuntimeError(
-                    f"llama-server exited with code {self._process.returncode}:\n"
-                    f"{stderr[-1000:]}"
+        for attempt in range(max_launch_attempts):
+            try:
+                self._process = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                 )
-            if self._is_server_healthy():
-                self._loaded = True
-                _log.info(
-                    "llama-server ready: %s (port %d, ctx %d, ngl %d)",
-                    self.model_name, self.port, self._num_ctx, self.num_gpu_layers,
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    f"'{self.server_path}' not found. Install llama.cpp or set "
+                    f"server_path in llama_cpp_config.json to the full path."
                 )
-                if status_callback:
-                    status_callback(
-                        f"llama-server ready — {self.model_name} (ctx={self._num_ctx})"
+
+            timeout = self._health_timeout
+            start = time.monotonic()
+            launch_failed = False
+
+            while time.monotonic() - start < timeout:
+                if self._process.poll() is not None:
+                    stderr = self._process.stderr.read().decode("utf-8", errors="replace")
+                    if attempt < max_launch_attempts - 1:
+                        _log.warning(
+                            "llama-server crashed on startup (attempt %d/%d, "
+                            "code %d) — retrying in %.0fs...",
+                            attempt + 1, max_launch_attempts,
+                            self._process.returncode, launch_retry_delay,
+                        )
+                        self._process = None
+                        time.sleep(launch_retry_delay)
+                        pool.wait_for_vram(needed_mb, device_index=0, timeout=10)
+                        launch_failed = True
+                        break
+                    raise RuntimeError(
+                        f"llama-server exited with code {self._process.returncode}:\n"
+                        f"{stderr[-1000:]}"
                     )
-                return
-            time.sleep(HEALTH_POLL_INTERVAL)
+                if self._is_server_healthy():
+                    self._loaded = True
+                    _log.info(
+                        "llama-server ready: %s (port %d, ctx %d, ngl %d)",
+                        self.model_name, self.port, self._num_ctx, self.num_gpu_layers,
+                    )
+                    if status_callback:
+                        status_callback(
+                            f"llama-server ready — {self.model_name} (ctx={self._num_ctx})"
+                        )
+                    return
+                time.sleep(HEALTH_POLL_INTERVAL)
+            else:
+                self._kill_process()
+                raise TimeoutError(
+                    f"llama-server did not become healthy within {timeout}s. "
+                    f"Check that the model fits in VRAM and the GGUF is valid."
+                )
 
-        self._kill_process()
-        raise TimeoutError(
-            f"llama-server did not become healthy within {timeout}s. "
-            f"Check that the model fits in VRAM and the GGUF is valid."
-        )
+            if not launch_failed:
+                break
 
     def _kill_process(self):
         if self._process and self._process.poll() is None:
