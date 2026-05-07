@@ -182,11 +182,17 @@ class LlamaCppEngine(BaseEngine):
         # with tier-aware launch: this is the upper bound, not the value.
         self._configured_num_ctx = model_config.get("num_ctx")
         self._health_timeout = model_config.get("health_timeout", HEALTH_TIMEOUT)
+        # Optional explicit GPU pin. None ⇒ auto-pick the GPU with the most
+        # free VRAM at load time (correct on multi-GPU rigs where the lower
+        # PCI index is a display card, e.g. 1080 Ti for screens + 4090 for
+        # inference).  Per-model override > env var > auto.
+        self._configured_gpu_index = model_config.get("gpu_index")
         # Tier-driven launch ctx, set by set_target_tier() before load().
         # When None, _compute_num_ctx falls back to the configured cap or the
         # legacy VRAM-fit heuristic.
         self._target_ctx: int | None = None
         self._num_ctx = None
+        self._active_gpu_index: int | None = None
         self._process = None
         self._loaded = False
         self._base_url = f"http://localhost:{self.port}"
@@ -242,6 +248,33 @@ class LlamaCppEngine(BaseEngine):
             if flag == "-ctk" and i + 1 < len(flags):
                 return flags[i + 1]
         return "f16"
+
+    def _resolve_gpu_index(self, pool) -> int:
+        """Pick the GPU to load on.
+
+        Priority: model_config['gpu_index'] > $ARTIFEX_GPU_INDEX > auto-pick
+        (the GPU with the most free VRAM).  Falls back to 0 when nvidia-smi
+        is unavailable so single-GPU and headless boxes keep working.
+        """
+        if self._configured_gpu_index is not None:
+            return int(self._configured_gpu_index)
+
+        env_idx = os.environ.get("ARTIFEX_GPU_INDEX")
+        if env_idx not in (None, ""):
+            try:
+                return int(env_idx)
+            except ValueError:
+                _log.warning(
+                    "ARTIFEX_GPU_INDEX=%r is not an int, ignoring", env_idx,
+                )
+
+        # find_best_device(0) returns the device with max free VRAM, or None
+        # if no devices were enumerated (no nvidia-smi).
+        picked = pool.find_best_device(0)
+        if picked is None:
+            _log.info("No GPUs enumerated; defaulting to device 0")
+            return 0
+        return picked
 
     def _compute_num_ctx(self) -> int:
         # Tier picker takes priority — set by request router via set_target_tier
@@ -316,9 +349,13 @@ class LlamaCppEngine(BaseEngine):
         from core.gpu_pool import get_pool
         pool = get_pool()
 
+        gpu_index = self._resolve_gpu_index(pool)
+        self._active_gpu_index = gpu_index
+
         kv_quant_str = self._get_kv_quant_str()
         allocation = pool.estimate_allocation_mb(
             self.model_path, self._num_ctx, kv_quant=kv_quant_str,
+            device_index=gpu_index,
         )
         needed_mb = (
             allocation["model_weight_mb"]
@@ -326,13 +363,13 @@ class LlamaCppEngine(BaseEngine):
             + allocation["compute_buffer_mb"]
         )
         _log.info(
-            "VRAM gate: need %.0f MB free (weight=%.0f + kv=%.0f + compute=%.0f)",
-            needed_mb, allocation["model_weight_mb"],
+            "VRAM gate: need %.0f MB free on GPU %d (weight=%.0f + kv=%.0f + compute=%.0f)",
+            needed_mb, gpu_index, allocation["model_weight_mb"],
             allocation["kv_cache_mb"], allocation["compute_buffer_mb"],
         )
-        if not pool.wait_for_vram(needed_mb, device_index=0):
+        if not pool.wait_for_vram(needed_mb, device_index=gpu_index):
             raise RuntimeError(
-                f"VRAM not available: need {needed_mb:.0f} MB free on GPU 0. "
+                f"VRAM not available: need {needed_mb:.0f} MB free on GPU {gpu_index}. "
                 f"Previous process may still be releasing memory. "
                 f"Try again in a few seconds or reduce context size."
             )
@@ -352,7 +389,16 @@ class LlamaCppEngine(BaseEngine):
         ]
         cmd.extend(self.extra_flags)
 
-        _log.info("llama-server cmd: %s", " ".join(cmd))
+        # PCI_BUS_ID ordering aligns CUDA's view with nvidia-smi's, so the
+        # index we resolved against the pool also points at the same device
+        # inside llama-server.  CUDA's default FASTEST_FIRST would otherwise
+        # reorder by compute capability and silently flip the indices.
+        launch_env = os.environ.copy()
+        launch_env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        launch_env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+
+        _log.info("llama-server cmd: %s  (CUDA_VISIBLE_DEVICES=%d)",
+                  " ".join(cmd), gpu_index)
 
         max_launch_attempts = 2
         launch_retry_delay = 5.0
@@ -361,6 +407,7 @@ class LlamaCppEngine(BaseEngine):
             try:
                 self._process = subprocess.Popen(
                     cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    env=launch_env,
                 )
             except FileNotFoundError:
                 raise FileNotFoundError(
@@ -388,7 +435,7 @@ class LlamaCppEngine(BaseEngine):
                         )
                         self._process = None
                         time.sleep(launch_retry_delay)
-                        pool.wait_for_vram(needed_mb, device_index=0, timeout=10)
+                        pool.wait_for_vram(needed_mb, device_index=gpu_index, timeout=10)
                         launch_failed = True
                         break
                     raise RuntimeError(

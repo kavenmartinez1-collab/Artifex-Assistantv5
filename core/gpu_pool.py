@@ -215,7 +215,7 @@ class GPUPool:
         self._lock = threading.Lock()
         self._devices: list[GPUDevice] = []
         self._nvidia_smi_available: Optional[bool] = None
-        self._baseline_used_mb: Optional[float] = None
+        self._baseline_used_mb: dict[int, float] = {}
         self._initialized = True
         # Initial enumeration
         self._enumerate_devices()
@@ -354,7 +354,7 @@ class GPUPool:
         """
         if not force:
             with self._lock:
-                cached = self._baseline_used_mb
+                cached = self._baseline_used_mb.get(device_index)
             if cached is not None:
                 return cached
 
@@ -375,7 +375,7 @@ class GPUPool:
             )
 
         with self._lock:
-            self._baseline_used_mb = baseline
+            self._baseline_used_mb[device_index] = baseline
         return baseline
 
     # ── CUDA Context Flush ──────────────────────────────────────────────
@@ -533,6 +533,7 @@ class GPUPool:
         num_ctx: int = 8192,
         kv_quant: str = "f16",
         extra_flags: Optional[list] = None,
+        device_index: int = 0,
     ) -> dict:
         """Estimate total VRAM needed to run a model config.
 
@@ -555,7 +556,10 @@ class GPUPool:
         """
         # Live baseline replaces the static SYSTEM_RESERVE_MB when measurable.
         # max() floors at the static value so we never under-reserve.
-        reserve_mb = max(float(SYSTEM_RESERVE_MB), self.measure_baseline())
+        reserve_mb = max(
+            float(SYSTEM_RESERVE_MB),
+            self.measure_baseline(device_index=device_index),
+        )
 
         result = {
             "model_weight_mb": 0.0,
