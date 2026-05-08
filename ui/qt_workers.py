@@ -6,6 +6,7 @@ communication for thread-safe GUI updates.
 """
 
 import threading
+import time
 import traceback
 
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, QObject
@@ -173,6 +174,7 @@ class PipelineWorker(QThread):
                 self.progress.emit(current, total, message)
                 self.status_changed.emit(message)
 
+            t0 = time.perf_counter()
             result = self.service.run_pipeline(
                 self.pipeline_type,
                 model_path=self.model_path,
@@ -181,6 +183,17 @@ class PipelineWorker(QThread):
                 cancel_event=self.cancel_event,
                 store_output=True,
             )
+            elapsed = time.perf_counter() - t0
+            # Wall-clock time for the GUI's perf summary line. The
+            # individual pipelines don't track this themselves; this
+            # worker is the one place that runs every pipeline type,
+            # so timing here covers vision/image/video/audio/3D/voice/
+            # embeddings uniformly. setdefault so a pipeline that
+            # ever computes its own better timing isn't overwritten.
+            if result is not None:
+                if result.metadata is None:
+                    result.metadata = {}
+                result.metadata.setdefault("elapsed_s", elapsed)
             self.result_ready.emit(result)
 
         except Exception as e:

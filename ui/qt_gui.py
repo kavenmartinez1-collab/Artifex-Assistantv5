@@ -181,6 +181,68 @@ def _dedupe_actions(actions):
     return out
 
 
+def _format_perf_summary(result) -> str | None:
+    """One-line perf line for the status bar after a non-text pipeline runs.
+
+    Reads `elapsed_s` (set by PipelineWorker) and whatever the pipeline
+    happened to populate in `metadata` (steps, fps, num_frames, duration_s,
+    width/height, output_tokens). Falls through gracefully when fields are
+    absent — even an "image · 4.2s" line is better than no signal at all.
+    """
+    if result is None:
+        return None
+    md = getattr(result, "metadata", None) or {}
+    elapsed = md.get("elapsed_s")
+    if elapsed is None:
+        return None
+
+    out = getattr(result, "output_type", "") or "result"
+    parts = [out, f"{elapsed:.1f}s"]
+
+    if out == "image":
+        w = md.get("width")
+        h = md.get("height")
+        # Fall back to the PIL Image content if the pipeline didn't
+        # stash dimensions in metadata.
+        if (w is None or h is None) and result.content is not None:
+            try:
+                w = result.content.width
+                h = result.content.height
+            except AttributeError:
+                pass
+        if w and h:
+            parts.append(f"{w}×{h}")
+        steps = md.get("num_steps") or md.get("steps")
+        if steps and elapsed > 0:
+            parts.append(f"{steps} steps · {elapsed/steps:.2f}s/step")
+    elif out == "video":
+        n = md.get("num_frames")
+        fps = md.get("fps")
+        if n and fps:
+            parts.append(f"{n}f @ {fps}fps")
+        elif n:
+            parts.append(f"{n} frames")
+        if n and elapsed > 0:
+            parts.append(f"{elapsed/n:.2f}s/frame")
+    elif out == "audio":
+        dur = md.get("duration_s") or md.get("duration")
+        if dur and elapsed > 0:
+            parts.append(f"{dur:.1f}s output ({dur/elapsed:.1f}× rt)")
+        words = md.get("word_count")
+        if words:
+            parts.append(f"{words} words")
+    elif out == "mesh":
+        steps = md.get("num_steps") or md.get("steps")
+        if steps and elapsed > 0:
+            parts.append(f"{steps} steps · {elapsed/steps:.2f}s/step")
+    elif out == "text":
+        toks = md.get("output_tokens") or md.get("token_count")
+        if toks and elapsed > 0:
+            parts.append(f"{toks} tok · {toks/elapsed:.1f} tok/s")
+
+    return " · ".join(parts)
+
+
 class ArtifexMainWindow(QMainWindow):
     """Main application window for Artifex Assistant V5."""
 
@@ -1173,7 +1235,7 @@ class ArtifexMainWindow(QMainWindow):
             bubble.add_text(f"3D mesh saved: {os.path.basename(path or 'unknown')}")
 
         self._chat_view.scroll_to_bottom()
-        self._finish_busy("Pipeline complete")
+        self._finish_busy(_format_perf_summary(result) or "Pipeline complete")
 
     def _on_recording_done(self, path):
         """Mic recording finished — auto-attach for STT, auto-send for Voice Assistant."""
@@ -1287,7 +1349,9 @@ class ArtifexMainWindow(QMainWindow):
                 self._audio_player.load_file(str(audio_path))
 
         self._chat_view.scroll_to_bottom()
-        self._finish_busy("Hold Space to talk | Or type and EXECUTE")
+        perf = _format_perf_summary(result)
+        hint = "Hold Space to talk | Or type and EXECUTE"
+        self._finish_busy(f"{perf}  ·  {hint}" if perf else hint)
 
     def _on_files_dropped(self, paths):
         """Files dropped — show preview if image."""
