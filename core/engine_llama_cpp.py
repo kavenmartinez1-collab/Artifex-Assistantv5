@@ -400,20 +400,40 @@ class LlamaCppEngine(BaseEngine):
         _log.info("llama-server cmd: %s  (CUDA_VISIBLE_DEVICES=%d)",
                   " ".join(cmd), gpu_index)
 
+        # Capture llama-server's combined stdout+stderr to a file. Two reasons:
+        # (1) llama-server prints model-loading details (and load failures)
+        # to STDOUT, not stderr — DEVNULL'ing stdout used to hide the real
+        # cause of every launch crash. (2) Python pipe buffers drop the tail
+        # of output on abnormal exit, so error messages near the crash often
+        # never reached us. A file has no buffer limit and outlives the
+        # process for forensic reads.
+        launch_log_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "logs",
+        )
+        os.makedirs(launch_log_dir, exist_ok=True)
+        launch_log_path = os.path.join(
+            launch_log_dir, f"llama-server-port{self.port}.log"
+        )
+
         max_launch_attempts = 2
         launch_retry_delay = 5.0
 
         for attempt in range(max_launch_attempts):
+            launch_log_fh = open(launch_log_path, "wb")
             try:
                 self._process = subprocess.Popen(
-                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    cmd, stdout=launch_log_fh, stderr=subprocess.STDOUT,
                     env=launch_env,
                 )
             except FileNotFoundError:
+                launch_log_fh.close()
                 raise FileNotFoundError(
                     f"'{self.server_path}' not found. Install llama.cpp or set "
                     f"server_path in llama_cpp_config.json to the full path."
                 )
+            # Parent doesn't need its handle once the child has inherited it.
+            launch_log_fh.close()
 
             timeout = self._health_timeout
             start = time.monotonic()
@@ -421,10 +441,15 @@ class LlamaCppEngine(BaseEngine):
 
             while time.monotonic() - start < timeout:
                 if self._process.poll() is not None:
-                    stderr = self._process.stderr.read().decode("utf-8", errors="replace")
+                    try:
+                        with open(launch_log_path, "rb") as f:
+                            launch_output = f.read().decode("utf-8", errors="replace")
+                    except OSError as e:
+                        launch_output = f"(could not read {launch_log_path}: {e})"
                     _log.error(
-                        "llama-server full stderr (attempt %d, code %d):\n%s",
-                        attempt + 1, self._process.returncode, stderr,
+                        "llama-server crashed (attempt %d, code %d). Launch log: %s\n%s",
+                        attempt + 1, self._process.returncode,
+                        launch_log_path, launch_output,
                     )
                     if attempt < max_launch_attempts - 1:
                         _log.warning(
@@ -439,8 +464,9 @@ class LlamaCppEngine(BaseEngine):
                         launch_failed = True
                         break
                     raise RuntimeError(
-                        f"llama-server exited with code {self._process.returncode}:\n"
-                        f"{stderr[-4000:]}"
+                        f"llama-server exited with code {self._process.returncode}.\n"
+                        f"Full launch log: {launch_log_path}\n"
+                        f"Last 4000 chars:\n{launch_output[-4000:]}"
                     )
                 if self._is_server_healthy():
                     self._loaded = True
@@ -457,7 +483,8 @@ class LlamaCppEngine(BaseEngine):
             else:
                 self._kill_process()
                 raise TimeoutError(
-                    f"llama-server did not become healthy within {timeout}s. "
+                    f"llama-server did not become healthy within {timeout}s.\n"
+                    f"Launch log: {launch_log_path}\n"
                     f"Check that the model fits in VRAM and the GGUF is valid."
                 )
 
