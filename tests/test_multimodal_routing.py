@@ -1,5 +1,7 @@
-"""Regression tests for backend-aware vision routing and context_window
-exposure. These cover the bug where Artifex auto-resolved a multimodal
+"""Regression tests for backend-aware vision routing and the model-info
+fields (context_length, recommended_max_completion,
+image_token_cost_per_megapixel) consumed by upstream-client's dynamic budget
+planner. Also covers the bug where Artifex auto-resolved a multimodal
 request to a model name from the WRONG backend's registry, causing
 set_active_model to silently fail and the server to keep running the
 previously-loaded model.
@@ -37,9 +39,10 @@ class TestClassifyCapabilitiesVision(unittest.TestCase):
         self.assertNotIn("vision", caps)
 
 
-class TestContextWindowFields(unittest.TestCase):
-    """Each backend must populate context_window so /v1/models can expose
-    it for client-side batching decisions."""
+class TestContextLengthFields(unittest.TestCase):
+    """Each backend must populate context_length so /v1/models can expose
+    it for client-side batching decisions.  Field name matches GGUF
+    metadata convention (general.context_length)."""
 
     def test_llama_cpp_context_from_num_ctx(self):
         from core.model_discovery import _discover_llama_cpp
@@ -57,7 +60,7 @@ class TestContextWindowFields(unittest.TestCase):
                  read_data=json.dumps(fake_cfg))):
             models = _discover_llama_cpp()
         self.assertEqual(len(models), 1)
-        self.assertEqual(models[0]["context_window"], 32768)
+        self.assertEqual(models[0]["context_length"], 32768)
 
     def test_llama_cpp_missing_num_ctx_is_zero(self):
         from core.model_discovery import _discover_llama_cpp
@@ -70,26 +73,106 @@ class TestContextWindowFields(unittest.TestCase):
              patch("builtins.open", unittest.mock.mock_open(
                  read_data=json.dumps(fake_cfg))):
             models = _discover_llama_cpp()
-        self.assertEqual(models[0]["context_window"], 0)
+        self.assertEqual(models[0]["context_length"], 0)
 
     def test_transformers_context_from_config_json(self):
-        from core.model_discovery import _get_transformers_context_window
+        from core.model_discovery import _get_transformers_context_length
         fake_config = json.dumps({"max_position_embeddings": 131072})
         with patch("builtins.open", unittest.mock.mock_open(read_data=fake_config)):
-            ctx = _get_transformers_context_window("/fake/model")
+            ctx = _get_transformers_context_length("/fake/model")
         self.assertEqual(ctx, 131072)
 
     def test_transformers_missing_config_returns_zero(self):
-        from core.model_discovery import _get_transformers_context_window
+        from core.model_discovery import _get_transformers_context_length
         with patch("builtins.open", side_effect=OSError):
-            ctx = _get_transformers_context_window("/missing/model")
+            ctx = _get_transformers_context_length("/missing/model")
         self.assertEqual(ctx, 0)
 
     def test_transformers_malformed_config_returns_zero(self):
-        from core.model_discovery import _get_transformers_context_window
+        from core.model_discovery import _get_transformers_context_length
         with patch("builtins.open", unittest.mock.mock_open(read_data="not json")):
-            ctx = _get_transformers_context_window("/bad/model")
+            ctx = _get_transformers_context_length("/bad/model")
         self.assertEqual(ctx, 0)
+
+
+class TestRecommendedMaxCompletion(unittest.TestCase):
+    """recommended_max_completion = min(context_length // 2, 16384).
+    Lets clients cap their max_tokens against the model's actual ctx
+    instead of echoing huge defaults like 32768 against an 8K-ctx model.
+    """
+
+    def test_half_of_small_context(self):
+        from core.model_discovery import _compute_recommended_max_completion
+        self.assertEqual(_compute_recommended_max_completion(8192), 4096)
+
+    def test_capped_at_16384_for_huge_context(self):
+        from core.model_discovery import _compute_recommended_max_completion
+        # 256K ctx → would be 128K, capped at 16384.
+        self.assertEqual(_compute_recommended_max_completion(262144), 16384)
+
+    def test_zero_context_returns_zero(self):
+        """Unknown context (e.g. Ollama unreachable) returns 0 so the
+        client falls back to its own default rather than a fabricated
+        cap."""
+        from core.model_discovery import _compute_recommended_max_completion
+        self.assertEqual(_compute_recommended_max_completion(0), 0)
+
+    def test_negative_context_returns_zero(self):
+        from core.model_discovery import _compute_recommended_max_completion
+        self.assertEqual(_compute_recommended_max_completion(-1), 0)
+
+    def test_llama_cpp_discovery_includes_recommended(self):
+        from core.model_discovery import _discover_llama_cpp
+        fake_cfg = {
+            "models": {
+                "small": {"path": "/m.gguf", "num_ctx": 8192, "extra_flags": []},
+                "large": {"path": "/m.gguf", "num_ctx": 262144, "extra_flags": []},
+            },
+        }
+        with patch("os.path.isfile", return_value=True), \
+             patch("builtins.open", unittest.mock.mock_open(
+                 read_data=json.dumps(fake_cfg))):
+            models = _discover_llama_cpp()
+        by_id = {m["id"]: m for m in models}
+        self.assertEqual(by_id["small"]["recommended_max_completion"], 4096)
+        self.assertEqual(by_id["large"]["recommended_max_completion"], 16384)
+
+
+class TestImageTokenCostField(unittest.TestCase):
+    """image_token_cost_per_megapixel: optional per-model declaration in
+    llama_cpp_config.json. Null when not set so consumers can pick their
+    own per-family heuristic."""
+
+    def test_llama_cpp_reads_from_config(self):
+        from core.model_discovery import _discover_llama_cpp
+        fake_cfg = {
+            "models": {
+                "vlm": {
+                    "path": "/m.gguf",
+                    "num_ctx": 8192,
+                    "extra_flags": ["--mmproj", "/p"],
+                    "image_token_cost_per_megapixel": 256,
+                },
+            },
+        }
+        with patch("os.path.isfile", return_value=True), \
+             patch("builtins.open", unittest.mock.mock_open(
+                 read_data=json.dumps(fake_cfg))):
+            models = _discover_llama_cpp()
+        self.assertEqual(models[0]["image_token_cost_per_megapixel"], 256)
+
+    def test_llama_cpp_default_null_when_unset(self):
+        from core.model_discovery import _discover_llama_cpp
+        fake_cfg = {
+            "models": {
+                "vlm": {"path": "/m.gguf", "num_ctx": 8192, "extra_flags": []},
+            },
+        }
+        with patch("os.path.isfile", return_value=True), \
+             patch("builtins.open", unittest.mock.mock_open(
+                 read_data=json.dumps(fake_cfg))):
+            models = _discover_llama_cpp()
+        self.assertIsNone(models[0]["image_token_cost_per_megapixel"])
 
 
 class TestPickVisionModelBackendAware(unittest.TestCase):

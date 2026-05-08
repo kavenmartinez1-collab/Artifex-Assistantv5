@@ -1229,12 +1229,23 @@ def create_app():
                 "x_backend": m["backend"],
                 "x_capabilities": m.get("capabilities", ["text"]),
                 "x_size": m.get("size", 0),
-                # x_context_window: model's max input+output token capacity.
-                # 0 = unknown (Ollama unreachable, missing config.json, etc.)
-                # Clients can use this to decide whether to chunk long jobs
-                # or pick a different model.
-                "x_context_window": int(m.get("context_window") or 0),
-                "x_vision": "vision" in m.get("capabilities", []),
+                # Model's max input+output token capacity.  Name matches
+                # GGUF metadata convention (general.context_length).
+                # 0 = unknown (Ollama unreachable, missing config.json,
+                # etc.); clients should fall back to their own defaults
+                # rather than treat 0 as a real limit.
+                "x_context_length": int(m.get("context_length") or 0),
+                # Suggested cap for client-requested max_tokens —
+                # roughly half the context, so prompt+history always
+                # has room.  0 when context_length is unknown.
+                "x_recommended_max_completion": int(
+                    m.get("recommended_max_completion") or 0
+                ),
+                # Token cost of a 1-megapixel image for this model's
+                # projector.  Null when not declared in per-model
+                # config; clients pick their own per-family heuristic.
+                "x_image_token_cost_per_megapixel":
+                    m.get("image_token_cost_per_megapixel"),
                 "x_active": (m["id"] == active_model and m["backend"] == active_backend),
             }
             for m in models

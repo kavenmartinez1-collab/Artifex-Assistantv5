@@ -66,26 +66,46 @@ def _classify_capabilities(
     return caps
 
 
-def _get_ollama_context_window(model_name: str) -> int:
-    """Best-effort context window for an Ollama model.
+# Cap for the recommended_max_completion derivation.  16384 is the
+# largest output budget that's still reasonable on a 128K-ctx model
+# without leaving the prompt budget too thin; on smaller-ctx models the
+# ctx//2 floor takes over before this kicks in.
+_RECOMMENDED_MAX_COMPLETION_CAP = 16384
 
-    Pulls from /api/show via the cached helper in core.ollama_ctx.  The
-    result is the model's trained max context, which is what clients
-    need to size batching decisions — not the Modelfile's num_ctx
-    (which is a floor, not a cap).  Returns 0 when Ollama is unreachable
-    or the response lacks the field.
+
+def _compute_recommended_max_completion(context_length: int) -> int:
+    """Derive a sensible default cap for client-requested max_tokens.
+
+    Returns half of context_length, capped at 16384, so the prompt
+    always has at least half the window to work with.  Returns 0 when
+    context_length is unknown so callers can fall back to their own
+    defaults rather than picking from a fabricated number.
+    """
+    if context_length <= 0:
+        return 0
+    return min(context_length // 2, _RECOMMENDED_MAX_COMPLETION_CAP)
+
+
+def _get_ollama_context_length(model_name: str) -> int:
+    """Best-effort context length for an Ollama model.
+
+    Pulls trained_ctx from /api/show via the cached helper in
+    core.ollama_ctx.  This is the model's architectural max, which is
+    what clients need for batching decisions — not the Modelfile's
+    num_ctx (which is a runtime floor, not a cap).  Returns 0 when
+    Ollama is unreachable or the metadata lacks the field.
     """
     try:
         from core.ollama_ctx import _get_model_meta
         meta = _get_model_meta(model_name)
         return int(meta.get("trained_ctx") or 0)
     except Exception as e:
-        _log.debug("Could not get context_window for %s: %s", model_name, e)
+        _log.debug("Could not get context_length for %s: %s", model_name, e)
         return 0
 
 
-def _get_transformers_context_window(model_path: str) -> int:
-    """Best-effort context window for a transformers model.
+def _get_transformers_context_length(model_path: str) -> int:
+    """Best-effort context length for a transformers model.
 
     Reads max_position_embeddings from the model's config.json.  This is
     the architectural maximum — runtime caps from quantization or
@@ -122,13 +142,19 @@ def _discover_ollama() -> list[dict]:
         if not name:
             continue
         display = name.rsplit(":latest", 1)[0] if name.endswith(":latest") else name
+        ctx_len = _get_ollama_context_length(display)
         models.append({
             "id": display,
             "backend": "ollama",
             "size": m.get("size", 0),
             "modified": m.get("modified_at", ""),
             "capabilities": _classify_capabilities(display),
-            "context_window": _get_ollama_context_window(display),
+            "context_length": ctx_len,
+            "recommended_max_completion": _compute_recommended_max_completion(ctx_len),
+            # Image-token cost is mmproj/projector-specific and not
+            # discoverable from /api/show today; null lets clients fall
+            # back to their own per-family heuristic.
+            "image_token_cost_per_megapixel": None,
         })
     return models
 
@@ -145,12 +171,19 @@ def _discover_llama_cpp() -> list[dict]:
 
     models = []
     for name, mcfg in cfg.get("models", {}).items():
+        ctx_len = int(mcfg.get("num_ctx") or 0)
+        # Optional per-model field — set in llama_cpp_config.json when
+        # the user knows the projector's token cost (varies by mmproj).
+        # Null when not declared.
+        img_cost = mcfg.get("image_token_cost_per_megapixel")
         models.append({
             "id": name,
             "backend": "llama_cpp",
             "size": 0,
             "capabilities": _classify_capabilities(name, llama_cpp_config=mcfg),
-            "context_window": int(mcfg.get("num_ctx") or 0),
+            "context_length": ctx_len,
+            "recommended_max_completion": _compute_recommended_max_completion(ctx_len),
+            "image_token_cost_per_megapixel": img_cost,
         })
     return models
 
@@ -167,12 +200,15 @@ def _discover_transformers() -> list[dict]:
                         size += os.path.getsize(os.path.join(root, f))
         except OSError:
             pass
+        ctx_len = _get_transformers_context_length(path)
         models.append({
             "id": name,
             "backend": "transformers",
             "size": size,
             "capabilities": _classify_capabilities(name),
-            "context_window": _get_transformers_context_window(path),
+            "context_length": ctx_len,
+            "recommended_max_completion": _compute_recommended_max_completion(ctx_len),
+            "image_token_cost_per_megapixel": None,
         })
     return models
 
