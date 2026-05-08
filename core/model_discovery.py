@@ -40,17 +40,71 @@ _CODE_PATTERNS = [
 ]
 
 
-def _classify_capabilities(name: str) -> list[str]:
+def _classify_capabilities(
+    name: str, *, llama_cpp_config: dict | None = None,
+) -> list[str]:
     caps = ["text"]
-    for p in _VISION_PATTERNS:
-        if p.search(name):
-            caps.append("vision")
-            break
+    has_vision = False
+    # llama_cpp publishes vision capability via --mmproj on the launch
+    # command — that's the authoritative signal the loaded server can
+    # accept image inputs.  Trust it before falling back to name guesses.
+    if llama_cpp_config:
+        flags = llama_cpp_config.get("extra_flags") or []
+        if "--mmproj" in flags:
+            has_vision = True
+    if not has_vision:
+        for p in _VISION_PATTERNS:
+            if p.search(name):
+                has_vision = True
+                break
+    if has_vision:
+        caps.append("vision")
     for p in _CODE_PATTERNS:
         if p.search(name):
             caps.append("code")
             break
     return caps
+
+
+def _get_ollama_context_window(model_name: str) -> int:
+    """Best-effort context window for an Ollama model.
+
+    Pulls from /api/show via the cached helper in core.ollama_ctx.  The
+    result is the model's trained max context, which is what clients
+    need to size batching decisions — not the Modelfile's num_ctx
+    (which is a floor, not a cap).  Returns 0 when Ollama is unreachable
+    or the response lacks the field.
+    """
+    try:
+        from core.ollama_ctx import _get_model_meta
+        meta = _get_model_meta(model_name)
+        return int(meta.get("trained_ctx") or 0)
+    except Exception as e:
+        _log.debug("Could not get context_window for %s: %s", model_name, e)
+        return 0
+
+
+def _get_transformers_context_window(model_path: str) -> int:
+    """Best-effort context window for a transformers model.
+
+    Reads max_position_embeddings from the model's config.json.  This is
+    the architectural maximum — runtime caps from quantization or
+    rope_scaling are applied at load time, not here.  Returns 0 when
+    config.json is missing or unparseable.
+    """
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return 0
+    val = cfg.get("max_position_embeddings")
+    if val is None:
+        return 0
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _discover_ollama() -> list[dict]:
@@ -74,6 +128,7 @@ def _discover_ollama() -> list[dict]:
             "size": m.get("size", 0),
             "modified": m.get("modified_at", ""),
             "capabilities": _classify_capabilities(display),
+            "context_window": _get_ollama_context_window(display),
         })
     return models
 
@@ -94,7 +149,8 @@ def _discover_llama_cpp() -> list[dict]:
             "id": name,
             "backend": "llama_cpp",
             "size": 0,
-            "capabilities": _classify_capabilities(name),
+            "capabilities": _classify_capabilities(name, llama_cpp_config=mcfg),
+            "context_window": int(mcfg.get("num_ctx") or 0),
         })
     return models
 
@@ -116,6 +172,7 @@ def _discover_transformers() -> list[dict]:
             "backend": "transformers",
             "size": size,
             "capabilities": _classify_capabilities(name),
+            "context_window": _get_transformers_context_window(path),
         })
     return models
 

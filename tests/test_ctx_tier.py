@@ -218,6 +218,31 @@ class TestModelQueueCtxTier:
         asyncio.run(run())
         assert ollama_unload_calls == []
 
+    def test_cross_backend_swap_clears_engine_cache(self):
+        """Switching from ollama to llama_cpp must call _unload_engine
+        in addition to the ollama HTTP unload.  Without this, the api
+        layer's _engine global stays as the OllamaEngine instance and
+        the next request silently runs against Ollama instead of the
+        new backend."""
+        q = self._fresh_queue()
+        ollama_unload_calls = []
+        engine_unload_calls = []
+        q._engine_unload_fn = lambda: engine_unload_calls.append("engine")
+
+        async def fake_ollama_unload(model):
+            ollama_unload_calls.append(model)
+
+        async def run():
+            with patch("core.config.set_active_backend"), \
+                 patch("core.config.set_active_model"), \
+                 patch.object(q, "_unload_ollama", new=fake_ollama_unload):
+                await q.switch_if_needed("m_olla", "ollama", ctx_tier=None)
+                await q.switch_if_needed("m_lcpp", "llama_cpp", ctx_tier=64_000)
+
+        asyncio.run(run())
+        assert ollama_unload_calls == ["m_olla"]
+        assert engine_unload_calls == ["engine"]
+
 
 # ── GPU baseline measurement ───────────────────────────────────────────
 

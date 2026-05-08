@@ -344,7 +344,13 @@ def get_active_model_path():
 
 
 def set_active_model(name):
-    """Switch active model by registry name. Works for all backends."""
+    """Switch active model by registry name. Works for all backends.
+
+    Returns True on success, False when the name isn't registered for the
+    current backend.  Failures are logged so a misroute (e.g. picking a
+    transformers name while the llama_cpp backend is active) doesn't
+    silently fall through to the previous model.
+    """
     global _active_model
     with _config_lock:
         if _active_backend == "ollama":
@@ -357,10 +363,21 @@ def set_active_model(name):
             if name in get_llama_cpp_models():
                 _active_model = name
                 return True
+            _log.warning(
+                "set_active_model(%r) ignored — not in llama_cpp_config.json. "
+                "Active model unchanged (%r). Available: %s",
+                name, _active_model,
+                sorted(get_llama_cpp_models().keys()),
+            )
             return False
         if name in MODELS:
             _active_model = MODELS[name]
             return True
+        _log.warning(
+            "set_active_model(%r) ignored — not in transformers MODELS. "
+            "Available: %s",
+            name, sorted(MODELS.keys()),
+        )
         return False
 
 

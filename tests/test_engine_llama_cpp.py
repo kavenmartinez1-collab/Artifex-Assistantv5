@@ -273,5 +273,84 @@ class TestNeedsReloadDocumented(unittest.TestCase):
         self.assertIn("True", TransformersEngine.needs_reload.__doc__)
 
 
+class TestAdoptedServerUnload(unittest.TestCase):
+    """Regression: unload() must terminate the underlying server even when
+    load() adopted a process we didn't spawn. Without this, a model/ctx-tier
+    switch can be a no-op at the OS level even though the queue thinks it
+    succeeded — the next adoption re-grabs the same orphan."""
+
+    def _make_engine(self):
+        from core.engine_llama_cpp import LlamaCppEngine
+        engine = LlamaCppEngine("test", {"path": "/fake/model.gguf"})
+        engine._loaded = True
+        return engine
+
+    def test_kill_process_calls_listener_kill_when_no_subprocess(self):
+        """When adopted (self._process is None) and a healthy server
+        exists, _kill_process must fall through to _kill_listener_on_port."""
+        engine = self._make_engine()
+        engine._process = None
+        engine._is_server_healthy = lambda: True
+        called = {"n": 0}
+        engine._kill_listener_on_port = lambda: called.update(n=called["n"] + 1)
+        engine._kill_process()
+        self.assertEqual(called["n"], 1)
+        self.assertIsNone(engine._process)
+
+    def test_kill_process_skips_listener_kill_when_no_server(self):
+        """If no server is healthy, no PID lookup is attempted (avoids
+        killing unrelated processes that may be on the port)."""
+        engine = self._make_engine()
+        engine._process = None
+        engine._is_server_healthy = lambda: False
+        called = {"n": 0}
+        engine._kill_listener_on_port = lambda: called.update(n=called["n"] + 1)
+        engine._kill_process()
+        self.assertEqual(called["n"], 0)
+
+    def test_kill_process_uses_subprocess_when_we_own_it(self):
+        """When we have a Popen handle, _kill_listener_on_port is NOT
+        called — terminate the subprocess directly."""
+        engine = self._make_engine()
+        proc = MagicMock()
+        proc.poll.return_value = None  # still running
+        engine._process = proc
+        engine._is_server_healthy = lambda: True  # would trip listener path if reached
+        called = {"n": 0}
+        engine._kill_listener_on_port = lambda: called.update(n=called["n"] + 1)
+        engine._kill_process()
+        self.assertEqual(called["n"], 0)
+        proc.terminate.assert_called_once()
+        self.assertIsNone(engine._process)
+
+    def test_kill_listener_on_port_only_kills_llama_server(self):
+        """The port-based killer must scope to processes named
+        'llama-server' so an unrelated service that happens to bind
+        the port is not taken down."""
+        from core.engine_llama_cpp import LlamaCppEngine
+        engine = LlamaCppEngine("test", {"path": "/fake/m.gguf", "port": 8081})
+
+        unrelated = MagicMock()
+        unrelated.info = {"pid": 100, "name": "node.exe", "exe": "C:/.../node.exe"}
+        # Even if it claims the port, executable name must rule it out.
+        unrelated.net_connections.return_value = []
+
+        target = MagicMock()
+        target.info = {"pid": 200, "name": "llama-server.exe",
+                       "exe": "C:/.../llama-server.exe"}
+        target.pid = 200
+        conn = MagicMock()
+        conn.laddr = MagicMock(port=8081)
+        import psutil as _psutil
+        conn.status = _psutil.CONN_LISTEN
+        target.net_connections.return_value = [conn]
+
+        with patch("psutil.process_iter", return_value=[unrelated, target]):
+            engine._kill_listener_on_port()
+
+        unrelated.terminate.assert_not_called()
+        target.terminate.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

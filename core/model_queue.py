@@ -134,9 +134,17 @@ class ModelQueue:
                     backend, model, ctx_tier,
                 )
 
-            if self._current_backend == "ollama":
-                await self._unload_ollama(self._current_model)
-            elif self._current_backend in ("transformers", "llama_cpp"):
+            if self._current_backend is not None:
+                if self._current_backend == "ollama":
+                    await self._unload_ollama(self._current_model)
+                # Always clear the api layer's cached engine when
+                # switching from any active backend.  For
+                # transformers/llama_cpp this also frees GPU memory; for
+                # ollama it's bookkeeping — without it, the next
+                # _get_engine() call returns the stale OllamaEngine
+                # instance even after a cross-backend swap, and the
+                # request silently runs against Ollama instead of the
+                # new backend.
                 await self._unload_engine()
 
             # If backend changed, the engine needs to be recreated
@@ -236,12 +244,15 @@ class ModelQueue:
             _log.warning("Failed to unload Ollama model %s: %s", model, e)
 
     async def _unload_engine(self):
-        """Unload the current engine (Transformers or llama.cpp) to free VRAM.
+        """Tear down the api layer's cached engine instance.
 
-        Uses a registered callback instead of directly importing api.server,
-        keeping core/ decoupled from the API layer. The callback calls
-        BaseEngine.unload() which is polymorphic — TransformersEngine frees
-        GPU memory, LlamaCppEngine kills the llama-server process.
+        Uses a registered callback so core/ doesn't import api/.  The
+        callback calls BaseEngine.unload() — polymorphic across backends:
+        TransformersEngine frees GPU memory, LlamaCppEngine kills the
+        llama-server process, OllamaEngine is a no-op (Ollama itself
+        already released the model via HTTP).  In all cases it then
+        clears the cached engine so the next request creates a fresh
+        instance for the now-active backend/model.
         """
         if self._engine_unload_fn is None:
             _log.warning("No engine unload callback registered — skipping")

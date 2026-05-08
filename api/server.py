@@ -412,17 +412,43 @@ def _infer_backend_from_model(name) -> str | None:
 
 
 def _pick_vision_model(backend: str) -> str | None:
-    """Find a vision-capable model installed on `backend`, by name pattern.
+    """Find a vision-capable model installed on `backend`.
 
-    For Ollama we refresh the model list first so a freshly-pulled model
-    becomes available without restarting the server. Returns None if no
-    matching model is installed.
+    Looks at the backend's own model registry — never returns a name from
+    a different backend's registry, since the caller routes the request
+    via `backend` and an unknown name would silently fall through
+    set_active_model and stay on the previously-loaded model.
+
+    Per backend:
+      - ollama: OLLAMA_MODELS, name-pattern match. Refreshes the tag list
+        first so a freshly-pulled model is visible without restart.
+      - llama_cpp: llama_cpp_config.json models. Prefers entries with
+        '--mmproj' in extra_flags (the explicit signal a llama-server
+        launch can do vision), then falls back to name patterns.
+      - transformers: MODELS dict, name-pattern match.
+
+    Returns None if no matching model is installed on `backend`.
     """
-    from core.config import MODELS, OLLAMA_MODELS, refresh_ollama_models
+    from core.config import (
+        MODELS, OLLAMA_MODELS, refresh_ollama_models, get_llama_cpp_models,
+    )
 
     if backend == "ollama":
         refresh_ollama_models()
         names = list(OLLAMA_MODELS.keys())
+    elif backend == "llama_cpp":
+        lcpp = get_llama_cpp_models()
+        # --mmproj is the explicit "this launch can do vision" signal in
+        # llama_cpp_config.json. Pick from that set first; only fall back
+        # to name patterns if no entry advertises mmproj.
+        mmproj_names = [
+            n for n, cfg in lcpp.items()
+            if "--mmproj" in (cfg.get("extra_flags") or [])
+        ]
+        if mmproj_names:
+            instruct = sorted(n for n in mmproj_names if "instruct" in n.lower())
+            return instruct[0] if instruct else sorted(mmproj_names)[0]
+        names = list(lcpp.keys())
     else:
         names = list(MODELS.keys())
 
@@ -1203,6 +1229,12 @@ def create_app():
                 "x_backend": m["backend"],
                 "x_capabilities": m.get("capabilities", ["text"]),
                 "x_size": m.get("size", 0),
+                # x_context_window: model's max input+output token capacity.
+                # 0 = unknown (Ollama unreachable, missing config.json, etc.)
+                # Clients can use this to decide whether to chunk long jobs
+                # or pick a different model.
+                "x_context_window": int(m.get("context_window") or 0),
+                "x_vision": "vision" in m.get("capabilities", []),
                 "x_active": (m["id"] == active_model and m["backend"] == active_backend),
             }
             for m in models

@@ -492,6 +492,19 @@ class LlamaCppEngine(BaseEngine):
                 break
 
     def _kill_process(self):
+        """Stop the llama-server bound to this engine.
+
+        Two paths because load() has two paths: when we spawned the
+        process ourselves we have a Popen handle and terminate via that;
+        when load() adopted an already-running server we have no Popen
+        handle (self._process is None) and must look up the listener by
+        port and terminate the OS process directly.
+
+        Without the second path, unload() silently leaves an adopted
+        server running and the next load() re-adopts the same orphan,
+        which is how a model/ctx-tier "switch" can be a no-op at the
+        server level even though the queue thinks it succeeded.
+        """
         if self._process and self._process.poll() is None:
             self._process.terminate()
             try:
@@ -499,7 +512,68 @@ class LlamaCppEngine(BaseEngine):
             except subprocess.TimeoutExpired:
                 self._process.kill()
                 self._process.wait(timeout=5)
+        elif self._is_server_healthy():
+            self._kill_listener_on_port()
         self._process = None
+
+    def _kill_listener_on_port(self):
+        """Find and terminate a llama-server listening on self.port.
+
+        Used by _kill_process() when this engine adopted an existing
+        server — without this, unload would be a no-op for adopted
+        servers.  Scopes the kill to processes whose executable name
+        contains 'llama-server' so an unrelated service that happens to
+        bind the port is left alone.
+        """
+        import psutil
+        matches: list[psutil.Process] = []
+        for proc in psutil.process_iter(["pid", "name", "exe"]):
+            try:
+                name = (proc.info.get("name") or "").lower()
+                exe = (proc.info.get("exe") or "").lower()
+                if "llama-server" not in name and "llama-server" not in exe:
+                    continue
+                conns = proc.net_connections(kind="tcp")
+                for conn in conns:
+                    if (
+                        conn.laddr is not None
+                        and conn.laddr.port == self.port
+                        and conn.status == psutil.CONN_LISTEN
+                    ):
+                        matches.append(proc)
+                        break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        if not matches:
+            _log.warning(
+                "Adopted server on port %d but no matching llama-server "
+                "process found to terminate; orphan may persist",
+                self.port,
+            )
+            return
+
+        for proc in matches:
+            try:
+                _log.info(
+                    "Terminating adopted llama-server pid=%d on port %d",
+                    proc.pid, self.port,
+                )
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except psutil.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except psutil.TimeoutExpired:
+                        pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                _log.warning("Could not terminate pid=%d: %s", proc.pid, e)
+
+        # Brief settle so the next load()'s health check doesn't race the
+        # OS releasing the listening socket.
+        time.sleep(0.5)
 
     def unload(self, status_callback=None):
         self._kill_process()
