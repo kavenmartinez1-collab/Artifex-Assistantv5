@@ -18,19 +18,19 @@
         "--metrics"
       ]
     },
-    "qwen3.6-27b-8k-specd": {
-      "_comment": "C1-agg: 8K ctx + Qwen3.5-4B spec-dec. ~22 GB VRAM, 43/67 tok/s mean/peak. Fast chat + vision.",
+    "qwen3.6-27b-32k-specd": {
+      "_comment": "C1-agg-32K: 32K ctx + Qwen3.5-4B spec-dec + vision. q4_0 KV keeps 32K KV in the same VRAM envelope 8K@q8_0 used. Mid-context multimodal default — survey/parse stages with image tokens + thinking budget exceed 8K, so this is the safer floor.",
       "path": "/path/to/Qwen3.6-27B-Q4_K_M.gguf",
       "num_gpu_layers": 99,
-      "num_ctx": 8192,
+      "num_ctx": 32000,
       "extra_flags": [
         "-fa", "on",
-        "-ctk", "q8_0", "-ctv", "q8_0",
+        "-ctk", "q4_0", "-ctv", "q4_0",
         "--swa-full",
         "-np", "1",
         "-md", "/path/to/Qwen3.5-4B-Q4_K_M.gguf",
-        "-ngld", "99", "-cd", "4096",
-        "--draft-max", "16", "--draft-min", "4", "--draft-p-min", "0.5",
+        "-ngld", "99", "-cd", "8192",
+        "--spec-draft-n-max", "16", "--spec-draft-n-min", "4", "--spec-draft-p-min", "0.5",
         "--jinja",
         "--reasoning-format", "deepseek",
         "--metrics",

@@ -625,7 +625,7 @@ The engine starts `llama-server` on the configured port, waits for it to become 
 
 ### Configuration
 
-`llama_cpp_config.json` defines the server binary and per-model settings. Below is an annotated example showing a 256K extended-context entry and an 8K speculative-decoding entry with vision:
+`llama_cpp_config.json` defines the server binary and per-model settings. Below is an annotated example showing a 256K extended-context entry and a 32K speculative-decoding entry with vision:
 
 ```jsonc
 {
@@ -647,18 +647,20 @@ The engine starts `llama-server` on the configured port, waits for it to become 
         "--metrics"
       ]
     },
-    // 8K context + speculative decoding — 43/67 tok/s mean/peak.
-    // Fast chat with vision support. ~22 GB VRAM.
-    "qwen3.6-27b-8k-specd": {
+    // 32K context + speculative decoding + vision. ~22 GB VRAM.
+    // q4_0 KV keeps the same envelope an 8K@q8_0 config used; 32K
+    // is the safer floor for survey/parse stages where image tokens
+    // and thinking budget routinely exceed 8K.
+    "qwen3.6-27b-32k-specd": {
       "path": "/path/to/Qwen3.6-27B-Q4_K_M.gguf",
       "num_gpu_layers": 99,
-      "num_ctx": 8192,
+      "num_ctx": 32000,
       "extra_flags": [
         "-fa", "on",
-        "-ctk", "q8_0", "-ctv", "q8_0",
+        "-ctk", "q4_0", "-ctv", "q4_0",
         "-md", "/path/to/Qwen3.5-4B-Q4_K_M.gguf",
-        "-ngld", "99", "-cd", "4096",
-        "--draft-max", "16", "--draft-min", "4", "--draft-p-min", "0.5",
+        "-ngld", "99", "-cd", "8192",
+        "--spec-draft-n-max", "16", "--spec-draft-n-min", "4", "--spec-draft-p-min", "0.5",
         "--jinja",
         "--reasoning-format", "deepseek",
         "--cache-reuse", "256",

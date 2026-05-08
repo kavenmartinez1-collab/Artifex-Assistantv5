@@ -150,3 +150,65 @@ class TestCompressHistory:
         result = compress_history(history, context_window=4)
         contents = " ".join(m["content"] for m in result)
         assert "EARLIER CONVERSATION" in contents
+
+
+class TestTruncateRepetition:
+    """_truncate_repetition must catch real verbatim loops without
+    amputating structured output (JSON arrays, equipment schedules, etc.)
+    where the same boilerplate repeats with item-specific data between."""
+
+    def test_genuine_loop_truncated(self):
+        """Same 80+ char phrase back-to-back 3 times = real loop."""
+        from core.inference import _truncate_repetition
+        # Exactly 80 chars repeated back-to-back so phrase_len=80 finds
+        # consecutive copies with gap=0.
+        phrase = "ABCDE" * 16  # 80 chars
+        text = phrase * 4
+        result = _truncate_repetition(text)
+        # Should cut at start of second occurrence — keeps just the first.
+        assert result == phrase.rstrip()
+
+    def test_structured_json_with_repeating_boilerplate_kept(self):
+        """JSON array of items sharing a long category string must NOT
+        be truncated — the data between boilerplate occurrences is
+        large enough that the gap-check rejects it as a false loop."""
+        from core.inference import _truncate_repetition
+        # Three items sharing a long category. Boilerplate is >80 chars.
+        # Item-specific data ("01", "04", "11" + qty + model) is the
+        # interpolated content between repetitions.
+        item_template = (
+            '{{"item_number": "{n}", "qty": {q}, "model": "{m}", '
+            '"equipment_category": "Underbar Fillers & Drainboards", '
+            '"remarks": ""}}'
+        )
+        items = [
+            item_template.format(n="01", q=8, m="KR24-R30"),
+            item_template.format(n="04", q=3, m="KR24-R15"),
+            item_template.format(n="11", q=1, m="KR24-GS12-PE"),
+            item_template.format(n="15", q=1, m="KR24-DR45"),
+        ]
+        text = "[" + ",\n".join(items) + "]"
+        result = _truncate_repetition(text)
+        # All four items must survive — the gap between the boilerplate
+        # is too large for a real loop.
+        assert "KR24-R30" in result
+        assert "KR24-R15" in result
+        assert "KR24-GS12-PE" in result
+        assert "KR24-DR45" in result
+
+    def test_short_text_unchanged(self):
+        """Below the 4×min_phrase_len floor, no analysis runs."""
+        from core.inference import _truncate_repetition
+        text = "short text"
+        assert _truncate_repetition(text) == text
+
+    def test_two_occurrences_unchanged(self):
+        """Two copies isn't enough — could be a legitimate header/footer
+        echo or a structural duplicate."""
+        from core.inference import _truncate_repetition
+        phrase = "The same eighty character phrase right here exactly to test the threshold."
+        # Pad to ensure len >= 4*80
+        text = phrase + phrase + (" " * 200)
+        # Two occurrences only.  Should not truncate.
+        result = _truncate_repetition(text)
+        assert result.count(phrase) == 2

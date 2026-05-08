@@ -129,22 +129,40 @@ def strip_think_blocks(text):
 def _truncate_repetition(text, min_phrase_len=80):
     """Detect and truncate when the model is stuck in a verbatim loop.
 
-    Requires the same phrase (80+ chars) to appear at least 3 times.
-    Two occurrences is normal in structured output (JSON arrays, markdown
-    tables); three consecutive matches is a genuine repetition loop.
+    A real loop emits the same phrase back-to-back with minimal gap
+    between occurrences ("X. X. X. X."), so the gap from one
+    occurrence's end to the next's start is much smaller than the
+    phrase itself.  Structured output (JSON arrays of similar items,
+    markdown tables, equipment schedules) often contains long
+    identical boilerplate but with item-specific data interpolated
+    between repetitions — those gaps are large, and the old
+    "3 occurrences anywhere" check fired spuriously on them, amputating
+    real output mid-field at the boundary between items.
+
+    Fires only when 3+ occurrences of an 80+ char phrase appear AND
+    each consecutive gap is less than 25% of the phrase length.
     """
     if len(text) < min_phrase_len * 4:
         return text
 
     for phrase_len in range(min_phrase_len, min(500, len(text) // 3) + 1, 20):
+        gap_threshold = phrase_len // 4
         for start in range(0, len(text) - phrase_len * 3):
             phrase = text[start:start + phrase_len]
             second = text.find(phrase, start + phrase_len)
             if second == -1:
                 continue
+            # Real loop: phrase ends and immediately the next copy
+            # begins (or with very few chars between).  Structured
+            # repetition: significant data between copies.
+            if second - (start + phrase_len) > gap_threshold:
+                continue
             third = text.find(phrase, second + phrase_len)
-            if third != -1:
-                return text[:second].rstrip()
+            if third == -1:
+                continue
+            if third - (second + phrase_len) > gap_threshold:
+                continue
+            return text[:second].rstrip()
 
     return text
 
