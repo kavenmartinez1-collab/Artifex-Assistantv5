@@ -188,6 +188,51 @@ def _discover_llama_cpp() -> list[dict]:
     return models
 
 
+def _discover_claude_cli() -> list[dict]:
+    """Discover claude_cli models from claude_cli_config.json.
+
+    Each entry surfaces the same x_* fields other backends do, so the
+    /v1/models response shape is uniform.  capabilities default to
+    ["text"] (Anthropic models support vision, but vision in this
+    codebase routes to Ollama / transformers — see _classify_capabilities).
+
+    x_active reflects whether the CLI is installed and OAuth state
+    exists; the check is cached for AUTH_PROBE_CACHE_S inside the engine
+    but the discovery re-probes on each refresh because it returns a
+    static dict that doesn't carry the engine's cache.  Cheap on cache
+    hit; the model_discovery cache (10s TTL) prevents repeat hits.
+    """
+    from core.config import get_claude_cli_models
+    from core.engine_claude_cli import probe_auth_state
+
+    models_cfg = get_claude_cli_models()
+    if not models_cfg:
+        return []
+
+    auth_ok, _reason = probe_auth_state()
+    models = []
+    for name, mcfg in models_cfg.items():
+        ctx_len = int(mcfg.get("context_length") or 0)
+        recommended = mcfg.get("recommended_max_completion")
+        if recommended is None:
+            recommended = _compute_recommended_max_completion(ctx_len)
+        capabilities = list(mcfg.get("capabilities") or ["text"])
+        models.append({
+            "id": name,
+            "backend": "claude_cli",
+            "size": 0,
+            "capabilities": capabilities,
+            "context_length": ctx_len,
+            "recommended_max_completion": int(recommended or 0),
+            "image_token_cost_per_megapixel": mcfg.get("image_token_cost_per_megapixel"),
+            # Surface auth state via x_active downstream.  The
+            # caller (api/server.list_models) maps this onto x_active
+            # alongside the global "this is the loaded model" check.
+            "claude_cli_authed": auth_ok,
+        })
+    return models
+
+
 def _discover_transformers() -> list[dict]:
     from core.config import MODELS
     models = []
@@ -223,6 +268,7 @@ def discover_all(force_refresh: bool = False) -> list[dict]:
     all_models = []
     all_models.extend(_discover_ollama())
     all_models.extend(_discover_llama_cpp())
+    all_models.extend(_discover_claude_cli())
     all_models.extend(_discover_transformers())
 
     _cached_models = all_models

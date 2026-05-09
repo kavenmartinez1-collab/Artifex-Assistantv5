@@ -1,0 +1,26 @@
+{
+  "_comment": "Claude CLI backend config. Copy to claude_cli_config.json. Each model name maps to a `claude --print --model <name>` invocation; `claude-code` is a sentinel that runs the CLI without --model so it uses its current default. Auth comes from %USERPROFILE%/.claude/ — run `claude /login` once on the host as the user that owns the Artifex process.",
+  "models": {
+    "claude-sonnet-4-6": {
+      "context_length": 200000,
+      "recommended_max_completion": 8192,
+      "capabilities": ["text"]
+    },
+    "claude-opus-4-7": {
+      "context_length": 200000,
+      "recommended_max_completion": 8192,
+      "capabilities": ["text"]
+    },
+    "claude-haiku-4-5-20251001": {
+      "context_length": 200000,
+      "recommended_max_completion": 8192,
+      "capabilities": ["text"]
+    },
+    "claude-code": {
+      "_comment": "No --model flag passed; CLI picks its current default.",
+      "context_length": 200000,
+      "recommended_max_completion": 8192,
+      "capabilities": ["text"]
+    }
+  }
+}

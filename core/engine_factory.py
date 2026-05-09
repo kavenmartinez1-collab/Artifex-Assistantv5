@@ -6,6 +6,7 @@ Returns the right engine based on the active backend setting.
 from core.config import (
     get_active_backend, get_active_ollama_model,
     get_active_llama_cpp_model, get_llama_cpp_model_config,
+    get_active_claude_cli_model, get_claude_cli_model_config,
 )
 
 
@@ -13,7 +14,8 @@ def create_engine():
     """Create an engine instance for the currently active backend.
 
     Returns:
-        BaseEngine — OllamaEngine, LlamaCppEngine, or TransformersEngine.
+        BaseEngine — OllamaEngine, LlamaCppEngine, ClaudeCliEngine, or
+        TransformersEngine.
     """
     backend = get_active_backend()
 
@@ -32,6 +34,17 @@ def create_engine():
             )
         model_config = get_llama_cpp_model_config(model_name)
         return LlamaCppEngine(model_name, model_config)
+
+    if backend == "claude_cli":
+        from core.engine_claude_cli import ClaudeCliEngine
+        model_name = get_active_claude_cli_model()
+        if not model_name:
+            raise RuntimeError(
+                "No claude CLI models configured. "
+                "Add models to claude_cli_config.json."
+            )
+        model_config = get_claude_cli_model_config(model_name)
+        return ClaudeCliEngine(model_name, model_config)
 
     from core.engine_transformers import TransformersEngine
     return TransformersEngine()

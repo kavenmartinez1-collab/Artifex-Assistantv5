@@ -61,7 +61,7 @@ _config_lock = threading.Lock()
 _active_model = None  # resolved lazily on first call
 
 # ===== BACKEND SWITCHING =====
-_active_backend = "transformers"  # "transformers", "ollama", or "llama_cpp"
+_active_backend = "transformers"  # "transformers", "ollama", "llama_cpp", or "claude_cli"
 
 
 def get_active_backend():
@@ -74,7 +74,7 @@ def set_active_backend(name):
     global _active_backend
     need_refresh = False
     with _config_lock:
-        if name in ("transformers", "ollama", "llama_cpp"):
+        if name in ("transformers", "ollama", "llama_cpp", "claude_cli"):
             _active_backend = name
             need_refresh = (name == "ollama" and not OLLAMA_MODELS)
         else:
@@ -330,6 +330,47 @@ def get_llama_cpp_model_config(model_name: str) -> dict:
     return model_cfg
 
 
+# ===== CLAUDE CLI CONFIGURATION =====
+CLAUDE_CLI_CONFIG_PATH = os.path.join(BASE_DIR, "claude_cli_config.json")
+_claude_cli_config: dict = {}
+_claude_cli_config_mtime: float = 0.0
+
+
+def _load_claude_cli_config():
+    """Load claude CLI config from disk.  Re-reads when file mtime changes."""
+    global _claude_cli_config, _claude_cli_config_mtime
+    if not os.path.isfile(CLAUDE_CLI_CONFIG_PATH):
+        return _claude_cli_config
+    try:
+        mtime = os.path.getmtime(CLAUDE_CLI_CONFIG_PATH)
+        if mtime == _claude_cli_config_mtime and _claude_cli_config:
+            return _claude_cli_config
+        with open(CLAUDE_CLI_CONFIG_PATH, "r", encoding="utf-8") as f:
+            _claude_cli_config = json.load(f)
+        _claude_cli_config_mtime = mtime
+    except (json.JSONDecodeError, OSError):
+        _claude_cli_config = {}
+    return _claude_cli_config
+
+
+def get_claude_cli_models() -> dict:
+    """Get available claude CLI models from config. Returns {name: config_dict}."""
+    cfg = _load_claude_cli_config()
+    return cfg.get("models", {})
+
+
+def get_claude_cli_model_config(model_name: str) -> dict:
+    """Get config for a specific claude CLI model. Merges global cli_path default."""
+    cfg = _load_claude_cli_config()
+    models = cfg.get("models", {})
+    if model_name not in models:
+        return {}
+    model_cfg = dict(models[model_name])
+    if "cli_path" not in model_cfg and "cli_path" in cfg:
+        model_cfg["cli_path"] = cfg["cli_path"]
+    return model_cfg
+
+
 # ===== MODEL SELECTION (all backends) =====
 
 def get_active_model_path():
@@ -370,6 +411,17 @@ def set_active_model(name):
                 sorted(get_llama_cpp_models().keys()),
             )
             return False
+        if _active_backend == "claude_cli":
+            if name in get_claude_cli_models():
+                _active_model = name
+                return True
+            _log.warning(
+                "set_active_model(%r) ignored — not in claude_cli_config.json. "
+                "Active model unchanged (%r). Available: %s",
+                name, _active_model,
+                sorted(get_claude_cli_models().keys()),
+            )
+            return False
         if name in MODELS:
             _active_model = MODELS[name]
             return True
@@ -387,6 +439,8 @@ def get_active_model_name():
         return get_active_ollama_model()
     if _active_backend == "llama_cpp":
         return get_active_llama_cpp_model()
+    if _active_backend == "claude_cli":
+        return get_active_claude_cli_model()
     path = get_active_model_path()
     for name, p in MODELS.items():
         if p == path:
@@ -411,6 +465,17 @@ def get_active_llama_cpp_model():
     """Get the active llama.cpp model name."""
     global _active_model
     models = get_llama_cpp_models()
+    if _active_model and _active_model in models:
+        return _active_model
+    if models:
+        return next(iter(models.keys()))
+    return None
+
+
+def get_active_claude_cli_model():
+    """Get the active claude CLI model name."""
+    global _active_model
+    models = get_claude_cli_models()
     if _active_model and _active_model in models:
         return _active_model
     if models:

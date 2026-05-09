@@ -125,7 +125,7 @@ class ChatCompletionRequest(BaseModel):
     web_tools: Optional[bool] = False
     grammar: Optional[str] = Field(None, description="GBNF grammar string for constrained generation (llama.cpp only)")
     response_format: Optional[dict] = Field(None, description="Response format constraint, e.g. {\"type\": \"json_object\"} or {\"type\": \"json_schema\", \"json_schema\": {...}}")
-    backend: Optional[Literal["ollama", "transformers", "llama_cpp"]] = Field(
+    backend: Optional[Literal["ollama", "transformers", "llama_cpp", "claude_cli"]] = Field(
         None,
         description=(
             "Backend override for this single request. When set, the model "
@@ -377,21 +377,24 @@ def _is_auto_sentinel(name) -> bool:
 def _infer_backend_from_model(name) -> str | None:
     """Look up which backend hosts a given model name.
 
-    Returns the backend id ("ollama", "llama_cpp", "transformers") if the
-    name matches an installed/configured model, else None. Sentinel names
-    return None — let the caller fall back to the active backend.
+    Returns the backend id ("ollama", "llama_cpp", "claude_cli",
+    "transformers") if the name matches an installed/configured model,
+    else None. Sentinel names return None — let the caller fall back to
+    the active backend.
 
-    Probe order is "cheapest first, most-likely first": Ollama's tag list
-    is an in-memory dict, llama.cpp is a small JSON config, and the
-    transformers MODELS map is also in memory. If a name appears under
-    multiple backends, the first hit wins (Ollama → llama.cpp → transformers).
-    Callers wanting a specific backend should set request.backend explicitly.
+    Probe order is "cheapest first, most-likely first": Ollama's tag
+    list is an in-memory dict, llama.cpp/claude_cli are small JSON
+    configs, and the transformers MODELS map is also in memory.  If a
+    name appears under multiple backends the first hit wins (Ollama →
+    llama.cpp → claude_cli → transformers).  Callers wanting a specific
+    backend should set request.backend explicitly.
     """
     if _is_auto_sentinel(name):
         return None
 
     from core.config import (
-        MODELS, OLLAMA_MODELS, get_llama_cpp_models, refresh_ollama_models,
+        MODELS, OLLAMA_MODELS, get_llama_cpp_models, get_claude_cli_models,
+        refresh_ollama_models,
     )
 
     if name in OLLAMA_MODELS:
@@ -404,6 +407,9 @@ def _infer_backend_from_model(name) -> str | None:
 
     if name in get_llama_cpp_models():
         return "llama_cpp"
+
+    if name in get_claude_cli_models():
+        return "claude_cli"
 
     if name in MODELS:
         return "transformers"
@@ -552,6 +558,20 @@ def _resolve_model_for_request(requested, has_images: bool, backend: str) -> str
             detail=(
                 f"Model '{requested}' not in llama.cpp config. "
                 f"Available: {', '.join(available) if available else '(none — add models to llama_cpp_config.json)'}."
+            ),
+        )
+
+    if backend == "claude_cli":
+        from core.config import get_claude_cli_models
+        ccli_models = get_claude_cli_models()
+        if requested in ccli_models:
+            return requested
+        available = sorted(ccli_models.keys())
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{requested}' not in claude_cli_config.json. "
+                f"Available: {', '.join(available) if available else '(none — add models to claude_cli_config.json)'}."
             ),
         )
 
@@ -1220,6 +1240,16 @@ def create_app():
         active_model = get_active_model_name()
         active_backend = get_active_backend()
 
+        def _x_active(m):
+            # claude_cli has no GPU-loaded concept; every invocation is a
+            # fresh subprocess.  Map x_active to "the CLI is installed +
+            # OAuth authenticated" so clients can see availability of all
+            # configured claude models simultaneously instead of just the
+            # one most recently invoked.
+            if m["backend"] == "claude_cli":
+                return bool(m.get("claude_cli_authed"))
+            return m["id"] == active_model and m["backend"] == active_backend
+
         data = [
             {
                 "id": m["id"],
@@ -1246,7 +1276,7 @@ def create_app():
                 # config; clients pick their own per-family heuristic.
                 "x_image_token_cost_per_megapixel":
                     m.get("image_token_cost_per_megapixel"),
-                "x_active": (m["id"] == active_model and m["backend"] == active_backend),
+                "x_active": _x_active(m),
             }
             for m in models
         ]
@@ -1457,7 +1487,7 @@ def create_app():
                     "completion_tokens": completion_tokens,
                     "total_tokens": prompt_tokens + completion_tokens,
                 },
-                "x_backend": "transformers",
+                "x_backend": backend,
             }
 
     # ─── Image Generation ────────────────────────────────────────────────
