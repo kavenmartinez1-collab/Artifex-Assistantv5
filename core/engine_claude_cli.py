@@ -22,7 +22,6 @@ serialization automatically.
 import logging
 import os
 import subprocess
-import sys
 import tempfile
 import time
 
@@ -31,7 +30,12 @@ from core.engine_base import BaseEngine
 _log = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = float(os.environ.get("CLAUDE_CLI_TIMEOUT", "1800"))
-DEFAULT_BIN = "claude.cmd" if sys.platform == "win32" else "claude"
+# Bare "claude" works on every platform — Windows installs claude.exe to
+# %USERPROFILE%\.local\bin and Python's subprocess on Windows resolves
+# unsuffixed names via PATHEXT.  An earlier draft defaulted to
+# "claude.cmd" on Windows, which was wrong (no such file exists in the
+# npm-installed layout).
+DEFAULT_BIN = "claude"
 AUTH_PROBE_CACHE_S = 60.0
 
 
