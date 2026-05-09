@@ -9,6 +9,16 @@ from abc import ABC, abstractmethod
 class BaseEngine(ABC):
     """Unified engine interface for model loading and streaming generation."""
 
+    # When True, the stream is assumed to begin *inside* a thinking
+    # block — the api server's ThinkFilter routes everything to
+    # on_thinking until it sees `</think>`, then flips to on_response.
+    # Right for transformers running Qwen3.5 (chat template pre-fills
+    # `<think>` before generation), wrong for engines that emit plain
+    # assistant text with no thinking markers (claude_cli) or that
+    # emit explicit `<think>...</think>` tags inline (llama.cpp).
+    # Subclasses override.
+    stream_starts_in_think: bool = True
+
     @abstractmethod
     def load(self, status_callback=None):
         """Load the model / verify backend is ready."""

@@ -81,6 +81,14 @@ class ClaudeCliEngine(BaseEngine):
     CLI pick" (no `--model` arg passed).
     """
 
+    # The CLI emits plain assistant text — no `<think>...</think>`
+    # markers — so the stream begins outside any thinking block.
+    # The default True (legacy transformers behavior) would otherwise
+    # route the entire response into on_thinking and emerge as
+    # delta.x_thinking on the SSE wire, which upstream-client's stream parser
+    # silently drops.
+    stream_starts_in_think = False
+
     def __init__(self, model_name: str, model_config: dict | None = None):
         self.model_name = model_name
         cfg = model_config or {}

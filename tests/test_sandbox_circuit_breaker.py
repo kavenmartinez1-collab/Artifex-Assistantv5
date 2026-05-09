@@ -144,11 +144,15 @@ class TestCooldown(unittest.TestCase):
     """Auto-reset after cooldown."""
 
     def test_auto_reset_after_cooldown(self):
-        cb = CircuitBreaker(BreakerConfig(cooldown_seconds=0.01))
+        # 10ms cooldown / 20ms sleep was tighter than Windows'
+        # time.sleep precision (~15ms scheduler quantum), so this test
+        # tripped ~20% of runs in isolation.  100ms / 200ms gives
+        # comfortable headroom on every supported platform.
+        cb = CircuitBreaker(BreakerConfig(cooldown_seconds=0.1))
         cb.trip("test")
         self.assertTrue(cb.is_tripped)
         import time
-        time.sleep(0.02)
+        time.sleep(0.2)
         self.assertFalse(cb.is_tripped)
 
 

@@ -855,6 +855,7 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
     tf = ThinkFilter(
         on_response=lambda t: out_queue.put(("content", t)),
         on_thinking=lambda t: out_queue.put(("thinking", t)),
+        starts_in_think=getattr(engine, "stream_starts_in_think", True),
     )
 
     full_text = ""

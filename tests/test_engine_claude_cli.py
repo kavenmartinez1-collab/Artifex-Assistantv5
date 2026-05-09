@@ -135,6 +135,16 @@ class TestEngineLifecycle(unittest.TestCase):
         )
         self.assertEqual(engine.get_context_size(), 200000)
 
+    def test_stream_starts_in_think_is_false(self):
+        """Regression: the SSE streaming layer reads this attribute to
+        decide whether to seed ThinkFilter as in-thinking.  Claude CLI
+        emits plain assistant text with no </think> marker — defaulting
+        to True (transformers behavior) routes the whole response into
+        delta.x_thinking instead of delta.content."""
+        from core.engine_claude_cli import ClaudeCliEngine
+        engine = ClaudeCliEngine("claude-sonnet-4-6")
+        self.assertFalse(engine.stream_starts_in_think)
+
 
 class TestEngineGeneration(unittest.TestCase):
     """Subprocess invocation: list args, no shell, ANTHROPIC_API_KEY stripped."""
