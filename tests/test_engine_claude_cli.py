@@ -241,6 +241,33 @@ class TestEngineGeneration(unittest.TestCase):
                     max_tokens=100, temperature=0.7,
                 )
 
+    def test_web_tools_translates_to_allowed_tools(self):
+        """web_tools=True must add `--allowedTools WebSearch,WebFetch`
+        so claude CLI uses Anthropic-native tool execution."""
+        engine = self._make_engine()
+        fake_proc = MagicMock(returncode=0, stdout=b"x", stderr=b"")
+        with patch("subprocess.run", return_value=fake_proc) as mock_run:
+            engine.generate_streaming(
+                [{"role": "user", "content": "research X"}],
+                max_tokens=100, temperature=0.7,
+                web_tools=True,
+            )
+        cmd = mock_run.call_args.args[0]
+        self.assertIn("--allowedTools", cmd)
+        idx = cmd.index("--allowedTools")
+        self.assertEqual(cmd[idx + 1], "WebSearch,WebFetch")
+
+    def test_no_web_tools_omits_allowed_tools(self):
+        engine = self._make_engine()
+        fake_proc = MagicMock(returncode=0, stdout=b"x", stderr=b"")
+        with patch("subprocess.run", return_value=fake_proc) as mock_run:
+            engine.generate_streaming(
+                [{"role": "user", "content": "hi"}],
+                max_tokens=100, temperature=0.7,
+            )
+        cmd = mock_run.call_args.args[0]
+        self.assertNotIn("--allowedTools", cmd)
+
     def test_on_token_emits_full_response_as_single_chunk(self):
         """Non-streaming CLI invocation; emit the whole response as one
         token chunk so streaming-interface callers still receive it."""

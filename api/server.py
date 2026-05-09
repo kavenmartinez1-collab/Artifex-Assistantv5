@@ -840,11 +840,17 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
 def _stream_transformers_raw(engine, messages, max_tokens, temperature,
                              out_queue: queue.Queue,
                              grammar=None, response_format=None,
-                             enable_thinking=True):
-    """Stream from Transformers/llama.cpp engine into a queue. Runs in a background thread.
+                             enable_thinking=True,
+                             web_tools=False):
+    """Stream from Transformers/llama.cpp/claude_cli engine into a queue.
+    Runs in a background thread.
 
     Uses ThinkFilter to separate thinking from response content.
     Pushes same tuple format as _stream_ollama_raw.
+
+    web_tools forwards to engines that have native tool support
+    (claude_cli → --allowedTools).  Engines without it accept and
+    ignore the flag.
     """
     tf = ThinkFilter(
         on_response=lambda t: out_queue.put(("content", t)),
@@ -864,6 +870,7 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
             grammar=grammar, response_format=response_format,
             raw_output=True,
             enable_thinking=enable_thinking,
+            web_tools=web_tools,
         )
         tf.flush()
 
@@ -965,12 +972,12 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                 daemon=True,
             )
         else:
-            # Both transformers and llama_cpp use BaseEngine.generate_streaming
+            # Transformers / llama_cpp / claude_cli — all use BaseEngine.generate_streaming
             engine = _get_engine()
             thread = threading.Thread(
                 target=_stream_transformers_raw,
                 args=(engine, current_messages, max_tokens, temperature, q,
-                      grammar, response_format, enable_thinking),
+                      grammar, response_format, enable_thinking, use_web_tools),
                 daemon=True,
             )
 
@@ -1460,6 +1467,7 @@ def create_app():
                     response_format=body.response_format,
                     raw_output=True,
                     enable_thinking=enable_thinking,
+                    web_tools=use_web_tools,
                 ),
             )
             response = response or ""

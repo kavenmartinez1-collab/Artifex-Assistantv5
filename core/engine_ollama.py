@@ -163,8 +163,13 @@ class OllamaEngine(BaseEngine):
                            on_token=None, on_complete=None,
                            enable_thinking=True,
                            grammar=None, response_format=None,
-                           raw_output=False) -> str:
-        """Stream a response from the Ollama /api/chat endpoint (localhost only)."""
+                           raw_output=False,
+                           web_tools=False) -> str:
+        """Stream a response from the Ollama /api/chat endpoint (localhost only).
+
+        web_tools is accepted-and-ignored — Ollama models use the
+        @search/@web_read post-processor in api/server.py for tools.
+        """
         self.load()
 
         from core.config import get_ollama_model_config

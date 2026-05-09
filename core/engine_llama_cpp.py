@@ -628,11 +628,16 @@ class LlamaCppEngine(BaseEngine):
                            on_token=None, on_complete=None,
                            enable_thinking=True,
                            grammar=None, response_format=None,
-                           raw_output=False) -> str:
+                           raw_output=False,
+                           web_tools=False) -> str:
         """Stream from llama-server's OpenAI-compatible /v1/chat/completions.
 
         Thinking is handled via <think> tags in the content stream (same as
         Transformers path).  The server-side streaming layer applies ThinkFilter.
+
+        web_tools is accepted-and-ignored — local llama.cpp models don't
+        have native tool execution; Artifex's @search/@web_read
+        post-processor in api/server.py handles tools for this backend.
         """
         self.load()
         self._last_gen_stats = {}

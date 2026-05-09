@@ -160,7 +160,8 @@ class ClaudeCliEngine(BaseEngine):
                            on_token=None, on_complete=None,
                            enable_thinking=True,
                            grammar=None, response_format=None,
-                           raw_output=False) -> str:
+                           raw_output=False,
+                           web_tools=False) -> str:
         """Run inference via the claude CLI.
 
         The CLI doesn't expose sampling controls (temperature,
@@ -176,6 +177,12 @@ class ClaudeCliEngine(BaseEngine):
         `--output-format stream-json` mapping yet).  When `on_token`
         is provided, the full response is emitted as a single chunk so
         the streaming-interface caller still gets it.
+
+        web_tools: when True, passes `--allowedTools WebSearch,WebFetch`
+        so the CLI uses Anthropic-native tool execution.  Unlike the
+        other backends — which get web tools via the @search/@web_read
+        post-processor wrapper in api/server.py — claude executes the
+        tools internally and returns the final synthesized response.
         """
         self.load()
         self._last_gen_stats = {}
@@ -185,6 +192,8 @@ class ClaudeCliEngine(BaseEngine):
         cmd: list[str] = [self._cli_path, "--print"]
         if self.model_name and self.model_name != "claude-code":
             cmd.extend(["--model", self.model_name])
+        if web_tools:
+            cmd.extend(["--allowedTools", "WebSearch,WebFetch"])
 
         sys_tempfile: str | None = None
         try:

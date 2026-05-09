@@ -41,7 +41,8 @@ class BaseEngine(ABC):
     def generate_streaming(self, messages, max_tokens, temperature,
                            on_token=None, on_complete=None,
                            enable_thinking=True,
-                           grammar=None, response_format=None) -> str:
+                           grammar=None, response_format=None,
+                           web_tools=False) -> str:
         """Run streaming inference.
 
         Args:
@@ -54,6 +55,14 @@ class BaseEngine(ABC):
             grammar: GBNF grammar string for constrained output (llama.cpp)
             response_format: dict like {"type": "json_object"} or
                 {"type": "json_schema", "json_schema": {...}}
+            web_tools: if True, the engine should ask the underlying
+                model to use any natively-supported web search /
+                fetch tools.  Backends without native tool support
+                (llama.cpp, ollama, transformers — they get web tools
+                via the @search/@web_read post-processor wrapper in
+                api/server.py instead) should accept and ignore the
+                flag.  claude_cli maps it to `--allowedTools
+                WebSearch,WebFetch`.
 
         Returns:
             The final response string (thinking stripped).

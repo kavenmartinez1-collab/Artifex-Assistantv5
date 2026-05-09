@@ -1138,8 +1138,13 @@ class TransformersEngine(BaseEngine):
                            on_token=None, on_complete=None,
                            enable_thinking=True,
                            grammar=None, response_format=None,
-                           raw_output=False) -> str:
-        """Run streaming inference on the local transformers model."""
+                           raw_output=False,
+                           web_tools=False) -> str:
+        """Run streaming inference on the local transformers model.
+
+        web_tools is accepted-and-ignored — transformers models use the
+        @search/@web_read post-processor in api/server.py for tools.
+        """
         self.load()
 
         tokenizer = self.tokenizer
