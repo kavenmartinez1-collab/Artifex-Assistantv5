@@ -643,14 +643,6 @@ class LlamaCppEngine(BaseEngine):
         self._last_gen_stats = {}
 
         req_messages = list(messages)
-        if not enable_thinking and req_messages:
-            if req_messages[0].get("role") == "system":
-                content = req_messages[0].get("content", "")
-                if "/no_think" not in content:
-                    req_messages[0] = dict(req_messages[0])
-                    req_messages[0]["content"] = "/no_think\n" + content
-            else:
-                req_messages.insert(0, {"role": "system", "content": "/no_think"})
 
         payload = {
             "model": self.model_name,
@@ -660,6 +652,12 @@ class LlamaCppEngine(BaseEngine):
             "cache_prompt": True,
         }
         if not enable_thinking:
+            # Qwen3.x chat templates gate the think block on an
+            # `enable_thinking` template variable — not a `/no_think` text
+            # directive. Pass it via chat_template_kwargs so the model
+            # actually skips the block instead of thinking anyway and
+            # leaking raw <think>...</think> into the response.
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
             payload["reasoning_format"] = "none"
         if max_tokens and max_tokens > 0:
             payload["max_tokens"] = max_tokens

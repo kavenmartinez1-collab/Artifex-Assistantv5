@@ -124,7 +124,7 @@ class TestGrammarPayload(unittest.TestCase):
 
 
 class TestEnableThinking(unittest.TestCase):
-    """P1-T9: enable_thinking=False injects /no_think into system message."""
+    """enable_thinking=False is passed to llama-server via chat_template_kwargs."""
 
     def _make_engine(self):
         from core.engine_llama_cpp import LlamaCppEngine
@@ -135,7 +135,7 @@ class TestEnableThinking(unittest.TestCase):
         return engine
 
     @patch("core.engine_llama_cpp.urllib.request.urlopen")
-    def test_thinking_disabled_injects_no_think(self, mock_urlopen):
+    def test_thinking_disabled_sets_chat_template_kwargs(self, mock_urlopen):
         engine = self._make_engine()
         mock_resp = MagicMock()
         mock_resp.__enter__ = MagicMock(return_value=mock_resp)
@@ -155,10 +155,14 @@ class TestEnableThinking(unittest.TestCase):
         call_args = mock_urlopen.call_args
         req = call_args[0][0]
         body = json.loads(req.data.decode())
-        self.assertTrue(body["messages"][0]["content"].startswith("/no_think"))
+        # enable_thinking goes through chat_template_kwargs, not a /no_think
+        # text injection — the system message must be left untouched.
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(body["reasoning_format"], "none")
+        self.assertEqual(body["messages"][0]["content"], "Be helpful.")
 
     @patch("core.engine_llama_cpp.urllib.request.urlopen")
-    def test_thinking_disabled_without_system_message(self, mock_urlopen):
+    def test_thinking_disabled_does_not_inject_system_message(self, mock_urlopen):
         engine = self._make_engine()
         mock_resp = MagicMock()
         mock_resp.__enter__ = MagicMock(return_value=mock_resp)
@@ -178,8 +182,10 @@ class TestEnableThinking(unittest.TestCase):
         call_args = mock_urlopen.call_args
         req = call_args[0][0]
         body = json.loads(req.data.decode())
-        self.assertEqual(body["messages"][0]["role"], "system")
-        self.assertEqual(body["messages"][0]["content"], "/no_think")
+        # No synthetic system message — the user message stays first.
+        self.assertEqual(body["messages"][0]["role"], "user")
+        self.assertEqual(body["messages"][0]["content"], "hi")
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
 
     @patch("core.engine_llama_cpp.urllib.request.urlopen")
     def test_thinking_enabled_no_injection(self, mock_urlopen):
@@ -202,7 +208,10 @@ class TestEnableThinking(unittest.TestCase):
         call_args = mock_urlopen.call_args
         req = call_args[0][0]
         body = json.loads(req.data.decode())
+        # Thinking enabled: no chat_template_kwargs, no reasoning_format override.
         self.assertEqual(body["messages"][0]["content"], "Be helpful.")
+        self.assertNotIn("chat_template_kwargs", body)
+        self.assertNotIn("reasoning_format", body)
 
     @patch("core.engine_llama_cpp.urllib.request.urlopen")
     def test_reasoning_content_wrapped_in_think_tags(self, mock_urlopen):
