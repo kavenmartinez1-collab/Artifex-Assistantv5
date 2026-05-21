@@ -38,14 +38,60 @@ _WEB_READ_PATTERN = re.compile(
     r'@web_read\(\s*["\u201c\u201d]?([^"\u201c\u201d)]+)["\u201c\u201d]?\s*\)'
 )
 
+# Native function-calling format emitted by Qwen3.x and similar models:
+#   <tool_call>{"name": "search", "arguments": {"query": "..."}}</tool_call>
+# When llama-server is launched with --jinja, the model's own chat template
+# trains it to emit tool calls as this JSON envelope rather than the @marker
+# syntax. Parse it so a model that reverts to its native format still
+# triggers tool execution.
+_TOOL_CALL_PATTERN = re.compile(
+    r'<tool_call>\s*(\{.*?\})\s*</tool_call>',
+    re.DOTALL,
+)
+
+
+def _extract_native_tool_calls(text: str) -> list[dict]:
+    """Extract <tool_call>{...}</tool_call> JSON calls for search / web_read.
+
+    Tolerates the naming a model picks for arguments (query/q, url/ref/n).
+    Non-web tools are ignored here \u2014 only @search/@web_read run in the API.
+    """
+    tools = []
+    for m in _TOOL_CALL_PATTERN.finditer(text):
+        try:
+            call = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        name = str(call.get("name", "")).lower()
+        args = call.get("arguments", {})
+        if not isinstance(args, dict):
+            continue
+        if name in ("search", "web_search", "websearch"):
+            query = args.get("query") or args.get("q") or args.get("text")
+            if query:
+                tools.append({"type": "search", "query": str(query),
+                              "raw": m.group(0)})
+        elif name in ("web_read", "webread", "fetch", "read_url", "open_url"):
+            ref = (args.get("url") or args.get("ref")
+                   or args.get("n") or args.get("index"))
+            if ref is not None:
+                tools.append({"type": "web_read", "ref": str(ref).strip(),
+                              "raw": m.group(0)})
+    return tools
+
 
 def extract_web_tools(text: str) -> list[dict]:
-    """Extract @search and @web_read tool calls from model response text."""
+    """Extract @search and @web_read tool calls from model response text.
+
+    Recognizes both the @marker syntax and the native <tool_call> JSON
+    envelope that Qwen3.x and other function-calling models emit.
+    """
     tools = []
     for m in _SEARCH_PATTERN.finditer(text):
         tools.append({"type": "search", "query": m.group(1), "raw": m.group(0)})
     for m in _WEB_READ_PATTERN.finditer(text):
         tools.append({"type": "web_read", "ref": m.group(1).strip(), "raw": m.group(0)})
+    tools.extend(_extract_native_tool_calls(text))
     return tools
 
 
