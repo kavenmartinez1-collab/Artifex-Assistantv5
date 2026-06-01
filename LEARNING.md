@@ -443,9 +443,9 @@ Key flags for speculative decoding in llama-server:
 -md /path/to/draft.gguf   # draft model
 -ngld 99                   # GPU layers for draft
 -cd 4096                   # draft context size
---draft-max 16             # max speculative tokens per batch
---draft-min 4              # min before checking acceptance
---draft-p-min 0.5          # acceptance probability threshold
+--spec-draft-n-max 16      # max speculative tokens per batch
+--spec-draft-n-min 4       # min before checking acceptance
+--spec-draft-p-min 0.5     # acceptance probability threshold
 ```
 
 Observed throughput on RTX 4090: 43 tok/s mean, 67 tok/s peak (8K context, Q4_K_M target + Q4_K_M draft).

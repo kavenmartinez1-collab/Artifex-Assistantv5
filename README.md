@@ -695,8 +695,8 @@ The engine starts `llama-server` on the configured port, waits for it to become 
 | `-md <path>` | Speculative decoding draft model GGUF (must share the same vocabulary) |
 | `-ngld <n>` | GPU layers for draft model (99 = all) |
 | `-cd <n>` | Draft model context size |
-| `--draft-max <n>` | Max draft tokens per speculative batch |
-| `--draft-min <n>` / `--draft-p-min <f>` | Min draft tokens / min acceptance probability |
+| `--spec-draft-n-max <n>` | Max draft tokens per speculative batch |
+| `--spec-draft-n-min <n>` / `--spec-draft-p-min <f>` | Min draft tokens / min acceptance probability |
 | `--mmproj <path>` | Vision projector GGUF for multimodal (VL) models |
 | `--swa-full` | Use full-size SWA cache — required for hybrid models (Qwen3.6) to avoid recurrent state desync |
 
