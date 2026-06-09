@@ -71,16 +71,51 @@ Path(QUARANTINE_DIR).mkdir(parents=True, exist_ok=True)
 # Shared HTTP client
 _client: Optional[httpx.AsyncClient] = None
 
+# Maximum redirect hops safe_request will follow. Each hop is re-validated
+# with sanitize_url before the request is sent.
+MAX_REDIRECTS = 5
+
 
 async def get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
-            follow_redirects=True,
-            max_redirects=5,
+            # Redirects are never followed automatically: an automatic follow
+            # would skip SSRF validation on the Location target. External
+            # fetches go through safe_request, which validates every hop.
+            follow_redirects=False,
             headers={"User-Agent": "Artifex-WebGateway/1.0 (AI research assistant)"},
         )
     return _client
+
+
+async def safe_request(
+    method: str,
+    url: str,
+    *,
+    timeout: float,
+    stream: bool = False,
+) -> httpx.Response:
+    """Issue a request, validating the URL and every redirect hop against SSRF rules.
+
+    Raises HTTPException(403) if any hop is blocked, HTTPException(502) if the
+    redirect chain exceeds MAX_REDIRECTS. When stream=True the caller must
+    close the returned response.
+    """
+    client = await get_client()
+    for _ in range(MAX_REDIRECTS + 1):
+        is_safe, reason = sanitize_url(url)
+        if not is_safe:
+            raise HTTPException(403, f"URL blocked: {reason}")
+        request = client.build_request(method, url, timeout=timeout)
+        resp = await client.send(request, stream=stream, follow_redirects=False)
+        if resp.is_redirect:
+            next_url = str(resp.url.join(resp.headers["location"]))
+            await resp.aclose()
+            url = next_url
+            continue
+        return resp
+    raise HTTPException(502, f"Too many redirects (max {MAX_REDIRECTS})")
 
 
 @app.on_event("shutdown")
@@ -203,16 +238,12 @@ async def fetch(req: FetchRequest, request: Request):
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    # URL safety check
-    is_safe, reason = sanitize_url(url)
-    if not is_safe:
-        raise HTTPException(403, f"URL blocked: {reason}")
-
-    # Fetch page
+    # Fetch page — safe_request validates the URL and every redirect hop
     try:
-        client = await get_client()
-        resp = await client.get(url, timeout=FETCH_TIMEOUT)
+        resp = await safe_request("GET", url, timeout=FETCH_TIMEOUT)
         resp.raise_for_status()
+    except HTTPException:
+        raise
     except httpx.TimeoutException:
         raise HTTPException(504, f"Fetch timed out after {FETCH_TIMEOUT}s")
     except httpx.HTTPStatusError as e:
@@ -271,11 +302,6 @@ async def download(req: DownloadRequest, request: Request):
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    # URL safety check
-    is_safe, reason = sanitize_url(url)
-    if not is_safe:
-        raise HTTPException(403, f"URL blocked: {reason}")
-
     # Determine filename
     if req.filename:
         filename = os.path.basename(req.filename)
@@ -310,8 +336,9 @@ async def download(req: DownloadRequest, request: Request):
     quarantine_path = os.path.join(QUARANTINE_DIR, f"{quarantine_id}_{filename}")
 
     try:
-        client = await get_client()
-        async with client.stream("GET", url, timeout=DOWNLOAD_TIMEOUT) as resp:
+        # safe_request validates the URL and every redirect hop
+        resp = await safe_request("GET", url, timeout=DOWNLOAD_TIMEOUT, stream=True)
+        try:
             resp.raise_for_status()
             total = 0
             with open(quarantine_path, "wb") as f:
@@ -323,7 +350,9 @@ async def download(req: DownloadRequest, request: Request):
                         raise HTTPException(413, f"File too large (>{MAX_DOWNLOAD_BYTES // (1024*1024)} MB)")
                     f.write(chunk)
 
-        content_type = resp.headers.get("content-type", "unknown")
+            content_type = resp.headers.get("content-type", "unknown")
+        finally:
+            await resp.aclose()
 
     except httpx.TimeoutException:
         if os.path.exists(quarantine_path):

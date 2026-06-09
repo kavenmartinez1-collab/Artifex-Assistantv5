@@ -136,3 +136,125 @@ class TestSanitizeUrlSsrfBypasses:
     def test_file_scheme_rejected(self):
         safe, reason = sanitize_url("file:///etc/passwd")
         assert not safe
+
+
+class TestSafeRequestRedirects:
+    """safe_request must re-validate every redirect hop, not just the first URL.
+
+    Uses unresolvable .test hostnames so _resolves_to_private passes them
+    through without real DNS, while blocked hosts/IPs are caught by the
+    static rules — no network access needed.
+    """
+
+    @pytest.fixture()
+    def gateway_main(self, tmp_path, monkeypatch):
+        import importlib.util
+
+        monkeypatch.setenv("QUARANTINE_DIR", str(tmp_path / "quarantine"))
+        # Reimport config so it picks up the env var; load the gateway's
+        # main.py by explicit path (the repo root also has a main.py).
+        sys.modules.pop("config", None)
+        spec = importlib.util.spec_from_file_location(
+            "gateway_main", os.path.join(_gateway_dir, "main.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        yield module
+        sys.modules.pop("config", None)
+
+    def _run(self, gateway_main, handler, method="GET", url="http://start.test/"):
+        import asyncio
+        import socket
+        import httpx
+
+        async def go():
+            client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler), follow_redirects=False
+            )
+            gateway_main._client = client
+            try:
+                return await gateway_main.safe_request(method, url, timeout=5)
+            finally:
+                await client.aclose()
+
+        # No real DNS: .test hosts are unresolvable (pass-through), blocked
+        # targets are caught by the static host/pattern rules before resolve.
+        with patch("socket.getaddrinfo", side_effect=socket.gaierror("no dns in tests")):
+            return asyncio.run(go())
+
+    def test_redirect_to_private_ip_blocked(self, gateway_main):
+        from fastapi import HTTPException
+        import httpx
+
+        attempted = []
+
+        def handler(request):
+            attempted.append(str(request.url))
+            return httpx.Response(302, headers={"location": "http://169.254.169.254/latest/meta-data/"})
+
+        with pytest.raises(HTTPException) as exc:
+            self._run(gateway_main, handler)
+        assert exc.value.status_code == 403
+        # The private target must never be contacted
+        assert all("169.254.169.254" not in u for u in attempted)
+
+    def test_redirect_to_localhost_blocked(self, gateway_main):
+        from fastapi import HTTPException
+        import httpx
+
+        def handler(request):
+            return httpx.Response(301, headers={"location": "http://localhost/admin"})
+
+        with pytest.raises(HTTPException) as exc:
+            self._run(gateway_main, handler)
+        assert exc.value.status_code == 403
+
+    def test_redirect_to_blocked_scheme_blocked(self, gateway_main):
+        from fastapi import HTTPException
+        import httpx
+
+        def handler(request):
+            return httpx.Response(302, headers={"location": "file:///etc/passwd"})
+
+        with pytest.raises(HTTPException) as exc:
+            self._run(gateway_main, handler)
+        assert exc.value.status_code == 403
+
+    def test_redirect_chain_to_public_followed(self, gateway_main):
+        import httpx
+
+        def handler(request):
+            if request.url.host == "start.test":
+                return httpx.Response(302, headers={"location": "https://final.test/page"})
+            return httpx.Response(200, text="hello")
+
+        resp = self._run(gateway_main, handler)
+        assert resp.status_code == 200
+        assert str(resp.url) == "https://final.test/page"
+
+    def test_relative_redirect_resolved_and_followed(self, gateway_main):
+        import httpx
+
+        def handler(request):
+            if request.url.path == "/":
+                return httpx.Response(302, headers={"location": "/landing"})
+            return httpx.Response(200, text="ok")
+
+        resp = self._run(gateway_main, handler)
+        assert resp.status_code == 200
+        assert resp.url.path == "/landing"
+
+    def test_too_many_redirects_rejected(self, gateway_main):
+        from fastapi import HTTPException
+        import httpx
+
+        count = {"n": 0}
+
+        def handler(request):
+            count["n"] += 1
+            return httpx.Response(302, headers={"location": f"http://hop{count['n']}.test/"})
+
+        with pytest.raises(HTTPException) as exc:
+            self._run(gateway_main, handler)
+        assert exc.value.status_code == 502
+        assert count["n"] == gateway_main.MAX_REDIRECTS + 1
