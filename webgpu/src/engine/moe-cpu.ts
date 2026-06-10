@@ -19,16 +19,23 @@
  * The shared expert and router run on GPU — this backend only computes
  * Σ wᵢ·downᵢ(silu(gateᵢ·x) ⊙ upᵢ(x)) over the selected routed experts.
  *
- * SAB layout (bytes; see sabLayout):
+ * Token batching (C4): a generation carries up to MOE_MAX_TOKENS tokens
+ * (one for decode; a whole prefill chunk otherwise). One SAB round-trip per
+ * layer per CHUNK instead of per token, and workers iterate (token, expert)
+ * pairs expert-major so a strip fetched into cache is reused by every token
+ * that routed to it.
+ *
+ * SAB layout (bytes; see sabLayout; M = MOE_MAX_TOKENS, K = MOE_MAX_K):
  *   ctl Int32[4]      — [0] GEN generation (-1 = shutdown), [1] DONE counter,
  *                       [2] LAYER index, [3] DONE_A phase-A barrier counter
- *   reqCount Int32[1]     — number of routed experts this generation (≤ K)
- *   reqExpert Int32[K]    — GLOBAL expert indices
- *   reqWeight Float32[K]  — routing weights (softmax over top-8)
- *   xq8 bytes             — hidden vector as Q8 act blocks (shared input)
- *   act2 Float32[K×ffnDim] — phase-A exchange: silu(gate)⊙up per expert,
- *                            worker w writes rows [w·ffnDim/NW, …)
- *   out Float32[H]        — routed output; worker w writes [w·H/NW, …)
+ *   nTokens Int32[1]      — tokens this generation (≤ M; 0 for touch)
+ *   reqCount Int32[M]     — routed experts per token (≤ K)
+ *   reqExpert Int32[M×K]  — GLOBAL expert indices, token-major
+ *   reqWeight Float32[M×K] — routing weights (softmax over top-8)
+ *   xq8 M slots           — hidden vectors as Q8 act blocks (shared input)
+ *   act2 Float32[M×K×ffnDim] — phase-A exchange: silu(gate)⊙up, slot
+ *                            (t·K+k); worker w writes rows [w·ffnDim/NW, …)
+ *   out Float32[M×H]      — routed output; worker w writes [t·H + w·H/NW, …)
  *   perf Float32[NW]      — per-worker busy ms for the last generation
  *
  * Protocol invariant: all non-atomic SAB writes happen BEFORE the Atomics
@@ -58,6 +65,11 @@ export function pickMoEWorkerCount(ffnDim: number, hiddenSize: number): number {
 }
 /** Max experts routed per token (top-8) — also worst case on one worker. */
 export const MOE_MAX_K = 8;
+/**
+ * Max tokens per generation. Matches the hybrid PREFILL_CHUNK in generate.ts
+ * (SSM recurrence caps prefill chunks at 16); decode always sends 1.
+ */
+export const MOE_MAX_TOKENS = 16;
 /** block_q8_act: f32 d + 256 int8 q + 8 int16 bsums. */
 export const Q8_BLOCK_BYTES = 276;
 
@@ -70,14 +82,21 @@ export const CTL_DONE_A = 3;
 export const TOUCH_LAYER = -2;
 
 export interface SABLayout {
+  /** Int32[1] — tokens this generation (0 for touch generations). */
+  nTokensOff: number;
+  /** Int32[M] — routed experts per token. */
   reqCountOff: number;
+  /** Int32[M×K] — global expert ids, token-major (slot t·K+k). */
   reqExpertOff: number;
+  /** Float32[M×K] — routing weights, token-major. */
   reqWeightOff: number;
+  /** M consecutive Q8-act slots of xq8Bytes each. */
   xq8Off: number;
+  /** Bytes per Q8-act slot (one hidden vector). */
   xq8Bytes: number;
-  /** Float32[K×ffnDim] — phase-A act2 exchange (silu(gate)⊙up per expert). */
+  /** Float32[M×K×ffnDim] — phase-A act2 exchange (silu(gate)⊙up, slot t·K+k). */
   act2Off: number;
-  /** Float32[H] — routed output, disjoint per-worker row slices. */
+  /** Float32[M×H] — routed output, disjoint per-worker row slices per token. */
   outOff: number;
   /** Float32[NW] — per-worker busy ms for the last generation (perf probe). */
   perfOff: number;
@@ -86,17 +105,19 @@ export interface SABLayout {
 
 export function sabLayout(numWorkers: number, hiddenSize: number, ffnDim: number): SABLayout {
   const K = MOE_MAX_K;
-  const reqCountOff = 16; // after ctl Int32[4]
-  const reqExpertOff = reqCountOff + 4;
-  const reqWeightOff = reqExpertOff + K * 4;
-  const xq8Off = reqWeightOff + K * 4;
+  const M = MOE_MAX_TOKENS;
+  const nTokensOff = 16; // after ctl Int32[4]
+  const reqCountOff = nTokensOff + 4;
+  const reqExpertOff = reqCountOff + M * 4;
+  const reqWeightOff = reqExpertOff + M * K * 4;
+  const xq8Off = reqWeightOff + M * K * 4;
   const xq8Bytes = (hiddenSize / 256) * Q8_BLOCK_BYTES;
-  let act2Off = xq8Off + xq8Bytes;
+  let act2Off = xq8Off + M * xq8Bytes;
   act2Off = act2Off + ((16 - (act2Off % 16)) % 16);
-  const outOff = act2Off + K * ffnDim * 4;
-  const perfOff = outOff + hiddenSize * 4;
+  const outOff = act2Off + M * K * ffnDim * 4;
+  const perfOff = outOff + M * hiddenSize * 4;
   const totalBytes = perfOff + numWorkers * 4;
-  return { reqCountOff, reqExpertOff, reqWeightOff, xq8Off, xq8Bytes, act2Off, outOff, perfOff, totalBytes };
+  return { nTokensOff, reqCountOff, reqExpertOff, reqWeightOff, xq8Off, xq8Bytes, act2Off, outOff, perfOff, totalBytes };
 }
 
 export interface ExpertSlabDesc {
@@ -160,6 +181,11 @@ export function topKSoftmax(logits: Float32Array, k: number): { ids: Int32Array;
 
 // ── Backend ────────────────────────────────────────────────────────────
 
+export interface MoERoute {
+  ids: Int32Array | number[];
+  weights: Float32Array | number[];
+}
+
 export interface MoEBackend {
   /**
    * Weighted routed-expert FFN for one token:
@@ -170,6 +196,18 @@ export interface MoEBackend {
     hidden: Float32Array,
     expertIds: Int32Array | number[],
     weights: Float32Array | number[],
+  ): Promise<Float32Array>;
+  /**
+   * Token-batched variant (prefill chunks): hidden is token-major
+   * [routes.length × hiddenSize]; returns the routed outputs in the same
+   * layout. One worker generation for the whole chunk — workers iterate
+   * (token, expert) pairs expert-major for strip cache reuse.
+   * routes.length ≤ MOE_MAX_TOKENS.
+   */
+  computeExpertsBatch(
+    layer: number,
+    hidden: Float32Array,
+    routes: MoERoute[],
   ): Promise<Float32Array>;
   /**
    * Warm-up / paging probe: workers [waveStart, waveStart+waveCount) stream
@@ -312,11 +350,12 @@ export async function createMoECPUBackend(opts: MoEBackendOpts): Promise<MoEBack
   const layout = sabLayout(numWorkers, hiddenSize, ffnDim);
   const sab = new SharedArrayBuffer(layout.totalBytes);
   const ctl = new Int32Array(sab, 0, 4);
-  const reqCount = new Int32Array(sab, layout.reqCountOff, 1);
-  const reqExpert = new Int32Array(sab, layout.reqExpertOff, MOE_MAX_K);
-  const reqWeight = new Float32Array(sab, layout.reqWeightOff, MOE_MAX_K);
-  const xq8 = new Uint8Array(sab, layout.xq8Off, layout.xq8Bytes);
-  const out = new Float32Array(sab, layout.outOff, hiddenSize);
+  const nTokens = new Int32Array(sab, layout.nTokensOff, 1);
+  const reqCount = new Int32Array(sab, layout.reqCountOff, MOE_MAX_TOKENS);
+  const reqExpert = new Int32Array(sab, layout.reqExpertOff, MOE_MAX_TOKENS * MOE_MAX_K);
+  const reqWeight = new Float32Array(sab, layout.reqWeightOff, MOE_MAX_TOKENS * MOE_MAX_K);
+  const xq8 = new Uint8Array(sab, layout.xq8Off, MOE_MAX_TOKENS * layout.xq8Bytes);
+  const out = new Float32Array(sab, layout.outOff, MOE_MAX_TOKENS * hiddenSize);
   const perfBusy = new Float32Array(sab, layout.perfOff, numWorkers);
 
   // ── Spawn + load the fleet ──
@@ -393,31 +432,42 @@ export async function createMoECPUBackend(opts: MoEBackendOpts): Promise<MoEBack
   let inFlight = false;
   let destroyed = false;
 
-  async function computeExperts(
+  async function computeExpertsBatch(
     layer: number,
     hidden: Float32Array,
-    expertIds: Int32Array | number[],
-    weights: Float32Array | number[],
+    routes: MoERoute[],
   ): Promise<Float32Array> {
+    const T = routes.length;
     if (destroyed) throw new Error('[MoE] backend destroyed');
     if (inFlight) throw new Error('[MoE] computeExperts is not reentrant — decode is sequential');
-    if (hidden.length !== hiddenSize) throw new Error(`[MoE] hidden length ${hidden.length} ≠ ${hiddenSize}`);
-    if (expertIds.length !== weights.length) throw new Error('[MoE] expertIds/weights length mismatch');
+    if (T < 1 || T > MOE_MAX_TOKENS) throw new Error(`[MoE] ${T} tokens > MOE_MAX_TOKENS ${MOE_MAX_TOKENS}`);
+    if (hidden.length !== T * hiddenSize) {
+      throw new Error(`[MoE] hidden length ${hidden.length} ≠ ${T}×${hiddenSize}`);
+    }
     inFlight = true;
     try {
       const t0 = performance.now();
-      // Quantize the hidden vector once, share with all workers.
-      serializeQ8(q8Quantize(hidden), xq8);
-
-      const n = expertIds.length;
-      if (n > MOE_MAX_K) throw new Error(`[MoE] ${n} experts > MOE_MAX_K ${MOE_MAX_K}`);
-      for (let k = 0; k < n; k++) {
-        const e = expertIds[k] as number;
-        if (e < 0 || e >= numExperts) throw new Error(`[MoE] expert id ${e} out of range`);
-        reqExpert[k] = e;
-        reqWeight[k] = weights[k] as number;
+      let totalPairs = 0;
+      for (let t = 0; t < T; t++) {
+        // Quantize each token's hidden vector once, share with all workers.
+        serializeQ8(
+          q8Quantize(hidden.subarray(t * hiddenSize, (t + 1) * hiddenSize)),
+          xq8.subarray(t * layout.xq8Bytes, (t + 1) * layout.xq8Bytes),
+        );
+        const { ids, weights } = routes[t];
+        const n = ids.length;
+        if (n !== weights.length) throw new Error('[MoE] expertIds/weights length mismatch');
+        if (n > MOE_MAX_K) throw new Error(`[MoE] ${n} experts > MOE_MAX_K ${MOE_MAX_K}`);
+        for (let k = 0; k < n; k++) {
+          const e = ids[k] as number;
+          if (e < 0 || e >= numExperts) throw new Error(`[MoE] expert id ${e} out of range`);
+          reqExpert[t * MOE_MAX_K + k] = e;
+          reqWeight[t * MOE_MAX_K + k] = weights[k] as number;
+        }
+        reqCount[t] = n;
+        totalPairs += n;
       }
-      reqCount[0] = n;
+      nTokens[0] = T;
 
       Atomics.store(ctl, CTL_DONE, 0);
       Atomics.store(ctl, CTL_DONE_A, 0);
@@ -435,7 +485,7 @@ export async function createMoECPUBackend(opts: MoEBackendOpts): Promise<MoEBack
       const t2 = performance.now();
 
       // Workers wrote disjoint row slices — the SAB out region IS the result.
-      const result = new Float32Array(out);
+      const result = out.slice(0, T * hiddenSize);
 
       let maxBusy = 0;
       let busySum = 0;
@@ -448,13 +498,22 @@ export async function createMoECPUBackend(opts: MoEBackendOpts): Promise<MoEBack
       perf.waitMs += t2 - t1;
       perf.workerBusyMs += maxBusy;
       perf.workerBusyAvgMs += busySum / numWorkers;
-      perf.maxExpertsPerWorker += n; // row-split: every worker computes all n
+      perf.maxExpertsPerWorker += totalPairs; // row-split: every worker computes all pairs
       perf.activeWorkers += numWorkers;
       perf.sumMs += performance.now() - t2;
       return result;
     } finally {
       inFlight = false;
     }
+  }
+
+  function computeExperts(
+    layer: number,
+    hidden: Float32Array,
+    expertIds: Int32Array | number[],
+    weights: Float32Array | number[],
+  ): Promise<Float32Array> {
+    return computeExpertsBatch(layer, hidden, [{ ids: expertIds, weights }]);
   }
 
   async function touchTest(
@@ -465,7 +524,7 @@ export async function createMoECPUBackend(opts: MoEBackendOpts): Promise<MoEBack
     if (inFlight) throw new Error('[MoE] busy — run touchTest while idle');
     inFlight = true;
     try {
-      reqCount[0] = 0;
+      nTokens[0] = 0;
       // Wave bounds (reqExpert is unused by touch generations): workers
       // outside [start, end) check in without streaming. Waves keep the
       // pagefile from being thrashed by NW concurrent streams at near-OOM.
@@ -502,7 +561,7 @@ export async function createMoECPUBackend(opts: MoEBackendOpts): Promise<MoEBack
     workers.forEach((w) => w.terminate());
   }
 
-  const backend: MoEBackend = { computeExperts, touchTest, destroy, numWorkers };
+  const backend: MoEBackend = { computeExperts, computeExpertsBatch, touchTest, destroy, numWorkers };
   // Console-accessible debug handle (touchTest paging probe).
   (globalThis as unknown as { __MOE_BACKEND__?: MoEBackend }).__MOE_BACKEND__ = backend;
   return backend;

@@ -30,6 +30,7 @@ import {
   CTL_LAYER,
   TOUCH_LAYER,
   MOE_MAX_K,
+  MOE_MAX_TOKENS,
   Q8_BLOCK_BYTES,
   sabLayout,
   type MoEWorkerInitMsg,
@@ -103,8 +104,9 @@ async function run(init: MoEWorkerInitMsg): Promise<void> {
     }
     stripPtrs.push(ptrs);
   }
-  const xq8Ptr = p;                                          // hidden as Q8 blocks
-  p = align16(p + (hiddenSize / 256) * Q8_BLOCK_BYTES);
+  const xq8SlotBytes = (hiddenSize / 256) * Q8_BLOCK_BYTES;
+  const xq8Ptr = p;                                          // M hidden-as-Q8 slots
+  p = align16(p + MOE_MAX_TOKENS * xq8SlotBytes);
   const gateOutPtr = p; p = align16(p + rowsA * 4);
   const upOutPtr = p; p = align16(p + rowsA * 4);
   const act2Ptr = p; p = align16(p + ffnDim * 4);            // full act2 (from SAB) f32
@@ -145,19 +147,27 @@ async function run(init: MoEWorkerInitMsg): Promise<void> {
     throw new Error(`SAB size ${sab.byteLength} ≠ layout ${layout.totalBytes} — layout mismatch with main thread`);
   }
   const ctl = new Int32Array(sab, 0, 4);
-  const reqCount = new Int32Array(sab, layout.reqCountOff, 1);
-  const reqExpert = new Int32Array(sab, layout.reqExpertOff, MOE_MAX_K);
-  const reqWeight = new Float32Array(sab, layout.reqWeightOff, MOE_MAX_K);
-  const xq8Shared = new Uint8Array(sab, layout.xq8Off, layout.xq8Bytes);
-  const act2Shared = new Float32Array(sab, layout.act2Off, MOE_MAX_K * ffnDim);
-  const myOut = new Float32Array(sab, layout.outOff + workerId * rowsB * 4, rowsB);
+  const nTokens = new Int32Array(sab, layout.nTokensOff, 1);
+  const reqCount = new Int32Array(sab, layout.reqCountOff, MOE_MAX_TOKENS);
+  const reqExpert = new Int32Array(sab, layout.reqExpertOff, MOE_MAX_TOKENS * MOE_MAX_K);
+  const reqWeight = new Float32Array(sab, layout.reqWeightOff, MOE_MAX_TOKENS * MOE_MAX_K);
+  const xq8Shared = new Uint8Array(sab, layout.xq8Off, MOE_MAX_TOKENS * layout.xq8Bytes);
+  const act2Shared = new Float32Array(sab, layout.act2Off, MOE_MAX_TOKENS * MOE_MAX_K * ffnDim);
+  // Full out region (M×H); this worker writes [t·H + workerId·rowsB, …) per token.
+  const outAll = new Float32Array(sab, layout.outOff, MOE_MAX_TOKENS * hiddenSize);
   const perfBusy = new Float32Array(sab, layout.perfOff, numWorkers);
 
   const gateOut = new Float32Array(mem.buffer, gateOutPtr, rowsA);
   const upOut = new Float32Array(mem.buffer, upOutPtr, rowsA);
   const act2 = new Float32Array(mem.buffer, act2Ptr, ffnDim);
   const downOut = new Float32Array(mem.buffer, downOutPtr, rowsB);
-  const xq8Heap = heap.subarray(xq8Ptr, xq8Ptr + layout.xq8Bytes);
+  const xq8Heap = heap.subarray(xq8Ptr, xq8Ptr + MOE_MAX_TOKENS * xq8SlotBytes);
+
+  // (token, k, expert) pair scratch for expert-major iteration.
+  const pairT = new Int32Array(MOE_MAX_TOKENS * MOE_MAX_K);
+  const pairK = new Int32Array(MOE_MAX_TOKENS * MOE_MAX_K);
+  const pairE = new Int32Array(MOE_MAX_TOKENS * MOE_MAX_K);
+  const pairOrder = new Int32Array(MOE_MAX_TOKENS * MOE_MAX_K);
 
   const gemvStrip = (slab: ExpertSlabDesc, regionBase: number, e: number, xPtr: number, yPtr: number, rows: number) => {
     const wPtr = regionBase + (slab.bytesPerExpert / numWorkers) * e;
@@ -203,8 +213,8 @@ async function run(init: MoEWorkerInitMsg): Promise<void> {
         }
       }
       // Publish acc so the sum can't be dead-code-eliminated. Main never
-      // reads touch output and the compute path re-zeroes myOut.
-      myOut[rowsB - 1] = acc;
+      // reads touch output and the compute path re-zeroes its out slices.
+      outAll[workerId * rowsB + rowsB - 1] = acc;
       perfBusy[workerId] = performance.now() - tBusy0;
       if (Atomics.add(ctl, CTL_DONE, 1) + 1 === numWorkers) {
         Atomics.notify(ctl, CTL_DONE);
@@ -212,17 +222,45 @@ async function run(init: MoEWorkerInitMsg): Promise<void> {
       continue;
     }
 
-    const n = Atomics.load(reqCount, 0);
+    const T = Atomics.load(nTokens, 0);
     const L = layers[layer];
 
-    // ── Phase A: gate/up strips + silu⊙ → act2 slices into SAB ──
-    if (n > 0) {
-      xq8Heap.set(xq8Shared);
+    // Collect (token, k, expert) pairs and order them expert-major: a strip
+    // pulled into cache for expert e serves every token that routed to e
+    // (decode T=1 keeps the natural order — no sort needed).
+    let nPairs = 0;
+    for (let t = 0; t < T; t++) {
+      const n = reqCount[t];
       for (let k = 0; k < n; k++) {
-        const e = reqExpert[k];
-        gemvStrip(L.gate, stripPtrs[layer][0], e, xq8Ptr, gateOutPtr, rowsA);
-        gemvStrip(L.up, stripPtrs[layer][1], e, xq8Ptr, upOutPtr, rowsA);
-        const base = k * ffnDim + workerId * rowsA;
+        pairT[nPairs] = t;
+        pairK[nPairs] = k;
+        pairE[nPairs] = reqExpert[t * MOE_MAX_K + k];
+        pairOrder[nPairs] = nPairs;
+        nPairs++;
+      }
+    }
+    if (T > 1) {
+      // Insertion sort of the identity order by expert id — nPairs ≤ 128.
+      for (let i = 1; i < nPairs; i++) {
+        const o = pairOrder[i];
+        const e = pairE[o];
+        let j = i - 1;
+        while (j >= 0 && pairE[pairOrder[j]] > e) { pairOrder[j + 1] = pairOrder[j]; j--; }
+        pairOrder[j + 1] = o;
+      }
+    }
+
+    // ── Phase A: gate/up strips + silu⊙ → act2 slot (t·K+k) into SAB ──
+    if (nPairs > 0) {
+      xq8Heap.set(xq8Shared.subarray(0, T * xq8SlotBytes));
+      for (let p2 = 0; p2 < nPairs; p2++) {
+        const o = pairOrder[p2];
+        const t = pairT[o];
+        const e = pairE[o];
+        const xPtr = xq8Ptr + t * xq8SlotBytes;
+        gemvStrip(L.gate, stripPtrs[layer][0], e, xPtr, gateOutPtr, rowsA);
+        gemvStrip(L.up, stripPtrs[layer][1], e, xPtr, upOutPtr, rowsA);
+        const base = (t * MOE_MAX_K + pairK[o]) * ffnDim + workerId * rowsA;
         for (let i = 0; i < rowsA; i++) {
           const g = gateOut[i];
           act2Shared[base + i] = (g / (1 + Math.exp(-g))) * upOut[i]; // silu(gate) ⊙ up
@@ -242,15 +280,22 @@ async function run(init: MoEWorkerInitMsg): Promise<void> {
     }
 
     // ── Phase B: full act2 from SAB → Q8 → down strip → weighted out slice ──
-    if (n > 0) {
-      myOut.fill(0);
-      for (let k = 0; k < n; k++) {
-        const e = reqExpert[k];
-        const weight = reqWeight[k];
-        act2.set(act2Shared.subarray(k * ffnDim, (k + 1) * ffnDim));
+    if (nPairs > 0) {
+      for (let t = 0; t < T; t++) {
+        const o = t * hiddenSize + workerId * rowsB;
+        outAll.fill(0, o, o + rowsB);
+      }
+      for (let p2 = 0; p2 < nPairs; p2++) {
+        const o = pairOrder[p2];
+        const t = pairT[o];
+        const e = pairE[o];
+        const slot = t * MOE_MAX_K + pairK[o];
+        const weight = reqWeight[slot];
+        act2.set(act2Shared.subarray(slot * ffnDim, (slot + 1) * ffnDim));
         wasm.q8_quantize(act2Ptr, act2Q8Ptr, ffnDim);
         gemvStrip(L.down, stripPtrs[layer][2], e, act2Q8Ptr, downOutPtr, rowsB);
-        for (let i = 0; i < rowsB; i++) myOut[i] += weight * downOut[i];
+        const outBase = t * hiddenSize + workerId * rowsB;
+        for (let i = 0; i < rowsB; i++) outAll[outBase + i] += weight * downOut[i];
       }
     }
 

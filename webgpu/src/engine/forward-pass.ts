@@ -62,7 +62,7 @@ import dequantQ4BF16WGSL from '../shaders/dequant_q4_bf16.wgsl?raw';
 import matmulGgufWGSL from '../shaders/matmul_gguf.wgsl?raw';
 import { GGML_TYPES } from '../model/gguf';
 import { dequantGGML } from '../model/gguf-dequant';
-import { topKSoftmax, type MoEBackend } from './moe-cpu';
+import { topKSoftmax, MOE_MAX_TOKENS, type MoEBackend } from './moe-cpu';
 
 // ── CPU embed helpers (BF16 → F32 decode) ──────────────────────────────
 const _cpuEmbedBuf = new ArrayBuffer(4);
@@ -2290,10 +2290,21 @@ export function createForwardPassEngine(
         const logits = new Float32Array(mappedA.slice(hBytes, hBytes + eBytes));
         stagingA.unmap();
 
-        // Kick token 0's experts NOW — decode (seqLen === 1) fully overlaps.
-        const route0 = topKSoftmax(logits.subarray(0, E), topK);
-        const pending0 = weights.moe.backend.computeExperts(
-          l, normed.subarray(0, H), route0.ids, route0.weights);
+        // Route ALL tokens and kick the WHOLE chunk as one worker generation
+        // (C4) — decode (seqLen === 1) and prefill chunks alike fully overlap
+        // phase 2. Workers iterate the chunk's (token, expert) pairs
+        // expert-major so each strip is read once per chunk.
+        if (seqLen > MOE_MAX_TOKENS) {
+          throw new Error(
+            `[MoE L${l}] seqLen ${seqLen} > MOE_MAX_TOKENS ${MOE_MAX_TOKENS} — `
+            + `keep PREFILL_CHUNK ≤ ${MOE_MAX_TOKENS} for MoE models (generate.ts)`,
+          );
+        }
+        const routes: Array<{ ids: Int32Array; weights: Float32Array }> = [];
+        for (let t = 0; t < seqLen; t++) {
+          routes.push(topKSoftmax(logits.subarray(t * E, (t + 1) * E), topK));
+        }
+        const pendingBatch = weights.moe.backend.computeExpertsBatch(l, normed, routes);
 
         // Phase 2: shared expert on the dense-FFN slots + readback, racing
         // the workers. (gateSilu fusion identical to the dense path above.)
@@ -2317,18 +2328,16 @@ export function createForwardPassEngine(
         const gateVec = weights.moe.sharedGateVecs[l];
         const combined = new Float32Array(seqLen * H);
 
+        // The batch was kicked before phase 2 — only the EXPOSED wait (after
+        // the shared-expert readback) lands in moe_experts.
+        const __expT0 = performance.now();
+        const routedAll = await pendingBatch;
+        __perfMoEExpertMs += performance.now() - __expT0;
+
         for (let t = 0; t < seqLen; t++) {
           const hidden = normed.subarray(t * H, (t + 1) * H);
-          const { ids, weights: rw } = t === 0
-            ? route0
-            : topKSoftmax(logits.subarray(t * E, (t + 1) * E), topK);
-          const __expT0 = performance.now();
-          // t === 0 was kicked before phase 2 — only the EXPOSED wait (after
-          // the shared-expert readback) lands in moe_experts now.
-          const routed = t === 0
-            ? await pending0
-            : await weights.moe.backend.computeExperts(l, hidden, ids, rw);
-          __perfMoEExpertMs += performance.now() - __expT0;
+          const { ids, weights: rw } = routes[t];
+          const routed = routedAll.subarray(t * H, (t + 1) * H);
           // Scalar shared-expert gate: sigmoid(x · ffn_gate_inp_shexp)
           let g = 0;
           for (let i = 0; i < H; i++) g += hidden[i] * gateVec[i];
