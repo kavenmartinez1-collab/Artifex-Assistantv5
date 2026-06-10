@@ -38,6 +38,20 @@ function debugApiPlugin(): Plugin {
         }
       });
 
+      // COOP/COEP for the bench page (and its workers) so SharedArrayBuffer
+      // works there, WITHOUT cross-origin-isolating the main app documents
+      // (isolation would break the main app's HF CDN fallback fetches).
+      // Headers on subresources are harmless; only documents activate isolation.
+      server.middlewares.use((req, res, next) => {
+        const path = (req.url || '').split('?')[0];
+        const isMainDoc = path === '/' || path === '/index.html' || path === '/worker.html';
+        if (!isMainDoc) {
+          res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+          res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+        }
+        next();
+      });
+
       server.middlewares.use('/api/test', (req, res) => {
         if (req.method === 'POST') {
           let body = '';
@@ -74,6 +88,7 @@ export default defineConfig({
       input: {
         main: 'index.html',
         worker: 'worker.html',
+        bench: 'bench.html',
       },
     },
   },

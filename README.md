@@ -1152,6 +1152,17 @@ Any HuggingFace model with a standard transformer decoder architecture works. Hy
 - **SmolLM2-135M-Instruct** — 30 layers, 576 hidden, GQA 9Q/3KV.
 - **SmolLM2-360M-Instruct** — 32 layers, 960 hidden, GQA 15Q/5KV.
 
+### MoE Microbenchmarks (Phase 0 — Qwen3.6-35B-A3B groundwork)
+
+A standalone bench page (`http://127.0.0.1:5173/bench.html`) measures the numbers the planned CPU-WASM-expert MoE design lives or dies by, before any of it is built:
+
+- **(a) 8 KB blocking GPU readback latency** — the structural per-layer sync cost (40/token). Chrome's `mapAsync` has a ~3 ms scheduling floor when the queue idles; pumping a 4-byte `writeBuffer` with sub-ms MessageChannel yields while the map is pending drops it to **0.19 ms mean** (16x).
+- **(b) `writeBuffer` host→GPU upload bandwidth** — ~2 GB/s large writes, ~6 GB/s at 0.7 MB expert granularity.
+- **(c) WASM SIMD Q5_K GEMV throughput** — hand-written freestanding wasm32 kernel (`src/wasm/q5k_gemv.c`, built with clang, no emscripten), validated against a JS reference to 1e-6. **17.2 GB/s aggregate across 8 workers** — llama.cpp-class dequant-dot throughput.
+- **(e) SharedArrayBuffer/Atomics worker wake latency** — ~6 µs round-trip (needs COOP/COEP, served for the bench page only).
+
+**Go/no-go result (RTX 5060 Ti 8GB + 32GB DDR5): 15.8 tok/s projected decode — PASS (gate: 8 tok/s).** The MoE build is a go. Node-side kernel validation: `npx tsx src/bench/validate-q5k.ts`; wasm rebuild: `src/wasm/build-wasm.sh` (requires LLVM clang with wasm32 target).
+
 ### Calibrated GPTQ Quantization
 
 For hybrid models like Qwen3.5 that combine Gated DeltaNet (linear attention / SSM) with standard softmax attention, INT4 quantization of SSM layers causes recurrence noise to compound — each token's error accumulates in the hidden state via geometric amplification (`h_t = A*h_{t-1} + B*x_t`, error grows as `A^N * epsilon`). Two approaches: **HailMary** quantizes everything (including SSM) to INT4 for maximum compression — this works in practice despite the theoretical risk. **Conservative (noact)** keeps SSM weights in BF16 for higher quality at the cost of larger VRAM.

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Phase 0 — MoE Microbenchmarks</title>
+  <style>
+    :root {
+      --bg: #0f111a;
+      --bg2: #161a2b;
+      --text: #c7d0ff;
+      --accent: #00f0ff;
+      --dim: #666688;
+      --success: #44ff88;
+      --error: #ff4444;
+      --mono: 'Consolas', 'Fira Code', 'JetBrains Mono', monospace;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
+      padding: 24px;
+      font-size: 13px;
+    }
+    h1 { color: var(--accent); font-size: 18px; margin-bottom: 4px; }
+    p.sub { color: var(--dim); margin-bottom: 16px; }
+    button {
+      background: var(--bg2);
+      color: var(--accent);
+      border: 1px solid #333366;
+      padding: 8px 20px;
+      font-family: var(--mono);
+      font-size: 14px;
+      cursor: pointer;
+      border-radius: 4px;
+    }
+    button:disabled { color: var(--dim); cursor: wait; }
+    #status { margin: 12px 0; color: var(--success); min-height: 18px; }
+    table { border-collapse: collapse; margin-top: 12px; width: 100%; max-width: 980px; }
+    td { border: 1px solid #222244; padding: 6px 10px; }
+    td.val { color: var(--accent); white-space: nowrap; }
+    td.note { color: var(--dim); }
+    .err { color: var(--error); margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Phase 0 — MoE Go/No-Go Microbenchmarks</h1>
+  <p class="sub">Qwen3.6-35B-A3B CPU-WASM-expert design: readback latency, upload bandwidth, Q5_K GEMV throughput, worker wake.</p>
+  <button id="run">Run benchmarks</button>
+  <div id="status"></div>
+  <div id="results"></div>
+  <script type="module" src="/src/bench/main.ts"></script>
+</body>
+</html>

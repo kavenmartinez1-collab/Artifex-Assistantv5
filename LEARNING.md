@@ -26,6 +26,7 @@
 16. [Gemma 4 Integration — A Different Architecture](#16-gemma-4-integration--a-different-architecture)
 17. [Glossary](#17-glossary)
 18. [The Sandbox — Making Agent Execution Safe](#18-the-sandbox--making-agent-execution-safe)
+19. [Measure Before You Build — The MoE Microbenchmarks](#19-measure-before-you-build--the-moe-microbenchmarks)
 
 ---
 
@@ -1938,6 +1939,69 @@ else:
 ```
 
 The beauty of this design is that **every new safety feature is just another hook**. If you want to add IP geolocation checking, token budget limits, or anything else — you write a function that returns `PolicyDecision` or `None`, and register it. The existing hooks don't need to change.
+
+---
+
+## 19. Measure Before You Build — The MoE Microbenchmarks
+
+### The problem
+
+We want to run **Qwen3.6-35B-A3B** (a Mixture-of-Experts model) in the browser. The model has 256 experts per layer but only activates 8 per token — so each decoded token reads ~737 MB of expert weights out of a 22 GB pool. That pool can't fit in 8 GB of VRAM, so the design puts experts in CPU RAM (in WASM workers) while the GPU runs everything else. llama.cpp does exactly this with its `--cpu-moe` flag; we're building the browser analogue.
+
+That design lives or dies by four numbers nobody could know in advance:
+
+1. **GPU→CPU readback latency.** The CPU needs the hidden state (8 KB) after every layer's attention to route and compute experts — 40 round-trips per token. If one round-trip costs 3 ms, that's 120 ms/token of pure synchronization before any math happens.
+2. **WASM dequant-dot throughput.** Can JavaScript-hosted WASM workers chew through 737 MB of Q5_K weights per token fast enough?
+3. **Upload bandwidth** for streaming experts to the GPU during prefill.
+4. **Worker wake latency** — how fast can the main thread wake 8 workers and get answers back?
+
+Rather than build the whole engine and discover the answer at the end, we wrote a standalone bench page (`webgpu/bench.html`) that measures all four in ~30 seconds and projects tokens/sec. **Gate: if the projection is under 8 tok/s, abort the design.** Total cost: one day. Cost of discovering the same thing after building Phase C: weeks.
+
+### Finding #1: Chrome's mapAsync has a hidden 3 ms floor — and a workaround
+
+The naive readback (`submit → mapAsync → await`) measured **~3.1 ms** — on both an RTX 5060 Ti and an RX 6700 XT. Same number on wildly different hardware is the tell: this isn't the GPU, it's the browser. An 8 KB PCIe copy costs microseconds; the other ~3 ms is Chrome's Dawn layer deciding *when to check* whether the map request completed. When the GPU queue goes idle, Dawn falls back to a timer tick to service map requests.
+
+The fix is almost comedic: **keep poking the queue while you wait.**
+
+```ts
+let done = false;
+const p = staging.mapAsync(GPUMapMode.READ).then(() => { done = true; });
+while (!done) {
+  device.queue.writeBuffer(pumpDst, 0, fourBytes); // forces Dawn to process completions
+  await fastYield();  // MessageChannel ping — sub-millisecond, unlike setTimeout(0)
+}
+```
+
+Each tiny `writeBuffer` forces Dawn to process pending completions. Result: **0.19 ms mean / 0.26 ms p95** — a 16× improvement. Two details matter:
+
+- `setTimeout(0)` is useless here — browsers clamp it to ~1 ms. A `MessageChannel` post-and-wait yields to the event loop in microseconds.
+- An *empty* `queue.submit([])` pump only got to ~0.85 ms; the 4-byte write was 4× better. Dawn appears to short-circuit empty submits.
+
+Lesson: in browser GPU programming, the API's *scheduling behavior* can dominate the hardware cost by 100×, and it's invisible until you measure it.
+
+### Finding #2: hand-written WASM SIMD matches llama.cpp-class throughput
+
+We wrote the Q5_K dequant-dot kernel in ~200 lines of freestanding C (`webgpu/src/wasm/q5k_gemv.c`), compiled with bare `clang --target=wasm32 -msimd128 -nostdlib` — no emscripten, no libc, per our supply-chain policy. The kernel quantizes activations to INT8 once per row-block, then uses `i32x4.dot_i16x8_s` (the WASM equivalent of x86 `pmaddwd`) for the inner product, exactly like llama.cpp's AVX2 path.
+
+One worker: 2.5 GB/s. Eight workers: **17.2 GB/s aggregate**. Sanity check: llama.cpp decoding this model at ~20 tok/s implies ~15 GB/s of expert reads — so browser WASM is genuinely competitive with native CPU inference for this workload. The 4 GB wasm32 address space cap is handled by sharding: worker *w* owns experts where `expert_id % 8 == w`.
+
+Before trusting the kernel, we validated it against an independent JS reference implementation, bit-exact on the INT8 quantization and within 1e-6 relative error on the GEMV (`npx tsx src/bench/validate-q5k.ts`). **Never build on an unvalidated kernel** — a 6-bit scale unpacking bug produces plausible-looking garbage that you'd otherwise chase through the whole engine months later (see Section 14 for how expensive that hunt is).
+
+### Finding #3: the cheap stuff is actually cheap
+
+SharedArrayBuffer + `Atomics.notify`/`Atomics.waitAsync` worker wake: **~6 µs** round-trip. This confirms the control plane (waking 8 workers 40 times per token) costs ~2 ms/token — negligible. The alternative, `postMessage`, costs ~0.1-1 ms per message and would have eaten 30-60 ms/token. This is why the bench page needs COOP/COEP headers (`crossOriginIsolated`) — SharedArrayBuffer is disabled without them (Spectre mitigation). We serve those headers for the bench page only, because cross-origin isolation would break the main app's CDN weight fetches.
+
+### The verdict
+
+```
+projected token time = 40 × 0.19 ms (sync)        =  7.6 ms
+                     + 737 MB ÷ 17.2 GB/s (experts) = 42.8 ms
+                     + GPU dense estimate           = 12.0 ms
+                     + misc                         =  1.0 ms
+                     ≈ 63 ms/token → 15.8 tok/s     → PASS (gate: 8)
+```
+
+Without the pump trick, the same arithmetic gives 5.4 tok/s — **FAIL**. One scheduling workaround was the difference between "ship it" and "redesign". That's the whole argument for Phase-0 benchmarking: the make-or-break number was something no amount of careful design could have predicted.
 
 ---
 
