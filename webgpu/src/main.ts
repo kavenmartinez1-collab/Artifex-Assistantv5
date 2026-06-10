@@ -746,7 +746,8 @@ function startAutoTestPoller() {
 // and row-gathers on CPU per token.
 async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTMLElement): Promise<void> {
   const { loadGGUFModel } = await import('./model/gguf-loader');
-  const { descriptorFromGGUF } = await import('./model/model-descriptor');
+  const { descriptorFromGGUF, applyRopeFreqFactors } = await import('./model/model-descriptor');
+  const { ggufArchitecture } = await import('./model/gguf');
   const { createGGUFLocator } = await import('./model/tensor-locator');
   const { createForwardPassEngine } = await import('./engine/forward-pass');
   const { createTokenizer, applyChatTemplate } = await import('./model/tokenizer');
@@ -768,7 +769,14 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
 
   setStatus('Building inference engine...');
   const config = descriptorFromGGUF(model.file);
-  const loc = createGGUFLocator(model.file.tensors);
+  // Gemma 4 proportional RoPE: derive per-layer rotatedPairs from the
+  // rope_freqs sentinel tensor ([1.0]×N rotating, ~1e30 frozen).
+  const ropeFreqsT = model.cpuTensors.get('rope_freqs.weight');
+  if (ropeFreqsT) {
+    applyRopeFreqFactors(config, new Float32Array(
+      ropeFreqsT.data.buffer, ropeFreqsT.data.byteOffset, ropeFreqsT.data.byteLength / 4));
+  }
+  const loc = createGGUFLocator(model.file.tensors, ggufArchitecture(model.file));
 
   const requireBuf = (role: TensorRole, l?: number): GPUBuffer => {
     const n = loc.locate(role, l);
@@ -886,6 +894,9 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
     const lw: any = {
       inputNorm: requireBuf('inputNorm', l),
       postAttnNorm: requireBuf('postAttnNorm', l),
+      // Gemma 4 sandwich norms (undefined on other archs)
+      attnPostNorm: roleBuf('attnPostNorm', l),
+      ffnPostNorm: roleBuf('ffnPostNorm', l),
     };
     if (config.layers[l].kind === 'linear_attention') {
       assignProj(lw, 'linearInProjQKV', 'linInProjQKV', l);

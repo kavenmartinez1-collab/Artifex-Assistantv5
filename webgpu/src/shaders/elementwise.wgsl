@@ -3,6 +3,7 @@
 struct Params {
   n: u32,
   broadcast_b: u32, // if > 0, index input_b as input_b[idx % broadcast_b]
+  scale: f32,       // softcap cap value (uniform buffers are zero-filled by default)
 }
 
 @group(0) @binding(0) var<storage, read> input_a: array<f32>;
@@ -29,6 +30,15 @@ fn gelu(@builtin(global_invocation_id) gid: vec3u) {
   output[idx] = 0.5 * x * (1.0 + tanh(inner));
 }
 
+// Softcap (Gemma): output = c * tanh(x / c) — bounds logits to (-c, c)
+@compute @workgroup_size(256)
+fn softcap(@builtin(global_invocation_id) gid: vec3u) {
+  let idx = gid.x;
+  if (idx >= params.n) { return; }
+  let c = params.scale;
+  output[idx] = c * tanh(input_a[idx] / c);
+}
+
 // ── Two-input operations ────────────────────────────────────────────────
 
 @group(0) @binding(3) var<storage, read> input_b: array<f32>;
@@ -44,12 +54,14 @@ fn add(@builtin(global_invocation_id) gid: vec3u) {
   output[idx] = input_a[idx] + input_b[b_idx];
 }
 
-// Element-wise multiply: output = a * b
+// Element-wise multiply: output = a * b (with optional broadcast on b,
+// e.g. a [1]-element layer_output_scale tensor scaling the whole stream)
 @compute @workgroup_size(256)
 fn mul(@builtin(global_invocation_id) gid: vec3u) {
   let idx = gid.x;
   if (idx >= params.n) { return; }
-  output[idx] = input_a[idx] * input_b[idx];
+  let b_idx = select(idx, idx % params.broadcast_b, params.broadcast_b > 0u);
+  output[idx] = input_a[idx] * input_b[b_idx];
 }
 
 // Fused multiply-add: output = a * b + output (accumulate)
@@ -70,6 +82,18 @@ fn gate_silu(@builtin(global_invocation_id) gid: vec3u) {
   let z = input_b[idx];
   let silu_z = z / (1.0 + exp(-z));
   output[idx] = input_a[idx] * silu_z;
+}
+
+// Gated GELU (tanh approx): output = a * gelu(b) — Gemma GeGLU FFN
+// (a = up projection, b = gate projection; mirrors gate_silu's convention)
+@compute @workgroup_size(256)
+fn gate_gelu(@builtin(global_invocation_id) gid: vec3u) {
+  let idx = gid.x;
+  if (idx >= params.n) { return; }
+  let x = input_b[idx];
+  let c = 0.7978845608; // sqrt(2/pi)
+  let inner = c * (x + 0.044715 * x * x * x);
+  output[idx] = input_a[idx] * 0.5 * x * (1.0 + tanh(inner));
 }
 
 // Softplus: output = log(1 + exp(a + b)) — used for SSM time delta

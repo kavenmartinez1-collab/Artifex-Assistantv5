@@ -9,8 +9,8 @@
 const { open } = require('node:fs/promises');
 const path = require('node:path');
 
-const { parseGGUF } = require('../.tmp-cjs/gguf.js');
-const { descriptorFromGGUF } = require('../.tmp-cjs/model-descriptor.js');
+const { parseGGUF, ggufArchitecture } = require('../.tmp-cjs/gguf.js');
+const { descriptorFromGGUF, applyRopeFreqFactors } = require('../.tmp-cjs/model-descriptor.js');
 const { createGGUFLocator } = require('../.tmp-cjs/tensor-locator.js');
 
 let failures = 0;
@@ -34,26 +34,42 @@ async function parseFile(p) {
   return file;
 }
 
+/** Read a tensor's raw bytes from the file (absolute offset from the header). */
+async function readTensorBytes(p, file, name) {
+  const t = file.tensors.get(name);
+  if (!t) throw new Error(`tensor "${name}" not in file`);
+  const fh = await open(p, 'r');
+  const buf = Buffer.alloc(t.byteLength);
+  const { bytesRead } = await fh.read(buf, 0, t.byteLength, t.offset);
+  await fh.close();
+  if (bytesRead !== t.byteLength) throw new Error(`short read for ${name}`);
+  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + t.byteLength);
+}
+
 /** Every tensor must be reachable through the locator (completeness check). */
 function coverageCheck(label, file, desc) {
-  const loc = createGGUFLocator(file.tensors);
-  const roles = [
+  const loc = createGGUFLocator(file.tensors, ggufArchitecture(file));
+  const globalRoles = [
     'embedTokens', 'finalNorm', 'lmHead',
-    'inputNorm', 'postAttnNorm',
+    'pleTokenEmbed', 'pleModelProj', 'pleProjNorm', 'ropeFreqs',
+  ];
+  const layerRoles = [
+    'inputNorm', 'postAttnNorm', 'attnPostNorm', 'ffnPostNorm', 'layerOutScale',
     'qProj', 'kProj', 'vProj', 'oProj', 'qBias', 'kBias', 'vBias', 'oBias', 'qNorm', 'kNorm',
     'gateProj', 'upProj', 'downProj',
     'linInProjQKV', 'linInProjA', 'linInProjB', 'linInProjZ', 'linOutProj',
     'linALog', 'linConv1dWeight', 'linDtBias', 'linNormWeight',
     'moeRouter', 'moeExpertGate', 'moeExpertUp', 'moeExpertDown',
     'moeSharedGateProj', 'moeSharedUpProj', 'moeSharedDownProj', 'moeSharedExpertGate',
+    'pleInpGate', 'pleProj', 'plePostNorm',
   ];
   const located = new Set();
-  for (const role of ['embedTokens', 'finalNorm', 'lmHead']) {
+  for (const role of globalRoles) {
     const n = loc.locate(role);
     if (n) located.add(n);
   }
   for (let l = 0; l < desc.numLayers; l++) {
-    for (const role of roles.slice(3)) {
+    for (const role of layerRoles) {
       const n = loc.locate(role, l);
       if (n) {
         check(file.tensors.has(n), `${label}: locate(${role},${l}) -> "${n}" not in file`);
@@ -124,6 +140,76 @@ function coverageCheck(label, file, desc) {
   eq(d9.layers[0].kind, 'linear_attention', '9B layer 0 kind');
   check(d9.layers[0].moe === undefined, '9B has no moe spec');
   coverageCheck('9B', f9, d9);
+
+  // ── Gemma 4 E4B ──────────────────────────────────────────────────────
+  const p4 = path.join(__dirname, '../../models/gemma-4-e4b-it-gguf/gemma-4-E4B-it-Q4_K_M.gguf');
+  const f4 = await parseFile(p4);
+  const d4 = descriptorFromGGUF(f4);
+  eq(d4.modelType, 'gemma4_text', 'E4B modelType');
+  eq(d4.numLayers, 42, 'E4B numLayers');
+  eq(d4.hiddenSize, 2560, 'E4B hiddenSize');
+  eq(d4.intermediateSize, 10240, 'E4B ffnDim');
+  eq(d4.numAttentionHeads, 8, 'E4B heads');
+  eq(d4.numKVHeads, 2, 'E4B kvHeads');
+  eq(d4.headDim, 512, 'E4B headDim (full layers)');
+  eq(d4.vocabSize, 262144, 'E4B vocabSize');
+  eq(d4.isHybrid, false, 'E4B isHybrid');
+  eq(d4.tieWordEmbeddings, true, 'E4B tied');
+  eq(d4.attentionBias, false, 'E4B attnBias');
+  eq(d4.activation, 'gelu_tanh', 'E4B activation');
+  eq(d4.finalLogitSoftcap, 30, 'E4B finalLogitSoftcap');
+  eq(d4.perLayerEmbed, true, 'E4B perLayerEmbed');
+  eq(d4.perLayerEmbedDim, 256, 'E4B perLayerEmbedDim');
+  eq(d4.embedScale, Math.sqrt(2560), 'E4B embedScale');
+  eq(d4.maxPositionEmbeddings, 131072, 'E4B maxPos');
+  eq(d4.ropeTheta, 1000000, 'E4B ropeTheta (full)');
+  eq(d4.layers.length, 42, 'E4B layers.length');
+
+  // SSSSSF ×7: full attention at 5,11,17,23,29,35,41; rest sliding
+  const FULL4 = new Set([5, 11, 17, 23, 29, 35, 41]);
+  for (let l = 0; l < 42; l++) {
+    const layer = d4.layers[l];
+    const full = FULL4.has(l);
+    eq(layer.kind, full ? 'full_attention' : 'sliding_attention', `E4B layer ${l} kind`);
+    eq(layer.headDim, full ? 512 : 256, `E4B layer ${l} headDim`);
+    eq(layer.rope?.theta, full ? 1000000 : 10000, `E4B layer ${l} rope theta`);
+    eq(layer.slidingWindow, full ? undefined : 512, `E4B layer ${l} slidingWindow`);
+    // KV sharing: layers 24-41 read L22 (sliding) / L23 (full)
+    const wantSrc = l < 24 ? undefined : (full ? 23 : 22);
+    eq(layer.kvSourceLayer, wantSrc, `E4B layer ${l} kvSourceLayer`);
+  }
+
+  // rope_freqs tensor data → rotatedPairs on full layers only
+  const freqRaw = await readTensorBytes(p4, f4, 'rope_freqs.weight');
+  const freqs = new Float32Array(freqRaw);
+  eq(freqs.length, 256, 'E4B rope_freqs length');
+  applyRopeFreqFactors(d4, freqs);
+  for (let l = 0; l < 42; l++) {
+    const want = FULL4.has(l) ? 64 : undefined;
+    eq(d4.layers[l].rope?.rotatedPairs, want, `E4B layer ${l} rotatedPairs`);
+  }
+
+  // Arch-aware norm-name override: gemma4's pre-FFN norm is ffn_norm, and
+  // post_attention_norm is the sandwich post-attn norm (Qwen3.5 is opposite).
+  const loc4 = createGGUFLocator(f4.tensors, ggufArchitecture(f4));
+  eq(loc4.locate('postAttnNorm', 0), 'blk.0.ffn_norm.weight', 'E4B postAttnNorm (pre-FFN)');
+  eq(loc4.locate('attnPostNorm', 0), 'blk.0.post_attention_norm.weight', 'E4B attnPostNorm (sandwich)');
+  eq(loc4.locate('ffnPostNorm', 0), 'blk.0.post_ffw_norm.weight', 'E4B ffnPostNorm');
+  eq(loc4.locate('layerOutScale', 0), 'blk.0.layer_output_scale.weight', 'E4B layerOutScale');
+  eq(loc4.locate('pleInpGate', 0), 'blk.0.inp_gate.weight', 'E4B pleInpGate');
+  eq(loc4.locate('pleProj', 0), 'blk.0.proj.weight', 'E4B pleProj');
+  eq(loc4.locate('plePostNorm', 0), 'blk.0.post_norm.weight', 'E4B plePostNorm');
+  eq(loc4.locate('pleTokenEmbed'), 'per_layer_token_embd.weight', 'E4B pleTokenEmbed');
+  eq(loc4.locate('pleModelProj'), 'per_layer_model_proj.weight', 'E4B pleModelProj');
+  eq(loc4.locate('pleProjNorm'), 'per_layer_proj_norm.weight', 'E4B pleProjNorm');
+  eq(loc4.locate('ropeFreqs'), 'rope_freqs.weight', 'E4B ropeFreqs');
+  eq(loc4.locate('lmHead'), 'token_embd.weight', 'E4B lmHead tied');
+  // Qwen 9B (no override): post_attention_norm IS the pre-FFN norm
+  const loc9 = createGGUFLocator(f9.tensors, ggufArchitecture(f9));
+  eq(loc9.locate('postAttnNorm', 3), 'blk.3.post_attention_norm.weight', '9B postAttnNorm default chain');
+  eq(loc9.locate('attnPostNorm', 3), undefined, '9B attnPostNorm absent');
+
+  coverageCheck('E4B', f4, d4);
 
   if (failures > 0) {
     console.error(`\n${failures} FAILURE(S)`);

@@ -30,8 +30,12 @@ export type TensorRole =
   // per-layer: MoE (Phase C — GGUF locator only)
   | 'moeRouter' | 'moeExpertGate' | 'moeExpertUp' | 'moeExpertDown'
   | 'moeSharedGateProj' | 'moeSharedUpProj' | 'moeSharedDownProj' | 'moeSharedExpertGate'
+  // per-layer: Gemma 4 sandwich norms + layer output scale (Phase D)
+  | 'attnPostNorm' | 'ffnPostNorm' | 'layerOutScale'
   // per-layer: Gemma 4 per-layer embeddings (Phase D)
-  | 'perLayerEmbed';
+  | 'pleInpGate' | 'pleProj' | 'plePostNorm'
+  // global: Gemma 4 PLE projections + RoPE frequency factors (Phase D)
+  | 'pleTokenEmbed' | 'pleModelProj' | 'pleProjNorm' | 'ropeFreqs';
 
 export interface TensorLocator {
   /**
@@ -116,6 +120,11 @@ const GGUF_GLOBAL: Partial<Record<TensorRole, string>> = {
   embedTokens: 'token_embd.weight',
   finalNorm: 'output_norm.weight',
   lmHead: 'output.weight',
+  // Gemma 4 PLE + RoPE frequency factors (Phase D)
+  pleTokenEmbed: 'per_layer_token_embd.weight',
+  pleModelProj: 'per_layer_model_proj.weight',
+  pleProjNorm: 'per_layer_proj_norm.weight',
+  ropeFreqs: 'rope_freqs.weight',
 };
 
 /**
@@ -161,6 +170,27 @@ const GGUF_LAYER: Partial<Record<TensorRole, string[]>> = {
   moeSharedUpProj: ['ffn_up_shexp.weight'],
   moeSharedDownProj: ['ffn_down_shexp.weight'],
   moeSharedExpertGate: ['ffn_gate_inp_shexp.weight'],
+  // Gemma 4 sandwich norms + layer output scale + PLE (Phase D)
+  ffnPostNorm: ['post_ffw_norm.weight'],
+  layerOutScale: ['layer_output_scale.weight'],
+  pleInpGate: ['inp_gate.weight'],
+  pleProj: ['proj.weight'],
+  plePostNorm: ['post_norm.weight'],
+};
+
+/**
+ * Arch-specific role overrides (checked before GGUF_LAYER).
+ *
+ * gemma4: 'post_attention_norm.weight' is the SANDWICH post-attention norm
+ * (applied to attn output before the residual add), and 'ffn_norm.weight'
+ * is the pre-FFN norm. Other archs (e.g. qwen35) use 'post_attention_norm'
+ * AS the pre-FFN norm — hence the default fallback chain in GGUF_LAYER.
+ */
+const GGUF_LAYER_ARCH: Record<string, Partial<Record<TensorRole, string[]>>> = {
+  gemma4: {
+    postAttnNorm: ['ffn_norm.weight'],
+    attnPostNorm: ['post_attention_norm.weight'],
+  },
 };
 
 /**
@@ -169,8 +199,10 @@ const GGUF_LAYER: Partial<Record<TensorRole, string[]>> = {
  */
 export function createGGUFLocator(
   tensorNames: Set<string> | Map<string, unknown>,
+  arch?: string,
 ): TensorLocator {
   const has = (name: string) => tensorNames.has(name);
+  const archOverrides = arch ? GGUF_LAYER_ARCH[arch] : undefined;
 
   return {
     locate(role: TensorRole, layer?: number): string | undefined {
@@ -185,7 +217,7 @@ export function createGGUFLocator(
       if (layer === undefined) {
         throw new Error(`TensorLocator: role "${role}" requires a layer index`);
       }
-      const suffixes = GGUF_LAYER[role];
+      const suffixes = archOverrides?.[role] ?? GGUF_LAYER[role];
       if (!suffixes) return undefined;
       for (const suffix of suffixes) {
         const name = `blk.${layer}.${suffix}`;

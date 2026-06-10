@@ -88,7 +88,11 @@ export interface LayerWeights {
   kBias?: GPUBuffer;       // [num_kv_heads * head_dim]
   vBias?: GPUBuffer;       // [num_kv_heads * head_dim]
   oBias?: GPUBuffer;       // [hidden_size]
-  postAttnNorm: GPUBuffer; // [hidden_size]
+  postAttnNorm: GPUBuffer; // [hidden_size] (pre-FFN norm)
+  // Gemma 4 sandwich norms — applied to the sub-block OUTPUT before its
+  // residual add (gemma4.cpp attn_post_norm / ffn_post_norm).
+  attnPostNorm?: GPUBuffer; // [hidden_size]
+  ffnPostNorm?: GPUBuffer;  // [hidden_size]
   gateProj: GPUBuffer;     // [intermediate_size, hidden_size]
   upProj: GPUBuffer;       // [intermediate_size, hidden_size]
   downProj: GPUBuffer;     // [hidden_size, intermediate_size]
@@ -392,6 +396,13 @@ export function createForwardPassEngine(
   // gate_silu is also used by SwiGLU FFN fusion (silu(gate) * up → one dispatch),
   // so create it unconditionally. Keeps platform-generality for non-hybrid models.
   const gateSiluPipeline = createComputePipeline(device, elementwiseWGSL, 'gate_silu', 'gate-silu');
+  // Fused gated activation for the dense FFN — Gemma uses GeGLU (gelu_tanh).
+  const gateActPipeline = config.activation === 'gelu_tanh'
+    ? createComputePipeline(device, elementwiseWGSL, 'gate_gelu', 'gate-gelu')
+    : gateSiluPipeline;
+  // Gemma: final logit softcapping c·tanh(x/c)
+  const softcapPipeline = config.finalLogitSoftcap
+    ? createComputePipeline(device, elementwiseWGSL, 'softcap', 'softcap') : null;
   const softplusPipeline = isHybrid
     ? createComputePipeline(device, elementwiseWGSL, 'softplus', 'softplus') : null;
   const conv1dPipeline = isHybrid
@@ -484,6 +495,8 @@ export function createForwardPassEngine(
   registerCat(tqEncodePipeline, 'tq_encode');
   registerCat(tqDecodePipeline, 'tq_decode');
   registerCat(gateSiluPipeline, 'gate_silu');
+  if (gateActPipeline !== gateSiluPipeline) registerCat(gateActPipeline, 'gate_gelu');
+  registerCat(softcapPipeline, 'softcap');
   registerCat(softplusPipeline, 'softplus');
   registerCat(conv1dPipeline, 'conv1d');
   registerCat(conv1dUpdatePipeline, 'conv1d_update');
@@ -622,6 +635,9 @@ export function createForwardPassEngine(
   const scratchDim = Math.max(ffnDim, nHeads * dHead, H, kvDim);
   const ffnTempBuf = createStorageBuffer(device, null, MAX_PREFILL * scratchDim * 4, 'ffn-temp', true);
   const logitsBuf = createStorageBuffer(device, null, V * 4, 'logits', true);
+  // Softcap needs a read-side copy (WebGPU can't bind one buffer read + read_write)
+  const logitsTempBuf = config.finalLogitSoftcap
+    ? createStorageBuffer(device, null, V * 4, 'logits-precap') : null;
   // MoE: router logits [seqLen, numExperts] (read back per layer for CPU top-k)
   const moeNumExperts = config.layers.find((d) => d.moe)?.moe?.numExperts ?? 0;
   const routerLogitsBuf = moeNumExperts > 0
@@ -1134,11 +1150,13 @@ export function createForwardPassEngine(
   function dispatchRMSNorm(
     inputBuf: GPUBuffer, outputBuf: GPUBuffer,
     weightBuf: GPUBuffer, rows: number, label: string,
+    dim: number = H, skipWeight = false,
   ) {
     const paramData = new ArrayBuffer(16);
-    new Uint32Array(paramData, 0, 1)[0] = H;
+    new Uint32Array(paramData, 0, 1)[0] = dim;
     new Float32Array(paramData, 4, 1)[0] = eps;
     new Uint32Array(paramData, 8, 1)[0] = useResidualWeight;
+    new Uint32Array(paramData, 12, 1)[0] = skipWeight ? 1 : 0;
     const paramBuf = getCachedUniform(new Uint8Array(paramData), `${label}-p`);
     const bg = createBindGroup(device, rmsnormPipeline, 0, [
       { binding: 0, resource: { buffer: inputBuf } },
@@ -1153,9 +1171,12 @@ export function createForwardPassEngine(
     pipeline: GPUComputePipeline,
     inputBuf: GPUBuffer, outputBuf: GPUBuffer,
     size: number, label: string, secondBuf?: GPUBuffer,
-    broadcastB?: number,
+    broadcastB?: number, scale?: number,
   ) {
-    const params = getCachedUniform(new Uint32Array([size, broadcastB ?? 0]), `${label}-p`);
+    const ewParamData = new ArrayBuffer(16);
+    new Uint32Array(ewParamData, 0, 2).set([size, broadcastB ?? 0]);
+    new Float32Array(ewParamData, 8, 1)[0] = scale ?? 0;
+    const params = getCachedUniform(new Uint8Array(ewParamData), `${label}-p`);
     const entries: Array<{ binding: number; resource: GPUBindingResource }> = [
       { binding: 0, resource: { buffer: inputBuf } },
       { binding: 1, resource: { buffer: outputBuf } },
@@ -1170,19 +1191,22 @@ export function createForwardPassEngine(
     qkBuf: GPUBuffer, seqLen: number, numHeads: number,
     posOffset: number, label: string,
     headDimOverride?: number, rotaryDimOverride?: number,
+    thetaOverride?: number, rotatedPairs?: number,
   ) {
     const hd = headDimOverride ?? dHead;
     const rd = rotaryDimOverride ?? 0;
-    // RoPE params struct: [seq_len, head_dim, num_heads, pos_offset, rope_base, rotary_dim]
-    const paramData = new ArrayBuffer(24);
+    const rp = rotatedPairs ?? 0;
+    // RoPE params struct: [seq_len, head_dim, num_heads, pos_offset, rope_base, rotary_dim, rotated_pairs]
+    const paramData = new ArrayBuffer(32);
     const u32View = new Uint32Array(paramData);
     const f32View = new Float32Array(paramData);
     u32View[0] = seqLen;
     u32View[1] = hd;
     u32View[2] = numHeads;
     u32View[3] = posOffset;
-    f32View[4] = ropeTheta;
+    f32View[4] = thetaOverride ?? ropeTheta;
     u32View[5] = rd;
+    u32View[6] = rp;
     const paramBuf = getCachedUniform(new Uint8Array(paramData), `${label}-p`);
 
     const bg = createBindGroup(device, ropePipeline, 0, [
@@ -1191,8 +1215,8 @@ export function createForwardPassEngine(
     ], label);
 
     const rotDim = rd > 0 ? rd : hd;
-    const halfDim = rotDim / 2;
-    const totalPairs = seqLen * numHeads * halfDim;
+    const activePairs = rp > 0 ? rp : rotDim / 2;
+    const totalPairs = seqLen * numHeads * activePairs;
     bd(ropePipeline, [bg], [workgroupCount(totalPairs, 256)], label);
   }
 
@@ -1220,7 +1244,7 @@ export function createForwardPassEngine(
     u32View[2] = dHead;
     u32View[3] = newSeqLen;
     u32View[4] = cacheLen;
-    f32View[5] = 1.0 / Math.sqrt(dHead);
+    f32View[5] = config.attnScale ?? 1.0 / Math.sqrt(dHead);
     u32View[6] = isCausal ? 1 : 0;
     u32View[7] = posOffset;
     const paramBuf = getCachedUniform(new Uint8Array(paramData), `${label}-p`);
@@ -1440,6 +1464,10 @@ export function createForwardPassEngine(
           throw new Error(`[EMBED GGUF] token ${tokenIds[t]}: row slice ${row.byteLength} != ${rowBytes} bytes`);
         }
         f32.set(dequantGGML(ggmlType, row, H), t * H);
+      }
+      // Gemma: scale embeddings by √hiddenSize (gemma4.cpp:155)
+      if (config.embedScale) {
+        for (let i = 0; i < f32.length; i++) f32[i] *= config.embedScale;
       }
       device.queue.writeBuffer(hiddenBuf, 0, f32.buffer, 0, seqLen * H * 4);
     } else if (weights.global.embedCPU) {
@@ -1983,35 +2011,22 @@ export function createForwardPassEngine(
         dispatchProjection(normedBuf, lw, 'vProj', vBuf, seqLen, kvDim, H, `L${l}-v`);
         await maybeAudit(l, vBuf, `L${l}-v-out`, seqLen, kvDim);
 
-        // Qwen3.5: per-head RMSNorm on Q and K (q_norm, k_norm)
-        // Uses (1+weight) convention — same as input layernorm
-        if (config.attnOutputGate && lw.qNorm && lw.kNorm) {
+        // Per-head RMSNorm on Q and K (q_norm, k_norm) — Qwen3.5, Gemma 4.
+        // Weight convention follows useResidualWeight (same as input layernorm).
+        if (lw.qNorm && lw.kNorm) {
           // Q norm: treat [seqLen * nHeads, dHead] as rows of dHead
-          const qNormParams = new ArrayBuffer(16);
-          new Uint32Array(qNormParams, 0, 1)[0] = dHead;
-          new Float32Array(qNormParams, 4, 1)[0] = eps;
-          new Uint32Array(qNormParams, 8, 1)[0] = useResidualWeight;
-          const qnp = getCachedUniform(new Uint8Array(qNormParams), `L${l}-qn-p`);
-          const qnBG = createBindGroup(device, rmsnormPipeline, 0, [
-            { binding: 0, resource: { buffer: qBuf } },
-            { binding: 1, resource: { buffer: attnOutBuf } },
-            { binding: 2, resource: { buffer: lw.qNorm } },
-            { binding: 3, resource: { buffer: qnp } },
-          ], `L${l}-qnorm`);
-          bd(rmsnormPipeline, [qnBG], [seqLen * nHeads], `L${l}-qnorm`);
+          dispatchRMSNorm(qBuf, attnOutBuf, lw.qNorm, seqLen * nHeads, `L${l}-qnorm`, dHead);
           batchCopy(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHead * 4);
-
           // K norm
-          const knp = getCachedUniform(new Uint8Array(qNormParams), `L${l}-kn-p`);
-          new Uint32Array(qNormParams, 0, 1)[0] = dHead; // same params
-          const knBG = createBindGroup(device, rmsnormPipeline, 0, [
-            { binding: 0, resource: { buffer: kBuf } },
-            { binding: 1, resource: { buffer: ffnTempBuf } },
-            { binding: 2, resource: { buffer: lw.kNorm } },
-            { binding: 3, resource: { buffer: knp } },
-          ], `L${l}-knorm`);
-          bd(rmsnormPipeline, [knBG], [seqLen * nKVHeads], `L${l}-knorm`);
+          dispatchRMSNorm(kBuf, ffnTempBuf, lw.kNorm, seqLen * nKVHeads, `L${l}-knorm`, dHead);
           batchCopy(ffnTempBuf, 0, kBuf, 0, seqLen * kvDim * 4);
+        }
+
+        // Gemma 4: weightless RMSNorm on V before caching (gemma4.cpp Vcur_normed).
+        // The weight buffer is a dummy — skip_weight=1 ignores it.
+        if (config.modelType === 'gemma4_text') {
+          batchCopy(vBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
+          dispatchRMSNorm(ffnTempBuf, vBuf, lw.inputNorm, seqLen * nKVHeads, `L${l}-vnorm`, dHead, true);
         }
 
         // Add bias if model has attention_bias
@@ -2028,11 +2043,16 @@ export function createForwardPassEngine(
         }
 
         // Apply RoPE to Q and K
-        // Qwen3.5 full attention uses partial RoPE (25% of head dims)
+        // Qwen3.5 full attention uses partial RoPE (25% of head dims).
+        // Gemma 4: per-layer theta (sliding 10k / full 1e6) + proportional
+        // RoPE on full layers (only the first rotatedPairs pairs rotate).
         const fullAttnRotaryDim = config.partialRotaryFactor
           ? Math.floor(config.partialRotaryFactor * dHead) : 0;
-        dispatchRoPE(qBuf, seqLen, nHeads, pos, `L${l}-rope-q`, undefined, fullAttnRotaryDim);
-        dispatchRoPE(kBuf, seqLen, nKVHeads, pos, `L${l}-rope-k`, undefined, fullAttnRotaryDim);
+        const layerRope = config.layers[l].rope;
+        dispatchRoPE(qBuf, seqLen, nHeads, pos, `L${l}-rope-q`, undefined, fullAttnRotaryDim,
+          layerRope?.theta, layerRope?.rotatedPairs);
+        dispatchRoPE(kBuf, seqLen, nKVHeads, pos, `L${l}-rope-k`, undefined, fullAttnRotaryDim,
+          layerRope?.theta, layerRope?.rotatedPairs);
 
         if (isDebug && l === 0) {
           flushBatch();
@@ -2206,6 +2226,13 @@ export function createForwardPassEngine(
         }
       }
 
+      // Gemma 4 sandwich norm: attn_post_norm on the attn output BEFORE the
+      // residual add (gemma4.cpp attn_post_norm).
+      if (lw.attnPostNorm) {
+        batchCopy(attnProjBuf, 0, normedBuf, 0, seqLen * H * 4);
+        dispatchRMSNorm(normedBuf, attnProjBuf, lw.attnPostNorm, seqLen, `L${l}-attn-post-norm`);
+      }
+
       // Residual: hidden = residual + attn_output (shared for both layer types)
       dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res1`, attnProjBuf);
 
@@ -2243,13 +2270,13 @@ export function createForwardPassEngine(
         dispatchProjection(normedBuf, lw, 'upProj', upBuf, seqLen, ffnDim, H, `L${l}-up`);
         await maybeAudit(l, upBuf, `L${l}-up-out`, seqLen, ffnDim);
 
-        // MODEL-SPECIFIC: SiLU for most models, GELU for some
-        // Fused SwiGLU activation: ffnTemp = up * silu(gate) in a single dispatch.
+        // Fused gated activation: ffnTemp = up * act(gate) in a single dispatch
+        // (act = silu for most models, gelu_tanh for Gemma — config.activation).
         // Saves one dispatch + one full ffnDim read/write of VRAM traffic per layer.
-        // Old two-dispatch path (kept for reference / GELU variants):
+        // Old two-dispatch path (kept for reference):
         // dispatchElementwise(siluPipeline, gateBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silu`);
         // dispatchElementwise(mulPipeline, ffnTempBuf, gateBuf, seqLen * ffnDim, `L${l}-mul`, upBuf);
-        dispatchElementwise(gateSiluPipeline, upBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silumul`, gateBuf);
+        dispatchElementwise(gateActPipeline, upBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silumul`, gateBuf);
 
         dispatchProjection(ffnTempBuf, lw, 'downProj', downBuf, seqLen, H, ffnDim, `L${l}-down`);
         await maybeAudit(l, downBuf, `L${l}-down-out`, seqLen, H);
@@ -2310,7 +2337,7 @@ export function createForwardPassEngine(
         // the workers. (gateSilu fusion identical to the dense path above.)
         dispatchProjection(normedBuf, lw, 'gateProj', gateBuf, seqLen, ffnDim, H, `L${l}-gate`);
         dispatchProjection(normedBuf, lw, 'upProj', upBuf, seqLen, ffnDim, H, `L${l}-up`);
-        dispatchElementwise(gateSiluPipeline, upBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silumul`, gateBuf);
+        dispatchElementwise(gateActPipeline, upBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silumul`, gateBuf);
         dispatchProjection(ffnTempBuf, lw, 'downProj', downBuf, seqLen, H, ffnDim, `L${l}-down`);
         const stagingB = moeStagingRing![moeStagingIdx];
         moeStagingIdx = (moeStagingIdx + 1) % moeStagingRing!.length;
@@ -2372,6 +2399,13 @@ export function createForwardPassEngine(
         }
         // writeBuffer executes in queue order BEFORE the res2 dispatch below.
         device.queue.writeBuffer(downBuf, 0, combined.buffer, 0, combined.byteLength);
+      }
+
+      // Gemma 4 sandwich norm: ffn_post_norm on the FFN output BEFORE the
+      // residual add (gemma4.cpp ffn_post_norm).
+      if (lw.ffnPostNorm) {
+        batchCopy(downBuf, 0, normedBuf, 0, seqLen * H * 4);
+        dispatchRMSNorm(normedBuf, downBuf, lw.ffnPostNorm, seqLen, `L${l}-ffn-post-norm`);
       }
 
       // Residual: hidden = residual + ffn_output
@@ -2514,6 +2548,14 @@ export function createForwardPassEngine(
       bd(matmulBTBF16Pipeline, [bg], [Math.ceil(1 / 16), Math.ceil(V / 16)], 'lm-head');
     } else {
       dispatchMatmulBT(lmInputBuf, lmHeadBuf, logitsBuf, 1, V, H, 'lm-head');
+    }
+
+    // Gemma: final logit softcapping — logits = c · tanh(logits / c)
+    // (gemma4.cpp result_output; lmHeadCPU path can't reach here for GGUF models)
+    if (config.finalLogitSoftcap && softcapPipeline && logitsTempBuf) {
+      batchCopy(logitsBuf, 0, logitsTempBuf, 0, V * 4);
+      dispatchElementwise(softcapPipeline, logitsTempBuf, logitsBuf, V, 'logit-softcap',
+        undefined, undefined, config.finalLogitSoftcap);
     }
 
     // If timing is active, encode the resolve + staging copy into the same

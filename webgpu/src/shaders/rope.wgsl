@@ -16,6 +16,10 @@ struct Params {
   pos_offset: u32,  // position offset (for KV-cache continuation)
   rope_base: f32,   // base frequency (10000.0 default)
   rotary_dim: u32,  // how many dims to rotate (0 = all, else partial RoPE)
+  // Gemma 4 proportional RoPE: pairing still spans rot_dim (pair i with
+  // i + rot_dim/2) and freqs use the rot_dim divisor, but only the first
+  // `rotated_pairs` pairs rotate — the rest are identity. 0 = all pairs.
+  rotated_pairs: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> qk: array<f32>; // in-place rotation
@@ -27,13 +31,14 @@ fn rope(@builtin(global_invocation_id) gid: vec3u) {
   // rotary_dim: 0 means rotate all dims, >0 means only first rotary_dim dims
   let rot_dim = select(params.head_dim, params.rotary_dim, params.rotary_dim > 0u);
   let half_rot = rot_dim / 2u;
-  let total_pairs = params.seq_len * params.num_heads * half_rot;
+  let active_pairs = select(half_rot, min(params.rotated_pairs, half_rot), params.rotated_pairs > 0u);
+  let total_pairs = params.seq_len * params.num_heads * active_pairs;
 
   if (idx >= total_pairs) { return; }
 
   // Decompose flat index into (seq_pos, head, pair_idx)
-  let pair_idx = idx % half_rot;
-  let remaining = idx / half_rot;
+  let pair_idx = idx % active_pairs;
+  let remaining = idx / active_pairs;
   let head = remaining % params.num_heads;
   let seq_pos = remaining / params.num_heads;
 

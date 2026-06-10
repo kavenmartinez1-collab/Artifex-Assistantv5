@@ -87,6 +87,7 @@ const EXPERT_RE = /^blk\.\d+\.ffn_(gate|up|down)_exps\.weight$/;
 const FUSED_EXPERT_RE = /^blk\.\d+\.ffn_gate_up_exps\.weight$/;
 const SHEXP_GATE_RE = /^blk\.\d+\.ffn_gate_inp_shexp\.weight$/;
 const BLK_RE = /^blk\.(\d+)\./;
+const DEAD_KV_RE = /^blk\.(\d+)\.(attn_k|attn_v|attn_k_norm)\.weight$/;
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -155,8 +156,14 @@ export async function loadGGUFModel(
 
   const tied = !file.tensors.has('output.weight');
   // token_embd stays in RAM for CPU row-gather; if tied it ALSO goes to GPU
-  // (it doubles as lm_head there).
-  const cpuNames = new Set(['token_embd.weight']);
+  // (it doubles as lm_head there). Gemma 4: the PLE table (2+ GB) is also a
+  // per-token row-gather → CPU; rope_freqs is read by the descriptor bridge
+  // on CPU (applyRopeFreqFactors), never dispatched.
+  const cpuNames = new Set([
+    'token_embd.weight',
+    'per_layer_token_embd.weight',
+    'rope_freqs.weight',
+  ]);
   const alsoGPU = tied ? new Set(['token_embd.weight']) : new Set<string>();
 
   // MTP guard: some GGUFs carry next-token-prediction blocks at blk.L,
@@ -168,21 +175,35 @@ export async function loadGGUFModel(
   };
   const isCPUOnly = (name: string): boolean => cpuNames.has(name) || SHEXP_GATE_RE.test(name);
 
+  // KV-sharing guard (gemma4): layers ≥ kvFromStart read another layer's KV
+  // cache; their own k/v projection weights ship in the GGUF but are dead.
+  const sharedKvLayers = archKV<number>(file, 'attention.shared_kv_layers', 0);
+  const kvFromStart = numLayers - sharedKvLayers;
+  const isDeadKV = (name: string): boolean => {
+    if (sharedKvLayers <= 0) return false;
+    const m = DEAD_KV_RE.exec(name);
+    return m !== null && Number(m[1]) >= kvFromStart;
+  };
+
   // ── VRAM + RAM gates: refuse before downloading anything ──
   let gpuBytesPlanned = 0;
+  let cpuBytesPlanned = 0;
   let expertBytes = 0;
   let totalFileBytes = 0;
   for (const t of file.tensors.values()) {
     if (FUSED_EXPERT_RE.test(t.name)) {
       throw new Error(`[GGUF] "${t.name}": fused gate+up expert tensors unsupported — expected split ffn_gate_exps/ffn_up_exps`);
     }
-    if (isMTP(t.name)) continue;
+    if (isMTP(t.name) || isDeadKV(t.name)) continue;
     if (EXPERT_RE.test(t.name)) {
       expertBytes += t.byteLength;
       continue; // CPU worker fleet, never downloaded here
     }
     totalFileBytes += t.byteLength;
-    if (isCPUOnly(t.name) && !alsoGPU.has(t.name)) continue;
+    if (isCPUOnly(t.name)) {
+      cpuBytesPlanned += t.byteLength; // raw blocks kept in RAM
+      if (!alsoGPU.has(t.name)) continue;
+    }
     gpuBytesPlanned += plannedGPUBytes(t);
   }
   const budget = opts?.vramBudgetBytes ?? 6.5e9;
@@ -194,9 +215,10 @@ export async function loadGGUFModel(
     );
   }
   const ramBudget = opts?.ramBudgetBytes ?? 24e9;
-  if (expertBytes > ramBudget) {
+  if (expertBytes + cpuBytesPlanned > ramBudget) {
     throw new Error(
-      `MoE expert weights need ~${(expertBytes / 1e9).toFixed(1)} GB CPU RAM but the budget is `
+      `CPU-resident weights (MoE experts ~${(expertBytes / 1e9).toFixed(1)} GB + `
+      + `embeddings/PLE ~${(cpuBytesPlanned / 1e9).toFixed(1)} GB) exceed the RAM budget of `
       + `~${(ramBudget / 1e9).toFixed(1)} GB — refusing to load. Close other applications or `
       + `use a smaller quantization of this model.`,
     );
@@ -211,7 +233,7 @@ export async function loadGGUFModel(
 
   for (const t of file.tensors.values()) {
     idx++;
-    if (isMTP(t.name)) continue;
+    if (isMTP(t.name) || isDeadKV(t.name)) continue;
     if (EXPERT_RE.test(t.name)) {
       expertTensors.set(t.name, t); // worker fleet fetches these itself
       continue;
