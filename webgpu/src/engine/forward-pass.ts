@@ -627,6 +627,42 @@ export function createForwardPassEngine(
   const routerLogitsBuf = moeNumExperts > 0
     ? createStorageBuffer(device, null, MAX_PREFILL * moeNumExperts * 4, 'moe-router-logits', true)
     : null;
+  // ── C3 fast readback ring ─────────────────────────────────────────
+  // Two pumped mapAsyncs per MoE layer: phase 1 (normed + router logits, then
+  // the workers are kicked) and phase 2 (shared-expert out, overlapping the
+  // workers) — instead of readBuffer() round-trips.
+  // Chrome's mapAsync has a ~3 ms resolution floor when the event loop idles;
+  // pumping a 4-byte writeBuffer + sub-ms MessageChannel yield while the map
+  // is pending forces real queue ticks → ~0.2 ms (measured in gpu-bench.ts).
+  // Ring of 2: each phase's buffer is unmapped before the next copy encoding
+  // that touches it, so A/B alternation per layer is alias-free.
+  const moeStagingBytes = MAX_PREFILL * (2 * H + moeNumExperts) * 4;
+  const moeStagingRing = moeNumExperts > 0
+    ? [0, 1].map((i) => device.createBuffer({
+        size: moeStagingBytes,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        label: `moe-staging-${i}`,
+      }))
+    : null;
+  let moeStagingIdx = 0;
+  const pumpDstBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST, label: 'map-pump' });
+  const pumpSrcArr = new Uint32Array(1);
+  const pumpChan = new MessageChannel();
+  pumpChan.port1.start();
+  const fastYield = () => new Promise<void>((resolve) => {
+    pumpChan.port1.addEventListener('message', () => resolve(), { once: true });
+    pumpChan.port2.postMessage(0);
+  });
+  /** mapAsync with the writeBuffer-pump trick. Never await a bare mapAsync. */
+  async function mapWithPump(staging: GPUBuffer, bytes: number): Promise<void> {
+    let done = false;
+    const p = staging.mapAsync(GPUMapMode.READ, 0, bytes).then(() => { done = true; });
+    while (!done) {
+      device.queue.writeBuffer(pumpDstBuf, 0, pumpSrcArr);
+      await fastYield();
+    }
+    await p;
+  }
   const tokenIdBuf = createStorageBuffer(device, null, MAX_PREFILL * 4, 'token-ids', true);
   // Small buffer for extracting last token's hidden state (for LM head after batch prefill)
   const lastHiddenBuf = createStorageBuffer(device, null, H * 4, 'last-hidden', true);
@@ -963,6 +999,9 @@ export function createForwardPassEngine(
   let __perfDispatchCount = 0;
   let __perfCopyCount = 0;
   let __perfBindGroupCount = 0;
+  // C3: MoE step breakdown — staging map wait vs CPU expert compute.
+  let __perfMoESyncMs = 0;
+  let __perfMoEExpertMs = 0;
 
   function bd(
     pipeline: GPUComputePipeline, bindGroups: GPUBindGroup[],
@@ -1365,6 +1404,8 @@ export function createForwardPassEngine(
     const __perfT0 = performance.now();
     const __perfDispStart = __perfDispatchCount;
     const __perfCopyStart = __perfCopyCount;
+    __perfMoESyncMs = 0;
+    __perfMoEExpertMs = 0;
 
     // Upload token IDs
     device.queue.writeBuffer(tokenIdBuf, 0, tokenIds.buffer, tokenIds.byteOffset, tokenIds.byteLength);
@@ -2192,52 +2233,102 @@ export function createForwardPassEngine(
 
       // ── FFN (SwiGLU) ───────────────────────────────────────────────
       // MODEL-SPECIFIC: Phi fuses gate+up into one projection.
-      dispatchProjection(normedBuf, lw, 'gateProj', gateBuf, seqLen, ffnDim, H, `L${l}-gate`);
-      await maybeAudit(l, gateBuf, `L${l}-gate-out`, seqLen, ffnDim);
-      dispatchProjection(normedBuf, lw, 'upProj', upBuf, seqLen, ffnDim, H, `L${l}-up`);
-      await maybeAudit(l, upBuf, `L${l}-up-out`, seqLen, ffnDim);
+      // MoE layers skip this block: the SHARED expert (same dense slots) is
+      // dispatched inside the MoE branch below, AFTER the workers are kicked,
+      // so its GPU time + readback overlap the CPU expert GEMVs.
+      const isMoELayer = !!(lw.moeRouter && weights.moe && routerLogitsBuf);
+      if (!isMoELayer) {
+        dispatchProjection(normedBuf, lw, 'gateProj', gateBuf, seqLen, ffnDim, H, `L${l}-gate`);
+        await maybeAudit(l, gateBuf, `L${l}-gate-out`, seqLen, ffnDim);
+        dispatchProjection(normedBuf, lw, 'upProj', upBuf, seqLen, ffnDim, H, `L${l}-up`);
+        await maybeAudit(l, upBuf, `L${l}-up-out`, seqLen, ffnDim);
 
-      // MODEL-SPECIFIC: SiLU for most models, GELU for some
-      // Fused SwiGLU activation: ffnTemp = up * silu(gate) in a single dispatch.
-      // Saves one dispatch + one full ffnDim read/write of VRAM traffic per layer.
-      // Old two-dispatch path (kept for reference / GELU variants):
-      // dispatchElementwise(siluPipeline, gateBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silu`);
-      // dispatchElementwise(mulPipeline, ffnTempBuf, gateBuf, seqLen * ffnDim, `L${l}-mul`, upBuf);
-      dispatchElementwise(gateSiluPipeline, upBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silumul`, gateBuf);
+        // MODEL-SPECIFIC: SiLU for most models, GELU for some
+        // Fused SwiGLU activation: ffnTemp = up * silu(gate) in a single dispatch.
+        // Saves one dispatch + one full ffnDim read/write of VRAM traffic per layer.
+        // Old two-dispatch path (kept for reference / GELU variants):
+        // dispatchElementwise(siluPipeline, gateBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silu`);
+        // dispatchElementwise(mulPipeline, ffnTempBuf, gateBuf, seqLen * ffnDim, `L${l}-mul`, upBuf);
+        dispatchElementwise(gateSiluPipeline, upBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silumul`, gateBuf);
 
-      dispatchProjection(ffnTempBuf, lw, 'downProj', downBuf, seqLen, H, ffnDim, `L${l}-down`);
-      await maybeAudit(l, downBuf, `L${l}-down-out`, seqLen, H);
+        dispatchProjection(ffnTempBuf, lw, 'downProj', downBuf, seqLen, H, ffnDim, `L${l}-down`);
+        await maybeAudit(l, downBuf, `L${l}-down-out`, seqLen, H);
+      }
 
       // ── MoE routed experts (Phase C) ──────────────────────────────
-      // For MoE layers the dense-FFN slots above computed the SHARED expert
-      // into downBuf. Add the routed experts: router logits on GPU → readback
-      // (normed hidden + logits + shared-out) → JS top-8 + softmax-8 → CPU
-      // worker fleet GEMVs → combine routed + sigmoid(g)·shared → write the
-      // result back into downBuf so the res2 add below is unchanged.
+      // Two-phase overlap (C3): phase 1 reads back normed hidden + router
+      // logits and kicks the worker fleet for token 0; phase 2 then dispatches
+      // the SHARED expert (dense-FFN slots) and reads it back WHILE the
+      // workers compute. Combine routed + sigmoid(g)·shared → write back into
+      // downBuf so the res2 add below is unchanged.
       // Ground truth: llama-graph.cpp build_moe_ffn + models/qwen35moe.cpp.
       if (lw.moeRouter && weights.moe && routerLogitsBuf) {
         const spec = config.layers[l].moe!;
         const E = spec.numExperts;
         const topK = spec.numExpertsPerToken;
+        const hBytes = seqLen * H * 4;
+        const eBytes = seqLen * E * 4;
 
+        // Phase 1: router logits + normed hidden.
+        // Ordering invariant: copies are recorded AFTER the router dispatch in
+        // the same batch, so a single flush covers compute + copy-to-staging.
         dispatchProjection(normedBuf, lw, 'moeRouter', routerLogitsBuf, seqLen, E, H, `L${l}-router`);
-        // Ordering invariant: flush every recorded dispatch BEFORE reading back.
+        const stagingA = moeStagingRing![moeStagingIdx];
+        moeStagingIdx = (moeStagingIdx + 1) % moeStagingRing!.length;
+        batchCopy(normedBuf, 0, stagingA, 0, hBytes);
+        batchCopy(routerLogitsBuf, 0, stagingA, hBytes, eBytes);
         flushBatch();
-        const [normedAB, logitsAB, sharedAB] = await Promise.all([
-          readBuffer(device, normedBuf, seqLen * H * 4),
-          readBuffer(device, routerLogitsBuf, seqLen * E * 4),
-          readBuffer(device, downBuf, seqLen * H * 4),
-        ]);
-        const normed = new Float32Array(normedAB);
-        const logits = new Float32Array(logitsAB);
-        const shared = new Float32Array(sharedAB);
+        let __syncT0 = performance.now();
+        await mapWithPump(stagingA, hBytes + eBytes);
+        __perfMoESyncMs += performance.now() - __syncT0;
+        const mappedA = stagingA.getMappedRange(0, hBytes + eBytes);
+        if (mappedA.byteLength !== hBytes + eBytes) {
+          throw new Error(`[MoE L${l}] staging map ${mappedA.byteLength} B, expected ${hBytes + eBytes} B`);
+        }
+        // slice() copies out — the views must outlive unmap().
+        const normed = new Float32Array(mappedA.slice(0, hBytes));
+        const logits = new Float32Array(mappedA.slice(hBytes, hBytes + eBytes));
+        stagingA.unmap();
+
+        // Kick token 0's experts NOW — decode (seqLen === 1) fully overlaps.
+        const route0 = topKSoftmax(logits.subarray(0, E), topK);
+        const pending0 = weights.moe.backend.computeExperts(
+          l, normed.subarray(0, H), route0.ids, route0.weights);
+
+        // Phase 2: shared expert on the dense-FFN slots + readback, racing
+        // the workers. (gateSilu fusion identical to the dense path above.)
+        dispatchProjection(normedBuf, lw, 'gateProj', gateBuf, seqLen, ffnDim, H, `L${l}-gate`);
+        dispatchProjection(normedBuf, lw, 'upProj', upBuf, seqLen, ffnDim, H, `L${l}-up`);
+        dispatchElementwise(gateSiluPipeline, upBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silumul`, gateBuf);
+        dispatchProjection(ffnTempBuf, lw, 'downProj', downBuf, seqLen, H, ffnDim, `L${l}-down`);
+        const stagingB = moeStagingRing![moeStagingIdx];
+        moeStagingIdx = (moeStagingIdx + 1) % moeStagingRing!.length;
+        batchCopy(downBuf, 0, stagingB, 0, hBytes);
+        flushBatch();
+        __syncT0 = performance.now();
+        await mapWithPump(stagingB, hBytes);
+        __perfMoESyncMs += performance.now() - __syncT0;
+        const mappedB = stagingB.getMappedRange(0, hBytes);
+        if (mappedB.byteLength !== hBytes) {
+          throw new Error(`[MoE L${l}] shared staging map ${mappedB.byteLength} B, expected ${hBytes} B`);
+        }
+        const shared = new Float32Array(mappedB.slice(0, hBytes));
+        stagingB.unmap();
         const gateVec = weights.moe.sharedGateVecs[l];
         const combined = new Float32Array(seqLen * H);
 
         for (let t = 0; t < seqLen; t++) {
           const hidden = normed.subarray(t * H, (t + 1) * H);
-          const { ids, weights: rw } = topKSoftmax(logits.subarray(t * E, (t + 1) * E), topK);
-          const routed = await weights.moe.backend.computeExperts(l, hidden, ids, rw);
+          const { ids, weights: rw } = t === 0
+            ? route0
+            : topKSoftmax(logits.subarray(t * E, (t + 1) * E), topK);
+          const __expT0 = performance.now();
+          // t === 0 was kicked before phase 2 — only the EXPOSED wait (after
+          // the shared-expert readback) lands in moe_experts now.
+          const routed = t === 0
+            ? await pending0
+            : await weights.moe.backend.computeExperts(l, hidden, ids, rw);
+          __perfMoEExpertMs += performance.now() - __expT0;
           // Scalar shared-expert gate: sigmoid(x · ffn_gate_inp_shexp)
           let g = 0;
           for (let i = 0; i < H; i++) g += hidden[i] * gateVec[i];
@@ -2541,6 +2632,7 @@ export function createForwardPassEngine(
     const __perfMs = __perfT1 - __perfT0;
     (globalThis as any).__perfLastForward = {
       seqLen, cpuMs: __perfMs, dispatches: __perfDisp, copies: __perfCopy,
+      moeSyncMs: __perfMoESyncMs, moeExpertMs: __perfMoEExpertMs,
     };
     // Auto-log for the first 5 forward calls so the user sees the breakdown
     // without needing to set any global flag. After that, silence (avoids log
@@ -2552,6 +2644,9 @@ export function createForwardPassEngine(
         + `dispatches=${__perfDisp} copies=${__perfCopy} `
         + `(per-token: ${(__perfMs / seqLen).toFixed(1)}ms, `
         + `${(__perfDisp / seqLen).toFixed(0)} dispatches)`
+        + (__perfMoESyncMs + __perfMoEExpertMs > 0
+          ? ` moe_sync=${__perfMoESyncMs.toFixed(1)}ms moe_experts=${__perfMoEExpertMs.toFixed(1)}ms`
+          : '')
       );
     }
 

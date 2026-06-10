@@ -817,6 +817,10 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
   if (moeSpec) {
     const { createMoECPUBackend } = await import('./engine/moe-cpu');
     setStatus('Loading MoE experts into CPU workers...');
+    // ?moeWorkers=8|16|32 overrides the hardwareConcurrency-based default
+    // (must divide numExperts) — for A/B perf testing across machines.
+    const moeWorkersParam = new URLSearchParams(window.location.search).get('moeWorkers');
+    const moeWorkersOverride = moeWorkersParam ? parseInt(moeWorkersParam, 10) : undefined;
     const backend = await createMoECPUBackend({
       url: model.url,
       expertTensors: model.expertTensors,
@@ -824,11 +828,45 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
       numExperts: moeSpec.numExperts,
       hiddenSize: config.hiddenSize,
       ffnDim: moeSpec.expertFFNDim,
+      numWorkers: moeWorkersOverride,
       onProgress: (message, frac) => {
         progressEl.textContent = message;
         setStatus(`Loading experts... ${Math.round(frac * 100)}%`);
       },
     });
+    // Warm-up: Windows trims/compresses the 22 GB of expert pages during the
+    // long load, leaving them cold (~0.15 GB/s on first touch → decode ran
+    // 2-3 tok/s instead of warm speed). Warm in WAVES of 8 workers: all-NW
+    // passes thrash the pagefile when commit is near RAM capacity (observed
+    // 0.01 GB/s first pass × 4 retries at 32 workers, minutes pinned at max
+    // RAM). Each wave gets full disk bandwidth, finishes fast, and its pages
+    // stay resident while the next wave runs.
+    // Two rounds: warming later waves can re-trim earlier waves' pages
+    // (observed: first decode after a clean round 1 still ran ms/expert=0.36
+    // vs 0.13 warm). Round 2 re-sweeps — resident waves pass in ~0.2 s, only
+    // the re-trimmed delta gets re-faulted.
+    const nw = backend.numWorkers;
+    const waveSize = Math.min(8, nw);
+    let warmMinGbps = Infinity;
+    const warmT0 = performance.now();
+    for (let round = 1; round <= 2; round++) {
+      warmMinGbps = Infinity;
+      for (let w0 = 0; w0 < nw; w0 += waveSize) {
+        const count = Math.min(waveSize, nw - w0);
+        const label = `Warming expert RAM (round ${round}, workers ${w0 + 1}-${w0 + count} of ${nw}`;
+        setStatus(`${label})...`);
+        let warm = await backend.touchTest!(w0, count);
+        for (let pass = 2; pass <= 4 && Math.min(...warm.gbps) < 1.5; pass++) {
+          setStatus(`${label}, pass ${pass})...`);
+          warm = await backend.touchTest!(w0, count);
+        }
+        warmMinGbps = Math.min(warmMinGbps, Math.min(...warm.gbps));
+      }
+    }
+    console.log(
+      `[MoE] warm-up done in ${((performance.now() - warmT0) / 1000).toFixed(1)}s `
+      + `(slowest worker ${warmMinGbps.toFixed(2)} GB/s${warmMinGbps < 1.5 ? ' — STILL COLD, expect a slow first generation' : ''})`,
+    );
     const sharedGateVecs: Float32Array[] = [];
     for (let l = 0; l < config.numLayers; l++) {
       if (!config.layers[l].moe) { sharedGateVecs.push(new Float32Array(0)); continue; }

@@ -589,6 +589,9 @@ export function generate(
       const __perfStepBudget = 5; // log first N decode steps
       let __perfFwdCpuSum = 0, __perfGpuWaitSum = 0, __perfReadbackSum = 0, __perfSampleSum = 0;
       let __perfDispatchSum = 0, __perfStepCount = 0;
+      let __perfMoESyncSum = 0, __perfMoEExpertSum = 0;
+      // Reset MoE backend perf so the SUMMARY covers decode only (not prefill).
+      ((globalThis as any).__MOE_PERF__ as { reset(): void } | undefined)?.reset?.();
       for (let step = 1; step < config.maxNewTokens; step++) {
         if (aborted) {
           stopReason = 'aborted';
@@ -649,13 +652,17 @@ export function generate(
       const __readbackMs = __tReadback - __tGpuDone;
       const __sampleMs = __tSample - __tReadback;
       const __lastFwd = (globalThis as any).__perfLastForward as
-        | { dispatches: number; copies: number; cpuMs: number } | undefined;
+        | { dispatches: number; copies: number; cpuMs: number; moeSyncMs?: number; moeExpertMs?: number } | undefined;
       const __dispatchCount = __lastFwd ? __lastFwd.dispatches : -1;
+      const __moeSyncMs = __lastFwd?.moeSyncMs ?? 0;
+      const __moeExpertMs = __lastFwd?.moeExpertMs ?? 0;
       __perfFwdCpuSum += __fwdCpuMs;
       __perfGpuWaitSum += __gpuWaitMs;
       __perfReadbackSum += __readbackMs;
       __perfSampleSum += __sampleMs;
       __perfDispatchSum += __dispatchCount;
+      __perfMoESyncSum += __moeSyncMs;
+      __perfMoEExpertSum += __moeExpertMs;
       __perfStepCount++;
       if (step <= __perfStepBudget) {
         const __total = __fwdCpuMs + __gpuWaitMs + __readbackMs + __sampleMs;
@@ -666,6 +673,9 @@ export function generate(
           + `sample=${__sampleMs.toFixed(1)}ms `
           + `total=${__total.toFixed(1)}ms `
           + `dispatches=${__dispatchCount}`
+          + (__moeSyncMs + __moeExpertMs > 0
+            ? ` | moe_sync=${__moeSyncMs.toFixed(1)}ms moe_experts=${__moeExpertMs.toFixed(1)}ms (inside fwd_cpu)`
+            : '')
         );
       } else if (step === __perfStepBudget + 1) {
         // Print bottleneck diagnosis once, then go silent
@@ -723,6 +733,8 @@ export function generate(
         if (avgFwd > avgGpu * 1.5) diag = 'CPU/dispatch-bound — bind-group cache & encoder fusion are highest leverage';
         else if (avgGpu > avgFwd * 1.5) diag = 'GPU-bound — kernel fusion (norm+proj, FFN swiglu) is the win';
         else if (avgRb > avgFwd && avgRb > avgGpu) diag = 'readback-bound — async overlap will help most';
+        const avgMoESync = __perfMoESyncSum / n;
+        const avgMoEExp = __perfMoEExpertSum / n;
         console.log(
           `[perf decode SUMMARY over ${n} steps] `
           + `avg_total=${avgTotal.toFixed(1)}ms (=${(1000 / avgTotal).toFixed(2)} tok/s) | `
@@ -731,7 +743,29 @@ export function generate(
           + `readback=${avgRb.toFixed(1)}ms (${pct(avgRb)}) `
           + `sample=${avgSp.toFixed(1)}ms (${pct(avgSp)}) | `
           + `avg_dispatches/token=${avgDisp.toFixed(0)}`
+          + (avgMoESync + avgMoEExp > 0
+            ? ` | moe_sync=${avgMoESync.toFixed(1)}ms moe_experts=${avgMoEExp.toFixed(1)}ms (inside fwd_cpu)`
+            : '')
         );
+        const __moePerf = (globalThis as any).__MOE_PERF__ as
+          | { calls: number; dispatchMs: number; waitMs: number; workerBusyMs: number;
+              workerBusyAvgMs: number; maxExpertsPerWorker: number; activeWorkers: number; sumMs: number }
+          | undefined;
+        if (__moePerf && __moePerf.calls > 0) {
+          const per = (v: number) => (v / __moePerf.calls).toFixed(2);
+          console.log(
+            `[perf decode SUMMARY] MoE per layer-call (n=${__moePerf.calls}): `
+            + `dispatch=${per(__moePerf.dispatchMs)}ms `
+            + `wait=${per(__moePerf.waitMs)}ms `
+            + `(worker_busy_max=${per(__moePerf.workerBusyMs)}ms `
+            + `busy_avg=${per(__moePerf.workerBusyAvgMs)}ms → `
+            + `sched_overhead=${per(__moePerf.waitMs - __moePerf.workerBusyMs)}ms) `
+            + `sum=${per(__moePerf.sumMs)}ms | `
+            + `experts_on_busiest=${per(__moePerf.maxExpertsPerWorker)} `
+            + `active_workers=${per(__moePerf.activeWorkers)}/${(globalThis as any).__MOE_BACKEND__?.numWorkers ?? '?'} `
+            + `ms/expert_busiest=${(__moePerf.workerBusyMs / __moePerf.maxExpertsPerWorker).toFixed(2)}`
+          );
+        }
         console.log(`[perf decode SUMMARY] DIAGNOSIS: ${diag}`);
       }
     } // end if !eos from first token

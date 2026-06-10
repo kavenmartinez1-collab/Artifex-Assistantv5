@@ -1,29 +1,39 @@
 /**
  * MoE CPU backend — Phase C control plane for Qwen3.6-35B-A3B experts.
  *
- * Spawns a fleet of WASM workers; each holds a contiguous shard of experts
- * (default 8 workers × 32 experts × 40 layers, ~2.78 GB each) fetched
- * directly from the GGUF file via HTTP Range. Decode-time dispatch rides a
- * SharedArrayBuffer + Atomics: main quantizes the hidden vector to Q8 once,
- * writes per-worker expert requests, bumps a generation counter; workers
- * GEMV their selected experts (gate→up→silu⊙→Q8→down) and accumulate the
- * weighted routed output into per-worker outboxes which main sums.
+ * ROW-SPLIT layout: every worker owns a 1/NW row-strip of ALL experts
+ * (worker w: gate/up rows [w·ffnDim/NW, …), down rows [w·H/NW, …), for all
+ * 256 experts × 40 layers, ~22.25/NW GB each), fetched via the dev-server's
+ * strided-gather endpoint. Every routed expert is computed by ALL workers in
+ * parallel — perfect load balance, no straggler (the old ownership layout
+ * was pinned at busy_max ≈ 2.1 ms/layer by E[max experts/worker] × the
+ * slowest core's serial GEMV speed).
+ *
+ * Decode generation (SAB + Atomics):
+ *   main: xq8 + request list → GEN++ → workers phase A: per expert k,
+ *   gate/up strip GEMVs + silu⊙ → act2 slice into SAB → DONE_A barrier
+ *   (worker-to-worker) → phase B: per expert k, quantize full act2[k] →
+ *   down strip GEMV → weighted accumulate into the worker's DISJOINT
+ *   out[w·H/NW …) slice → DONE. Main reads out[0..H) directly — no summing.
  *
  * The shared expert and router run on GPU — this backend only computes
  * Σ wᵢ·downᵢ(silu(gateᵢ·x) ⊙ upᵢ(x)) over the selected routed experts.
  *
  * SAB layout (bytes; see sabLayout):
  *   ctl Int32[4]      — [0] GEN generation (-1 = shutdown), [1] DONE counter,
- *                       [2] LAYER index for this generation
- *   reqCount Int32[NW]        — selected experts owned by each worker
- *   reqExpert Int32[NW×K]     — LOCAL expert indices (worker-relative)
- *   reqWeight Float32[NW×K]   — routing weights (softmax over top-8)
- *   xq8 bytes                 — hidden vector as Q8 act blocks (shared input)
- *   out Float32[NW×H]         — per-worker weighted routed-output partials
+ *                       [2] LAYER index, [3] DONE_A phase-A barrier counter
+ *   reqCount Int32[1]     — number of routed experts this generation (≤ K)
+ *   reqExpert Int32[K]    — GLOBAL expert indices
+ *   reqWeight Float32[K]  — routing weights (softmax over top-8)
+ *   xq8 bytes             — hidden vector as Q8 act blocks (shared input)
+ *   act2 Float32[K×ffnDim] — phase-A exchange: silu(gate)⊙up per expert,
+ *                            worker w writes rows [w·ffnDim/NW, …)
+ *   out Float32[H]        — routed output; worker w writes [w·H/NW, …)
+ *   perf Float32[NW]      — per-worker busy ms for the last generation
  *
- * Protocol invariant: all non-atomic SAB writes happen BEFORE the
- * Atomics.store to GEN (main) / DONE (worker), which establishes the
- * happens-before edge for the reader.
+ * Protocol invariant: all non-atomic SAB writes happen BEFORE the Atomics
+ * op that publishes them (GEN store on main; DONE_A/DONE add on workers),
+ * which establishes the happens-before edge for the reader.
  */
 
 import { ggmlTypeTraits, GGML_TYPES, type GGUFTensorInfo } from '../model/gguf';
@@ -31,7 +41,21 @@ import { q8Quantize } from '../bench/q5k-ref';
 
 // ── Shared constants / SAB layout (single source of truth for the worker) ──
 
-export const MOE_NUM_WORKERS = 8;
+/**
+ * Adaptive worker count. Row-split sharding requires the count to divide
+ * both ffnDim (gate/up rows) and hiddenSize (down rows); powers of two do.
+ * Work per worker is uniform (1/NW of every routed expert), so the only
+ * scaling limit is hardware threads. Default: largest power of two ≤
+ * hardwareConcurrency, clamped to [4, 16]. Override via
+ * MoEBackendOpts.numWorkers (?moeWorkers= in main.ts) for A/B testing.
+ */
+export function pickMoEWorkerCount(ffnDim: number, hiddenSize: number): number {
+  const hc = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 8;
+  let n = 4;
+  while (n * 2 <= hc && n * 2 <= 16) n *= 2;
+  while (n > 1 && (ffnDim % n !== 0 || hiddenSize % n !== 0)) n /= 2;
+  return n;
+}
 /** Max experts routed per token (top-8) — also worst case on one worker. */
 export const MOE_MAX_K = 8;
 /** block_q8_act: f32 d + 256 int8 q + 8 int16 bsums. */
@@ -40,6 +64,10 @@ export const Q8_BLOCK_BYTES = 276;
 export const CTL_GEN = 0;
 export const CTL_DONE = 1;
 export const CTL_LAYER = 2;
+/** Phase-A barrier counter (workers wait on each other, not main). */
+export const CTL_DONE_A = 3;
+/** CTL_LAYER sentinel: stream the whole shard (paging/bandwidth probe). */
+export const TOUCH_LAYER = -2;
 
 export interface SABLayout {
   reqCountOff: number;
@@ -47,21 +75,28 @@ export interface SABLayout {
   reqWeightOff: number;
   xq8Off: number;
   xq8Bytes: number;
+  /** Float32[K×ffnDim] — phase-A act2 exchange (silu(gate)⊙up per expert). */
+  act2Off: number;
+  /** Float32[H] — routed output, disjoint per-worker row slices. */
   outOff: number;
+  /** Float32[NW] — per-worker busy ms for the last generation (perf probe). */
+  perfOff: number;
   totalBytes: number;
 }
 
-export function sabLayout(numWorkers: number, hiddenSize: number): SABLayout {
+export function sabLayout(numWorkers: number, hiddenSize: number, ffnDim: number): SABLayout {
   const K = MOE_MAX_K;
   const reqCountOff = 16; // after ctl Int32[4]
-  const reqExpertOff = reqCountOff + numWorkers * 4;
-  const reqWeightOff = reqExpertOff + numWorkers * K * 4;
-  const xq8Off = reqWeightOff + numWorkers * K * 4;
+  const reqExpertOff = reqCountOff + 4;
+  const reqWeightOff = reqExpertOff + K * 4;
+  const xq8Off = reqWeightOff + K * 4;
   const xq8Bytes = (hiddenSize / 256) * Q8_BLOCK_BYTES;
-  let outOff = xq8Off + xq8Bytes;
-  outOff = outOff + ((16 - (outOff % 16)) % 16);
-  const totalBytes = outOff + numWorkers * hiddenSize * 4;
-  return { reqCountOff, reqExpertOff, reqWeightOff, xq8Off, xq8Bytes, outOff, totalBytes };
+  let act2Off = xq8Off + xq8Bytes;
+  act2Off = act2Off + ((16 - (act2Off % 16)) % 16);
+  const outOff = act2Off + K * ffnDim * 4;
+  const perfOff = outOff + hiddenSize * 4;
+  const totalBytes = perfOff + numWorkers * 4;
+  return { reqCountOff, reqExpertOff, reqWeightOff, xq8Off, xq8Bytes, act2Off, outOff, perfOff, totalBytes };
 }
 
 export interface ExpertSlabDesc {
@@ -85,8 +120,7 @@ export interface MoEWorkerInitMsg {
   workerId: number;
   url: string;
   sab: SharedArrayBuffer;
-  expertStart: number;
-  expertCount: number;
+  numExperts: number;
   hiddenSize: number;
   ffnDim: number;
   numWorkers: number;
@@ -137,9 +171,15 @@ export interface MoEBackend {
     expertIds: Int32Array | number[],
     weights: Float32Array | number[],
   ): Promise<Float32Array>;
+  /**
+   * Warm-up / paging probe: workers [waveStart, waveStart+waveCount) stream
+   * their FULL shard sequentially and report ms + GB/s (defaults: all).
+   * Resident memory ≈ bench speed (~2 GB/s/worker); paged-out memory is
+   * 10-100× slower. Run from console: await __MOE_BACKEND__.touchTest()
+   */
+  touchTest?(waveStart?: number, waveCount?: number): Promise<{ workerMs: number[]; gbps: number[] }>;
   destroy(): void;
   readonly numWorkers: number;
-  readonly expertsPerWorker: number;
 }
 
 export interface MoEBackendOpts {
@@ -187,22 +227,62 @@ export function serializeQ8(act: ReturnType<typeof q8Quantize>, dst: Uint8Array)
   }
 }
 
-type WaitAsyncFn = (
-  ta: Int32Array,
-  i: number,
-  v: number,
-) => { async: boolean; value: Promise<string> | string };
+/** Decode-perf accumulators, inspectable as __MOE_PERF__ in the console. */
+export interface MoEPerf {
+  calls: number;
+  /** Q8 quantize + serialize + request routing + signal (main thread). */
+  dispatchMs: number;
+  /** Signal → all workers DONE (includes wake latency + compute). */
+  waitMs: number;
+  /** Max per-worker busy time per call, summed — the pure compute floor. */
+  workerBusyMs: number;
+  /** Mean busy time across ACTIVE workers per call, summed. */
+  workerBusyAvgMs: number;
+  /** Experts on the busiest worker per call, summed (routing imbalance). */
+  maxExpertsPerWorker: number;
+  /** Workers with ≥1 expert per call, summed. */
+  activeWorkers: number;
+  /** Partial-sum reduction (main thread). */
+  sumMs: number;
+  reset(): void;
+}
+
+function getMoEPerf(): MoEPerf {
+  const g = globalThis as unknown as { __MOE_PERF__?: MoEPerf };
+  if (!g.__MOE_PERF__) {
+    g.__MOE_PERF__ = {
+      calls: 0,
+      dispatchMs: 0,
+      waitMs: 0,
+      workerBusyMs: 0,
+      workerBusyAvgMs: 0,
+      maxExpertsPerWorker: 0,
+      activeWorkers: 0,
+      sumMs: 0,
+      reset() {
+        this.calls = 0;
+        this.dispatchMs = 0;
+        this.waitMs = 0;
+        this.workerBusyMs = 0;
+        this.workerBusyAvgMs = 0;
+        this.maxExpertsPerWorker = 0;
+        this.activeWorkers = 0;
+        this.sumMs = 0;
+      },
+    };
+  }
+  return g.__MOE_PERF__;
+}
 
 export async function createMoECPUBackend(opts: MoEBackendOpts): Promise<MoEBackend> {
-  const numWorkers = opts.numWorkers ?? MOE_NUM_WORKERS;
   const { numLayers, numExperts, hiddenSize, ffnDim } = opts;
-  if (numExperts % numWorkers !== 0) {
-    throw new Error(`[MoE] ${numExperts} experts not divisible by ${numWorkers} workers`);
+  const numWorkers = opts.numWorkers ?? pickMoEWorkerCount(ffnDim, hiddenSize);
+  if (ffnDim % numWorkers !== 0 || hiddenSize % numWorkers !== 0) {
+    throw new Error(`[MoE] row-split needs ${numWorkers} workers to divide ffnDim ${ffnDim} and hidden ${hiddenSize}`);
   }
   if (!crossOriginIsolated) {
     throw new Error('[MoE] not crossOriginIsolated — SharedArrayBuffer unavailable (COOP/COEP headers missing)');
   }
-  const expertsPerWorker = numExperts / numWorkers;
 
   // Per-layer slab descriptors from the deferred expert tensors.
   const layers: MoELayerSlabs[] = [];
@@ -229,23 +309,25 @@ export async function createMoECPUBackend(opts: MoEBackendOpts): Promise<MoEBack
     layers.push({ gate, up, down });
   }
 
-  const layout = sabLayout(numWorkers, hiddenSize);
+  const layout = sabLayout(numWorkers, hiddenSize, ffnDim);
   const sab = new SharedArrayBuffer(layout.totalBytes);
   const ctl = new Int32Array(sab, 0, 4);
-  const reqCount = new Int32Array(sab, layout.reqCountOff, numWorkers);
-  const reqExpert = new Int32Array(sab, layout.reqExpertOff, numWorkers * MOE_MAX_K);
-  const reqWeight = new Float32Array(sab, layout.reqWeightOff, numWorkers * MOE_MAX_K);
+  const reqCount = new Int32Array(sab, layout.reqCountOff, 1);
+  const reqExpert = new Int32Array(sab, layout.reqExpertOff, MOE_MAX_K);
+  const reqWeight = new Float32Array(sab, layout.reqWeightOff, MOE_MAX_K);
   const xq8 = new Uint8Array(sab, layout.xq8Off, layout.xq8Bytes);
-  const out = new Float32Array(sab, layout.outOff, numWorkers * hiddenSize);
+  const out = new Float32Array(sab, layout.outOff, hiddenSize);
+  const perfBusy = new Float32Array(sab, layout.perfOff, numWorkers);
 
   // ── Spawn + load the fleet ──
   const workers: Worker[] = [];
   const loaded = new Array<number>(numWorkers).fill(0);
-  const shardBytes = layers.reduce(
-    (s, L) => s + (L.gate.bytesPerExpert + L.up.bytesPerExpert + L.down.bytesPerExpert) * expertsPerWorker,
+  // Row-split: every worker holds 1/NW of every expert tensor.
+  const totalBytes = layers.reduce(
+    (s, L) => s + (L.gate.bytesPerExpert + L.up.bytesPerExpert + L.down.bytesPerExpert) * numExperts,
     0,
   );
-  const totalBytes = shardBytes * numWorkers;
+  const shardBytes = totalBytes / numWorkers;
 
   try {
     await Promise.all(
@@ -274,8 +356,7 @@ export async function createMoECPUBackend(opts: MoEBackendOpts): Promise<MoEBack
             workerId: w,
             url: opts.url,
             sab,
-            expertStart: w * expertsPerWorker,
-            expertCount: expertsPerWorker,
+            numExperts,
             hiddenSize,
             ffnDim,
             numWorkers,
@@ -291,11 +372,23 @@ export async function createMoECPUBackend(opts: MoEBackendOpts): Promise<MoEBack
   }
 
   console.log(
-    `[MoE] fleet ready: ${numWorkers} workers × ${expertsPerWorker} experts × ${numLayers} layers `
-    + `(${(totalBytes / 1e9).toFixed(2)} GB in RAM)`,
+    `[MoE] fleet ready: ${numWorkers} workers, row-split 1/${numWorkers} of all `
+    + `${numExperts} experts × ${numLayers} layers (${(totalBytes / 1e9).toFixed(2)} GB in RAM)`,
   );
 
-  const waitAsync = (Atomics as unknown as { waitAsync?: WaitAsyncFn }).waitAsync;
+  // Sub-ms event-loop yield (same MessageChannel trick as the mapAsync pump
+  // in gpu-bench/forward-pass). Atomics.waitAsync resolution rides the
+  // macrotask queue (~1 ms each) and main re-armed it after EVERY worker's
+  // DONE increment — up to 8 wakeups/layer ≈ 8 ms/layer of pure scheduling.
+  const yieldChan = new MessageChannel();
+  yieldChan.port1.start();
+  const microYield = () =>
+    new Promise<void>((resolve) => {
+      yieldChan.port1.addEventListener('message', () => resolve(), { once: true });
+      yieldChan.port2.postMessage(0);
+    });
+
+  const perf = getMoEPerf();
   let generation = 0;
   let inFlight = false;
   let destroyed = false;
@@ -312,46 +405,90 @@ export async function createMoECPUBackend(opts: MoEBackendOpts): Promise<MoEBack
     if (expertIds.length !== weights.length) throw new Error('[MoE] expertIds/weights length mismatch');
     inFlight = true;
     try {
+      const t0 = performance.now();
       // Quantize the hidden vector once, share with all workers.
       serializeQ8(q8Quantize(hidden), xq8);
 
-      reqCount.fill(0);
-      for (let k = 0; k < expertIds.length; k++) {
+      const n = expertIds.length;
+      if (n > MOE_MAX_K) throw new Error(`[MoE] ${n} experts > MOE_MAX_K ${MOE_MAX_K}`);
+      for (let k = 0; k < n; k++) {
         const e = expertIds[k] as number;
         if (e < 0 || e >= numExperts) throw new Error(`[MoE] expert id ${e} out of range`);
-        const w = Math.floor(e / expertsPerWorker);
-        const n = reqCount[w];
-        if (n >= MOE_MAX_K) throw new Error(`[MoE] >${MOE_MAX_K} experts routed to worker ${w}`);
-        reqExpert[w * MOE_MAX_K + n] = e - w * expertsPerWorker; // local index
-        reqWeight[w * MOE_MAX_K + n] = weights[k] as number;
-        reqCount[w] = n + 1;
+        reqExpert[k] = e;
+        reqWeight[k] = weights[k] as number;
       }
+      reqCount[0] = n;
 
       Atomics.store(ctl, CTL_DONE, 0);
+      Atomics.store(ctl, CTL_DONE_A, 0);
       Atomics.store(ctl, CTL_LAYER, layer);
       generation++;
       Atomics.store(ctl, CTL_GEN, generation);
       Atomics.notify(ctl, CTL_GEN);
+      const t1 = performance.now();
 
-      // Wait for all workers (idle ones ack immediately).
-      for (;;) {
-        const done = Atomics.load(ctl, CTL_DONE);
-        if (done === numWorkers) break;
-        if (waitAsync) {
-          const r = waitAsync(ctl, CTL_DONE, done);
-          if (r.async) await r.value;
-        } else {
-          await new Promise((res) => setTimeout(res, 0)); // poll fallback
-        }
+      // Wait for all workers via sub-ms MessageChannel poll (NOT
+      // Atomics.waitAsync — see yieldChan comment above).
+      while (Atomics.load(ctl, CTL_DONE) !== numWorkers) {
+        await microYield();
       }
+      const t2 = performance.now();
 
-      const result = new Float32Array(hiddenSize);
+      // Workers wrote disjoint row slices — the SAB out region IS the result.
+      const result = new Float32Array(out);
+
+      let maxBusy = 0;
+      let busySum = 0;
       for (let w = 0; w < numWorkers; w++) {
-        if (reqCount[w] === 0) continue;
-        const part = out.subarray(w * hiddenSize, (w + 1) * hiddenSize);
-        for (let i = 0; i < hiddenSize; i++) result[i] += part[i];
+        if (perfBusy[w] > maxBusy) maxBusy = perfBusy[w];
+        busySum += perfBusy[w];
       }
+      perf.calls++;
+      perf.dispatchMs += t1 - t0;
+      perf.waitMs += t2 - t1;
+      perf.workerBusyMs += maxBusy;
+      perf.workerBusyAvgMs += busySum / numWorkers;
+      perf.maxExpertsPerWorker += n; // row-split: every worker computes all n
+      perf.activeWorkers += numWorkers;
+      perf.sumMs += performance.now() - t2;
       return result;
+    } finally {
+      inFlight = false;
+    }
+  }
+
+  async function touchTest(
+    waveStart = 0,
+    waveCount = numWorkers,
+  ): Promise<{ workerMs: number[]; gbps: number[] }> {
+    if (destroyed) throw new Error('[MoE] backend destroyed');
+    if (inFlight) throw new Error('[MoE] busy — run touchTest while idle');
+    inFlight = true;
+    try {
+      reqCount[0] = 0;
+      // Wave bounds (reqExpert is unused by touch generations): workers
+      // outside [start, end) check in without streaming. Waves keep the
+      // pagefile from being thrashed by NW concurrent streams at near-OOM.
+      reqExpert[0] = waveStart;
+      reqExpert[1] = waveStart + waveCount;
+      Atomics.store(ctl, CTL_DONE, 0);
+      Atomics.store(ctl, CTL_DONE_A, 0);
+      Atomics.store(ctl, CTL_LAYER, TOUCH_LAYER);
+      generation++;
+      Atomics.store(ctl, CTL_GEN, generation);
+      Atomics.notify(ctl, CTL_GEN);
+      while (Atomics.load(ctl, CTL_DONE) !== numWorkers) {
+        await microYield();
+      }
+      const workerMs = Array.from(perfBusy).slice(waveStart, waveStart + waveCount);
+      const gbps = workerMs.map((ms) => shardBytes / 1e9 / (ms / 1000));
+      console.log(
+        `[MoE touchTest] workers ${waveStart}-${waveStart + waveCount - 1} | `
+        + `shard=${(shardBytes / 1e9).toFixed(2)} GB/worker | `
+        + `ms: ${workerMs.map((m) => m.toFixed(0)).join(' ')} | `
+        + `GB/s: ${gbps.map((g) => g.toFixed(2)).join(' ')}`,
+      );
+      return { workerMs, gbps };
     } finally {
       inFlight = false;
     }
@@ -365,5 +502,8 @@ export async function createMoECPUBackend(opts: MoEBackendOpts): Promise<MoEBack
     workers.forEach((w) => w.terminate());
   }
 
-  return { computeExperts, destroy, numWorkers, expertsPerWorker };
+  const backend: MoEBackend = { computeExperts, touchTest, destroy, numWorkers };
+  // Console-accessible debug handle (touchTest paging probe).
+  (globalThis as unknown as { __MOE_BACKEND__?: MoEBackend }).__MOE_BACKEND__ = backend;
+  return backend;
 }

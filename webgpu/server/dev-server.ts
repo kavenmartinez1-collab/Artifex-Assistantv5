@@ -209,6 +209,42 @@ app.get('/api/hf-cache/:org/:model/:action(resolve|raw)/main/*', (req, res) => {
   res.setHeader('Accept-Ranges', 'bytes');
   res.setHeader('Content-Type', 'application/octet-stream');
 
+  // Strided gather (MoE row-split expert strips): returns `gatherCount`
+  // chunks of `gatherChunk` bytes read at gatherStart + i*gatherStride,
+  // concatenated. Lets a worker fetch its 1/N row-strip of all experts in
+  // one round-trip per tensor instead of 256 tiny Range requests.
+  if (req.query.gatherStart !== undefined) {
+    const start = Number(req.query.gatherStart);
+    const stride = Number(req.query.gatherStride);
+    const chunk = Number(req.query.gatherChunk);
+    const count = Number(req.query.gatherCount);
+    const valid =
+      [start, stride, chunk, count].every((v) => Number.isSafeInteger(v) && v >= 0)
+      && chunk > 0 && count > 0 && stride >= chunk
+      && chunk * count <= 1 << 30
+      && start + (count - 1) * stride + chunk <= fileSize;
+    if (!valid) return res.status(416).json({ error: 'bad gather params' });
+    const total = chunk * count;
+    (async () => {
+      const fd = await fs.promises.open(filePath, 'r');
+      try {
+        const buf = Buffer.allocUnsafe(total);
+        for (let i = 0; i < count; i++) {
+          const { bytesRead } = await fd.read(buf, i * chunk, chunk, start + i * stride);
+          if (bytesRead !== chunk) throw new Error(`short read: chunk ${i} got ${bytesRead}/${chunk}`);
+        }
+        res.setHeader('Content-Length', total);
+        res.end(buf);
+      } finally {
+        await fd.close();
+      }
+    })().catch((err) => {
+      if (!res.headersSent) res.status(500).json({ error: String(err) });
+      else res.destroy();
+    });
+    return;
+  }
+
   const rangeHeader = req.headers.range;
   if (rangeHeader) {
     const [startStr, endStr] = rangeHeader.replace('bytes=', '').split('-');
