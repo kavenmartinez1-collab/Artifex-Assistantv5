@@ -93,6 +93,13 @@ export interface LayerWeights {
   // residual add (gemma4.cpp attn_post_norm / ffn_post_norm).
   attnPostNorm?: GPUBuffer; // [hidden_size]
   ffnPostNorm?: GPUBuffer;  // [hidden_size]
+  // Gemma 4 PLE sub-block (after the FFN residual) + per-layer output scale
+  pleInpGate?: GPUBuffer;     // [ple_dim, hidden_size]
+  pleInpGate_gg?: GGUFWeight;
+  pleProj?: GPUBuffer;        // [hidden_size, ple_dim]
+  pleProj_gg?: GGUFWeight;
+  plePostNorm?: GPUBuffer;    // [hidden_size]
+  layerOutScale?: GPUBuffer;  // [1] — scales the whole stream after PLE
   gateProj: GPUBuffer;     // [intermediate_size, hidden_size]
   upProj: GPUBuffer;       // [intermediate_size, hidden_size]
   downProj: GPUBuffer;     // [hidden_size, intermediate_size]
@@ -196,6 +203,13 @@ export interface GlobalWeights {
   embedGG?: { data: Uint8Array; ggmlType: number; rowBytes: number };
   /** GGUF lm_head: repacked k-quant blocks on GPU (matmul_gguf kernel). */
   lmHeadGG?: GGUFWeight;
+  /** Gemma 4 PLE: per-layer token table, CPU row-gather like embedGG. */
+  pleTokenEmbedGG?: { data: Uint8Array; ggmlType: number; rowBytes: number };
+  /** Gemma 4 PLE: hidden → [n_layer * ple_dim] projection. */
+  pleModelProj?: GPUBuffer;
+  pleModelProj_gg?: GGUFWeight;
+  /** Gemma 4 PLE: RMSNorm weight [ple_dim] for the projected inputs. */
+  pleProjNorm?: GPUBuffer;
 }
 
 /** All model weights on the GPU. */
@@ -403,6 +417,9 @@ export function createForwardPassEngine(
   // Gemma: final logit softcapping c·tanh(x/c)
   const softcapPipeline = config.finalLogitSoftcap
     ? createComputePipeline(device, elementwiseWGSL, 'softcap', 'softcap') : null;
+  // Gemma 4 PLE: (per_layer_proj + inp_per_layer) × 1/√2 combine
+  const addscalePipeline = config.perLayerEmbed
+    ? createComputePipeline(device, elementwiseWGSL, 'addscale', 'addscale') : null;
   const softplusPipeline = isHybrid
     ? createComputePipeline(device, elementwiseWGSL, 'softplus', 'softplus') : null;
   const conv1dPipeline = isHybrid
@@ -497,6 +514,7 @@ export function createForwardPassEngine(
   registerCat(gateSiluPipeline, 'gate_silu');
   if (gateActPipeline !== gateSiluPipeline) registerCat(gateActPipeline, 'gate_gelu');
   registerCat(softcapPipeline, 'softcap');
+  registerCat(addscalePipeline, 'addscale');
   registerCat(softplusPipeline, 'softplus');
   registerCat(conv1dPipeline, 'conv1d');
   registerCat(conv1dUpdatePipeline, 'conv1d_update');
@@ -638,6 +656,25 @@ export function createForwardPassEngine(
   // Softcap needs a read-side copy (WebGPU can't bind one buffer read + read_write)
   const logitsTempBuf = config.finalLogitSoftcap
     ? createStorageBuffer(device, null, V * 4, 'logits-precap') : null;
+  // ── Gemma 4 PLE buffers ─────────────────────────────────────────────
+  // Token-major combined per-layer input [tokens][n_layer][dPle].
+  // pleInpBuf: CPU row-gather of per_layer_token_embd × √dPle (writeBuffer).
+  // pleProjBuf / pleCombinedBuf: rotate through projection → scale → norm →
+  // combine (WebGPU forbids binding one buffer read + read_write).
+  const dPle = config.perLayerEmbedDim ?? 0;
+  const pleDim = config.perLayerEmbed ? L * dPle : 0; // 42 × 256 = 10752
+  const pleInpBuf = pleDim > 0
+    ? createStorageBuffer(device, null, MAX_PREFILL * pleDim * 4, 'ple-inp') : null;
+  const pleProjBuf = pleDim > 0
+    ? createStorageBuffer(device, null, MAX_PREFILL * pleDim * 4, 'ple-proj') : null;
+  const pleCombinedBuf = pleDim > 0
+    ? createStorageBuffer(device, null, MAX_PREFILL * pleDim * 4, 'ple-combined') : null;
+  // Per-layer gate output [tokens, dPle]
+  const pleGateBuf = pleDim > 0
+    ? createStorageBuffer(device, null, MAX_PREFILL * dPle * 4, 'ple-gate') : null;
+  // [1] constant 1/√H — per_layer_projection_scale (broadcast mul)
+  const pleProjScaleBuf = pleDim > 0
+    ? createStorageBuffer(device, new Float32Array([1.0 / Math.sqrt(H)]), 4, 'ple-proj-scale') : null;
   // MoE: router logits [seqLen, numExperts] (read back per layer for CPU top-k)
   const moeNumExperts = config.layers.find((d) => d.moe)?.moe?.numExperts ?? 0;
   const routerLogitsBuf = moeNumExperts > 0
@@ -1172,10 +1209,12 @@ export function createForwardPassEngine(
     inputBuf: GPUBuffer, outputBuf: GPUBuffer,
     size: number, label: string, secondBuf?: GPUBuffer,
     broadcastB?: number, scale?: number,
+    aSlice?: { len: number; stride: number; off: number },
   ) {
-    const ewParamData = new ArrayBuffer(16);
+    const ewParamData = new ArrayBuffer(32);
     new Uint32Array(ewParamData, 0, 2).set([size, broadcastB ?? 0]);
     new Float32Array(ewParamData, 8, 1)[0] = scale ?? 0;
+    new Uint32Array(ewParamData, 12, 3).set([aSlice?.len ?? 0, aSlice?.stride ?? 0, aSlice?.off ?? 0]);
     const params = getCachedUniform(new Uint8Array(ewParamData), `${label}-p`);
     const entries: Array<{ binding: number; resource: GPUBindingResource }> = [
       { binding: 0, resource: { buffer: inputBuf } },
@@ -1599,6 +1638,42 @@ export function createForwardPassEngine(
       } catch (e) {
         console.error('[EMBED-TABLE] readback failed:', e);
       }
+    }
+
+    // ── Gemma 4 PLE input (once per forward) ─────────────────────────
+    // gemma4.cpp:145-173:
+    //   inp_per_layer = get_rows(per_layer_tok_embd, tokens) × √dPle
+    //   per_layer_proj = RMSNorm(per_layer_model_proj @ inpL × 1/√H, proj_norm)
+    //   combined = (per_layer_proj + inp_per_layer) × 1/√2
+    // Token-major layout [tokens][L][dPle] (ggml permutes to layer-major;
+    // we instead use a strided slice view in the per-layer gate_gelu).
+    if (pleDim > 0 && weights.global.pleTokenEmbedGG
+        && pleInpBuf && pleProjBuf && pleCombinedBuf && pleProjScaleBuf) {
+      const { data, ggmlType, rowBytes } = weights.global.pleTokenEmbedGG;
+      const tokScale = Math.sqrt(dPle);
+      const pleF32 = new Float32Array(seqLen * pleDim);
+      for (let t = 0; t < seqLen; t++) {
+        const row = data.subarray(tokenIds[t] * rowBytes, (tokenIds[t] + 1) * rowBytes);
+        if (row.byteLength !== rowBytes) {
+          throw new Error(`[PLE GGUF] token ${tokenIds[t]}: row slice ${row.byteLength} != ${rowBytes} bytes`);
+        }
+        const vals = dequantGGML(ggmlType, row, pleDim);
+        for (let i = 0; i < pleDim; i++) pleF32[t * pleDim + i] = vals[i] * tokScale;
+      }
+      device.queue.writeBuffer(pleInpBuf, 0, pleF32.buffer, 0, seqLen * pleDim * 4);
+      // per_layer_proj = model_proj @ inpL (inpL = embed stream, already ×√H)
+      dispatchProjection(hiddenBuf, weights.global as unknown as LayerWeights, 'pleModelProj',
+        pleProjBuf, seqLen, pleDim, H, 'ple-model-proj');
+      // × 1/√H BEFORE the norm — RMSNorm is scale-invariant in the limit, but
+      // skipping this would scale the effective eps by H (1e-6 → 2.56e-3).
+      dispatchElementwise(mulPipeline, pleProjBuf, pleCombinedBuf, seqLen * pleDim,
+        'ple-proj-scale', pleProjScaleBuf, 1);
+      // RMSNorm over each dPle-sized row (seqLen × L rows)
+      dispatchRMSNorm(pleCombinedBuf, pleProjBuf, weights.global.pleProjNorm!,
+        seqLen * L, 'ple-proj-norm', dPle);
+      // combined = (per_layer_proj + inp_per_layer) × 1/√2
+      dispatchElementwise(addscalePipeline!, pleProjBuf, pleCombinedBuf, seqLen * pleDim,
+        'ple-combine', pleInpBuf, 0, Math.SQRT1_2);
     }
 
     // ── Transformer layers ───────────────────────────────────────────
@@ -2433,6 +2508,29 @@ export function createForwardPassEngine(
 
       // Residual: hidden = residual + ffn_output
       dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res2`, downBuf);
+
+      // ── Gemma 4 PLE sub-block (gemma4.cpp:397-457) ───────────────────
+      // x = x + RMSNorm(proj @ (gelu(inp_gate @ x) ⊙ combined[l]), post_norm)
+      // then ×out_scale (broadcast [1], applied to the whole stream).
+      if (pleDim > 0 && pleCombinedBuf && pleGateBuf
+          && (lw.pleInpGate || lw.pleInpGate_gg)) {
+        // gate = inp_gate @ x  [seqLen, dPle]
+        dispatchProjection(hiddenBuf, lw, 'pleInpGate', pleGateBuf, seqLen, dPle, H, `L${l}-ple-gate`);
+        // gelu(gate) ⊙ combined[l] — strided slice of token-major [tok][L][dPle]
+        dispatchElementwise(gateActPipeline, pleCombinedBuf, normedBuf, seqLen * dPle,
+          `L${l}-ple-gate-gelu`, pleGateBuf, 0, 0, { len: dPle, stride: pleDim, off: l * dPle });
+        // proj: dPle → H
+        dispatchProjection(normedBuf, lw, 'pleProj', attnProjBuf, seqLen, H, dPle, `L${l}-ple-proj`);
+        dispatchRMSNorm(attnProjBuf, normedBuf, lw.plePostNorm!, seqLen, `L${l}-ple-post-norm`);
+        // residual: pe_in (hiddenBuf) + ple_out (normedBuf) → attnProjBuf
+        dispatchElementwise(addPipeline, hiddenBuf, attnProjBuf, seqLen * H, `L${l}-ple-res`, normedBuf);
+        if (lw.layerOutScale) {
+          dispatchElementwise(mulPipeline, attnProjBuf, hiddenBuf, seqLen * H,
+            `L${l}-out-scale`, lw.layerOutScale, 1);
+        } else {
+          batchCopy(attnProjBuf, 0, hiddenBuf, 0, seqLen * H * 4);
+        }
+      }
 
       // Dump hidden state after every layer for comparison with PyTorch reference
       if (isDebug) {

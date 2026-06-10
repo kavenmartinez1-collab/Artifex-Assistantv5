@@ -197,7 +197,8 @@ async function testSiLU(device: GPUDevice): Promise<TestResult> {
 
   const inputBuf = createStorageBuffer(device, input, N * 4, 'silu-input');
   const outputBuf = createStorageBuffer(device, null, N * 4, 'silu-output', true);
-  const paramsBuf = createUniformBuffer(device, new Uint32Array([N]), 'silu-params');
+  // Elementwise Params is 6 fields (24 B) — pad past the 16 B default fill
+  const paramsBuf = createUniformBuffer(device, new Uint32Array([N, 0, 0, 0, 0, 0]), 'silu-params');
 
   const pipeline = createComputePipeline(device, elementwiseWGSL, 'silu', 'test-silu');
   const bg = createBindGroup(device, pipeline, 0, [
@@ -225,7 +226,7 @@ async function testAdd(device: GPUDevice): Promise<TestResult> {
 
   const aBuf = createStorageBuffer(device, a, N * 4, 'add-a');
   const outBuf = createStorageBuffer(device, null, N * 4, 'add-out', true);
-  const paramsBuf = createUniformBuffer(device, new Uint32Array([N]), 'add-params');
+  const paramsBuf = createUniformBuffer(device, new Uint32Array([N, 0, 0, 0, 0, 0]), 'add-params');
   const bBuf = createStorageBuffer(device, b, N * 4, 'add-b');
 
   const pipeline = createComputePipeline(device, elementwiseWGSL, 'add', 'test-add');
@@ -254,7 +255,7 @@ async function testMul(device: GPUDevice): Promise<TestResult> {
 
   const aBuf = createStorageBuffer(device, a, N * 4, 'mul-a');
   const outBuf = createStorageBuffer(device, null, N * 4, 'mul-out', true);
-  const paramsBuf = createUniformBuffer(device, new Uint32Array([N]), 'mul-params');
+  const paramsBuf = createUniformBuffer(device, new Uint32Array([N, 0, 0, 0, 0, 0]), 'mul-params');
   const bBuf = createStorageBuffer(device, b, N * 4, 'mul-b');
 
   const pipeline = createComputePipeline(device, elementwiseWGSL, 'mul', 'test-mul');

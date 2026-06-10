@@ -818,6 +818,21 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
   }
   console.log(`[GGUF] embed: CPU row-gather (${embedCpu.rowBytes} B/row); lm_head: ${lmHeadT.dtype}${config.tieWordEmbeddings ? ' (tied)' : ''}`);
 
+  // Gemma 4 PLE: token table stays CPU-resident (row-gather per token);
+  // model_proj + proj_norm live on GPU.
+  if (config.perLayerEmbed) {
+    const pleCpu = model.cpuTensors.get('per_layer_token_embd.weight');
+    if (!pleCpu) throw new Error('GGUF bridge: per_layer_token_embd.weight missing from CPU store');
+    global.pleTokenEmbedGG = { data: pleCpu.data, ggmlType: pleCpu.ggmlType, rowBytes: pleCpu.rowBytes };
+    const mpName = loc.locate('pleModelProj');
+    const mpT = mpName ? model.tensors.get(mpName) : undefined;
+    if (!mpT) throw new Error(`GGUF bridge: missing tensor for role "pleModelProj" (name: ${mpName ?? 'unmapped'})`);
+    if (mpT.isQuantized) global.pleModelProj_gg = { data: mpT.buffer, ggmlType: mpT.ggmlType };
+    else global.pleModelProj = mpT.buffer;
+    global.pleProjNorm = requireBuf('pleProjNorm');
+    console.log(`[GGUF] PLE: token table CPU (${pleCpu.rowBytes} B/row), model_proj ${mpT.dtype}`);
+  }
+
   // MoE (Phase C): experts live in CPU RAM across a wasm worker fleet; the
   // shared expert rides the dense FFN slots (ffnDim === expertFFNDim).
   const moeSpec = config.layers.find((d) => d.moe)?.moe;
@@ -936,6 +951,12 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
       assignProj(lw, 'gateProj', 'gateProj', l);
       assignProj(lw, 'upProj', 'upProj', l);
       assignProj(lw, 'downProj', 'downProj', l);
+    }
+    if (config.perLayerEmbed) {
+      assignProj(lw, 'pleInpGate', 'pleInpGate', l);
+      assignProj(lw, 'pleProj', 'pleProj', l);
+      lw.plePostNorm = requireBuf('plePostNorm', l);
+      lw.layerOutScale = roleBuf('layerOutScale', l);
     }
     layers.push(lw);
   }
