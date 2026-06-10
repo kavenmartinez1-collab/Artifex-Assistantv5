@@ -116,6 +116,8 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 | WebGPU batch prefill | PASS | 29-token prompt in 1 chunk at ~150 tok/s (vs one-by-one before) |
 | WebGPU GGUF native path | PASS | Qwen3.5-9B i1-Q4_K_M at 8.4-8.7 tok/s, 4.71 GB VRAM, greedy matches llama.cpp |
 | WebGPU 35B MoE decode | PASS | Qwen3.6-35B-A3B at 8.08 tok/s (32 CPU workers) / ~7.5 tok/s (default 16) on 8 GB VRAM + 32 GB RAM |
+| WebGPU 35B MoE prefill | PASS | 11 tok/s — token-batched worker protocol, one expert pass per layer per 16-token chunk |
+| WebGPU 35B MoE parity | PASS | 320 teacher-forced greedy steps vs llama-server: 1.6% mismatch, all top-2 near-tie swaps (quant noise, no corruption) |
 | Localhost binding | PASS | Confirmed NOT accessible on LAN IP |
 
 ## Supported GPU Tiers
@@ -1182,7 +1184,9 @@ The full 35B MoE model decodes at **8.08 tok/s on an 8 GB GPU + 32 GB RAM box** 
 - **Adaptive worker count** — picks a power of two from `hardwareConcurrency` (default cap 16, ~7.5 tok/s); `?moeWorkers=32` opt-in reaches 8.08 tok/s on a 16-thread i5-14400F.
 - **Wave warm-up** — Windows trims/compresses the 22 GB of expert pages during the long load (first touch runs 10-100x slow). Workers re-fault their shards in waves of 8, two rounds, so the box never sits pinned at max RAM commit.
 
-Correctness is held to llama.cpp: teacher-forced greedy parity 0/64 mismatches (`scripts/parity-diff.mjs`), router math validated against a literal port of `build_moe_ffn` (`scripts/test-router-math.mjs`), expert slab indexing validated against the real GGUF on disk in Node (`scripts/test-expert-ffn.mjs`). RAM note: the browser tab needs ~24 GB while running — close it before starting a native llama-server, and close it fully (not refresh) before reloading.
+- **Chunked prefill (C4)** — the worker protocol batches up to 16 tokens per SAB generation (matching the hybrid prefill chunk size); workers walk the chunk's (token, expert) pairs expert-major so each weight strip is read once per chunk. Prefill runs at **11 tok/s**, faster than decode.
+
+Correctness is held to llama.cpp: final validation ran 5 prompts × 64 teacher-forced greedy steps against llama-server `--cpu-moe` — 5/320 mismatches (1.6%), every one a top-2 swap on a near-tie logit gap (quantization noise; 2/5 prompts exact). Tooling: `scripts/parity-diff.mjs`, router math validated against a literal port of `build_moe_ffn` (`scripts/test-router-math.mjs`), expert slab indexing validated against the real GGUF on disk in Node (`scripts/test-expert-ffn.mjs`). RAM note: the browser tab needs ~24 GB while running — close it before starting a native llama-server, and close it fully (not refresh) before reloading.
 
 ### Calibrated GPTQ Quantization
 
