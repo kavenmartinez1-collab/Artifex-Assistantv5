@@ -1227,6 +1227,7 @@ export function createForwardPassEngine(
     qBuf: GPUBuffer, kCacheBuf: GPUBuffer, vCacheBuf: GPUBuffer,
     outputBuf: GPUBuffer, newSeqLen: number, cacheLen: number,
     isCausal: boolean, posOffset: number, label: string,
+    headDimOverride?: number, window?: number,
   ) {
     if (cacheLen > MAX_ATTN_CACHE) {
       throw new Error(
@@ -1236,17 +1237,19 @@ export function createForwardPassEngine(
         `with a larger var<workgroup> scores array.`,
       );
     }
-    const paramData = new ArrayBuffer(32);
+    const hd = headDimOverride ?? dHead;
+    const paramData = new ArrayBuffer(48);
     const u32View = new Uint32Array(paramData);
     const f32View = new Float32Array(paramData);
     u32View[0] = nHeads;
     u32View[1] = nKVHeads;
-    u32View[2] = dHead;
+    u32View[2] = hd;
     u32View[3] = newSeqLen;
     u32View[4] = cacheLen;
-    f32View[5] = config.attnScale ?? 1.0 / Math.sqrt(dHead);
+    f32View[5] = config.attnScale ?? 1.0 / Math.sqrt(hd);
     u32View[6] = isCausal ? 1 : 0;
     u32View[7] = posOffset;
+    u32View[8] = window ?? 0;
     const paramBuf = getCachedUniform(new Uint8Array(paramData), `${label}-p`);
 
     const useSoftpick = (globalThis as any).__USE_SOFTPICK__ === true;
@@ -1985,6 +1988,16 @@ export function createForwardPassEngine(
       } else {
         // ── STANDARD SOFTMAX ATTENTION ────────────────────────────────
 
+        // Per-layer attention geometry (Gemma 4: sliding layers use head_dim
+        // 256, full-attention layers 512). Uniform models fall back to globals.
+        const dHeadL = config.layers[l].headDim ?? dHead;
+        const kvDimL = nKVHeads * dHeadL;
+        // KV sharing (Gemma 4 layers 24-41): consume another layer's cache,
+        // skip K/V projection + norm + RoPE + cache write entirely.
+        const kvSrc = config.layers[l].kvSourceLayer;
+        const kvLayer = kvSrc ?? l;
+        const slidingWindow = config.layers[l].slidingWindow ?? 0;
+
         // Q, K, V projections (auto-selects f32 or INT4 matmul)
         if (config.attnOutputGate) {
           // Qwen3.5: Q proj outputs [nHeads, dHead*2] — interleaved [Q_h0, gate_h0, Q_h1, gate_h1, ...]
@@ -2003,30 +2016,35 @@ export function createForwardPassEngine(
           // Copy deinterleaved Q from attnOutBuf back to qBuf
           batchCopy(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHead * 4);
         } else {
-          dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHead, H, `L${l}-q`);
-          await maybeAudit(l, qBuf, `L${l}-q-out`, seqLen, nHeads * dHead);
+          dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHeadL, H, `L${l}-q`);
+          await maybeAudit(l, qBuf, `L${l}-q-out`, seqLen, nHeads * dHeadL);
         }
-        dispatchProjection(normedBuf, lw, 'kProj', kBuf, seqLen, kvDim, H, `L${l}-k`);
-        await maybeAudit(l, kBuf, `L${l}-k-out`, seqLen, kvDim);
-        dispatchProjection(normedBuf, lw, 'vProj', vBuf, seqLen, kvDim, H, `L${l}-v`);
-        await maybeAudit(l, vBuf, `L${l}-v-out`, seqLen, kvDim);
+        if (kvSrc === undefined) {
+          dispatchProjection(normedBuf, lw, 'kProj', kBuf, seqLen, kvDimL, H, `L${l}-k`);
+          await maybeAudit(l, kBuf, `L${l}-k-out`, seqLen, kvDimL);
+          dispatchProjection(normedBuf, lw, 'vProj', vBuf, seqLen, kvDimL, H, `L${l}-v`);
+          await maybeAudit(l, vBuf, `L${l}-v-out`, seqLen, kvDimL);
+        }
 
         // Per-head RMSNorm on Q and K (q_norm, k_norm) — Qwen3.5, Gemma 4.
         // Weight convention follows useResidualWeight (same as input layernorm).
-        if (lw.qNorm && lw.kNorm) {
+        // Gated independently: Gemma 4 KV-sharing layers (24-41) have qNorm
+        // but no kNorm (attn_k_norm is dead weight, skipped by the loader).
+        if (lw.qNorm) {
           // Q norm: treat [seqLen * nHeads, dHead] as rows of dHead
-          dispatchRMSNorm(qBuf, attnOutBuf, lw.qNorm, seqLen * nHeads, `L${l}-qnorm`, dHead);
-          batchCopy(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHead * 4);
-          // K norm
-          dispatchRMSNorm(kBuf, ffnTempBuf, lw.kNorm, seqLen * nKVHeads, `L${l}-knorm`, dHead);
-          batchCopy(ffnTempBuf, 0, kBuf, 0, seqLen * kvDim * 4);
+          dispatchRMSNorm(qBuf, attnOutBuf, lw.qNorm, seqLen * nHeads, `L${l}-qnorm`, dHeadL);
+          batchCopy(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHeadL * 4);
+        }
+        if (lw.kNorm && kvSrc === undefined) {
+          dispatchRMSNorm(kBuf, ffnTempBuf, lw.kNorm, seqLen * nKVHeads, `L${l}-knorm`, dHeadL);
+          batchCopy(ffnTempBuf, 0, kBuf, 0, seqLen * kvDimL * 4);
         }
 
         // Gemma 4: weightless RMSNorm on V before caching (gemma4.cpp Vcur_normed).
         // The weight buffer is a dummy — skip_weight=1 ignores it.
-        if (config.modelType === 'gemma4_text') {
-          batchCopy(vBuf, 0, ffnTempBuf, 0, seqLen * kvDim * 4);
-          dispatchRMSNorm(ffnTempBuf, vBuf, lw.inputNorm, seqLen * nKVHeads, `L${l}-vnorm`, dHead, true);
+        if (config.modelType === 'gemma4_text' && kvSrc === undefined) {
+          batchCopy(vBuf, 0, ffnTempBuf, 0, seqLen * kvDimL * 4);
+          dispatchRMSNorm(ffnTempBuf, vBuf, lw.inputNorm, seqLen * nKVHeads, `L${l}-vnorm`, dHeadL, true);
         }
 
         // Add bias if model has attention_bias
@@ -2047,12 +2065,14 @@ export function createForwardPassEngine(
         // Gemma 4: per-layer theta (sliding 10k / full 1e6) + proportional
         // RoPE on full layers (only the first rotatedPairs pairs rotate).
         const fullAttnRotaryDim = config.partialRotaryFactor
-          ? Math.floor(config.partialRotaryFactor * dHead) : 0;
+          ? Math.floor(config.partialRotaryFactor * dHeadL) : 0;
         const layerRope = config.layers[l].rope;
-        dispatchRoPE(qBuf, seqLen, nHeads, pos, `L${l}-rope-q`, undefined, fullAttnRotaryDim,
+        dispatchRoPE(qBuf, seqLen, nHeads, pos, `L${l}-rope-q`, dHeadL, fullAttnRotaryDim,
           layerRope?.theta, layerRope?.rotatedPairs);
-        dispatchRoPE(kBuf, seqLen, nKVHeads, pos, `L${l}-rope-k`, undefined, fullAttnRotaryDim,
-          layerRope?.theta, layerRope?.rotatedPairs);
+        if (kvSrc === undefined) {
+          dispatchRoPE(kBuf, seqLen, nKVHeads, pos, `L${l}-rope-k`, dHeadL, fullAttnRotaryDim,
+            layerRope?.theta, layerRope?.rotatedPairs);
+        }
 
         if (isDebug && l === 0) {
           flushBatch();
@@ -2098,8 +2118,10 @@ export function createForwardPassEngine(
             seqLen, cacheLen, isCausal, pos, `L${l}-attn`,
           );
         } else {
-          copyToKVCache(kBuf, kvCache.keys[l], seqLen, kvDim, pos);
-          copyToKVCache(vBuf, kvCache.values[l], seqLen, kvDim, pos);
+          if (kvSrc === undefined) {
+            copyToKVCache(kBuf, kvCache.keys[l], seqLen, kvDimL, pos);
+            copyToKVCache(vBuf, kvCache.values[l], seqLen, kvDimL, pos);
+          }
 
           // ── Attention KV-cache probe ───────────────────────────────
           // Gated on __DEBUG_ATTN_KV__ (number): interval between samples
@@ -2118,9 +2140,9 @@ export function createForwardPassEngine(
               flushBatch();
               await device.queue.onSubmittedWorkDone();
               const validTokens = pos + seqLen;
-              const validBytes = validTokens * kvDim * 4;
-              const kBytes = await readBuffer(device, kvCache.keys[l], validBytes);
-              const vBytes = await readBuffer(device, kvCache.values[l], validBytes);
+              const validBytes = validTokens * kvDimL * 4;
+              const kBytes = await readBuffer(device, kvCache.keys[kvLayer], validBytes);
+              const vBytes = await readBuffer(device, kvCache.values[kvLayer], validBytes);
               const kArr = new Float32Array(kBytes);
               const vArr = new Float32Array(vBytes);
               let kSumSq = 0, vSumSq = 0;
@@ -2141,10 +2163,10 @@ export function createForwardPassEngine(
                 if (a > vMax) vMax = a;
               }
               // Last-token slice stats — isolates what was just written.
-              const lastOff = pos * kvDim;
+              const lastOff = pos * kvDimL;
               let kLastSq = 0, vLastSq = 0;
               let kLastMax = 0, vLastMax = 0;
-              for (let i = 0; i < seqLen * kvDim; i++) {
+              for (let i = 0; i < seqLen * kvDimL; i++) {
                 const kv = kArr[lastOff + i];
                 const vv = vArr[lastOff + i];
                 if (!Number.isNaN(kv)) {
@@ -2170,14 +2192,15 @@ export function createForwardPassEngine(
                 + `max|V_last|=${vLastMax.toExponential(3)} `
                 + (kNaN > 0 ? `K_NaN=${kNaN} ` : '')
                 + (vNaN > 0 ? `V_NaN=${vNaN} ` : '')
-                + `tokens=${validTokens} kvDim=${kvDim}`
+                + `tokens=${validTokens} kvDim=${kvDimL}`
               );
             }
           }
 
           dispatchAttention(
-            qBuf, kvCache.keys[l], kvCache.values[l], attnOutBuf,
+            qBuf, kvCache.keys[kvLayer], kvCache.values[kvLayer], attnOutBuf,
             seqLen, cacheLen, isCausal, pos, `L${l}-attn`,
+            dHeadL, slidingWindow,
           );
         }
 
@@ -2208,7 +2231,7 @@ export function createForwardPassEngine(
 
         // QuIP#/QuaRot: Hadamard rotation before o_proj (its weights were also rotated)
         if (useHadamard) {
-          const oDim = nHeads * dHead;
+          const oDim = nHeads * dHeadL;
           if ((oDim & (oDim - 1)) === 0) {
             batchCopy(attnOutBuf, 0, ffnTempBuf, 0, seqLen * oDim * 4);
             dispatchHadamard(ffnTempBuf, attnOutBuf, seqLen, oDim, 0, `L${l}-had-o`);
@@ -2216,7 +2239,7 @@ export function createForwardPassEngine(
         }
 
         // Output projection: [seq, nHeads*dHead] → [seq, H]
-        dispatchProjection(attnOutBuf, lw, 'oProj', attnProjBuf, seqLen, H, nHeads * dHead, `L${l}-o`);
+        dispatchProjection(attnOutBuf, lw, 'oProj', attnProjBuf, seqLen, H, nHeads * dHeadL, `L${l}-o`);
         await maybeAudit(l, attnProjBuf, `L${l}-o-out`, seqLen, H);
 
         // O projection bias
@@ -2756,9 +2779,17 @@ export function createForwardPassEngine(
         if (config.isHybrid && config.layers[l].kind === 'linear_attention') {
           keys.push(null as any);   // placeholder — not used for linear layers
           values.push(null as any);
+        } else if (config.layers[l].kvSourceLayer !== undefined) {
+          // KV sharing (Gemma 4 layers 24-41): alias the source layer's
+          // buffers — no allocation, attention reads the shared cache.
+          const src = config.layers[l].kvSourceLayer!;
+          keys.push(keys[src]);
+          values.push(values[src]);
         } else {
-          keys.push(createStorageBuffer(device, null, maxSeqLen * kvDim * 4, `kv-k-${l}`, true));
-          values.push(createStorageBuffer(device, null, maxSeqLen * kvDim * 4, `kv-v-${l}`, true));
+          // Per-layer head_dim (Gemma 4: sliding 256, full 512)
+          const kvDimL = nKVHeads * (config.layers[l].headDim ?? dHead);
+          keys.push(createStorageBuffer(device, null, maxSeqLen * kvDimL * 4, `kv-k-${l}`, true));
+          values.push(createStorageBuffer(device, null, maxSeqLen * kvDimL * 4, `kv-v-${l}`, true));
         }
       }
       return { keys, values, position: 0, maxSeqLen, ssmState };
@@ -2815,8 +2846,12 @@ export function createForwardPassEngine(
   }
 
   function destroyKVCache(kvCache: KVCache): void {
-    for (const buf of kvCache.keys) if (buf) buf.destroy();
-    for (const buf of kvCache.values) if (buf) buf.destroy();
+    // KV-sharing layers alias their source layer's buffers — dedupe so each
+    // GPUBuffer is destroyed exactly once.
+    const seen = new Set<GPUBuffer>();
+    for (const buf of [...kvCache.keys, ...kvCache.values]) {
+      if (buf && !seen.has(buf)) { seen.add(buf); buf.destroy(); }
+    }
     if (kvCache.compressed) {
       const c = kvCache.compressed;
       c.scratchK.destroy();

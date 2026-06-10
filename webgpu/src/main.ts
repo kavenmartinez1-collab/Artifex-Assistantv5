@@ -910,8 +910,12 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
       lw.linearNormWeight = requireBuf('linNormWeight', l);
     } else {
       assignProj(lw, 'qProj', 'qProj', l);
-      assignProj(lw, 'kProj', 'kProj', l);
-      assignProj(lw, 'vProj', 'vProj', l);
+      // KV-sharing layers (Gemma 4 ≥24) read another layer's cache; their
+      // k/v weights are dead in the GGUF and the loader never uploaded them.
+      if (config.layers[l].kvSourceLayer === undefined) {
+        assignProj(lw, 'kProj', 'kProj', l);
+        assignProj(lw, 'vProj', 'vProj', l);
+      }
       assignProj(lw, 'oProj', 'oProj', l);
       lw.qNorm = roleBuf('qNorm', l);
       lw.kNorm = roleBuf('kNorm', l);

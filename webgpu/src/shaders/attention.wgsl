@@ -27,6 +27,11 @@ struct Params {
   scale: f32,           // 1.0 / sqrt(head_dim)
   is_causal: u32,       // 1 = apply causal mask, 0 = no mask
   pos_offset: u32,      // position offset of first new token in the sequence
+  // Sliding-window attention (Gemma 4): 0 = disabled (full causal).
+  // llama.cpp LLAMA_SWA_TYPE_STANDARD semantics: key j is masked when
+  // q_pos - j >= window. Applied in BOTH prefill and decode (unlike the
+  // causal mask, which only matters when new_seq_len > 1).
+  window: u32,
 }
 
 // Softpick (rectified softmax, arXiv:2504.20966): USE_SOFTPICK=1 replaces
@@ -86,12 +91,19 @@ fn attention(@builtin(local_invocation_id) lid: vec3u,
     }
     scores[j] = dot * scale;
 
+    let q_abs_pos = params.pos_offset + q_pos;
+
     // Causal mask: if this query position can't attend to cache position j
     if (params.is_causal == 1u) {
-      let q_abs_pos = params.pos_offset + q_pos;
       if (j > q_abs_pos) {
         scores[j] = -1e9;  // effectively -infinity for softmax
       }
+    }
+
+    // Sliding-window mask (active in decode too): mask j when
+    // q_abs_pos - j >= window  ⇔  j + window <= q_abs_pos
+    if (params.window > 0u && j + params.window <= q_abs_pos) {
+      scores[j] = -1e9;
     }
 
     j = j + 256u;
