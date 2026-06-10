@@ -25,7 +25,7 @@
  *   5. Sliding window attention: Mistral limits attention span
  */
 
-import type { ModelConfig } from '../model/model-config';
+import type { ModelDescriptor } from '../model/model-descriptor';
 import {
   createComputePipeline,
   createBindGroup,
@@ -225,8 +225,8 @@ export interface ForwardPassEngine {
   /** Destroy all buffers in a KV cache. */
   destroyKVCache(kvCache: KVCache): void;
 
-  /** Get the model config. */
-  readonly config: ModelConfig;
+  /** Get the model descriptor. */
+  readonly config: ModelDescriptor;
 }
 
 /**
@@ -234,7 +234,7 @@ export interface ForwardPassEngine {
  */
 export function createForwardPassEngine(
   device: GPUDevice,
-  config: ModelConfig,
+  config: ModelDescriptor,
   weights: ModelWeights,
 ): ForwardPassEngine {
   const {
@@ -1430,7 +1430,7 @@ export function createForwardPassEngine(
     // ── Transformer layers ───────────────────────────────────────────
     for (let l = 0; l < L; l++) {
       const lw = weights.layers[l];
-      const isLinearLayer = config.layerTypes?.[l] === 'linear_attention';
+      const isLinearLayer = config.layers[l].kind === 'linear_attention';
 
       // Save hidden state for residual connection
       batchCopy(hiddenBuf, 0, residualBuf, 0, seqLen * H * 4);
@@ -2396,7 +2396,7 @@ export function createForwardPassEngine(
     }
     // For hybrid models, allocate SSM state for linear attention layers
     let ssmState: SSMState | undefined;
-    if (config.isHybrid && config.layerTypes) {
+    if (config.isHybrid) {
       const hiddenStates: GPUBuffer[] = [];
       const convStates: GPUBuffer[] = [];
       const layerToSSMIndex: number[] = new Array(L).fill(-1);
@@ -2410,7 +2410,7 @@ export function createForwardPassEngine(
 
       let ssmIdx = 0;
       for (let l = 0; l < L; l++) {
-        if (config.layerTypes[l] === 'linear_attention') {
+        if (config.layers[l].kind === 'linear_attention') {
           // h: [num_key_heads, key_head_dim, grouped_value_dim]
           // grouped_value_dim = (num_value_heads / num_key_heads) * value_head_dim
           const hSize = linNKH * linKD * linGroupedVD * 4;
@@ -2432,7 +2432,7 @@ export function createForwardPassEngine(
       const values: GPUBuffer[] = [];
       for (let l = 0; l < L; l++) {
         // For hybrid models, only full attention layers need KV cache
-        if (config.isHybrid && config.layerTypes?.[l] === 'linear_attention') {
+        if (config.isHybrid && config.layers[l].kind === 'linear_attention') {
           keys.push(null as any);   // placeholder — not used for linear layers
           values.push(null as any);
         } else {

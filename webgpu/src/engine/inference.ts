@@ -22,7 +22,8 @@ import { createForwardPassEngine, type ModelWeights, type LayerWeights, type Glo
 import { generate, type SamplingConfig, type GenerationResult, type GenerationHandle, type OnTokenCallback } from './generate';
 import { loadModel, unloadModel, type LoadedModel, type LoadProgress } from '../model/weight-loader';
 import { createTokenizer, applyChatTemplate, type Tokenizer } from '../model/tokenizer';
-import { parseModelConfig, getWeightNameMap, resolveLayerWeightName, estimateVRAM, type ModelConfig } from '../model/model-config';
+import { getWeightNameMap, resolveLayerWeightName, estimateVRAM, type ModelConfig } from '../model/model-config';
+import { descriptorFromHFConfig, type ModelDescriptor } from '../model/model-descriptor';
 import type { GPUTensor } from '../model/weight-loader';
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -47,8 +48,8 @@ export interface InferenceSession {
     onToken?: OnTokenCallback,
   ): GenerationHandle;
 
-  /** Get the model config. */
-  readonly config: ModelConfig;
+  /** Get the model descriptor. */
+  readonly config: ModelDescriptor;
 
   /** Get the tokenizer. */
   readonly tokenizer: Tokenizer;
@@ -146,7 +147,7 @@ export async function createInferenceSession(
 
   // ── Step 4: Parse config and build engine ──────────────────────────
   status('Building inference engine...');
-  const config = parseModelConfig(loadedModel.config);
+  const config = descriptorFromHFConfig(loadedModel.config);
   const modelWeights = bridgeWeights(loadedModel.tensors, config);
   const engine = createForwardPassEngine(gpu.device, config, modelWeights);
   const vramEstimate = estimateVRAM(config);

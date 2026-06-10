@@ -12,7 +12,9 @@ import { runKernelTests } from './engine/kernel-tests';
 import { loadModel, unloadModel, previewModel, formatBytes, getCacheStats, clearCache, type LoadedModel } from './model';
 import { setAuthToken, useLocalCache, resetToRemote } from './model/hf-hub';
 import { createInferenceSession, type InferenceSession } from './engine/inference';
-import { parseModelConfig, estimateVRAM, getWeightNameMap, resolveLayerWeightName } from './model/model-config';
+import { parseModelConfig, estimateVRAM } from './model/model-config';
+import { descriptorFromHFConfig } from './model/model-descriptor';
+import type { TensorRole } from './model/tensor-locator';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -645,16 +647,19 @@ loadBtn.addEventListener('click', async () => {
     // Build inference session from loaded weights
     setStatus('Building inference engine...');
     try {
-      const config = parseModelConfig(currentModel.config);
+      const config = descriptorFromHFConfig(currentModel.config);
 
       // Import bridgeWeights and engine builder
       const { createForwardPassEngine } = await import('./engine/forward-pass');
       const { createTokenizer } = await import('./model/tokenizer');
-      const { autoDetectWeightNameMap, resolveLayerWeightName } = await import('./model/model-config');
+      const { createHFLocator } = await import('./model/tensor-locator');
       const { generate } = await import('./engine/generate');
 
-      // Bridge weight tensors to structured format (auto-detects prefix)
-      const nameMap = autoDetectWeightNameMap(config.modelType, currentModel!.tensors);
+      // Bridge weight tensors by canonical role (locator auto-detects prefix)
+      const loc = createHFLocator(config.modelType, currentModel!.tensors);
+      const embedName = loc.locate('embedTokens')!;
+      const finalNormName = loc.locate('finalNorm')!;
+      const lmHeadName = loc.locate('lmHead')!;
       const getTensor = (name: string) => {
         const t = currentModel!.tensors.get(name);
         if (!t) throw new Error(`Missing tensor: ${name}`);
@@ -663,10 +668,10 @@ loadBtn.addEventListener('click', async () => {
 
       // Auto-detect if embedding is stored as packed 16-bit (BF16/F16)
       // This happens when: (a) keepBF16=true and tensor is >1MB, or (b) f32 would exceed 2GB buffer limit
-      const embedTensor = currentModel!.tensors.get(nameMap.embedTokens);
+      const embedTensor = currentModel!.tensors.get(embedName);
       const embedIsF16 = embedTensor ? (embedTensor.dtype === 'BF16' || embedTensor.dtype === 'F16') : false;
       console.log(
-        `[Engine] embed lookup: nameMap.embedTokens="${nameMap.embedTokens}", `
+        `[Engine] embed lookup: embedTokens="${embedName}", `
         + `found=${!!embedTensor}, dtype=${embedTensor?.dtype}, `
         + `byteLength=${embedTensor?.byteLength}, shape=${embedTensor?.shape}, `
         + `embedIsF16=${embedIsF16}`
@@ -676,21 +681,21 @@ loadBtn.addEventListener('click', async () => {
       }
 
       // Embedding may be f32, BF16, or GPTQ INT4
-      const embedBuf = currentModel!.tensors.get(nameMap.embedTokens)?.buffer ?? null;
+      const embedBuf = currentModel!.tensors.get(embedName)?.buffer ?? null;
       const lmHeadBuf = config.tieWordEmbeddings
         ? embedBuf
-        : (currentModel!.tensors.get(nameMap.lmHead)?.buffer ?? null);
+        : (currentModel!.tensors.get(lmHeadName)?.buffer ?? null);
 
       // Use a dummy buffer for embedTokens/lmHead when they're GPTQ (the Q4 path is used instead)
-      const dummyBuf = embedBuf ?? lmHeadBuf ?? getTensor(nameMap.finalNorm);
+      const dummyBuf = embedBuf ?? lmHeadBuf ?? getTensor(finalNormName);
 
       const global: any = {
         embedTokens: embedBuf ?? dummyBuf,
         embedIsF16: embedBuf ? embedIsF16 : false,
-        finalNorm: getTensor(nameMap.finalNorm),
+        finalNorm: getTensor(finalNormName),
         lmHead: lmHeadBuf ?? dummyBuf,
         lmHeadIsBF16: lmHeadBuf ? (() => {
-          const tensorName = config.tieWordEmbeddings ? nameMap.embedTokens : nameMap.lmHead;
+          const tensorName = config.tieWordEmbeddings ? embedName : lmHeadName;
           const t = currentModel!.tensors.get(tensorName);
           const isBF16 = t ? (t.dtype === 'BF16' || t.dtype === 'F16') : false;
           if (isBF16) console.log(`[Engine] LM head is ${t!.dtype}${config.tieWordEmbeddings ? ' (tied)' : ''}, using BF16 matmul`);
@@ -702,6 +707,11 @@ loadBtn.addEventListener('click', async () => {
       const tryGetTensor = (name: string): GPUBuffer | undefined => {
         const t = currentModel!.tensors.get(name);
         return t?.buffer;
+      };
+      // Helper for optional per-layer roles (returns undefined if role unmapped)
+      const tryGetRole = (role: TensorRole, l: number): GPUBuffer | undefined => {
+        const n = loc.locate(role, l);
+        return n ? tryGetTensor(n) : undefined;
       };
 
       // Helper to load GPTQ quad (qweight + scales + qzeros + g_idx) for a projection
@@ -798,7 +808,7 @@ loadBtn.addEventListener('click', async () => {
       };
 
       // Check if embedding is stored CPU-side (oversized BF16, saves ~2.4 GB VRAM)
-      const embedBaseName = nameMap.embedTokens.replace('.weight', '');
+      const embedBaseName = embedName.replace('.weight', '');
       const cpuEmbedTensor = currentModel!.tensors.get(`${embedBaseName}.cpu_embed`) as any;
       if (cpuEmbedTensor?.cpuEmbedData) {
         const { parts, splitPoint, isBF16 } = cpuEmbedTensor.cpuEmbedData;
@@ -816,7 +826,7 @@ loadBtn.addEventListener('click', async () => {
       }
 
       // Check if embedding is GPTQ INT4 (saves ~1.4 GB VRAM)
-      const embedQ4 = (!embedSplitData && !cpuEmbedTensor) ? tryGetQ4(nameMap.embedTokens) : undefined;
+      const embedQ4 = (!embedSplitData && !cpuEmbedTensor) ? tryGetQ4(embedName) : undefined;
       if (embedQ4) {
         global.embedQ4 = embedQ4;
         global.embedIsF16 = false;
@@ -825,7 +835,7 @@ loadBtn.addEventListener('click', async () => {
 
       // Check if lm_head is stored CPU-side or split across GPU buffers
       if (!config.tieWordEmbeddings) {
-        const lmHeadBaseName = nameMap.lmHead.replace('.weight', '');
+        const lmHeadBaseName = lmHeadName.replace('.weight', '');
         const cpuLmHeadTensor = currentModel!.tensors.get(`${lmHeadBaseName}.cpu_lm_head`) as any;
         if (cpuLmHeadTensor?.cpuLmHeadData) {
           const { parts, splitPoint, isBF16 } = cpuLmHeadTensor.cpuLmHeadData;
@@ -843,7 +853,7 @@ loadBtn.addEventListener('click', async () => {
             global.lmHeadIsBF16 = false;
             console.log(`[Engine] LM head is split BF16: ${lmHeadSplitData.buffers.length} buffers, splitPoints=[${lmHeadSplitData.splitPoints}]`);
           } else {
-            const lmHeadQ4 = tryGetQ4(nameMap.lmHead);
+            const lmHeadQ4 = tryGetQ4(lmHeadName);
             if (lmHeadQ4) {
               global.lmHeadQ4 = lmHeadQ4;
               global.lmHeadIsBF16 = false;
@@ -889,15 +899,15 @@ loadBtn.addEventListener('click', async () => {
 
       const layers = [];
       for (let l = 0; l < config.numLayers; l++) {
-        const isLinearLayer = config.layerTypes?.[l] === 'linear_attention';
+        const isLinearLayer = config.layers[l].kind === 'linear_attention';
 
         // Shared weights (both layer types)
-        const gateName = resolveLayerWeightName(nameMap.layer.gateProj, l);
-        const upName = resolveLayerWeightName(nameMap.layer.upProj, l);
-        const downName = resolveLayerWeightName(nameMap.layer.downProj, l);
+        const gateName = loc.locate('gateProj', l)!;
+        const upName = loc.locate('upProj', l)!;
+        const downName = loc.locate('downProj', l)!;
         const lw: any = {
-          inputNorm: getTensor(resolveLayerWeightName(nameMap.layer.inputNorm, l)),
-          postAttnNorm: getTensor(resolveLayerWeightName(nameMap.layer.postAttnNorm, l)),
+          inputNorm: getTensor(loc.locate('inputNorm', l)!),
+          postAttnNorm: getTensor(loc.locate('postAttnNorm', l)!),
           gateProj: tryGetTensor(gateName),
           upProj: tryGetTensor(upName),
           downProj: tryGetTensor(downName),
@@ -906,15 +916,15 @@ loadBtn.addEventListener('click', async () => {
         trackBF16(upName, lw.upProj);
         trackBF16(downName, lw.downProj);
 
-        if (isLinearLayer && nameMap.linearLayer) {
+        const linQKVName = loc.locate('linInProjQKV', l);
+        if (isLinearLayer && linQKVName) {
           // ── Linear attention layer weights ──────────────────────────
-          const lin = nameMap.linearLayer;
           const linNames = {
-            qkv: resolveLayerWeightName(lin.inProjQKV, l),
-            a: resolveLayerWeightName(lin.inProjA, l),
-            b: resolveLayerWeightName(lin.inProjB, l),
-            z: resolveLayerWeightName(lin.inProjZ, l),
-            out: resolveLayerWeightName(lin.outProj, l),
+            qkv: linQKVName,
+            a: loc.locate('linInProjA', l)!,
+            b: loc.locate('linInProjB', l)!,
+            z: loc.locate('linInProjZ', l)!,
+            out: loc.locate('linOutProj', l)!,
           };
           lw.linearInProjQKV = tryGetTensor(linNames.qkv);
           lw.linearInProjA = tryGetTensor(linNames.a);
@@ -929,17 +939,17 @@ loadBtn.addEventListener('click', async () => {
           trackBF16(linNames.out, lw.linearOutProj);
 
           // Non-quantized weights (BF16/F16 → f32)
-          lw.linearALog = tryGetTensor(resolveLayerWeightName(lin.aLog, l));
-          lw.linearConv1dWeight = tryGetTensor(resolveLayerWeightName(lin.conv1dWeight, l));
-          lw.linearDtBias = tryGetTensor(resolveLayerWeightName(lin.dtBias, l));
-          lw.linearNormWeight = tryGetTensor(resolveLayerWeightName(lin.normWeight, l));
+          lw.linearALog = tryGetRole('linALog', l);
+          lw.linearConv1dWeight = tryGetRole('linConv1dWeight', l);
+          lw.linearDtBias = tryGetRole('linDtBias', l);
+          lw.linearNormWeight = tryGetRole('linNormWeight', l);
 
           // GPTQ INT4 / INT8 for linear attention projections
           if (config.isQuantized) {
             const linQ4Keys = ['linearInProjQKV', 'linearInProjA', 'linearInProjB', 'linearInProjZ', 'linearOutProj'] as const;
-            const linNameKeys = ['inProjQKV', 'inProjA', 'inProjB', 'inProjZ', 'outProj'] as const;
+            const linRoles = ['linInProjQKV', 'linInProjA', 'linInProjB', 'linInProjZ', 'linOutProj'] as const;
             for (let k = 0; k < linQ4Keys.length; k++) {
-              const weightName = resolveLayerWeightName(lin[linNameKeys[k]], l);
+              const weightName = loc.locate(linRoles[k], l)!;
               // Try INT8 first, then INT4
               const q8 = tryGetQ8(weightName);
               if (q8) {
@@ -963,10 +973,10 @@ loadBtn.addEventListener('click', async () => {
           }
         } else {
           // ── Standard softmax attention layer weights ────────────────
-          const qName = resolveLayerWeightName(nameMap.layer.qProj, l);
-          const kName = resolveLayerWeightName(nameMap.layer.kProj, l);
-          const vName = resolveLayerWeightName(nameMap.layer.vProj, l);
-          const oName = resolveLayerWeightName(nameMap.layer.oProj, l);
+          const qName = loc.locate('qProj', l)!;
+          const kName = loc.locate('kProj', l)!;
+          const vName = loc.locate('vProj', l)!;
+          const oName = loc.locate('oProj', l)!;
           lw.qProj = tryGetTensor(qName);
           lw.kProj = tryGetTensor(kName);
           lw.vProj = tryGetTensor(vName);
@@ -980,7 +990,7 @@ loadBtn.addEventListener('click', async () => {
           if (config.isQuantized) {
             const nameKeys = ['qProj', 'kProj', 'vProj', 'oProj'] as const;
             for (const key of nameKeys) {
-              const weightName = resolveLayerWeightName(nameMap.layer[key], l);
+              const weightName = loc.locate(key, l)!;
               const q8 = tryGetQ8(weightName);
               if (q8) {
                 (lw as any)[`${key}_q8`] = q8;
@@ -996,16 +1006,16 @@ loadBtn.addEventListener('click', async () => {
 
           // Bias terms (only for full attention layers with bias)
           if (config.attentionBias) {
-            lw.qBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.qBias, l));
-            lw.kBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.kBias, l));
-            lw.vBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.vBias, l));
-            lw.oBias = tryGetTensor(resolveLayerWeightName(nameMap.layer.oBias, l));
+            lw.qBias = tryGetRole('qBias', l);
+            lw.kBias = tryGetRole('kBias', l);
+            lw.vBias = tryGetRole('vBias', l);
+            lw.oBias = tryGetRole('oBias', l);
           }
 
           // Q/K per-head RMSNorm (Qwen3.5 full attention)
-          if (nameMap.layer.qNorm) {
-            lw.qNorm = tryGetTensor(resolveLayerWeightName(nameMap.layer.qNorm, l));
-            lw.kNorm = tryGetTensor(resolveLayerWeightName(nameMap.layer.kNorm!, l));
+          if (loc.locate('qNorm', l) !== undefined) {
+            lw.qNorm = tryGetRole('qNorm', l);
+            lw.kNorm = tryGetRole('kNorm', l);
             if (l === 3) console.log(`[Engine] L3 qNorm: ${lw.qNorm ? 'FOUND' : 'MISSING'}, kNorm: ${lw.kNorm ? 'FOUND' : 'MISSING'}`);
           }
         }
@@ -1013,7 +1023,7 @@ loadBtn.addEventListener('click', async () => {
         // FFN GPTQ INT4 / INT8 (shared for both layer types)
         if (config.isQuantized) {
           for (const key of ['gateProj', 'upProj', 'downProj'] as const) {
-            const weightName = resolveLayerWeightName(nameMap.layer[key], l);
+            const weightName = loc.locate(key, l)!;
             const q8 = tryGetQ8(weightName);
             if (q8) {
               (lw as any)[`${key}_q8`] = q8;
@@ -1031,8 +1041,8 @@ loadBtn.addEventListener('click', async () => {
       }
 
       if (config.isHybrid) {
-        const linCount = config.layerTypes!.filter(t => t === 'linear_attention').length;
-        const fullCount = config.layerTypes!.filter(t => t === 'full_attention').length;
+        const linCount = config.layers.filter(d => d.kind === 'linear_attention').length;
+        const fullCount = config.layers.filter(d => d.kind === 'full_attention').length;
         console.log(`[Engine] Hybrid model: ${linCount} linear + ${fullCount} full attention layers`);
       }
       if (l0Keys.length > 0) console.log(`[Engine] attentionBias=${config.attentionBias}`);
