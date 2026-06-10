@@ -106,6 +106,12 @@ class TurboQuantCodec:
         self.device = device
         self.dtype = dtype
 
+        if head_dim < 8 or (head_dim & (head_dim - 1)) != 0:
+            # fast_wht needs a power of 2; sign packing needs a multiple of 8.
+            raise ValueError(
+                f"TurboQuant requires power-of-2 head_dim >= 8, got {head_dim}"
+            )
+
         cb = CODEBOOK[bits]
         self.centroids = torch.tensor(cb["centroids"], dtype=torch.float32, device=device)
         self.thresholds = torch.tensor(cb["thresholds"], dtype=torch.float32, device=device)
@@ -229,6 +235,7 @@ class TurboQuantCache(Cache):
         self._compressed = {}
         self._compressed_len = {}
         self._max_layer_seen = 0
+        self._warned_head_dim = False
 
         # Cache base class attributes that generate() may access.
         # These live on the wrapper so __getattr__ doesn't need to
@@ -324,12 +331,21 @@ class TurboQuantCache(Cache):
         k_enc = k_codec.encode(k_flat, compute_qjl=True)
         v_enc = v_codec.encode(v_flat, compute_qjl=False)
 
+        # Reshape every encoded field to (batch, heads, tokens, ...) so blobs
+        # from successive compression events concatenate on the TOKEN axis.
+        # A flat (B*H*T, ...) dim-0 concat would interleave tokens across
+        # heads on reshape — scrambled reconstruction for any kv_heads > 1.
+        for enc in (k_enc, v_enc):
+            for key in enc:
+                t = enc[key]
+                enc[key] = t.reshape(batch, heads, old_len, *t.shape[1:])
+
         prev = self._compressed.get(layer_idx)
         if prev is not None:
             for key in k_enc:
-                k_enc[key] = torch.cat([prev["keys"][key], k_enc[key]], dim=0)
+                k_enc[key] = torch.cat([prev["keys"][key], k_enc[key]], dim=2)
             for key in v_enc:
-                v_enc[key] = torch.cat([prev["values"][key], v_enc[key]], dim=0)
+                v_enc[key] = torch.cat([prev["values"][key], v_enc[key]], dim=2)
             self._compressed_len[layer_idx] = prev["shape"][2] + old_len
         else:
             self._compressed_len[layer_idx] = old_len
@@ -352,10 +368,16 @@ class TurboQuantCache(Cache):
         k_codec = self._get_k_codec(head_dim, device)
         v_codec = self._get_v_codec(head_dim, device)
 
+        # Stored fields are (batch, heads, tokens, ...); flatten row-major to
+        # the (B*H*T, ...) layout the codec expects — token-fastest per head,
+        # matching the reshape below.
+        k_in = {k: t.reshape(-1, *t.shape[3:]) for k, t in compressed["keys"].items()}
+        v_in = {k: t.reshape(-1, *t.shape[3:]) for k, t in compressed["values"].items()}
+
         # Decode and cast to match the model's compute dtype (e.g. BF16)
         target_dtype = key_states.dtype
-        k_decoded = k_codec.decode(compressed["keys"]).reshape(batch, heads, comp_len, head_dim).to(target_dtype)
-        v_decoded = v_codec.decode(compressed["values"]).reshape(batch, heads, comp_len, head_dim).to(target_dtype)
+        k_decoded = k_codec.decode(k_in).reshape(batch, heads, comp_len, head_dim).to(target_dtype)
+        v_decoded = v_codec.decode(v_in).reshape(batch, heads, comp_len, head_dim).to(target_dtype)
 
         full_k = torch.cat([k_decoded, key_states], dim=2)
         full_v = torch.cat([v_decoded, value_states], dim=2)
@@ -375,19 +397,68 @@ class TurboQuantCache(Cache):
         if keys.ndim != 4:
             return keys, values
 
+        # Sliding-window layers (Gemma 3/4 etc.) self-cap their KV at the
+        # window size and keep internal cumulative-length bookkeeping —
+        # truncating their storage desyncs masks for almost no VRAM gain.
+        # Only compress unbounded full-attention layers.
+        layers = getattr(self._inner, 'layers', None)
+        if (layers is not None and layer_idx < len(layers)
+                and getattr(layers[layer_idx], 'is_sliding', False)):
+            return keys, values
+
+        # fast_wht needs power-of-2 head_dim (sign packing needs %8==0).
+        # Skip compression rather than crash mid-generation.
+        head_dim = keys.shape[-1]
+        if head_dim < 8 or (head_dim & (head_dim - 1)) != 0:
+            if not self._warned_head_dim:
+                self._warned_head_dim = True
+                import logging
+                logging.getLogger(__name__).warning(
+                    "TurboQuantCache: head_dim %d is not a power of 2 — "
+                    "KV compression disabled for this model", head_dim)
+            return keys, values
+
         # Compress tokens beyond residual_length
         k_recent, v_recent = self._compress_overflow(layer_idx, keys, values)
 
-        # Update inner cache to only hold recent tokens
-        if hasattr(self._inner, 'key_cache') and self._inner.key_cache is not None:
-            if isinstance(self._inner.key_cache, list) and layer_idx < len(self._inner.key_cache):
-                self._inner.key_cache[layer_idx] = k_recent
-                self._inner.value_cache[layer_idx] = v_recent
+        # Truncate the inner cache to the recent window. If we can't find the
+        # storage, compressing would DUPLICATE tokens (full cache + compressed
+        # copy), so refuse loudly rather than corrupt generation.
+        if k_recent.shape[2] != keys.shape[2] and not self._truncate_inner(layer_idx, k_recent, v_recent):
+            raise RuntimeError(
+                "TurboQuantCache: cannot truncate inner cache "
+                f"({type(self._inner).__name__}) — unsupported transformers "
+                "cache layout; disable TurboQuant KV for this model"
+            )
 
         # Reconstruct full K/V for this attention computation
         full_k, full_v = self._reconstruct_full(layer_idx, k_recent, v_recent)
 
         return full_k, full_v
+
+    def _truncate_inner(self, layer_idx, k_recent, v_recent):
+        """Replace layer storage with the recent window. Returns True on success.
+
+        transformers >= 5 stores per-layer tensors on cache.layers[i].keys /
+        .values; older versions used parallel key_cache / value_cache lists.
+        """
+        inner = self._inner
+        layers = getattr(inner, 'layers', None)
+        if layers is not None and layer_idx < len(layers):
+            layer = layers[layer_idx]
+            if hasattr(layer, 'keys') and layer.keys is not None:
+                layer.keys = k_recent
+                layer.values = v_recent
+                return True
+        key_cache = getattr(inner, 'key_cache', None)
+        if isinstance(key_cache, list) and layer_idx < len(key_cache):
+            key_cache[layer_idx] = k_recent
+            inner.value_cache[layer_idx] = v_recent
+            # Some versions expose key_cache as a property that rebuilds a
+            # fresh list — mutating it silently does nothing. Verify.
+            check = getattr(inner, 'key_cache')[layer_idx]
+            return check.shape[2] == k_recent.shape[2]
+        return False
 
     def get_seq_length(self, layer_idx=0):
         base_len = self._inner.get_seq_length(layer_idx)
