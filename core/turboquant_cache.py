@@ -120,6 +120,11 @@ class TurboQuantCodec:
 
         self.jl_matrix = _generate_jl_matrix(head_dim, seed=137, device=device)
 
+        # MSE-optimal shrinkage for the 1-bit JL residual-direction estimate:
+        # E[cos(u_hat, r)] for m=d sign projections in d dims. Adding the full
+        # residual norm along a partially-wrong direction would overshoot.
+        self.qjl_alpha = 1.0 / math.sqrt(1.0 + (math.pi / 2.0) * (head_dim - 1) / head_dim)
+
     def to(self, device):
         self.device = device
         self.centroids = self.centroids.to(device)
@@ -153,7 +158,7 @@ class TurboQuantCodec:
         indices = torch.where(sign >= 0, bins, bins + self.num_centroids)
 
         result = {
-            "indices": indices.to(torch.uint8),
+            "indices": self._pack_indices(indices.to(torch.uint8)),
             "norms": norms.squeeze(-1).to(self.dtype),
         }
 
@@ -173,6 +178,27 @@ class TurboQuantCodec:
 
         return result
 
+    def _pack_indices(self, indices):
+        """Pack (N, d) uint8 indices (values < 2**bits) into bits/8 bytes per
+        channel: groups of 8 indices become `bits` bytes."""
+        bits, d = self.bits, self.head_dim
+        g = indices.reshape(-1, d // 8, 8).to(torch.int64)
+        shifts = torch.arange(8, device=indices.device, dtype=torch.int64) * bits
+        words = (g << shifts).sum(dim=-1)                       # 8*bits-bit words
+        byte_shifts = torch.arange(bits, device=indices.device, dtype=torch.int64) * 8
+        packed = ((words.unsqueeze(-1) >> byte_shifts) & 0xFF).to(torch.uint8)
+        return packed.reshape(-1, d * bits // 8)
+
+    def _unpack_indices(self, packed):
+        """Inverse of _pack_indices → (N, d) int64."""
+        bits, d = self.bits, self.head_dim
+        b = packed.reshape(-1, d // 8, bits).to(torch.int64)
+        byte_shifts = torch.arange(bits, device=packed.device, dtype=torch.int64) * 8
+        words = (b << byte_shifts).sum(dim=-1)
+        shifts = torch.arange(8, device=packed.device, dtype=torch.int64) * bits
+        mask = (1 << bits) - 1
+        return ((words.unsqueeze(-1) >> shifts) & mask).reshape(-1, d)
+
     def _unpack_sign_bits(self, sign_packed):
         d = self.head_dim
         bit_weights = (2 ** torch.arange(8, device=sign_packed.device)).to(torch.uint8)
@@ -181,7 +207,7 @@ class TurboQuantCodec:
 
     def decode(self, encoded):
         """Decode compressed representation back to approximate vectors."""
-        indices = encoded["indices"].long()
+        indices = self._unpack_indices(encoded["indices"])
         norms = encoded["norms"].float()
 
         is_negative = indices >= self.num_centroids
@@ -189,9 +215,18 @@ class TurboQuantCodec:
         sign = torch.where(is_negative, -1.0, 1.0)
 
         dequant_abs = self.centroids[bins] / self.sqrt_d
-        dequantized_rotated = sign * dequant_abs
+        rotated = sign * dequant_abs
 
-        reconstructed = fast_wht(dequantized_rotated)
+        if "sign_packed" in encoded:
+            # QJL stage 2: estimate the quantization-residual direction from
+            # its 1-bit JL signs, scale by the stored residual norm with
+            # MSE-optimal shrinkage, and add it back in the rotated domain.
+            u = self._unpack_sign_bits(encoded["sign_packed"]) @ self.jl_matrix
+            u = u / torch.linalg.norm(u, dim=-1, keepdim=True).clamp(min=1e-8)
+            r_norm = encoded["residual_norms"].float().reshape(-1, 1)
+            rotated = rotated + (self.qjl_alpha * r_norm) * u
+
+        reconstructed = fast_wht(rotated)
         return (norms.unsqueeze(-1) * reconstructed).to(self.dtype)
 
 
