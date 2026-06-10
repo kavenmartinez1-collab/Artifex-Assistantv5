@@ -114,6 +114,8 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 | WebGPU inference | PASS | Qwen2.5-0.5B-Instruct generates coherent English at ~20 tok/s in Chrome (f32), ~10 tok/s with TurboQuant 4-bit KV |
 | WebGPU kernel tests | **15/15 PASS** | SiLU, Add, Mul, Matmul (naive, tiled, BT, BT-BF16 x3), Softmax, RMSNorm, TurboQuant 3-bit, TurboQuant 4-bit, Lloyd-Max codebook MSE, Asymmetric score |
 | WebGPU batch prefill | PASS | 29-token prompt in 1 chunk at ~150 tok/s (vs one-by-one before) |
+| WebGPU GGUF native path | PASS | Qwen3.5-9B i1-Q4_K_M at 8.4-8.7 tok/s, 4.71 GB VRAM, greedy matches llama.cpp |
+| WebGPU 35B MoE decode | PASS | Qwen3.6-35B-A3B at 8.08 tok/s (32 CPU workers) / ~7.5 tok/s (default 16) on 8 GB VRAM + 32 GB RAM |
 | Localhost binding | PASS | Confirmed NOT accessible on LAN IP |
 
 ## Supported GPU Tiers
@@ -1145,6 +1147,8 @@ Phases 0-6 complete plus Gated DeltaNet/Mamba-2 hybrid support, TurboQuant KV ca
 
 Any HuggingFace model with a standard transformer decoder architecture works. Hybrid Mamba-2 models (Qwen3.5) have full support with calibrated GPTQ quantization. Weight name prefixes are auto-detected. Tested:
 
+- **Qwen3.6-35B-A3B UD-Q5_K_S GGUF** (`local/...`, 35B MoE: 256 experts, 8 active + 1 shared) — 40 layers, all MoE. GPU non-experts + CPU WASM expert fleet. **8.08 tok/s** (`?moeWorkers=32`) / ~7.5 tok/s (default) on RTX 5060 Ti 8GB + 32GB DDR5. Greedy parity with llama.cpp.
+- **Qwen3.5-9B abliterated i1-Q4_K_M GGUF** — 8.4-8.7 tok/s, 4.71 GB VRAM, native k-quant matmul, greedy matches llama.cpp through 1200+ tokens.
 - **Qwen3.5-9B HailMary** (`local/qwen3.5-9b-HailMary`) — 32 layers (24 Gated DeltaNet + 8 full attention), 4096 hidden, 16Q/4KV GQA. **5.74 GB — fits 8 GB VRAM with ~2 GB headroom.** Coherent, accurate responses at 2.5 tok/s on RTX 5060 Ti 8GB. BF16 embed + INT4 GPTQ SSM/attention/FFN + INT4 RTN lm_head. Thinking mode with visible reasoning chain.
 - **Qwen3.5-9B noact** (`local/qwen3.5-9b-GPTQv2-noact`) — Same architecture, 9.37 GB. BF16 embed/lm_head/SSM + INT4 attention/FFN. 1.9 tok/s. Higher quality (BF16 lm_head) but larger VRAM footprint.
 - **Qwen3.5-2B** (`Qwen/Qwen3.5-2B`) — 24 layers (18 Gated DeltaNet + 6 full attention), 2048 hidden, GQA 8Q/2KV. Coherent English at 5.2 tok/s with native BF16 weights (4.18 GB VRAM).
@@ -1162,6 +1166,23 @@ A standalone bench page (`http://127.0.0.1:5173/bench.html`) measures the number
 - **(e) SharedArrayBuffer/Atomics worker wake latency** — ~6 µs round-trip (needs COOP/COEP, served for the bench page only).
 
 **Go/no-go result (RTX 5060 Ti 8GB + 32GB DDR5): 15.8 tok/s projected decode — PASS (gate: 8 tok/s).** The MoE build is a go. Node-side kernel validation: `npx tsx src/bench/validate-q5k.ts`; wasm rebuild: `src/wasm/build-wasm.sh` (requires LLVM clang with wasm32 target).
+
+### GGUF Native Path (Phase B)
+
+GGUF models load directly from the local HF cache or `models/` directory — no conversion. K-quant blocks (Q8_0/Q4_K/Q5_K/Q6_K) stay in native format on GPU and are dequantized on the fly inside `matmul_gguf.wgsl`; `token_embd` stays in CPU RAM (per-token row gather + dequant). Validated: **Qwen3.5-9B abliterated i1-Q4_K_M runs at 8.4-8.7 tok/s in 4.71 GB VRAM**, greedy output matching llama.cpp token-for-token. Three llama.cpp conversion quirks are compensated at load (`ssm_a = -exp(A_log)`, tiled v-head DeltaNet layout, norms stored as `w+1`).
+
+### Qwen3.6-35B-A3B MoE in the Browser (Phase C)
+
+The full 35B MoE model decodes at **8.08 tok/s on an 8 GB GPU + 32 GB RAM box** — the design the Phase 0 bench green-lit, built:
+
+- **Split residency** — non-expert weights (~2.7 GB) on GPU via the GGUF path; all 22.25 GB of Q5_K expert weights in CPU RAM, sharded across WASM workers (SharedArrayBuffer + Atomics, requires COOP/COEP).
+- **Row-split expert layout** — every worker owns a 1/N row-strip of *all* 256 experts, so each routed expert is computed by all workers in parallel. Perfect load balance: the earlier expert-ownership layout was pinned at ~5.6 tok/s by whichever worker drew the most experts onto the slowest core (E-core straggler).
+- **Two-phase GPU/CPU overlap** — per MoE layer, the GPU's shared-expert FFN and its readback execute *while* the CPU workers compute the routed experts, hiding ~0.6 ms/layer.
+- **Per-layer pipeline** — attention/DeltaNet + router on GPU → one pumped 9 KB readback → top-8 routing in JS → worker fleet computes expert GEMVs (the validated Q5_K WASM kernel) → combine with sigmoid-gated shared expert → 8 KB write back. Zero new WGSL kernels.
+- **Adaptive worker count** — picks a power of two from `hardwareConcurrency` (default cap 16, ~7.5 tok/s); `?moeWorkers=32` opt-in reaches 8.08 tok/s on a 16-thread i5-14400F.
+- **Wave warm-up** — Windows trims/compresses the 22 GB of expert pages during the long load (first touch runs 10-100x slow). Workers re-fault their shards in waves of 8, two rounds, so the box never sits pinned at max RAM commit.
+
+Correctness is held to llama.cpp: teacher-forced greedy parity 0/64 mismatches (`scripts/parity-diff.mjs`), router math validated against a literal port of `build_moe_ffn` (`scripts/test-router-math.mjs`), expert slab indexing validated against the real GGUF on disk in Node (`scripts/test-expert-ffn.mjs`). RAM note: the browser tab needs ~24 GB while running — close it before starting a native llama-server, and close it fully (not refresh) before reloading.
 
 ### Calibrated GPTQ Quantization
 

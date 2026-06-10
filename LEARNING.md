@@ -2005,4 +2005,52 @@ Without the pump trick, the same arithmetic gives 5.4 tok/s — **FAIL**. One sc
 
 ---
 
+## 20. Building the MoE Engine — Three Walls and How We Got Past Them
+
+Phase 0 projected 15.8 tok/s. The first working build of the real engine (Phase C2 — correct output, greedy parity 0/64 with llama.cpp) ran at **2.1 tok/s**. Six optimization rounds later it crossed the gate at **8.08 tok/s**. None of the wins came from making math faster — every one came from finding out *where time actually went*, and three times the answer was somewhere we didn't expect.
+
+### Wall #1: the operating system was eating our memory
+
+The first decode after loading 22 GB of expert weights ran at 2 tok/s with the per-expert GEMV measuring **0.7-3.7 ms instead of the benched 0.15 ms**. Same kernel, same weights, 5-25× slower. The culprit wasn't in our code at all: **Windows trims and compresses memory pages it considers idle**, and during a multi-minute 22 GB load, the pages loaded first look very idle by the end. The first touch of a trimmed page triggers a fault + decompression — we measured 0.02-0.06 GB/s on first touch versus 3.5-4.5 GB/s on the second pass over the same memory.
+
+Three escalating fixes, each taught by a failed run:
+
+1. **Warm-up pass** — after loading, every worker streams its entire shard once to re-fault everything. Worked... sometimes. One pass at near-full RAM commit can itself get trimmed while it runs.
+2. **Retry until proven warm** — repeat the streaming pass until the slowest worker reports resident-speed bandwidth (≥1.5 GB/s). Worked, but with 32 workers all streaming simultaneously while the file cache still held 22 GB of standby pages, the passes thrashed the pagefile at 0.01 GB/s and the box sat pinned at 31.8/31.8 GB for minutes — one bad allocation away from an OOM.
+3. **Waves** — warm 8 workers at a time (the rest stay parked in `Atomics.wait`), two full rounds, because warming the *last* wave re-trims a bit of the *first*. Each wave gets the full fault-in bandwidth, and peak memory pressure stays staged instead of pinned.
+
+Lesson: when a validated kernel suddenly runs 10× slow, suspect the memory system before the code. The kernel was never the problem — its *pages* were. And a browser detail that bites hard at this scale: **refreshing the tab double-commits** (the old tab's 22 GB isn't released until its workers die), so a 32 GB box must close the tab fully before reloading.
+
+### Wall #2: adding workers stopped helping, and the reason was a product of two factors
+
+With experts assigned to workers by ownership (`expert_id % N == worker`), the per-layer critical path is whichever worker is unluckiest: `busy_max = (experts landing on the busiest worker) × (ms per expert on whatever core that worker got)`. We scaled 8 → 16 → 32 workers and measured:
+
+| Workers | E[max experts/worker] | ms/expert (busiest) | busy_max |
+|---|---|---|---|
+| 8 | 2.58 | 0.86 | 2.22 ms |
+| 16 | 2.07 | 1.00 | 2.07 ms |
+| 32 | 1.64 | 1.28 | 2.10 ms |
+
+The straggler statistics improved exactly as the math says they should — and the per-expert speed got worse by the same factor, because on a hybrid P/E-core CPU, more threads means the marginal thread lands on an E-core or a hyperthread sibling. The product was pinned at ~2.1 ms. **Each factor in isolation told a story of progress; only the product told the truth.**
+
+The escape was to stop fighting the lottery: **row-split**. Instead of worker *w* owning a subset of experts, every worker owns a 1/N *row-strip of every expert* (the K-quant superblock layout makes any row range a contiguous byte range, so each worker fetches its strips with one strided-gather request per tensor). Every routed expert is now computed by all workers in parallel, with a barrier between the gate/up and down halves (the down GEMV needs the full intermediate activation, so workers exchange strips through the SharedArrayBuffer). Work per worker is uniform *by construction* — there is no straggler to be unlucky. `busy_max` fell from 2.07 to 1.03 ms, and worker count started scaling again (32 workers beat 16 even on 16 hardware threads, because half the work per worker amortizes the slow-core penalty).
+
+Lesson: load *balancing* chases a distribution; load *splitting* deletes it. If the unit of work can be partitioned uniformly, that beats any assignment policy — and it's worth restructuring the data layout to get it.
+
+### Wall #3: the GPU and CPU were taking turns instead of working
+
+The per-layer sequence was: GPU computes attention + router + shared expert → read everything back → route → CPU workers compute experts → combine. Strictly serial — while workers ran, the GPU idled; while the GPU ran, workers idled.
+
+But the dependency graph is looser than the code was: the *shared* expert (a small dense FFN every token goes through) depends only on the layer input, not on the routing decision. So: read back just the hidden state + router logits first (one small pumped readback), kick the workers, *then* dispatch the shared-expert FFN and its readback while the workers are busy. The GPU's shared-expert time and the second readback now hide entirely under CPU expert compute — ~24 ms/token reclaimed without making anything faster.
+
+Lesson: before optimizing either side of a producer/consumer split, draw the actual dependency graph. "GPU, then CPU" was an artifact of writing the code top-to-bottom, not a real data dependency.
+
+### The accounting rule that made all of this debuggable
+
+Every one of these walls was found by **instrumented attribution, not intuition** — per-layer counters separating worker busy-time (max and average), scheduling overhead, GPU-sync time, and *exposed* expert wait (what's left after overlap). Twice the generic profiler verdict ("CPU/dispatch-bound") pointed at the wrong thing because a wait inside a CPU frame *looks* like CPU work. The numbers that cracked each wall were ratios the profiler doesn't compute: warm-vs-cold bandwidth on identical reads (Wall 1), `busy_max` as an explicit product of two measured factors (Wall 2), and full-wait vs exposed-wait (Wall 3).
+
+Final state: 123.7 ms/token = 8.08 tok/s, output token-identical to the slow reference path, on a consumer 8 GB GPU + 32 GB RAM running a 35B-parameter model in a browser tab.
+
+---
+
 *"Unless the LORD builds the house, the builders labor in vain." — Psalm 127:1*
