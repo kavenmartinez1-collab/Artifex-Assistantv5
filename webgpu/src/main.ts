@@ -366,6 +366,8 @@ async function init() {
       setStatus('WebGPU ready — load a model or run kernel tests');
     }
 
+    startKernelTestPoller();
+
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     gpuBadge.textContent = 'No WebGPU';
@@ -379,6 +381,55 @@ async function init() {
 }
 
 // ─── Kernel Tests ────────────────────────────────────────────────────────────
+
+/** Run kernel tests on the current device and POST results to /api/debug. */
+async function runKernelTestsToDebugAPI(): Promise<void> {
+  const results = await runKernelTests(gpu!.device);
+  const passed = results.filter(r => r.passed).length;
+  console.log(`[AutoTest] Kernel tests: ${passed}/${results.length} passed`);
+  await fetch('/api/debug', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind: 'kernel-tests', passed, failed: results.length - passed, results }),
+  });
+}
+
+/**
+ * Pre-session /api/test poller: lets the dev loop trigger kernel tests via
+ * `POST /api/test {"kernelTests":true}` without a model loaded. Stops as soon
+ * as a session exists (the per-session poller owns the queue from then on,
+ * and handles kernelTests itself). Prompt items popped here without a session
+ * are re-queued untouched.
+ */
+let kernelPollerActive = false;
+function startKernelTestPoller(): void {
+  if (kernelPollerActive) return;
+  kernelPollerActive = true;
+  (async () => {
+    while (!session) {
+      try {
+        const resp = await fetch('/api/test');
+        const test = await resp.json();
+        if (test && test.kernelTests === true && gpu) {
+          await runKernelTestsToDebugAPI();
+        } else if (test && typeof test.loadRepo === 'string') {
+          // Dev-loop model load: set the repo field and click Load.
+          ($('model-repo') as HTMLInputElement).value = test.loadRepo;
+          loadBtn.click();
+        } else if (test && test.prompt) {
+          // Not ours — a prompt test queued before any model loaded. Put it back.
+          await fetch('/api/test', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(test),
+          });
+        }
+      } catch { /* dev-server hiccup — keep polling */ }
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    kernelPollerActive = false;
+  })();
+}
 
 testBtn.addEventListener('click', async () => {
   if (!gpu) {
@@ -520,6 +571,310 @@ sendBtn.addEventListener('click', async () => {
   }
 });
 
+// ─── Auto-test polling ──────────────────────────────────────────────────────
+// Polls /api/test for queued prompts/kernel-test requests while a session
+// exists. Shared by the safetensors and GGUF load paths.
+function startAutoTestPoller() {
+      // Intercept console.log to capture debug output from forward pass
+      const _origLog = console.log;
+      let debugLogs: string[] = [];
+
+      (async function pollTests() {
+        while (session) {
+          try {
+            const resp = await fetch('/api/test');
+            const test = await resp.json();
+            if (test && test.kernelTests === true && gpu) {
+              await runKernelTestsToDebugAPI();
+            } else if (test && test.prompt) {
+              _origLog(`[AutoTest] Running: "${test.prompt}"`);
+
+              // Enable debug mode for this run's first forward pass
+              (globalThis as any).__DEBUG_FORWARD_PASS__ = true;
+
+              // Divergence probe: when the test request asks for it, arm the
+              // full per-layer dump on the first forward pass. Dump lands in
+              // globalThis.__DEBUG_DUMP_RESULT__ and rides back with the POST.
+              if (test.dumpStats === true) {
+                (globalThis as any).__DEBUG_DUMP_RESULT__ = undefined;
+                (globalThis as any).__DEBUG_DUMP_STATS__ = true;
+                // Optional: caller may request additional dumps at specific decode
+                // steps. Default schedule covers early/mid/late decode drift.
+                const decodeSteps = Array.isArray(test.decodeDumpSteps)
+                  ? test.decodeDumpSteps
+                  : [1, 10, 50];
+                (globalThis as any).__DEBUG_DUMP_DECODE_STEPS__ = decodeSteps;
+              }
+              // Diagnostic: caller may force a non-default prefill chunk size.
+              if (typeof test.prefillChunk === 'number' && test.prefillChunk > 0) {
+                (globalThis as any).__DEBUG_PREFILL_CHUNK__ = test.prefillChunk;
+              } else {
+                (globalThis as any).__DEBUG_PREFILL_CHUNK__ = undefined;
+              }
+              // Per-tensor audit: list of layer indices to dump every linear
+              // projection output for. Generic by design — labels are
+              // L${l}-${proj}-out so future model families need only a
+              // per-family JSON name-map (no engine changes).
+              if (Array.isArray(test.auditLayers) && test.auditLayers.length > 0) {
+                (globalThis as any).__DEBUG_AUDIT_LAYERS__ = test.auditLayers;
+              } else {
+                (globalThis as any).__DEBUG_AUDIT_LAYERS__ = undefined;
+              }
+              // SSM state-drift probe: read back hidden-state h from each
+              // linear_attn layer every N forward() calls and log ‖h‖, max|h|,
+              // nonzero%. Cost is ~48 MB readback per sample on Qwen3.5 so use
+              // a coarse interval for long decodes (50-200).
+              if (typeof test.ssmProbeInterval === 'number' && test.ssmProbeInterval > 0) {
+                (globalThis as any).__DEBUG_SSM_STATE__ = test.ssmProbeInterval;
+              } else {
+                (globalThis as any).__DEBUG_SSM_STATE__ = undefined;
+              }
+              // Channel-saturation probe: extends SSM-PROBE line with top-K
+              // channel indices by per-VD max|h|. A frozen attractor shows the
+              // SAME top channel indices at every sample; fluctuating ones = noise.
+              if (typeof test.ssmChannels === 'number' && test.ssmChannels > 0) {
+                (globalThis as any).__DEBUG_SSM_CHANNELS__ = test.ssmChannels;
+              } else {
+                (globalThis as any).__DEBUG_SSM_CHANNELS__ = undefined;
+              }
+              // Attention KV-cache probe: reads ‖K‖, ‖V‖ for the 8 softmax-attn
+              // layers at every N forward() calls. Cost grows with pos; use
+              // coarse intervals (100-200) on long decodes.
+              if (typeof test.attnKvInterval === 'number' && test.attnKvInterval > 0) {
+                (globalThis as any).__DEBUG_ATTN_KV__ = test.attnKvInterval;
+              } else {
+                (globalThis as any).__DEBUG_ATTN_KV__ = undefined;
+              }
+              // Softpick (rectified softmax) — replaces exp normalization in
+              // the 8 softmax attention layers to prevent sink saturation.
+              // A/B flag for evaluating whether it fixes long-decode collapse.
+              if (test.useSoftpick === true) {
+                (globalThis as any).__USE_SOFTPICK__ = true;
+              } else {
+                (globalThis as any).__USE_SOFTPICK__ = false;
+              }
+              // Logit-distribution probe — logs top-5 raw logits + stats
+              // every N decode steps. Used to tell concentrated collapse
+              // (top-1 gap >> rest) from broad uncertainty (flat distribution).
+              if (typeof test.logitProbeInterval === 'number' && test.logitProbeInterval > 0) {
+                (globalThis as any).__DEBUG_LOGIT_TOPK__ = test.logitProbeInterval;
+              } else {
+                (globalThis as any).__DEBUG_LOGIT_TOPK__ = undefined;
+              }
+
+              // Capture console.log output during inference
+              debugLogs = [];
+              console.log = (...args: any[]) => {
+                const line = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+                debugLogs.push(line);
+                _origLog(...args);
+              };
+
+              const messages = [
+                { role: 'system', content: 'You are Artifex, a helpful AI assistant.' },
+                { role: 'user', content: test.prompt },
+              ];
+              const t0 = performance.now();
+              const handle = session.chat(
+                messages,
+                {
+                  temperature: test.temperature ?? 0,
+                  topP: test.topP ?? 0.9,
+                  maxNewTokens: test.maxTokens ?? 50,
+                  repetitionPenalty: test.repetitionPenalty ?? 1.15,
+                  // New sampler params (2026). Pass-through — when undefined,
+                  // generate.ts applies its own defaults (minP=0.05, DRY=0.8).
+                  minP: test.minP,
+                  dryMultiplier: test.dryMultiplier,
+                  dryBase: test.dryBase,
+                  dryAllowedLength: test.dryAllowedLength,
+                  dryRangeLastN: test.dryRangeLastN,
+                },
+                () => {},
+              );
+              const result = await handle.result;
+              const elapsed = performance.now() - t0;
+
+              // Restore console.log
+              console.log = _origLog;
+
+              const dumpResult = (globalThis as any).__DEBUG_DUMP_RESULT__;
+              const debugData = {
+                prompt: test.prompt,
+                output: result.text,
+                tokens: result.numTokens,
+                tokPerSec: result.tokensPerSecond,
+                stopReason: result.stopReason,
+                elapsedMs: Math.round(elapsed),
+                promptTokens: result.promptTokens,
+                tokenIds: result.tokenIds,
+                consoleLogs: debugLogs,
+                layerDump: dumpResult ?? null,
+              };
+              (globalThis as any).__DEBUG_DUMP_RESULT__ = undefined;
+              (globalThis as any).__DEBUG_DUMP_DECODE_STEPS__ = undefined;
+              (globalThis as any).__DEBUG_AUDIT_LAYERS__ = undefined;
+              (globalThis as any).__DEBUG_SSM_STATE__ = undefined;
+              (globalThis as any).__DEBUG_SSM_CHANNELS__ = undefined;
+              (globalThis as any).__DEBUG_ATTN_KV__ = undefined;
+              (globalThis as any).__USE_SOFTPICK__ = false;
+              (globalThis as any).__DEBUG_LOGIT_TOPK__ = undefined;
+              console.log(`[AutoTest] Result: "${result.text}" (${result.numTokens} tok, ${result.tokensPerSecond.toFixed(1)} tok/s)`);
+              await fetch('/api/debug', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(debugData),
+              });
+            }
+          } catch { /* server not available */ }
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      })();
+}
+
+// ─── GGUF Load Path ──────────────────────────────────────────────────────────
+// Loads a GGUF-only model dir (no config.json). K-quant weights stay in native
+// llama.cpp block format on GPU (matmul_gguf kernels); token_embd stays in RAM
+// and row-gathers on CPU per token.
+async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTMLElement): Promise<void> {
+  const { loadGGUFModel } = await import('./model/gguf-loader');
+  const { descriptorFromGGUF } = await import('./model/model-descriptor');
+  const { createGGUFLocator } = await import('./model/tensor-locator');
+  const { createForwardPassEngine } = await import('./engine/forward-pass');
+  const { createTokenizer, applyChatTemplate } = await import('./model/tokenizer');
+  const { generate } = await import('./engine/generate');
+
+  addMessage('system', `Loading GGUF: ${repo}/${ggufFile} ...`);
+  const model = await loadGGUFModel(gpu!.device, repo, ggufFile, (p) => {
+    progressEl.textContent = p.message;
+    if (p.overallProgress !== undefined) {
+      setStatus(`Loading ${repo}... ${Math.round(p.overallProgress * 100)}%`);
+    }
+  });
+  currentModel = model as unknown as LoadedModel;
+
+  addMessage('system',
+    `Weights loaded: ${model.tensors.size} GPU tensors, ${formatBytes(model.totalGPUBytes)} GPU memory\n` +
+    `Load time: ${(model.loadTimeMs / 1000).toFixed(1)}s (GGUF native)`,
+    'weights loaded');
+
+  setStatus('Building inference engine...');
+  const config = descriptorFromGGUF(model.file);
+  const loc = createGGUFLocator(model.file.tensors);
+
+  const requireBuf = (role: TensorRole, l?: number): GPUBuffer => {
+    const n = loc.locate(role, l);
+    const t = n ? model.tensors.get(n) : undefined;
+    if (!t) {
+      throw new Error(`GGUF bridge: missing tensor for role "${role}"${l !== undefined ? ` (layer ${l})` : ''} (name: ${n ?? 'unmapped'})`);
+    }
+    return t.buffer;
+  };
+  const roleBuf = (role: TensorRole, l?: number): GPUBuffer | undefined => {
+    const n = loc.locate(role, l);
+    return n ? model.tensors.get(n)?.buffer : undefined;
+  };
+  /** Quantized tensor → `{slot}_gg` (matmul_gguf); F32/F16 → plain slot (matmul_bt). */
+  const assignProj = (lw: any, slot: string, role: TensorRole, l: number) => {
+    const n = loc.locate(role, l);
+    const t = n ? model.tensors.get(n) : undefined;
+    if (!t) throw new Error(`GGUF bridge: missing tensor for role "${role}" (layer ${l})`);
+    if (t.isQuantized) lw[`${slot}_gg`] = { data: t.buffer, ggmlType: t.ggmlType };
+    else lw[slot] = t.buffer;
+  };
+
+  // Global weights. embedTokens/lmHead get a dummy f32 buffer when the real
+  // weight rides the embedGG / lmHeadGG path (mirrors the GPTQ-embed pattern).
+  const embedCpu = model.cpuTensors.get('token_embd.weight');
+  if (!embedCpu) throw new Error('GGUF bridge: token_embd.weight missing from CPU store');
+  const finalNorm = requireBuf('finalNorm');
+  const lmHeadName = loc.locate('lmHead')!; // falls back to token_embd.weight when tied
+  const lmHeadT = model.tensors.get(lmHeadName);
+  if (!lmHeadT) throw new Error(`GGUF bridge: lm_head tensor "${lmHeadName}" not on GPU`);
+  const global: any = {
+    embedTokens: finalNorm,  // dummy — embedGG path is used
+    finalNorm,
+    lmHead: lmHeadT.isQuantized ? finalNorm : lmHeadT.buffer,
+    embedGG: { data: embedCpu.data, ggmlType: embedCpu.ggmlType, rowBytes: embedCpu.rowBytes },
+  };
+  if (lmHeadT.isQuantized) {
+    global.lmHeadGG = { data: lmHeadT.buffer, ggmlType: lmHeadT.ggmlType };
+  }
+  console.log(`[GGUF] embed: CPU row-gather (${embedCpu.rowBytes} B/row); lm_head: ${lmHeadT.dtype}${config.tieWordEmbeddings ? ' (tied)' : ''}`);
+
+  const layers: any[] = [];
+  for (let l = 0; l < config.numLayers; l++) {
+    if (config.layers[l].moe) {
+      throw new Error('GGUF MoE layers are not supported yet (Phase C)');
+    }
+    const lw: any = {
+      inputNorm: requireBuf('inputNorm', l),
+      postAttnNorm: requireBuf('postAttnNorm', l),
+    };
+    if (config.layers[l].kind === 'linear_attention') {
+      assignProj(lw, 'linearInProjQKV', 'linInProjQKV', l);
+      assignProj(lw, 'linearInProjA', 'linInProjA', l);
+      assignProj(lw, 'linearInProjB', 'linInProjB', l);
+      assignProj(lw, 'linearInProjZ', 'linInProjZ', l);
+      assignProj(lw, 'linearOutProj', 'linOutProj', l);
+      lw.linearALog = requireBuf('linALog', l);
+      lw.linearConv1dWeight = requireBuf('linConv1dWeight', l);
+      lw.linearDtBias = requireBuf('linDtBias', l);
+      lw.linearNormWeight = requireBuf('linNormWeight', l);
+    } else {
+      assignProj(lw, 'qProj', 'qProj', l);
+      assignProj(lw, 'kProj', 'kProj', l);
+      assignProj(lw, 'vProj', 'vProj', l);
+      assignProj(lw, 'oProj', 'oProj', l);
+      lw.qNorm = roleBuf('qNorm', l);
+      lw.kNorm = roleBuf('kNorm', l);
+      if (config.attentionBias) {
+        lw.qBias = roleBuf('qBias', l);
+        lw.kBias = roleBuf('kBias', l);
+        lw.vBias = roleBuf('vBias', l);
+        lw.oBias = roleBuf('oBias', l);
+      }
+    }
+    assignProj(lw, 'gateProj', 'gateProj', l);
+    assignProj(lw, 'upProj', 'upProj', l);
+    assignProj(lw, 'downProj', 'downProj', l);
+    layers.push(lw);
+  }
+  if (config.isHybrid) {
+    const linCount = config.layers.filter(d => d.kind === 'linear_attention').length;
+    console.log(`[GGUF] Hybrid model: ${linCount} linear + ${config.numLayers - linCount} full attention layers`);
+  }
+
+  const engine = createForwardPassEngine(gpu!.device, config, { global, layers });
+  const tokenizer = await createTokenizer({ modelId: repo });
+  resetToRemote();
+
+  session = {
+    run: (prompt, sampling, onToken) => generate(gpu!.device, engine, tokenizer, prompt, sampling, onToken),
+    chat: (messages: Array<{role: string; content: string}>, sampling: any, onToken: any, opts?: { enableThinking?: boolean }) => {
+      const tokenIds = applyChatTemplate(tokenizer, messages, opts);
+      return generate(gpu!.device, engine, tokenizer, tokenIds, sampling, onToken);
+    },
+    config,
+    tokenizer,
+    gpu: gpu!,
+    vramEstimate: estimateVRAM(config),
+    destroy: () => { unloadModel(currentModel!); session = null; },
+  } as InferenceSession;
+
+  promptEl.disabled = false;
+  sendBtn.disabled = false;
+
+  addMessage('system',
+    `Inference engine ready! (GGUF native)\n` +
+    `Model: ${config.modelType} — ${config.numLayers} layers, ${config.numAttentionHeads} heads, d=${config.hiddenSize}\n` +
+    `Vocab: ${config.vocabSize} | RoPE θ=${config.ropeTheta}\n` +
+    `Type a message to chat!`,
+    'engine ready');
+  setStatus(`Ready: ${repo}`);
+  startAutoTestPoller();
+}
+
 // ─── Load Model ──────────────────────────────────────────────────────────────
 
 loadBtn.addEventListener('click', async () => {
@@ -568,12 +923,14 @@ loadBtn.addEventListener('click', async () => {
   try {
     // Check if model is available in local HF cache (50-100x faster than CDN)
     let usingLocalCache = false;
+    let localFiles: string[] | null = null;
     try {
       const cacheResp = await fetch('/api/hf-cache/models');
       if (cacheResp.ok) {
         const cached = await cacheResp.json() as Array<{ repo: string; files: string[] }>;
         const localModel = cached.find(m => m.repo === repo);
         if (localModel) {
+          localFiles = localModel.files;
           useLocalCache();
           usingLocalCache = true;
           addMessage('system', `Loading ${repo} from local HF cache (fast)...`);
@@ -583,6 +940,14 @@ loadBtn.addEventListener('click', async () => {
 
     if (!usingLocalCache) {
       addMessage('system', `Connecting to HuggingFace: ${repo}...`);
+    }
+
+    // GGUF-only model dir (no config.json): native GGUF load path
+    const ggufFiles = (localFiles ?? []).filter(f => f.endsWith('.gguf') && !f.toLowerCase().includes('mmproj'));
+    if (ggufFiles.length > 0 && !(localFiles ?? []).includes('config.json')) {
+      await buildGGUFSession(repo, ggufFiles[0], progressEl);
+      updateFooter({ model: repo.split('/').pop() || repo });
+      return;
     }
 
     // Preview first (just headers, fast)
@@ -1106,160 +1471,7 @@ loadBtn.addEventListener('click', async () => {
 
       setStatus(`Ready: ${repo}`);
 
-      // ── Auto-test polling: check /api/test for queued prompts ─────
-      // Intercept console.log to capture debug output from forward pass
-      const _origLog = console.log;
-      let debugLogs: string[] = [];
-
-      (async function pollTests() {
-        while (session) {
-          try {
-            const resp = await fetch('/api/test');
-            const test = await resp.json();
-            if (test && test.prompt) {
-              _origLog(`[AutoTest] Running: "${test.prompt}"`);
-
-              // Enable debug mode for this run's first forward pass
-              (globalThis as any).__DEBUG_FORWARD_PASS__ = true;
-
-              // Divergence probe: when the test request asks for it, arm the
-              // full per-layer dump on the first forward pass. Dump lands in
-              // globalThis.__DEBUG_DUMP_RESULT__ and rides back with the POST.
-              if (test.dumpStats === true) {
-                (globalThis as any).__DEBUG_DUMP_RESULT__ = undefined;
-                (globalThis as any).__DEBUG_DUMP_STATS__ = true;
-                // Optional: caller may request additional dumps at specific decode
-                // steps. Default schedule covers early/mid/late decode drift.
-                const decodeSteps = Array.isArray(test.decodeDumpSteps)
-                  ? test.decodeDumpSteps
-                  : [1, 10, 50];
-                (globalThis as any).__DEBUG_DUMP_DECODE_STEPS__ = decodeSteps;
-              }
-              // Diagnostic: caller may force a non-default prefill chunk size.
-              if (typeof test.prefillChunk === 'number' && test.prefillChunk > 0) {
-                (globalThis as any).__DEBUG_PREFILL_CHUNK__ = test.prefillChunk;
-              } else {
-                (globalThis as any).__DEBUG_PREFILL_CHUNK__ = undefined;
-              }
-              // Per-tensor audit: list of layer indices to dump every linear
-              // projection output for. Generic by design — labels are
-              // L${l}-${proj}-out so future model families need only a
-              // per-family JSON name-map (no engine changes).
-              if (Array.isArray(test.auditLayers) && test.auditLayers.length > 0) {
-                (globalThis as any).__DEBUG_AUDIT_LAYERS__ = test.auditLayers;
-              } else {
-                (globalThis as any).__DEBUG_AUDIT_LAYERS__ = undefined;
-              }
-              // SSM state-drift probe: read back hidden-state h from each
-              // linear_attn layer every N forward() calls and log ‖h‖, max|h|,
-              // nonzero%. Cost is ~48 MB readback per sample on Qwen3.5 so use
-              // a coarse interval for long decodes (50-200).
-              if (typeof test.ssmProbeInterval === 'number' && test.ssmProbeInterval > 0) {
-                (globalThis as any).__DEBUG_SSM_STATE__ = test.ssmProbeInterval;
-              } else {
-                (globalThis as any).__DEBUG_SSM_STATE__ = undefined;
-              }
-              // Channel-saturation probe: extends SSM-PROBE line with top-K
-              // channel indices by per-VD max|h|. A frozen attractor shows the
-              // SAME top channel indices at every sample; fluctuating ones = noise.
-              if (typeof test.ssmChannels === 'number' && test.ssmChannels > 0) {
-                (globalThis as any).__DEBUG_SSM_CHANNELS__ = test.ssmChannels;
-              } else {
-                (globalThis as any).__DEBUG_SSM_CHANNELS__ = undefined;
-              }
-              // Attention KV-cache probe: reads ‖K‖, ‖V‖ for the 8 softmax-attn
-              // layers at every N forward() calls. Cost grows with pos; use
-              // coarse intervals (100-200) on long decodes.
-              if (typeof test.attnKvInterval === 'number' && test.attnKvInterval > 0) {
-                (globalThis as any).__DEBUG_ATTN_KV__ = test.attnKvInterval;
-              } else {
-                (globalThis as any).__DEBUG_ATTN_KV__ = undefined;
-              }
-              // Softpick (rectified softmax) — replaces exp normalization in
-              // the 8 softmax attention layers to prevent sink saturation.
-              // A/B flag for evaluating whether it fixes long-decode collapse.
-              if (test.useSoftpick === true) {
-                (globalThis as any).__USE_SOFTPICK__ = true;
-              } else {
-                (globalThis as any).__USE_SOFTPICK__ = false;
-              }
-              // Logit-distribution probe — logs top-5 raw logits + stats
-              // every N decode steps. Used to tell concentrated collapse
-              // (top-1 gap >> rest) from broad uncertainty (flat distribution).
-              if (typeof test.logitProbeInterval === 'number' && test.logitProbeInterval > 0) {
-                (globalThis as any).__DEBUG_LOGIT_TOPK__ = test.logitProbeInterval;
-              } else {
-                (globalThis as any).__DEBUG_LOGIT_TOPK__ = undefined;
-              }
-
-              // Capture console.log output during inference
-              debugLogs = [];
-              console.log = (...args: any[]) => {
-                const line = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
-                debugLogs.push(line);
-                _origLog(...args);
-              };
-
-              const messages = [
-                { role: 'system', content: 'You are Artifex, a helpful AI assistant.' },
-                { role: 'user', content: test.prompt },
-              ];
-              const t0 = performance.now();
-              const handle = session.chat(
-                messages,
-                {
-                  temperature: test.temperature ?? 0,
-                  topP: test.topP ?? 0.9,
-                  maxNewTokens: test.maxTokens ?? 50,
-                  repetitionPenalty: test.repetitionPenalty ?? 1.15,
-                  // New sampler params (2026). Pass-through — when undefined,
-                  // generate.ts applies its own defaults (minP=0.05, DRY=0.8).
-                  minP: test.minP,
-                  dryMultiplier: test.dryMultiplier,
-                  dryBase: test.dryBase,
-                  dryAllowedLength: test.dryAllowedLength,
-                  dryRangeLastN: test.dryRangeLastN,
-                },
-                () => {},
-              );
-              const result = await handle.result;
-              const elapsed = performance.now() - t0;
-
-              // Restore console.log
-              console.log = _origLog;
-
-              const dumpResult = (globalThis as any).__DEBUG_DUMP_RESULT__;
-              const debugData = {
-                prompt: test.prompt,
-                output: result.text,
-                tokens: result.numTokens,
-                tokPerSec: result.tokensPerSecond,
-                stopReason: result.stopReason,
-                elapsedMs: Math.round(elapsed),
-                promptTokens: result.promptTokens,
-                tokenIds: result.tokenIds,
-                consoleLogs: debugLogs,
-                layerDump: dumpResult ?? null,
-              };
-              (globalThis as any).__DEBUG_DUMP_RESULT__ = undefined;
-              (globalThis as any).__DEBUG_DUMP_DECODE_STEPS__ = undefined;
-              (globalThis as any).__DEBUG_AUDIT_LAYERS__ = undefined;
-              (globalThis as any).__DEBUG_SSM_STATE__ = undefined;
-              (globalThis as any).__DEBUG_SSM_CHANNELS__ = undefined;
-              (globalThis as any).__DEBUG_ATTN_KV__ = undefined;
-              (globalThis as any).__USE_SOFTPICK__ = false;
-              (globalThis as any).__DEBUG_LOGIT_TOPK__ = undefined;
-              console.log(`[AutoTest] Result: "${result.text}" (${result.numTokens} tok, ${result.tokensPerSecond.toFixed(1)} tok/s)`);
-              await fetch('/api/debug', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(debugData),
-              });
-            }
-          } catch { /* server not available */ }
-          await new Promise(r => setTimeout(r, 2000));
-        }
-      })();
+      startAutoTestPoller();
 
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

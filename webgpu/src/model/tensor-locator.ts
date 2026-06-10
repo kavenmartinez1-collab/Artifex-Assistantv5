@@ -108,3 +108,90 @@ export function createHFLocator(
     },
   };
 }
+
+// ── GGUF locator ───────────────────────────────────────────────────────
+
+/** Global GGUF tensor names. */
+const GGUF_GLOBAL: Partial<Record<TensorRole, string>> = {
+  embedTokens: 'token_embd.weight',
+  finalNorm: 'output_norm.weight',
+  lmHead: 'output.weight',
+};
+
+/**
+ * Per-layer GGUF name suffixes ('blk.{L}.' prefix added at locate time).
+ * Mapping verified against llama.cpp gguf-py/gguf/tensor_mapping.py:
+ *   ssm_alpha ← linear_attn.in_proj_a, ssm_beta ← in_proj_b,
+ *   attn_qkv ← in_proj_qkv, attn_gate ← in_proj_z, ssm_a ← A_log (no .weight),
+ *   ssm_dt.bias ← dt_bias.
+ * Arrays = fallback chain (first name present in the file wins).
+ */
+const GGUF_LAYER: Partial<Record<TensorRole, string[]>> = {
+  inputNorm: ['attn_norm.weight'],
+  postAttnNorm: ['post_attention_norm.weight', 'ffn_norm.weight'],
+  qProj: ['attn_q.weight'],
+  kProj: ['attn_k.weight'],
+  vProj: ['attn_v.weight'],
+  oProj: ['attn_output.weight'],
+  qBias: ['attn_q.bias'],
+  kBias: ['attn_k.bias'],
+  vBias: ['attn_v.bias'],
+  oBias: ['attn_output.bias'],
+  qNorm: ['attn_q_norm.weight'],
+  kNorm: ['attn_k_norm.weight'],
+  gateProj: ['ffn_gate.weight'],
+  upProj: ['ffn_up.weight'],
+  downProj: ['ffn_down.weight'],
+  // Gated DeltaNet
+  linInProjQKV: ['attn_qkv.weight'],
+  linInProjA: ['ssm_alpha.weight'],
+  linInProjB: ['ssm_beta.weight'],
+  linInProjZ: ['attn_gate.weight'],
+  linOutProj: ['ssm_out.weight'],
+  linALog: ['ssm_a'],
+  linConv1dWeight: ['ssm_conv1d.weight'],
+  linDtBias: ['ssm_dt.bias'],
+  linNormWeight: ['ssm_norm.weight'],
+  // MoE
+  moeRouter: ['ffn_gate_inp.weight'],
+  moeExpertGate: ['ffn_gate_exps.weight'],
+  moeExpertUp: ['ffn_up_exps.weight'],
+  moeExpertDown: ['ffn_down_exps.weight'],
+  moeSharedGateProj: ['ffn_gate_shexp.weight'],
+  moeSharedUpProj: ['ffn_up_shexp.weight'],
+  moeSharedDownProj: ['ffn_down_shexp.weight'],
+  moeSharedExpertGate: ['ffn_gate_inp_shexp.weight'],
+};
+
+/**
+ * GGUF locator. Resolves roles to blk.{L}.* / global GGUF tensor names,
+ * returning undefined when the tensor isn't present in this file.
+ */
+export function createGGUFLocator(
+  tensorNames: Set<string> | Map<string, unknown>,
+): TensorLocator {
+  const has = (name: string) => tensorNames.has(name);
+
+  return {
+    locate(role: TensorRole, layer?: number): string | undefined {
+      const globalName = GGUF_GLOBAL[role];
+      if (globalName !== undefined) {
+        if (role === 'lmHead' && !has(globalName)) {
+          // Tied embeddings: llama.cpp dups output from token_embd
+          return GGUF_GLOBAL.embedTokens;
+        }
+        return has(globalName) ? globalName : undefined;
+      }
+      if (layer === undefined) {
+        throw new Error(`TensorLocator: role "${role}" requires a layer index`);
+      }
+      const suffixes = GGUF_LAYER[role];
+      if (!suffixes) return undefined;
+      for (const suffix of suffixes) {
+        const name = `blk.${layer}.${suffix}`;
+        if (has(name)) return name;
+      }
+      return undefined;
+    },
+  };
+}

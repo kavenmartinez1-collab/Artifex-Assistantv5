@@ -17,6 +17,13 @@ struct Params {
   num_value_heads: u32,    // 32
   key_head_dim: u32,       // 128
   grouped_value_dim: u32,  // 256 = (num_value_heads / num_key_heads) * value_head_dim
+  // V-head ordering of the V/beta/decay/output buffers:
+  //   0 = grouped (HF safetensors): v-heads of k-head g are [g*r .. g*r+r-1]
+  //   1 = tiled (GGUF, llama.cpp convert reorders): v-head (g, j) sits at j*nkh + g
+  layout_tiled: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
 }
 
 // Per-head vectors for the current token (Q and K are L2-normalized and Q is scaled by 1/sqrt(kd))
@@ -49,11 +56,13 @@ fn ssm_step(@builtin(local_invocation_id) lid: vec3u,
 
   let h_base = kh * kd * gvd;
 
+  let tiled = params.layout_tiled == 1u;
+
   // Step 1: Decay state — h = decay * h
   // decay is per value head
   var v = tid;
   while (v < gvd) {
-    let vh = kh * vh_per_kh + v / vhd;
+    let vh = select(kh * vh_per_kh + v / vhd, (v / vhd) * nkh + kh, tiled);
     let d = decay[vh];
     for (var k = 0u; k < kd; k = k + 1u) {
       let h_idx = h_base + k * gvd + v;
@@ -73,8 +82,8 @@ fn ssm_step(@builtin(local_invocation_id) lid: vec3u,
     }
 
     // Step 3: delta = (V - kv_mem) * beta
-    let vh = kh * vh_per_kh + v / vhd;
-    let v_val = V[kh * gvd + v];
+    let vh = select(kh * vh_per_kh + v / vhd, (v / vhd) * nkh + kh, tiled);
+    let v_val = V[select(kh * gvd + v, vh * vhd + (v % vhd), tiled)];
     let beta_val = beta[vh];
     let delta = (v_val - kv_mem) * beta_val;
 
@@ -97,7 +106,9 @@ fn ssm_step(@builtin(local_invocation_id) lid: vec3u,
     for (var k = 0u; k < kd; k = k + 1u) {
       dot += h[h_base + k * gvd + v] * Q[kh * kd + k];
     }
-    output[kh * gvd + v] = dot * scale;
+    // Tiled: write where the (tiled-ordered) z-gate and out_proj expect it.
+    let vh_out = select(kh * vh_per_kh + v / vhd, (v / vhd) * nkh + kh, tiled);
+    output[select(kh * gvd + v, vh_out * vhd + (v % vhd), tiled)] = dot * scale;
     v = v + 256u;
   }
 }

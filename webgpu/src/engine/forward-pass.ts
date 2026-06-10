@@ -59,6 +59,9 @@ import ssmStepWGSL from '../shaders/ssm_step.wgsl?raw';
 import l2normWGSL from '../shaders/l2norm.wgsl?raw';
 import hadamardWGSL from '../shaders/hadamard.wgsl?raw';
 import dequantQ4BF16WGSL from '../shaders/dequant_q4_bf16.wgsl?raw';
+import matmulGgufWGSL from '../shaders/matmul_gguf.wgsl?raw';
+import { GGML_TYPES } from '../model/gguf';
+import { dequantGGML } from '../model/gguf-dequant';
 
 // ── CPU embed helpers (BF16 → F32 decode) ──────────────────────────────
 const _cpuEmbedBuf = new ArrayBuffer(4);
@@ -66,6 +69,12 @@ const _cpuEmbedU32 = new Uint32Array(_cpuEmbedBuf);
 const _cpuEmbedF32 = new Float32Array(_cpuEmbedBuf);
 
 // ── Types ────────────────────────────────────────────────────────────────
+
+/** GGUF k-quant weight: repacked block data + its ggml type (Q8_0/Q4_K/Q5_K/Q6_K). */
+export interface GGUFWeight {
+  data: GPUBuffer;
+  ggmlType: number;
+}
 
 /** GPU buffers for one transformer layer's weights. */
 export interface LayerWeights {
@@ -109,6 +118,21 @@ export interface LayerWeights {
   gateProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
   upProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
   downProj_q8?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };
+
+  // GGUF k-quant weight buffers (native llama.cpp blocks, repacked to
+  // 4-byte-aligned strides at load — see gguf-dequant.ts repack*)
+  qProj_gg?: GGUFWeight;
+  kProj_gg?: GGUFWeight;
+  vProj_gg?: GGUFWeight;
+  oProj_gg?: GGUFWeight;
+  gateProj_gg?: GGUFWeight;
+  upProj_gg?: GGUFWeight;
+  downProj_gg?: GGUFWeight;
+  linearInProjQKV_gg?: GGUFWeight;
+  linearInProjA_gg?: GGUFWeight;
+  linearInProjB_gg?: GGUFWeight;
+  linearInProjZ_gg?: GGUFWeight;
+  linearOutProj_gg?: GGUFWeight;
 
   // Linear attention (Gated DeltaNet) weights — only for hybrid models
   linearInProjQKV?: GPUBuffer;
@@ -156,6 +180,10 @@ export interface GlobalWeights {
   lmHeadQ4?: { qweight: GPUBuffer; scales: GPUBuffer; qzeros: GPUBuffer; g_idx: GPUBuffer; hasActOrder?: boolean };  // GPTQ INT4 lm_head
   lmHeadSplit?: { buffers: GPUBuffer[]; splitPoints: number[] };  // Split BF16 for oversized lm_head
   lmHeadCPU?: { parts: Uint8Array[]; splitPoint: number; hiddenSize: number; vocabSize: number; isBF16: boolean };
+  /** GGUF embed: raw k-quant blocks kept in RAM, CPU row-gather + dequant per token. */
+  embedGG?: { data: Uint8Array; ggmlType: number; rowBytes: number };
+  /** GGUF lm_head: repacked k-quant blocks on GPU (matmul_gguf kernel). */
+  lmHeadGG?: GGUFWeight;
 }
 
 /** All model weights on the GPU. */
@@ -294,6 +322,14 @@ export function createForwardPassEngine(
   const matmulQ8Pipeline = config.isQuantized
     ? createComputePipeline(device, matmulQ8WGSL, 'matmul_bt_q8', 'matmul-q8')
     : null;
+  // GGUF k-quant dequantizing GEMV/GEMM — one workgroup per output element
+  const matmulGgufPipelines: Record<number, GPUComputePipeline> | null =
+    config.sourceFormat === 'gguf' ? {
+      [GGML_TYPES.Q8_0]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q8_0', 'matmul-gguf-q8_0'),
+      [GGML_TYPES.Q4_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q4_k', 'matmul-gguf-q4_k'),
+      [GGML_TYPES.Q5_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_k', 'matmul-gguf-q5_k'),
+      [GGML_TYPES.Q6_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q6_k', 'matmul-gguf-q6_k'),
+    } : null;
   // Hadamard transform for QuIP#/QuaRot incoherence processing
   const hadamardPipeline = config.isQuantized
     ? createComputePipeline(device, hadamardWGSL, 'hadamard', 'hadamard')
@@ -373,7 +409,8 @@ export function createForwardPassEngine(
     ? createComputePipeline(device, l2normWGSL, 'l2_normalize', 'l2-norm') : null;
 
   // ── On-the-fly Q4 → BF16 dequant for SSM projections (hybrid + quantized) ──
-  const needsGpuDequant = isHybrid && config.isQuantized;
+  // GGUF models never need this — k-quant weights dispatch via matmul_gguf directly.
+  const needsGpuDequant = isHybrid && config.isQuantized && config.sourceFormat !== 'gguf';
   const dequantQ4Pipeline = needsGpuDequant
     ? createComputePipeline(device, dequantQ4BF16WGSL, 'dequant_q4_to_bf16', 'dequant-q4-bf16')
     : null;
@@ -731,6 +768,24 @@ export function createForwardPassEngine(
 
   }
 
+  /** C[M,N] = A[M,K] @ dequant_gguf(W)^T — native GGUF k-quant blocks. */
+  function dispatchMatmulGGUF(
+    aBuf: GPUBuffer, gg: GGUFWeight, cBuf: GPUBuffer,
+    M: number, N: number, K: number, label: string,
+  ) {
+    const pipeline = matmulGgufPipelines?.[gg.ggmlType];
+    if (!pipeline) throw new Error(`matmul_gguf "${label}": no pipeline for ggml type ${gg.ggmlType}`);
+    const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);
+    const bg = createBindGroup(device, pipeline, 0, [
+      { binding: 0, resource: { buffer: aBuf } },
+      { binding: 1, resource: { buffer: gg.data } },
+      { binding: 2, resource: { buffer: cBuf } },
+      { binding: 3, resource: { buffer: params } },
+    ], label);
+    // One workgroup per output element (n, m); z chunks n past the 65535 cap.
+    bd(pipeline, [bg], [Math.min(N, 65535), M, Math.ceil(N / 65535)], label);
+  }
+
   // Set of GPU buffers stored as BF16 (need matmul_bt_bf16 kernel)
   const bf16Set = weights.bf16Buffers ?? new Set<GPUBuffer>();
 
@@ -766,7 +821,14 @@ export function createForwardPassEngine(
     outputBuf: GPUBuffer, M: number, N: number, K: number, label: string,
     gpuDequant = false,
   ) {
-    // Priority: E8 2-bit > INT8 > INT4 GPTQ > BF16 > f32
+    // Priority: GGUF k-quant > E8 2-bit > INT8 > INT4 GPTQ > BF16 > f32
+    const ggKey = `${proj}_gg` as keyof LayerWeights;
+    const gg = lw[ggKey] as GGUFWeight | undefined;
+    if (gg) {
+      dispatchMatmulGGUF(inputBuf, gg, outputBuf, M, N, K, label);
+      return;
+    }
+
     const e8key = `${proj}_e8` as keyof LayerWeights;
     const e8 = lw[e8key] as { indices: GPUBuffer; scales: GPUBuffer; offsets: GPUBuffer } | undefined;
     if (e8) {
@@ -1299,7 +1361,19 @@ export function createForwardPassEngine(
     }
 
     // ── Embedding (CPU BF16, split BF16, single BF16/f32, or GPTQ INT4) ──
-    if (weights.global.embedCPU) {
+    if (weights.global.embedGG) {
+      // GGUF embed: CPU row-gather + k-quant dequant of the token's row
+      const { data, ggmlType, rowBytes } = weights.global.embedGG;
+      const f32 = new Float32Array(seqLen * H);
+      for (let t = 0; t < seqLen; t++) {
+        const row = data.subarray(tokenIds[t] * rowBytes, (tokenIds[t] + 1) * rowBytes);
+        if (row.byteLength !== rowBytes) {
+          throw new Error(`[EMBED GGUF] token ${tokenIds[t]}: row slice ${row.byteLength} != ${rowBytes} bytes`);
+        }
+        f32.set(dequantGGML(ggmlType, row, H), t * H);
+      }
+      device.queue.writeBuffer(hiddenBuf, 0, f32.buffer, 0, seqLen * H * 4);
+    } else if (weights.global.embedCPU) {
       const { parts, splitPoint, hiddenSize: embedH, isBF16 } = weights.global.embedCPU;
       const f32 = new Float32Array(seqLen * embedH);
       for (let t = 0; t < seqLen; t++) {
@@ -1644,8 +1718,12 @@ export function createForwardPassEngine(
         // 7. SSM step: update hidden state, readout via Q
         // Decay is per value head [32], not per key dim
         if (ssmStepPipeline) {
+          // layout_tiled: GGUF V/beta/decay buffers are in llama.cpp's tiled
+          // v-head order (convert_hf_to_gguf reorders grouped → tiled); HF
+          // safetensors are grouped. ssm_step must index accordingly.
+          const ssmLayoutTiled = config.sourceFormat === 'gguf' ? 1 : 0;
           const ssmParams = getCachedUniform(
-            new Uint32Array([linNKH, linNVH, linKD, linGroupedVD]), `L${l}-ssm-p`);
+            new Uint32Array([linNKH, linNVH, linKD, linGroupedVD, ssmLayoutTiled, 0, 0, 0]), `L${l}-ssm-p`);
           const ssmBG0 = createBindGroup(device, ssmStepPipeline, 0, [
             { binding: 0, resource: { buffer: linQBuf! } },
             { binding: 1, resource: { buffer: linKBuf! } }, // K after conv1d + silu + L2 norm
@@ -2225,6 +2303,9 @@ export function createForwardPassEngine(
         { binding: 5, resource: { buffer: split.buffers[1] } },
       ], 'lm-head-s1');
       bd(matmulBTBF16Pipeline, [bg1], [Math.ceil(1 / 16), Math.ceil(V_hi / 16)], 'lm-head-s1');
+    } else if (weights.global.lmHeadGG) {
+      // GGUF k-quant lm_head (kernel z-chunks N past the 65535 workgroup cap)
+      dispatchMatmulGGUF(lmInputBuf, weights.global.lmHeadGG, logitsBuf, 1, V, H, 'lm-head');
     } else if (lmIsQ4) {
       // GPTQ INT4 lm_head (saves ~1.4 GB vs BF16)
       dispatchMatmulQ4(lmInputBuf, weights.global.lmHeadQ4!, logitsBuf, 1, V, H, 'lm-head');

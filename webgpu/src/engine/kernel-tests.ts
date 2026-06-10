@@ -11,6 +11,8 @@ import matmulWGSL from '../shaders/matmul.wgsl?raw';
 import softmaxWGSL from '../shaders/softmax.wgsl?raw';
 import rmsnormWGSL from '../shaders/rmsnorm.wgsl?raw';
 import ropeWGSL from '../shaders/rope.wgsl?raw';
+import matmulGgufWGSL from '../shaders/matmul_gguf.wgsl?raw';
+import { dequantGGML, repackGGUFForGPU } from '../model/gguf-dequant';
 import { createTurboQuantPipeline } from './turboquant-pipeline';
 import {
   generateHadamardMatrix, generateJLMatrix, generateSPiMatrix, buildCodebook,
@@ -795,6 +797,108 @@ async function testAsymmetricScore(device: GPUDevice): Promise<TestResult> {
   };
 }
 
+// ─── GGUF k-quant matmul kernels ─────────────────────────────────────────────
+// Validated against gguf-dequant.ts, which is itself validated bit-exact
+// against the official Python gguf package (kernel-audit rule).
+
+/** Minimal f32 → f16 bits encoder (normal range only — fine for test scales). */
+function f32ToF16Bits(v: number): number {
+  const f32 = new Float32Array(1);
+  const u32 = new Uint32Array(f32.buffer);
+  f32[0] = v;
+  const bits = u32[0];
+  const sign = (bits >>> 16) & 0x8000;
+  const exp = ((bits >>> 23) & 0xff) - 127 + 15;
+  const frac = (bits >>> 13) & 0x3ff;
+  if (exp <= 0) return sign;            // flush to zero
+  if (exp >= 31) return sign | 0x7c00;  // inf
+  return sign | (exp << 10) | frac;
+}
+
+/** Generate random valid GGUF blocks for `n` elements of the given type. */
+function makeGGUFTestBlocks(ggmlType: number, n: number, rng: () => number): Uint8Array {
+  const layouts: Record<number, { blockElems: number; typeSize: number }> = {
+    8: { blockElems: 32, typeSize: 34 },    // Q8_0
+    12: { blockElems: 256, typeSize: 144 }, // Q4_K
+    13: { blockElems: 256, typeSize: 176 }, // Q5_K
+    14: { blockElems: 256, typeSize: 210 }, // Q6_K
+  };
+  const { blockElems, typeSize } = layouts[ggmlType];
+  const nb = n / blockElems;
+  const out = new Uint8Array(nb * typeSize);
+  for (let i = 0; i < out.length; i++) out[i] = Math.floor(rng() * 256);
+  // Overwrite f16 scale fields with sane small values so dequant magnitudes
+  // stay O(1) (random f16 bits can be inf/NaN or 1e4-scale).
+  const dv = new DataView(out.buffer);
+  for (let b = 0; b < nb; b++) {
+    const base = b * typeSize;
+    if (ggmlType === 8) {
+      dv.setUint16(base, f32ToF16Bits(0.01 + rng() * 0.02), true);          // d
+    } else if (ggmlType === 14) {
+      dv.setUint16(base + 208, f32ToF16Bits(0.002 + rng() * 0.004), true);  // d (scales are i8)
+    } else {
+      dv.setUint16(base, f32ToF16Bits(0.005 + rng() * 0.01), true);         // d
+      dv.setUint16(base + 2, f32ToF16Bits(rng() * 0.005), true);            // dmin
+    }
+  }
+  return out;
+}
+
+async function runGGUFMatmulTest(
+  device: GPUDevice, name: string, entry: string, ggmlType: number,
+  M: number, N: number, K: number,
+): Promise<TestResult> {
+  const rng = createTestRNG(0x66f0 ^ (ggmlType * 7919 + N));
+  const a = new Float32Array(M * K);
+  for (let i = 0; i < a.length; i++) a[i] = rng() * 0.5 - 0.25;
+
+  // Per-row blocks (GGUF rows are contiguous along K)
+  const blocks = makeGGUFTestBlocks(ggmlType, N * K, rng);
+  // CPU reference: dequant whole tensor (row-major [N, K]) then matmul B^T
+  const wF32 = dequantGGML(ggmlType, blocks, N * K);
+  const expected = cpuMatmulBT(a, new Float32Array(wF32), M, N, K);
+
+  const packed = repackGGUFForGPU(ggmlType, blocks, N * K);
+  const aBuf = createStorageBuffer(device, a, a.byteLength, 'gguf-a');
+  const wBuf = createStorageBuffer(device, packed, packed.byteLength, 'gguf-w');
+  const cBuf = createStorageBuffer(device, null, M * N * 4, 'gguf-c', true);
+  const paramsBuf = createUniformBuffer(device, new Uint32Array([M, N, K, 0]), 'gguf-p');
+
+  const pipeline = createComputePipeline(device, matmulGgufWGSL, entry, `test-${entry}`);
+  const bg = createBindGroup(device, pipeline, 0, [
+    { binding: 0, resource: { buffer: aBuf } },
+    { binding: 1, resource: { buffer: wBuf } },
+    { binding: 2, resource: { buffer: cBuf } },
+    { binding: 3, resource: { buffer: paramsBuf } },
+  ]);
+
+  // Grid: x = min(N, 65535), y = M, z = ceil(N / 65535)
+  const elapsed = await dispatchAndWait(device, pipeline, [bg],
+    [Math.min(N, 65535), M, Math.ceil(N / 65535)], entry);
+  const result = new Float32Array(await readBuffer(device, cBuf));
+
+  // Relative tolerance: GPU f32 accumulation vs CPU f64 reference
+  let maxAbs = 0;
+  for (let i = 0; i < expected.length; i++) maxAbs = Math.max(maxAbs, Math.abs(expected[i]));
+  const tol = Math.max(1e-3, maxAbs * 1e-4);
+  const { close, maxDiff } = arrClose(result, expected, tol);
+
+  aBuf.destroy(); wBuf.destroy(); cBuf.destroy(); paramsBuf.destroy();
+  return { name, passed: close, elapsed_ms: elapsed, maxDiff };
+}
+
+const testGGUFQ8_0 = (d: GPUDevice) =>
+  runGGUFMatmulTest(d, 'GGUF Q8_0 matmul', 'matmul_gguf_q8_0', 8, 3, 70, 512);
+const testGGUFQ4K = (d: GPUDevice) =>
+  runGGUFMatmulTest(d, 'GGUF Q4_K matmul', 'matmul_gguf_q4_k', 12, 3, 70, 512);
+const testGGUFQ5K = (d: GPUDevice) =>
+  runGGUFMatmulTest(d, 'GGUF Q5_K matmul', 'matmul_gguf_q5_k', 13, 3, 70, 512);
+const testGGUFQ6K = (d: GPUDevice) =>
+  runGGUFMatmulTest(d, 'GGUF Q6_K matmul', 'matmul_gguf_q6_k', 14, 3, 70, 512);
+// N > 65535 exercises the wid.z row-chunking path (lm_head is N=248320)
+const testGGUFQ8_0Wide = (d: GPUDevice) =>
+  runGGUFMatmulTest(d, 'GGUF Q8_0 matmul (N>65535)', 'matmul_gguf_q8_0', 8, 1, 65600, 64);
+
 // ─── Run All Tests ───────────────────────────────────────────────────────────
 
 export async function runKernelTests(device: GPUDevice): Promise<TestResult[]> {
@@ -808,6 +912,11 @@ export async function runKernelTests(device: GPUDevice): Promise<TestResult[]> {
     { name: 'Matmul BT BF16 (small)', fn: testMatmulBTBF16Small },
     { name: 'Matmul BT BF16 (large)', fn: testMatmulBTBF16Large },
     { name: 'Matmul BT BF16 (K=2048)', fn: testMatmulBTBF16RealDims },
+    { name: 'GGUF Q8_0 matmul', fn: testGGUFQ8_0 },
+    { name: 'GGUF Q4_K matmul', fn: testGGUFQ4K },
+    { name: 'GGUF Q5_K matmul', fn: testGGUFQ5K },
+    { name: 'GGUF Q6_K matmul', fn: testGGUFQ6K },
+    { name: 'GGUF Q8_0 matmul (N>65535)', fn: testGGUFQ8_0Wide },
     { name: 'Softmax', fn: testSoftmax },
     { name: 'RMSNorm', fn: testRMSNorm },
     { name: 'TurboQuant (3-bit)', fn: testTurboQuant3bit },

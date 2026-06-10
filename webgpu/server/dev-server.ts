@@ -137,7 +137,7 @@ app.get('/api/hf-cache/models', (_req, res) => {
         const repo = dir.replace('models--', '').replace(/--/g, '/');
         const snap = resolveSnapshot(repo);
         if (!snap) continue;
-        const files = fs.readdirSync(snap).filter(f => f.endsWith('.safetensors') || f === 'config.json');
+        const files = fs.readdirSync(snap).filter(f => f.endsWith('.safetensors') || f.endsWith('.gguf') || f === 'config.json');
         const totalSize = files.reduce((s, f) => {
           try { return s + fs.statSync(path.join(snap, f)).size; } catch { return s; }
         }, 0);
@@ -151,9 +151,12 @@ app.get('/api/hf-cache/models', (_req, res) => {
       for (const dir of localEntries) {
         const fullDir = path.join(LOCAL_MODELS_DIR, dir);
         if (!fs.statSync(fullDir).isDirectory()) continue;
-        // Check for config.json (indicates a model)
-        if (!fs.existsSync(path.join(fullDir, 'config.json'))) continue;
-        const files = fs.readdirSync(fullDir).filter(f => f.endsWith('.safetensors') || f === 'config.json');
+        // A model dir has config.json (safetensors) or .gguf files
+        const allFiles = fs.readdirSync(fullDir);
+        const hasConfig = fs.existsSync(path.join(fullDir, 'config.json'));
+        const hasGguf = allFiles.some(f => f.endsWith('.gguf'));
+        if (!hasConfig && !hasGguf) continue;
+        const files = allFiles.filter(f => f.endsWith('.safetensors') || f.endsWith('.gguf') || f === 'config.json');
         const totalSize = files.reduce((s, f) => {
           try { return s + fs.statSync(path.join(fullDir, f)).size; } catch { return s; }
         }, 0);

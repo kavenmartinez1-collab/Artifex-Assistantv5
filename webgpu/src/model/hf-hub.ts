@@ -259,6 +259,11 @@ export async function discoverShards(repo: string): Promise<ShardInfo[]> {
 
 // ─── File Download ───────────────────────────────────────────────────────────
 
+/** Resolve a repo file to its download URL (local dev-server or HF CDN). */
+export function resolveFileUrl(repo: string, filename: string): string {
+  return `${HF_BASE}/${repo}/resolve/main/${filename}`;
+}
+
 /**
  * Download a byte range from a URL.
  * Uses HTTP Range requests to avoid downloading the entire file at once.
