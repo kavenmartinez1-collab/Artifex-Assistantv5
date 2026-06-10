@@ -108,3 +108,6 @@ scripts/run-temp-test.sh
 *.sock
 research/
 control-center/node_modules/
+
+# ── Third-party source for in-tree backend builds (llama.cpp, etc.) ──
+vendor/

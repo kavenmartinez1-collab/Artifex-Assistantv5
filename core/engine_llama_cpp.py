@@ -355,7 +355,7 @@ class LlamaCppEngine(BaseEngine):
         kv_quant_str = self._get_kv_quant_str()
         allocation = pool.estimate_allocation_mb(
             self.model_path, self._num_ctx, kv_quant=kv_quant_str,
-            device_index=gpu_index,
+            device_index=gpu_index, extra_flags=self.extra_flags,
         )
         needed_mb = (
             allocation["model_weight_mb"]
@@ -396,6 +396,25 @@ class LlamaCppEngine(BaseEngine):
         launch_env = os.environ.copy()
         launch_env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         launch_env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+
+        # llama-server.exe depends on ggml-cuda.dll, which in turn depends on
+        # cudart64_12.dll / cublas64_12.dll / cublasLt64_12.dll. If the CUDA
+        # Toolkit's bin dir is not on PATH, Windows can't resolve them and the
+        # process dies at the loader with exit code 0xC0000135 (DLL_NOT_FOUND)
+        # before producing any output. Prepend the newest installed CUDA bin
+        # dir to PATH for the child so the launch is self-contained.
+        if sys.platform == "win32":
+            cuda_root = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+            if os.path.isdir(cuda_root):
+                versions = sorted(
+                    (d for d in os.listdir(cuda_root) if d.startswith("v")),
+                    reverse=True,
+                )
+                for v in versions:
+                    cuda_bin = os.path.join(cuda_root, v, "bin")
+                    if os.path.isfile(os.path.join(cuda_bin, "cudart64_12.dll")):
+                        launch_env["PATH"] = cuda_bin + os.pathsep + launch_env.get("PATH", "")
+                        break
 
         _log.info("llama-server cmd: %s  (CUDA_VISIBLE_DEVICES=%d)",
                   " ".join(cmd), gpu_index)

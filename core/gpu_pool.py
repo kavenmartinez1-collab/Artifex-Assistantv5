@@ -547,8 +547,9 @@ class GPUPool:
             model_path: Path to the GGUF model file.
             num_ctx: Context length in tokens.
             kv_quant: KV cache quantization type (key in KV_QUANT_BPE).
-            extra_flags: Unused currently, reserved for future flags that
-                         affect VRAM (e.g., speculative decoding draft model).
+            extra_flags: llama-server flags from model config. Scanned for
+                         --cpu-moe / --n-cpu-moe to scale model_weight_mb
+                         when MoE experts are offloaded to CPU RAM.
 
         Returns:
             Dict with component breakdown and total_mb.
@@ -571,16 +572,56 @@ class GPUPool:
         }
 
         # Model weight from file size
+        model_weight_mb = 0.0
         try:
             file_size_bytes = os.path.getsize(model_path)
             model_weight_mb = (file_size_bytes / (1024 * 1024)) * MODEL_OVERHEAD_FACTOR
-            result["model_weight_mb"] = model_weight_mb
         except OSError as e:
             _log.warning("Cannot stat model file %s: %s — using 0 for weight", model_path, e)
             result["estimation_method"] = "degraded_no_file"
 
         # KV cache from GGUF architecture
         arch = read_gguf_kv_params(model_path)
+
+        # MoE offload adjustment: --cpu-moe / --n-cpu-moe push expert weights
+        # to CPU RAM, so GPU residency drops to the non-expert portion
+        # (embeddings, attention, DeltaNet, output head, shared experts).
+        # For A3B-style MoE (256 routed experts, 8 active) experts are ~85%
+        # of total weight; the remaining ~15% stays on GPU. Conservative
+        # vs measured residency, so the gate trends toward accept-and-fit.
+        MOE_WEIGHT_FRACTION = 0.85
+        moe_on_gpu_fraction = 1.0
+        if extra_flags:
+            if "--cpu-moe" in extra_flags or "-cmoe" in extra_flags:
+                moe_on_gpu_fraction = 0.0
+            else:
+                for i, f in enumerate(extra_flags):
+                    if f in ("--n-cpu-moe", "-ncmoe") and i + 1 < len(extra_flags):
+                        try:
+                            n_cpu_moe = int(extra_flags[i + 1])
+                        except ValueError:
+                            continue
+                        total_blocks = (arch or {}).get("block_count") or 40
+                        moe_on_gpu_fraction = max(
+                            0.0, 1.0 - (n_cpu_moe / total_blocks)
+                        )
+                        break
+
+        if moe_on_gpu_fraction < 1.0 and model_weight_mb > 0:
+            non_moe_mb = model_weight_mb * (1.0 - MOE_WEIGHT_FRACTION)
+            moe_on_gpu_mb = (
+                model_weight_mb * MOE_WEIGHT_FRACTION * moe_on_gpu_fraction
+            )
+            adjusted_mb = non_moe_mb + moe_on_gpu_mb
+            _log.info(
+                "MoE offload: model_weight scaled %.0f → %.0f MB "
+                "(moe_on_gpu_fraction=%.2f)",
+                model_weight_mb, adjusted_mb, moe_on_gpu_fraction,
+            )
+            model_weight_mb = adjusted_mb
+
+        result["model_weight_mb"] = model_weight_mb
+
         if arch is not None:
             bpe_k = KV_QUANT_BPE.get(kv_quant, KV_QUANT_BPE["f16"])
             bpe_v = KV_QUANT_BPE.get(kv_quant, KV_QUANT_BPE["f16"])
