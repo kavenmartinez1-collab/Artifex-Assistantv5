@@ -13,7 +13,7 @@ mkdir -p "$OUT"
   -Wl,--no-entry \
   -Wl,--export=__heap_base \
   -Wl,--initial-memory=16777216 \
-  -Wl,--max-memory=1073741824 \
+  -Wl,--max-memory=4294967296 \
   -o "$OUT/q5k_gemv.wasm" \
   "$DIR/q5k_gemv.c"
 

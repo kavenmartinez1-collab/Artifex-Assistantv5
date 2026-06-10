@@ -38,17 +38,15 @@ function debugApiPlugin(): Plugin {
         }
       });
 
-      // COOP/COEP for the bench page (and its workers) so SharedArrayBuffer
-      // works there, WITHOUT cross-origin-isolating the main app documents
-      // (isolation would break the main app's HF CDN fallback fetches).
-      // Headers on subresources are harmless; only documents activate isolation.
-      server.middlewares.use((req, res, next) => {
-        const path = (req.url || '').split('?')[0];
-        const isMainDoc = path === '/' || path === '/index.html' || path === '/worker.html';
-        if (!isMainDoc) {
-          res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-          res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
-        }
+      // COOP/COEP on ALL documents so the main app is crossOriginIsolated —
+      // SharedArrayBuffer is required for the Phase C MoE expert workers.
+      // COEP `credentialless` (not require-corp) keeps the HF CDN fallback
+      // fetches working: anonymous cross-origin requests are allowed without
+      // CORP headers, and HF serves Access-Control-Allow-Origin: * for the
+      // CORS-mode authorized fetches.
+      server.middlewares.use((_req, res, next) => {
+        res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+        res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
         next();
       });
 

@@ -111,13 +111,21 @@ async function runAll() {
       `kernel validated vs JS ref (maxRelErr ${w1.validationMaxRelErr.toExponential(1)})`
     );
 
-    if (crossOriginIsolated || true) {
-      // plain workers don't need isolation; only the wake bench does
-      setStatus('(c) WASM Q5_K GEMV, 8 workers...');
-      const w8 = await benchWasmGemv(8, 256, 3000, setStatus);
-      results.wasm8 = w8;
-      agg8 = w8.aggregateGBps;
-      add('(c) WASM Q5_K GEMV, 8 workers', `${w8.aggregateGBps.toFixed(2)} GB/s aggregate`, 'target ≥ 25 GB/s');
+    {
+      // plain workers don't need isolation; only the wake bench does.
+      // 2/4/8 scaling → per-worker bandwidth under contention, which decides
+      // the Phase C straggler penalty (E[max experts on one worker] ≈ 2.3).
+      for (const n of [2, 4, 8]) {
+        setStatus(`(c) WASM Q5_K GEMV, ${n} workers...`);
+        const wn = await benchWasmGemv(n, 256, n === 8 ? 3000 : 1500, setStatus);
+        (results as Record<string, unknown>)[`wasm${n}`] = wn;
+        if (n === 8) agg8 = wn.aggregateGBps;
+        add(
+          `(c) WASM Q5_K GEMV, ${n} workers`,
+          `${wn.aggregateGBps.toFixed(2)} GB/s aggregate`,
+          `${(wn.aggregateGBps / n).toFixed(2)} GB/s per worker${n === 8 ? ' — target ≥ 25 GB/s aggregate' : ''}`,
+        );
+      }
     }
 
     if (crossOriginIsolated) {
@@ -166,5 +174,86 @@ async function runAll() {
   }
 }
 
+/**
+ * C0 go/no-go: allocate 8 × Phase-C-shard-sized wasm memories in workers and
+ * touch every OS page (~22.3 GB real commit, like 8 expert shards coexisting).
+ * If Chrome can't hold this, Phase C is no-go.
+ */
+const RAM_WORKERS = 8;
+const SHARD_BYTES = Math.ceil(22.25e9 / RAM_WORKERS); // 2.78 GB per worker
+
+async function runRamSmoke() {
+  out.innerHTML = '';
+  const btns = [
+    document.getElementById('run') as HTMLButtonElement,
+    document.getElementById('ram-smoke') as HTMLButtonElement,
+  ];
+  btns.forEach((b) => (b.disabled = true));
+  const workers: Worker[] = [];
+  try {
+    log(`<table><tbody id="tbody"></tbody></table>`);
+    const tbody = document.getElementById('tbody')!;
+    const add = (name: string, value: string, note = '') =>
+      tbody.insertAdjacentHTML('beforeend', row(name, value, note));
+
+    setStatus(`allocating ${RAM_WORKERS} × ${(SHARD_BYTES / 2 ** 30).toFixed(2)} GiB...`);
+    const t0 = performance.now();
+
+    type AllocResult =
+      | { cmd: 'alloc-done'; workerId: number; grewBytes: number; growMs: number; touchMs: number }
+      | { cmd: 'alloc-fail'; workerId: number; grewBytes: number; error: string };
+
+    const settled = await Promise.all(
+      Array.from({ length: RAM_WORKERS }, (_, i) => {
+        const w = new Worker(new URL('./ram-smoke-worker.ts', import.meta.url), { type: 'module' });
+        workers.push(w);
+        return new Promise<AllocResult>((resolve, reject) => {
+          w.onmessage = (ev: MessageEvent<AllocResult>) => {
+            setStatus(`worker ${ev.data.workerId}: ${ev.data.cmd} (${(ev.data.grewBytes / 2 ** 30).toFixed(2)} GiB)`);
+            resolve(ev.data);
+          };
+          w.onerror = (e) => reject(new Error(`worker ${i}: ${e.message}`));
+          w.postMessage({ cmd: 'alloc', workerId: i, bytes: SHARD_BYTES });
+        });
+      })
+    );
+    const totalMs = performance.now() - t0;
+
+    let committed = 0;
+    let fails = 0;
+    for (const r of settled) {
+      committed += r.grewBytes;
+      if (r.cmd === 'alloc-done') {
+        add(`worker ${r.workerId}`, `${(r.grewBytes / 2 ** 30).toFixed(2)} GiB`, `grow ${r.growMs.toFixed(0)} ms, touch ${r.touchMs.toFixed(0)} ms`);
+      } else {
+        fails++;
+        add(`worker ${r.workerId}`, `FAIL @ ${(r.grewBytes / 2 ** 30).toFixed(2)} GiB`, r.error);
+      }
+    }
+
+    const pass = fails === 0;
+    add(
+      '── RAM SMOKE ──',
+      `${(committed / 2 ** 30).toFixed(2)} GiB committed in ${(totalMs / 1000).toFixed(1)} s`,
+      pass ? `PASS — all ${RAM_WORKERS} shards held simultaneously` : `FAIL — ${fails} worker(s) could not allocate; Phase C no-go`
+    );
+    results.ramSmoke = { workers: settled, committedBytes: committed, totalMs, pass };
+    results.finishedAt = new Date().toISOString();
+    setStatus(pass ? `RAM smoke PASS — ${(committed / 2 ** 30).toFixed(2)} GiB held; releasing...` : 'RAM smoke FAIL');
+    await postResults();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    results.error = msg;
+    setStatus(`ERROR: ${msg}`);
+    log(`<p class="err">${msg}</p>`);
+    await postResults();
+  } finally {
+    // Release the ~22 GB before re-enabling anything else.
+    workers.forEach((w) => w.terminate());
+    btns.forEach((b) => (b.disabled = false));
+  }
+}
+
 document.getElementById('run')!.addEventListener('click', runAll);
+document.getElementById('ram-smoke')!.addEventListener('click', runRamSmoke);
 setStatus(`ready — crossOriginIsolated=${crossOriginIsolated}`);

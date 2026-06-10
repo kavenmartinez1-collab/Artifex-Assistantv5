@@ -1,1 +1,6 @@
 .tmp-cjs/
+# local debug artifacts (parity captures, eval-callback dumps, ground-truth notes)
+.parity-*.json
+.eval-callback-*.log
+.greedy35b.json
+.l0-reference.md

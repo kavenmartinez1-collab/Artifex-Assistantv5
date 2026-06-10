@@ -73,7 +73,11 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
     // If still local/, try a generic fallback based on known patterns
     if (modelId.startsWith('local/')) {
       const name = modelId.toLowerCase();
-      if (name.includes('qwen3.5')) modelId = 'Qwen/Qwen3.5-9B';
+      // Order matters: 'qwen3.6' also contains 'qwen3'. Qwen3.6 uses a NEW
+      // 248320-token vocab (EOS 248046) — the Qwen3/3.5 tokenizers are NOT
+      // compatible (vocab ~151936) and produce garbage encode/decode.
+      if (name.includes('qwen3.6')) modelId = 'Qwen/Qwen3.6-35B-A3B';
+      else if (name.includes('qwen3.5')) modelId = 'Qwen/Qwen3.5-9B';
       else if (name.includes('qwen3')) modelId = 'Qwen/Qwen3-8B';
       else if (name.includes('qwen2.5')) modelId = 'Qwen/Qwen2.5-0.5B-Instruct';
       console.log(`[Tokenizer] Local model fallback, using tokenizer from: ${modelId}`);

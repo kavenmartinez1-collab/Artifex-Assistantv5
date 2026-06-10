@@ -62,6 +62,7 @@ import dequantQ4BF16WGSL from '../shaders/dequant_q4_bf16.wgsl?raw';
 import matmulGgufWGSL from '../shaders/matmul_gguf.wgsl?raw';
 import { GGML_TYPES } from '../model/gguf';
 import { dequantGGML } from '../model/gguf-dequant';
+import { topKSoftmax, type MoEBackend } from './moe-cpu';
 
 // ── CPU embed helpers (BF16 → F32 decode) ──────────────────────────────
 const _cpuEmbedBuf = new ArrayBuffer(4);
@@ -163,6 +164,13 @@ export interface LayerWeights {
   linearConv1dWeight?: GPUBuffer; // [dim, 1, kernel_size] causal conv kernel
   linearDtBias?: GPUBuffer;       // [num_key_heads * key_head_dim] time step bias
   linearNormWeight?: GPUBuffer;   // group norm weight
+
+  /**
+   * MoE router (ffn_gate_inp.weight, F32 [num_experts, hidden]). Presence
+   * marks the layer as MoE: gateProj/upProj/downProj then hold the SHARED
+   * expert and the routed experts run on weights.moe.backend (CPU fleet).
+   */
+  moeRouter?: GPUBuffer;
 }
 
 /** GPU buffers for global (non-layer) weights. */
@@ -192,6 +200,12 @@ export interface ModelWeights {
   layers: LayerWeights[];
   /** Set of GPU buffers that store BF16 data (not converted to f32). */
   bf16Buffers?: Set<GPUBuffer>;
+  /** Phase C MoE: CPU expert fleet + per-layer shared-expert gate vectors. */
+  moe?: {
+    backend: MoEBackend;
+    /** sharedGateVecs[l] = ffn_gate_inp_shexp.weight (F32 [hidden]) — scalar sigmoid gate. */
+    sharedGateVecs: Float32Array[];
+  };
 }
 
 /** Compressed KV cache data (TurboQuant). */
@@ -399,6 +413,9 @@ export function createForwardPassEngine(
   const linConvDim = linNKH * linKD; // dimension that goes through conv1d (K projection)
   const linVHPerKH = linNKH > 0 ? linNVH / linNKH : 0; // value heads per key head group (e.g., 2)
   const linGroupedVD = linVHPerKH * linVD; // grouped value dim per key head (e.g., 256)
+  // DeltaNet z-gate width = nVHeads * dHead. NOT H: on Qwen3.6-35B H=2048 but z=4096
+  // (they coincide on Qwen3.5-9B, which masked sizing bugs here).
+  const linZDim = linNVH * linVD;
 
   // Compile additional Mamba-2 kernels
   const sigmoidPipeline = isHybrid
@@ -416,7 +433,7 @@ export function createForwardPassEngine(
     : null;
 
   // Temp buffer sized for the largest SSM projection's BF16 output.
-  // SSM projections: QKV [linQKVDim, H], A [linNVH, H], B [linNVH, H], Z [H, H], OutProj [H, outDim]
+  // SSM projections: QKV [linQKVDim, H], A [linNVH, H], B [linNVH, H], Z [linZDim, H], OutProj [H, outDim]
   // BF16 output size = N * K/2 * 4 bytes (u32 per k-pair)
   const dequantMaxN = needsGpuDequant
     ? Math.max(linQKVDim, linNVH, H)
@@ -598,9 +615,18 @@ export function createForwardPassEngine(
   const gateBuf = createStorageBuffer(device, null, MAX_PREFILL * ffnDim * 4, 'ffn-gate', true);
   const upBuf = createStorageBuffer(device, null, MAX_PREFILL * ffnDim * 4, 'ffn-up', true);
   const downBuf = createStorageBuffer(device, null, MAX_PREFILL * H * 4, 'ffn-down', true);
-  // Temp buffer for in-place elementwise ops (WebGPU can't read+write same buffer)
-  const ffnTempBuf = createStorageBuffer(device, null, MAX_PREFILL * ffnDim * 4, 'ffn-temp', true);
+  // Temp buffer for in-place elementwise ops (WebGPU can't read+write same buffer).
+  // CAUTION: also used as scratch for H-sized copies (hadamard, biases) and
+  // nHeads*dHead attention-gate copies — on MoE models ffnDim (=expert dim,
+  // e.g. 512) is SMALLER than both, so size by the max of all its uses.
+  const scratchDim = Math.max(ffnDim, nHeads * dHead, H, kvDim);
+  const ffnTempBuf = createStorageBuffer(device, null, MAX_PREFILL * scratchDim * 4, 'ffn-temp', true);
   const logitsBuf = createStorageBuffer(device, null, V * 4, 'logits', true);
+  // MoE: router logits [seqLen, numExperts] (read back per layer for CPU top-k)
+  const moeNumExperts = config.layers.find((d) => d.moe)?.moe?.numExperts ?? 0;
+  const routerLogitsBuf = moeNumExperts > 0
+    ? createStorageBuffer(device, null, MAX_PREFILL * moeNumExperts * 4, 'moe-router-logits', true)
+    : null;
   const tokenIdBuf = createStorageBuffer(device, null, MAX_PREFILL * 4, 'token-ids', true);
   // Small buffer for extracting last token's hidden state (for LM head after batch prefill)
   const lastHiddenBuf = createStorageBuffer(device, null, H * 4, 'last-hidden', true);
@@ -612,7 +638,9 @@ export function createForwardPassEngine(
   // ssmOutBuf holds the SSM block's output for one token before being copied
   // into the multi-token attnProjBuf at that token's offset.
   const ssmInputBuf = isHybrid ? createStorageBuffer(device, null, H * 4, 'ssm-input', true) : null;
-  const ssmOutBuf = isHybrid ? createStorageBuffer(device, null, H * 4, 'ssm-out', true) : null;
+  // ssmOutBuf doubles as scratch for the RMSNormGated + silu(z) gate output,
+  // which is linZDim (= nVHeads*dHead) wide — larger than H on the 35B MoE.
+  const ssmOutBuf = isHybrid ? createStorageBuffer(device, null, Math.max(H, linZDim) * 4, 'ssm-out', true) : null;
 
   // Linear attention intermediate buffers (only for hybrid models)
   const linQKVBuf = isHybrid ? createStorageBuffer(device, null, linQKVDim * 4, 'lin-qkv', true) : null;
@@ -621,7 +649,7 @@ export function createForwardPassEngine(
   const linVBuf = isHybrid ? createStorageBuffer(device, null, linNVH * linVD * 4, 'lin-v', true) : null;
   const linABuf = isHybrid ? createStorageBuffer(device, null, linConvDim * 4, 'lin-a', true) : null;
   const linBBuf = isHybrid ? createStorageBuffer(device, null, linNVH * 4, 'lin-beta', true) : null;
-  const linZBuf = isHybrid ? createStorageBuffer(device, null, H * 4, 'lin-z', true) : null;
+  const linZBuf = isHybrid ? createStorageBuffer(device, null, linZDim * 4, 'lin-z', true) : null;
   const linOutBuf = isHybrid ? createStorageBuffer(device, null, linNKH * linGroupedVD * 4, 'lin-out', true) : null;
   const linConvOutBuf = isHybrid ? createStorageBuffer(device, null, linQKVDim * 4, 'lin-conv-out', true) : null;
   const linDecayBuf = isHybrid ? createStorageBuffer(device, null, linNVH * 4, 'lin-decay', true) : null;
@@ -1615,11 +1643,11 @@ export function createForwardPassEngine(
         // Option A: read from per-token slice ssmInputBuf instead of multi-token normedBuf.
         dispatchProjection(ssmInputBuf!, lw, 'linearInProjA', linABuf!, 1, linNVH, H, `L${l}-lin-a`, needsGpuDequant);
         dispatchProjection(ssmInputBuf!, lw, 'linearInProjB', linBBuf!, 1, linNVH, H, `L${l}-lin-b`, needsGpuDequant);
-        dispatchProjection(ssmInputBuf!, lw, 'linearInProjZ', linZBuf!, 1, H, H, `L${l}-lin-z`, needsGpuDequant);
+        dispatchProjection(ssmInputBuf!, lw, 'linearInProjZ', linZBuf!, 1, linZDim, H, `L${l}-lin-z`, needsGpuDequant);
         if (ssmT === seqLen - 1) {
           await maybeAudit(l, linABuf!, `L${l}-lin-a-out`, 1, linNVH);
           await maybeAudit(l, linBBuf!, `L${l}-lin-b-out`, 1, linNVH);
-          await maybeAudit(l, linZBuf!, `L${l}-lin-z-out`, 1, H);
+          await maybeAudit(l, linZBuf!, `L${l}-lin-z-out`, 1, linZDim);
         }
 
         // Debug: A, B, Z projection outputs — first token only
@@ -2101,7 +2129,7 @@ export function createForwardPassEngine(
         }
 
         // Qwen3.5: output gating — attn_output = attn_output * sigmoid(gate)
-        // gate is in linZBuf (from Q projection split)
+        // gate is in attnGateBuf (from Q projection split)
         // gate shape is [seqLen, nHeads * dHead] — reshaped from [seqLen, nHeads, dHead]
         if (config.attnOutputGate && attnGateBuf && sigmoidPipeline) {
           const gateDim = seqLen * nHeads * dHead;
@@ -2179,6 +2207,72 @@ export function createForwardPassEngine(
 
       dispatchProjection(ffnTempBuf, lw, 'downProj', downBuf, seqLen, H, ffnDim, `L${l}-down`);
       await maybeAudit(l, downBuf, `L${l}-down-out`, seqLen, H);
+
+      // ── MoE routed experts (Phase C) ──────────────────────────────
+      // For MoE layers the dense-FFN slots above computed the SHARED expert
+      // into downBuf. Add the routed experts: router logits on GPU → readback
+      // (normed hidden + logits + shared-out) → JS top-8 + softmax-8 → CPU
+      // worker fleet GEMVs → combine routed + sigmoid(g)·shared → write the
+      // result back into downBuf so the res2 add below is unchanged.
+      // Ground truth: llama-graph.cpp build_moe_ffn + models/qwen35moe.cpp.
+      if (lw.moeRouter && weights.moe && routerLogitsBuf) {
+        const spec = config.layers[l].moe!;
+        const E = spec.numExperts;
+        const topK = spec.numExpertsPerToken;
+
+        dispatchProjection(normedBuf, lw, 'moeRouter', routerLogitsBuf, seqLen, E, H, `L${l}-router`);
+        // Ordering invariant: flush every recorded dispatch BEFORE reading back.
+        flushBatch();
+        const [normedAB, logitsAB, sharedAB] = await Promise.all([
+          readBuffer(device, normedBuf, seqLen * H * 4),
+          readBuffer(device, routerLogitsBuf, seqLen * E * 4),
+          readBuffer(device, downBuf, seqLen * H * 4),
+        ]);
+        const normed = new Float32Array(normedAB);
+        const logits = new Float32Array(logitsAB);
+        const shared = new Float32Array(sharedAB);
+        const gateVec = weights.moe.sharedGateVecs[l];
+        const combined = new Float32Array(seqLen * H);
+
+        for (let t = 0; t < seqLen; t++) {
+          const hidden = normed.subarray(t * H, (t + 1) * H);
+          const { ids, weights: rw } = topKSoftmax(logits.subarray(t * E, (t + 1) * E), topK);
+          const routed = await weights.moe.backend.computeExperts(l, hidden, ids, rw);
+          // Scalar shared-expert gate: sigmoid(x · ffn_gate_inp_shexp)
+          let g = 0;
+          for (let i = 0; i < H; i++) g += hidden[i] * gateVec[i];
+          g = 1 / (1 + Math.exp(-g));
+          for (let i = 0; i < H; i++) combined[t * H + i] = routed[i] + g * shared[t * H + i];
+
+          // One-shot per-layer MoE probe: set __DEBUG_MOE__ = true in the
+          // console, send one message — logs every MoE layer for the first
+          // forward pass, then self-clears.
+          if (t === 0 && ((globalThis as any).__DEBUG_MOE__ || (globalThis as any).__DEBUG_MOE)) {
+            const st = (v: Float32Array) => {
+              let s = 0, mx = 0, nan = 0;
+              for (let i = 0; i < v.length; i++) {
+                const a = v[i];
+                if (Number.isNaN(a)) nan++;
+                s += a * a;
+                if (Math.abs(a) > mx) mx = Math.abs(a);
+              }
+              return `${Math.sqrt(s).toFixed(3)}/${mx.toFixed(3)}${nan ? `/NaN${nan}` : ''}`;
+            };
+            console.log(
+              `[MoE L${l}] normed ${st(hidden as Float32Array)} | logits ${st(logits.subarray(t * E, (t + 1) * E))} `
+              + `| top8 ${Array.from(ids).join(',')} w0 ${rw[0].toFixed(3)} | routed ${st(routed)} `
+              + `| shexp ${st(shared.subarray(t * H, (t + 1) * H))} g ${g.toFixed(3)} `
+              + `| combined ${st(combined.subarray(t * H, (t + 1) * H))}`,
+            );
+            if (l === config.numLayers - 1) {
+              (globalThis as any).__DEBUG_MOE__ = false;
+              (globalThis as any).__DEBUG_MOE = false;
+            }
+          }
+        }
+        // writeBuffer executes in queue order BEFORE the res2 dispatch below.
+        device.queue.writeBuffer(downBuf, 0, combined.buffer, 0, combined.byteLength);
+      }
 
       // Residual: hidden = residual + ffn_output
       dispatchElementwise(addPipeline, residualBuf, hiddenBuf, seqLen * H, `L${l}-res2`, downBuf);

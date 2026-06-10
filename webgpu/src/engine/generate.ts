@@ -404,6 +404,28 @@ function sampleFromLogits(
   return candidates[candidates.length - 1][0];
 }
 
+// ── Parity capture ───────────────────────────────────────────────────────
+// Gated on __DEBUG_PARITY__ (truthy): records prompt token IDs and, per decode
+// step, the RAW top-5 logits (before any penalty/sampler mutation) plus the
+// chosen token into globalThis.__PARITY_LOG__. Dump from the console with
+// copy(JSON.stringify(__PARITY_LOG__)) and diff against llama-server via
+// scripts/parity-diff.mjs.
+function parityTop5(logits: Float32Array): Array<[number, number]> {
+  const K = 5;
+  const top: Array<[number, number]> = [];
+  for (let i = 0; i < logits.length; i++) {
+    const v = logits[i];
+    if (top.length < K) {
+      top.push([i, v]);
+      if (top.length === K) top.sort((a, b) => b[1] - a[1]);
+    } else if (v > top[K - 1][1]) {
+      top[K - 1] = [i, v];
+      top.sort((a, b) => b[1] - a[1]);
+    }
+  }
+  return top;
+}
+
 // ── Generation Loop ──────────────────────────────────────────────────────
 
 /**
@@ -453,6 +475,12 @@ export function generate(
     // ── Step 1: Tokenize ─────────────────────────────────────────────
     const promptIds = typeof prompt === 'string' ? tokenizer.encode(prompt) : prompt;
     const promptTokens = promptIds.length;
+    const parityLog: { promptIds: number[]; steps: Array<{ top5: Array<[number, number]>; chosen: number }> } | null =
+      (globalThis as any).__DEBUG_PARITY__ ? { promptIds: [...promptIds], steps: [] } : null;
+    if (parityLog) {
+      (globalThis as any).__PARITY_LOG__ = parityLog;
+      console.log('[Parity] capture armed — dump with copy(JSON.stringify(__PARITY_LOG__))');
+    }
     console.log(`[Generate] Prompt: ${promptTokens} tokens, first 5: [${promptIds.slice(0, 5).join(', ')}]`);
     // Debug: decode the full prompt to see what the model actually sees
     console.log(`[Generate] Decoded prompt: "${tokenizer.decode(promptIds)}"`);
@@ -539,7 +567,10 @@ export function generate(
       device, prefillOutput!.logitsBuffer, engine.config.vocabSize * 4,
     );
     const firstLogits = new Float32Array(firstLogitsRaw);
+    // Parity: capture raw top-5 BEFORE sampleFromLogits (it mutates logits in place)
+    if (parityLog) parityLog.steps.push({ top5: parityTop5(firstLogits), chosen: -1 });
     let lastTokenId = sampleFromLogits(firstLogits, config, generatedIds);
+    if (parityLog) parityLog.steps[parityLog.steps.length - 1].chosen = lastTokenId;
 
     if (tokenizer.isEos(lastTokenId)) {
       stopReason = 'eos';
@@ -602,7 +633,9 @@ export function generate(
       }
 
       // Sample next token
+      if (parityLog) parityLog.steps.push({ top5: parityTop5(logits), chosen: -1 });
       const nextId = sampleFromLogits(logits, config, generatedIds);
+      if (parityLog) parityLog.steps[parityLog.steps.length - 1].chosen = nextId;
       const __tSample = performance.now();
 
       // ── Per-step perf accounting (Step 1 measurement layer) ──────────

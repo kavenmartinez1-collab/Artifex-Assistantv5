@@ -314,6 +314,14 @@ async function initGPU(adapter?: GPUAdapter) {
 async function init() {
   setStatus('Detecting GPUs...');
 
+  // Phase C MoE expert workers need SharedArrayBuffer, which requires
+  // cross-origin isolation (COOP/COEP — served by vite.config.ts).
+  if (!crossOriginIsolated) {
+    console.warn('[Init] NOT crossOriginIsolated — SharedArrayBuffer unavailable; MoE (GGUF expert-offload) models will not load. Check COOP/COEP headers.');
+  } else {
+    console.log('[Init] crossOriginIsolated — SharedArrayBuffer available');
+  }
+
   try {
     // Discover all available GPU adapters
     discoveredAdapters = await discoverAdapters();
@@ -802,11 +810,41 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
   }
   console.log(`[GGUF] embed: CPU row-gather (${embedCpu.rowBytes} B/row); lm_head: ${lmHeadT.dtype}${config.tieWordEmbeddings ? ' (tied)' : ''}`);
 
+  // MoE (Phase C): experts live in CPU RAM across a wasm worker fleet; the
+  // shared expert rides the dense FFN slots (ffnDim === expertFFNDim).
+  const moeSpec = config.layers.find((d) => d.moe)?.moe;
+  let moe: { backend: import('./engine/moe-cpu').MoEBackend; sharedGateVecs: Float32Array[] } | undefined;
+  if (moeSpec) {
+    const { createMoECPUBackend } = await import('./engine/moe-cpu');
+    setStatus('Loading MoE experts into CPU workers...');
+    const backend = await createMoECPUBackend({
+      url: model.url,
+      expertTensors: model.expertTensors,
+      numLayers: config.numLayers,
+      numExperts: moeSpec.numExperts,
+      hiddenSize: config.hiddenSize,
+      ffnDim: moeSpec.expertFFNDim,
+      onProgress: (message, frac) => {
+        progressEl.textContent = message;
+        setStatus(`Loading experts... ${Math.round(frac * 100)}%`);
+      },
+    });
+    const sharedGateVecs: Float32Array[] = [];
+    for (let l = 0; l < config.numLayers; l++) {
+      if (!config.layers[l].moe) { sharedGateVecs.push(new Float32Array(0)); continue; }
+      const t = model.cpuTensors.get(`blk.${l}.ffn_gate_inp_shexp.weight`);
+      if (!t) throw new Error(`GGUF bridge: blk.${l}.ffn_gate_inp_shexp.weight missing from CPU store`);
+      sharedGateVecs.push(new Float32Array(t.data.buffer, t.data.byteOffset, config.hiddenSize));
+    }
+    moe = { backend, sharedGateVecs };
+    addMessage('system',
+      `MoE experts loaded: ${moeSpec.numExperts} experts × ${config.layers.filter(d => d.moe).length} layers `
+      + `(${formatBytes(model.expertBytes)}) across ${backend.numWorkers} CPU workers`,
+      'experts loaded');
+  }
+
   const layers: any[] = [];
   for (let l = 0; l < config.numLayers; l++) {
-    if (config.layers[l].moe) {
-      throw new Error('GGUF MoE layers are not supported yet (Phase C)');
-    }
     const lw: any = {
       inputNorm: requireBuf('inputNorm', l),
       postAttnNorm: requireBuf('postAttnNorm', l),
@@ -835,9 +873,17 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
         lw.oBias = roleBuf('oBias', l);
       }
     }
-    assignProj(lw, 'gateProj', 'gateProj', l);
-    assignProj(lw, 'upProj', 'upProj', l);
-    assignProj(lw, 'downProj', 'downProj', l);
+    if (config.layers[l].moe) {
+      // Shared expert in the dense FFN slots; router marks the layer as MoE.
+      assignProj(lw, 'gateProj', 'moeSharedGateProj', l);
+      assignProj(lw, 'upProj', 'moeSharedUpProj', l);
+      assignProj(lw, 'downProj', 'moeSharedDownProj', l);
+      lw.moeRouter = requireBuf('moeRouter', l);
+    } else {
+      assignProj(lw, 'gateProj', 'gateProj', l);
+      assignProj(lw, 'upProj', 'upProj', l);
+      assignProj(lw, 'downProj', 'downProj', l);
+    }
     layers.push(lw);
   }
   if (config.isHybrid) {
@@ -845,8 +891,15 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
     console.log(`[GGUF] Hybrid model: ${linCount} linear + ${config.numLayers - linCount} full attention layers`);
   }
 
-  const engine = createForwardPassEngine(gpu!.device, config, { global, layers });
+  const engine = createForwardPassEngine(gpu!.device, config, { global, layers, moe });
   const tokenizer = await createTokenizer({ modelId: repo });
+  // Guard: a tokenizer from the wrong model family silently produces garbage
+  // (e.g. Qwen3-8B fallback vocab 151936 vs Qwen3.6 vocab 248320).
+  if (tokenizer.vocabSize && Math.abs(tokenizer.vocabSize - config.vocabSize) > 1024) {
+    throw new Error(
+      `Tokenizer/model vocab mismatch: tokenizer ${tokenizer.modelId} has ${tokenizer.vocabSize} tokens ` +
+      `but model expects ${config.vocabSize}. Wrong tokenizer fallback?`);
+  }
   resetToRemote();
 
   session = {
@@ -859,7 +912,7 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
     tokenizer,
     gpu: gpu!,
     vramEstimate: estimateVRAM(config),
-    destroy: () => { unloadModel(currentModel!); session = null; },
+    destroy: () => { moe?.backend.destroy(); unloadModel(currentModel!); session = null; },
   } as InferenceSession;
 
   promptEl.disabled = false;

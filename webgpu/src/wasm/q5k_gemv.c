@@ -191,3 +191,69 @@ void q5k_gemv(const block_q5_K *w, const block_q8_act *x, float *y, int rows, in
     y[r] = q5k_dot_row(w + (uint32_t)r * (uint32_t)nb, x, nb);
   }
 }
+
+/*
+ * Q6_K superblock layout (ggml, 256 elements, 210 bytes):
+ *   ql[128] (low 4 bits), qh[64] (upper 2 bits), scales[16] (int8, per-16),
+ *   d (f16). Dequant: x[i] = d * sc[i/16] * (q6[i] - 32), q6 in 0..63.
+ *
+ * Only a few ffn_down_exps tensors are Q6_K (k-quant bump layers), so this
+ * is a straightforward scalar port of llama.cpp ggml_vec_dot_q6_K_q8_K —
+ * <5% of expert bytes per token, clang -O3 auto-vectorizes the inner loop.
+ */
+typedef struct {
+  uint8_t ql[128];
+  uint8_t qh[64];
+  int8_t scales[16];
+  uint16_t d; // ggml fp16 super-scale
+} block_q6_K;
+
+_Static_assert(sizeof(block_q6_K) == 210, "block_q6_K must be 210 bytes");
+
+static float q6k_dot_row(const block_q6_K *w, const block_q8_act *x, int nb) {
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; i++) {
+    const block_q6_K *b = (const block_q6_K *)((const uint8_t *)w + (uint32_t)i * 210u);
+    const block_q8_act *a = &x[i];
+    const float d = f16_to_f32(b->d) * a->d;
+
+    const uint8_t *ql = b->ql;
+    const uint8_t *qh = b->qh;
+    const int8_t *sc = b->scales;
+    const int8_t *q8 = a->q;
+
+    int32_t isum = 0;
+    for (int n = 0; n < 2; n++) { // two 128-element halves
+      for (int l = 0; l < 32; l++) {
+        int32_t q1 = (int32_t)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+        int32_t q2 = (int32_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+        int32_t q3 = (int32_t)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+        int32_t q4 = (int32_t)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+        isum += (int32_t)sc[l / 16 + 0] * q1 * (int32_t)q8[l]
+              + (int32_t)sc[l / 16 + 2] * q2 * (int32_t)q8[l + 32]
+              + (int32_t)sc[l / 16 + 4] * q3 * (int32_t)q8[l + 64]
+              + (int32_t)sc[l / 16 + 6] * q4 * (int32_t)q8[l + 96];
+      }
+      ql += 64;
+      qh += 32;
+      sc += 8;
+      q8 += 128;
+    }
+    sumf += d * (float)isum;
+  }
+  return sumf;
+}
+
+/**
+ * GEMV: y[rows] = W[rows x cols] @ x, W row-major Q6_K, x pre-quantized Q8.
+ * cols must be a multiple of 256. Note: block_q6_K is 210 bytes (unaligned —
+ * row pointers are computed in bytes).
+ */
+__attribute__((export_name("q6k_gemv")))
+void q6k_gemv(const block_q6_K *w, const block_q8_act *x, float *y, int rows, int cols) {
+  int nb = cols / QK_K;
+  uint32_t rowBytes = (uint32_t)nb * 210u;
+  for (int r = 0; r < rows; r++) {
+    y[r] = q6k_dot_row((const block_q6_K *)((const uint8_t *)w + (uint32_t)r * rowBytes), x, nb);
+  }
+}

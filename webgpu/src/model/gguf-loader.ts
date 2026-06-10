@@ -19,6 +19,7 @@
 import {
   parseGGUF,
   ggmlTypeTraits,
+  archKV,
   GGML_TYPES,
   type GGUFFile,
   type GGUFTensorInfo,
@@ -53,8 +54,16 @@ export interface GGUFTensorCPU {
 export interface LoadedGGUFModel {
   repo: string;
   file: GGUFFile;
+  /** Resolved file URL — MoE workers Range-fetch expert slabs from it. */
+  url: string;
   tensors: Map<string, GGUFTensorGPU>;
   cpuTensors: Map<string, GGUFTensorCPU>;
+  /**
+   * MoE expert tensors (ffn_{gate,up,down}_exps) — NOT fetched/uploaded here.
+   * Raw GGUF tensor infos (abs offset/byteLength/ne) for the CPU worker fleet.
+   */
+  expertTensors: Map<string, GGUFTensorInfo>;
+  expertBytes: number;
   totalGPUBytes: number;
   tensorCount: number;
   loadTimeMs: number;
@@ -70,6 +79,14 @@ const QUANT_GPU_TYPES = new Set<number>([
 ]);
 
 const MAX_CHUNK = 128 * 1024 * 1024;
+
+// MoE expert placement (Phase C): expert slabs stay in the file, fetched by
+// the CPU worker fleet; the per-layer shared-expert router gate vector stays
+// on CPU (scalar sigmoid gate is computed in JS).
+const EXPERT_RE = /^blk\.\d+\.ffn_(gate|up|down)_exps\.weight$/;
+const FUSED_EXPERT_RE = /^blk\.\d+\.ffn_gate_up_exps\.weight$/;
+const SHEXP_GATE_RE = /^blk\.\d+\.ffn_gate_inp_shexp\.weight$/;
+const BLK_RE = /^blk\.(\d+)\./;
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -128,7 +145,7 @@ export async function loadGGUFModel(
   repo: string,
   filename: string,
   onProgress?: (p: GGUFLoadProgress) => void,
-  opts?: { vramBudgetBytes?: number },
+  opts?: { vramBudgetBytes?: number; ramBudgetBytes?: number },
 ): Promise<LoadedGGUFModel> {
   const t0 = performance.now();
   const url = resolveFileUrl(repo, filename);
@@ -142,12 +159,30 @@ export async function loadGGUFModel(
   const cpuNames = new Set(['token_embd.weight']);
   const alsoGPU = tied ? new Set(['token_embd.weight']) : new Set<string>();
 
-  // ── VRAM gate: refuse before downloading anything ──
+  // MTP guard: some GGUFs carry next-token-prediction blocks at blk.L,
+  // L ≥ block_count — the forward pass never runs them, skip entirely.
+  const numLayers = archKV<number>(file, 'block_count');
+  const isMTP = (name: string): boolean => {
+    const m = BLK_RE.exec(name);
+    return m !== null && Number(m[1]) >= numLayers;
+  };
+  const isCPUOnly = (name: string): boolean => cpuNames.has(name) || SHEXP_GATE_RE.test(name);
+
+  // ── VRAM + RAM gates: refuse before downloading anything ──
   let gpuBytesPlanned = 0;
+  let expertBytes = 0;
   let totalFileBytes = 0;
   for (const t of file.tensors.values()) {
+    if (FUSED_EXPERT_RE.test(t.name)) {
+      throw new Error(`[GGUF] "${t.name}": fused gate+up expert tensors unsupported — expected split ffn_gate_exps/ffn_up_exps`);
+    }
+    if (isMTP(t.name)) continue;
+    if (EXPERT_RE.test(t.name)) {
+      expertBytes += t.byteLength;
+      continue; // CPU worker fleet, never downloaded here
+    }
     totalFileBytes += t.byteLength;
-    if (cpuNames.has(t.name) && !alsoGPU.has(t.name)) continue;
+    if (isCPUOnly(t.name) && !alsoGPU.has(t.name)) continue;
     gpuBytesPlanned += plannedGPUBytes(t);
   }
   const budget = opts?.vramBudgetBytes ?? 6.5e9;
@@ -158,15 +193,29 @@ export async function loadGGUFModel(
       + `(${file.tensorCount} tensors, ${(totalFileBytes / 1e9).toFixed(1)} GB on disk)`,
     );
   }
+  const ramBudget = opts?.ramBudgetBytes ?? 24e9;
+  if (expertBytes > ramBudget) {
+    throw new Error(
+      `MoE expert weights need ~${(expertBytes / 1e9).toFixed(1)} GB CPU RAM but the budget is `
+      + `~${(ramBudget / 1e9).toFixed(1)} GB — refusing to load. Close other applications or `
+      + `use a smaller quantization of this model.`,
+    );
+  }
 
   const tensors = new Map<string, GGUFTensorGPU>();
   const cpuTensors = new Map<string, GGUFTensorCPU>();
+  const expertTensors = new Map<string, GGUFTensorInfo>();
   let totalGPUBytes = 0;
   let doneBytes = 0;
   let idx = 0;
 
   for (const t of file.tensors.values()) {
     idx++;
+    if (isMTP(t.name)) continue;
+    if (EXPERT_RE.test(t.name)) {
+      expertTensors.set(t.name, t); // worker fleet fetches these itself
+      continue;
+    }
     onProgress?.({
       message: `[${idx}/${file.tensorCount}] ${t.name} (${t.typeName}, ${(t.byteLength / 1e6).toFixed(1)} MB)`,
       overallProgress: doneBytes / totalFileBytes,
@@ -174,7 +223,7 @@ export async function loadGGUFModel(
 
     const raw = await fetchTensorBytes(url, t.offset, t.byteLength);
 
-    if (cpuNames.has(t.name)) {
+    if (isCPUOnly(t.name)) {
       const { blockSize, typeSize } = ggmlTypeTraits(t.ggmlType);
       cpuTensors.set(t.name, {
         data: raw,
@@ -184,7 +233,7 @@ export async function loadGGUFModel(
       });
     }
 
-    if (!cpuNames.has(t.name) || alsoGPU.has(t.name)) {
+    if (!isCPUOnly(t.name) || alsoGPU.has(t.name)) {
       let buf: GPUBuffer;
       let isQuantized = false;
       if (t.ggmlType === GGML_TYPES.F32) {
@@ -233,14 +282,18 @@ export async function loadGGUFModel(
   console.log(
     `[GGUF-Loader] ${repo}/${filename}: ${tensors.size} GPU tensors `
     + `(${(totalGPUBytes / 1e9).toFixed(2)} GB), ${cpuTensors.size} CPU tensors, `
+    + `${expertTensors.size} expert tensors deferred (${(expertBytes / 1e9).toFixed(2)} GB for worker fleet), `
     + `${(loadTimeMs / 1000).toFixed(1)}s${tied ? ' (tied embeddings)' : ''}`,
   );
 
   return {
     repo,
     file,
+    url,
     tensors,
     cpuTensors,
+    expertTensors,
+    expertBytes,
     totalGPUBytes,
     tensorCount: file.tensorCount,
     loadTimeMs,
