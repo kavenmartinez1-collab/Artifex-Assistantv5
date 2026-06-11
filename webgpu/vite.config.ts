@@ -99,6 +99,8 @@ export default defineConfig({
     proxy: {
       // Proxy metrics to the dev server
       '/metrics': 'http://127.0.0.1:3001',
+      // GPU info (VRAM auto-budget) lives on the dev server
+      '/api/gpu-info': 'http://127.0.0.1:3001',
       // Proxy local HF cache to the dev server (streams large weight shards)
       '/api/hf-cache': {
         target: 'http://127.0.0.1:3001',

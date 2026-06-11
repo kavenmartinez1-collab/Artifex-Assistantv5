@@ -731,7 +731,8 @@ async function resolveVRAMBudget(): Promise<number | undefined> {
   if (manual > 0) return manual * 1e9;
   try {
     const resp = await fetch('/api/gpu-info');
-    if (resp.ok) {
+    const isJson = (resp.headers.get('content-type') ?? '').includes('json');
+    if (resp.ok && isJson) {
       const { gpus } = await resp.json() as { gpus: Array<{ name: string; freeMB: number; displayActive: boolean }> };
       const pick = gpus.find(g => g.displayActive) ?? gpus[0];
       if (pick && pick.freeMB > 0) {
@@ -739,8 +740,15 @@ async function resolveVRAMBudget(): Promise<number | undefined> {
         console.log(`[VRAM] auto budget: ${(budget / 1e9).toFixed(1)} GB (driver-reported free minus 1 GB reserve)`);
         return budget;
       }
+      console.warn('[VRAM] /api/gpu-info returned no usable GPUs — using loader default budget');
+    } else {
+      // A non-JSON 200 means the request never reached the dev server
+      // (e.g. vite served its SPA fallback because the path isn't proxied).
+      console.warn(`[VRAM] /api/gpu-info unavailable (status ${resp.status}, json=${isJson}) — using loader default budget`);
     }
-  } catch { /* no driver info — fall through */ }
+  } catch (err) {
+    console.warn('[VRAM] gpu-info fetch failed — using loader default budget:', err);
+  }
   return undefined;
 }
 
