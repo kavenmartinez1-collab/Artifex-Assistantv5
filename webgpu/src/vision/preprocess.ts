@@ -99,7 +99,12 @@ export async function preprocessImage(
   let W: number, H: number;
   if (desc.preprocess.resize.kind === 'smart') {
     const r = desc.preprocess.resize;
-    ({ width: W, height: H } = smartResize(bitmap.width, bitmap.height, r.factor, r.minPixels, r.maxPixels));
+    // The ViT attention kernel reads at most 3840 patches per image
+    // (attention.wgsl workgroup scores array) — clamp the area budget so
+    // smart-resize can never exceed it, whatever the checkpoint configures.
+    const kernelMaxPixels = 3840 * P * P;
+    const maxPx = Math.min(r.maxPixels, kernelMaxPixels);
+    ({ width: W, height: H } = smartResize(bitmap.width, bitmap.height, r.factor, r.minPixels, maxPx));
   } else {
     W = desc.preprocess.resize.width;
     H = desc.preprocess.resize.height;
