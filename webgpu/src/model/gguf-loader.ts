@@ -201,6 +201,31 @@ export async function loadGGUFModel(
     return m !== null && Number(m[1]) >= kvFromStart;
   };
 
+  // ── Pre-flight quant check — fail fast with guidance, before any download ──
+  // The GPU path dequantizes Q4_K/Q5_K/Q6_K/Q8_0 (+ F16/F32/BF16) natively.
+  // Legacy (Q4_0/Q4_1/Q5_0/Q5_1) and IQ-imatrix quants aren't wired yet, so a
+  // model in those would fail tensor-by-tensor mid-load. Catch it up front and
+  // tell the user exactly what to download instead.
+  const SUPPORTED_GPU = new Set<number>([
+    GGML_TYPES.F32, GGML_TYPES.F16, GGML_TYPES.BF16,
+    GGML_TYPES.Q8_0, GGML_TYPES.Q4_K, GGML_TYPES.Q5_K, GGML_TYPES.Q6_K,
+  ]);
+  const unsupportedTypes = new Map<string, number>();
+  for (const t of file.tensors.values()) {
+    if (isVision(t.name) || isMTP(t.name) || isDeadKV(t.name) || EXPERT_RE.test(t.name)) continue;
+    if (!SUPPORTED_GPU.has(t.ggmlType)) {
+      unsupportedTypes.set(t.typeName, (unsupportedTypes.get(t.typeName) ?? 0) + 1);
+    }
+  }
+  if (unsupportedTypes.size > 0) {
+    const list = [...unsupportedTypes.entries()].map(([n, c]) => `${n} (${c} tensors)`).join(', ');
+    throw new Error(
+      `This GGUF uses quantization the WebGPU engine can't run yet: ${list}. `
+      + `Supported: Q4_K, Q5_K, Q6_K, Q8_0 (and F16/F32/BF16). `
+      + `Download a K-quant build instead — e.g. a *-Q4_K_M.gguf or *-Q5_K_M.gguf. `
+      + `(Legacy Q4_0/Q5_0 and IQ-imatrix quants aren't supported.)`);
+  }
+
   // ── VRAM + RAM gates: refuse before downloading anything ──
   let gpuBytesPlanned = 0;
   let cpuBytesPlanned = 0;

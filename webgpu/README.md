@@ -30,8 +30,9 @@ store.
 
 ## Quickstart
 
-Requires **Node.js 18+** and a **WebGPU-capable browser** (Chrome/Edge 113+, or
-Firefox/Safari with WebGPU enabled).
+Requires **Node.js 18+** and a **WebGPU-capable browser**. **Chrome is the
+reference target** (most reliable WebGPU); Edge usually matches but can lag,
+and Firefox/Safari need WebGPU enabled.
 
 ```bash
 npm install
@@ -64,6 +65,18 @@ To point at model directories elsewhere on disk, create
 
 or set `ARTIFEX_MODEL_DIRS` (`;`-separated). Only aliases ever reach the
 browser — absolute paths stay server-side.
+
+## Choosing a model
+
+The engine fits weights in VRAM (experts for MoE models stream from system
+RAM). It tells you up front if a model won't fit on your GPU — pick a smaller
+one or a lower quant. As a rough guide, a model needs a bit more free VRAM than
+its file size; an ~8 GB card comfortably runs 7–9B models at Q4_K_M.
+
+**GGUF quantization**: the engine runs **K-quants and Q8_0** —
+`Q4_K_M`, `Q5_K_M`, `Q6_K`, `Q8_0` (plus F16/F32/BF16). Legacy `Q4_0`/`Q5_0`
+and `IQ*` (imatrix) quants aren't supported yet; the engine says so before
+downloading. When in doubt, grab a `*-Q4_K_M.gguf`.
 
 ## Vision
 

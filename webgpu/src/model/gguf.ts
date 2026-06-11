@@ -57,6 +57,18 @@ const TYPE_TRAITS: Record<number, { blockSize: number; typeSize: number; name: G
   [GGML_TYPES.Q5_K]: { blockSize: 256, typeSize: 176, name: 'Q5_K' },
   [GGML_TYPES.Q6_K]: { blockSize: 256, typeSize: 210, name: 'Q6_K' },
   [GGML_TYPES.Q8_K]: { blockSize: 256, typeSize: 292, name: 'Q8_K' },
+  // IQ (imatrix) quants — block sizes only, so any GGUF PARSES; the loader's
+  // pre-flight check reports them as unsupported-for-inference with guidance
+  // rather than crashing mid-parse with a cryptic type number.
+  [GGML_TYPES.IQ2_XXS]: { blockSize: 256, typeSize: 66,  name: 'IQ2_XXS' },
+  [GGML_TYPES.IQ2_XS]:  { blockSize: 256, typeSize: 74,  name: 'IQ2_XS' },
+  [GGML_TYPES.IQ3_XXS]: { blockSize: 256, typeSize: 98,  name: 'IQ3_XXS' },
+  [GGML_TYPES.IQ1_S]:   { blockSize: 256, typeSize: 50,  name: 'IQ1_S' },
+  [GGML_TYPES.IQ4_NL]:  { blockSize: 32,  typeSize: 18,  name: 'IQ4_NL' },
+  [GGML_TYPES.IQ3_S]:   { blockSize: 256, typeSize: 110, name: 'IQ3_S' },
+  [GGML_TYPES.IQ2_S]:   { blockSize: 256, typeSize: 82,  name: 'IQ2_S' },
+  [GGML_TYPES.IQ4_XS]:  { blockSize: 256, typeSize: 136, name: 'IQ4_XS' },
+  [GGML_TYPES.IQ1_M]:   { blockSize: 256, typeSize: 56,  name: 'IQ1_M' },
 };
 
 export function ggmlTypeTraits(ggmlType: number): { blockSize: number; typeSize: number; name: GGMLTypeName } {
