@@ -176,7 +176,20 @@ export function descriptorFromGGUF(file: GGUFFile): ModelDescriptor {
   const hiddenSize = archKV<number>(file, 'embedding_length');
   const numLayers = archKV<number>(file, 'block_count') - archKV<number>(file, 'nextn_predict_layers', 0);
   const numAttentionHeads = archKV<number>(file, 'attention.head_count');
-  const numKVHeads = archKV<number>(file, 'attention.head_count_kv', numAttentionHeads);
+  // Some qwen35 GGUFs (e.g. Ollama's qwen3.5:9b) store head_count_kv PER LAYER
+  // — 0 on the DeltaNet linear layers, the real count on full-attention layers
+  // — while others (the 27B) store a plain scalar. Reduce an array to the
+  // scalar full-attention KV head count (the layer's own kvDim is derived from
+  // this; linear layers don't use it). Reading the array as a scalar made every
+  // KV size garbage → "wrong sizes, layer 0".
+  const kvRaw = archKV<number | number[]>(file, 'attention.head_count_kv', numAttentionHeads);
+  let numKVHeads: number;
+  if (Array.isArray(kvRaw)) {
+    const nonzero = kvRaw.filter((v) => typeof v === 'number' && v > 0);
+    numKVHeads = nonzero.length > 0 ? Math.max(...nonzero) : numAttentionHeads;
+  } else {
+    numKVHeads = kvRaw;
+  }
   const headDim = archKV<number>(file, 'attention.key_length', hiddenSize / numAttentionHeads);
 
   // Hybrid (Gated DeltaNet) detection via ssm.* keys

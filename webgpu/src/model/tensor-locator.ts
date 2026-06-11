@@ -159,7 +159,7 @@ const GGUF_LAYER: Partial<Record<TensorRole, string[]>> = {
   linOutProj: ['ssm_out.weight'],
   linALog: ['ssm_a'],
   linConv1dWeight: ['ssm_conv1d.weight'],
-  linDtBias: ['ssm_dt.bias'],
+  linDtBias: ['ssm_dt.bias', 'ssm_dt'],  // qwen3.5:9b names it 'ssm_dt' (no .bias)
   linNormWeight: ['ssm_norm.weight'],
   // MoE
   moeRouter: ['ffn_gate_inp.weight'],
