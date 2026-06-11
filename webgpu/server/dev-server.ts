@@ -17,7 +17,7 @@ import { OrchestrationHub } from './ws-hub.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const METRICS_FILE = path.join(__dirname, '..', 'metrics.jsonl');
-const PORT = 3001;
+const PORT = Number(process.env.PORT) || 3001;
 
 const app = express();
 app.use(cors());
@@ -103,15 +103,160 @@ const HF_CACHE_DIR = process.env.HF_HOME
 // Project's local models directory (for custom quantized models)
 const LOCAL_MODELS_DIR = path.resolve(__dirname, '..', '..', 'models');
 
-/** Resolve a repo ID to its local directory (checks project models/ first, then HF cache) */
-function resolveSnapshot(repo: string): string | null {
-  // Check project models/ directory first (e.g., "local/qwen3.5-9b-mixed-GPTQ-Int4")
-  // Convention: "local/<dirname>" maps to models/<dirname>/
+// ─── Extra model directories (private to this machine) ──────────────────────
+// Two config sources, both server-side only:
+//   - ARTIFEX_MODEL_DIRS env var — ';'-separated directory list
+//   - model-dirs.local.json (gitignored, next to package.json) — JSON string array
+// Each directory is scanned for loose *.gguf files and for model subdirectories
+// (config.json or *.gguf inside). Everything surfaces to the browser as
+// 'local/<alias>' — absolute paths never reach the client, so no box/system
+// info leaks into the UI, exports, or the public repo.
+
+const EXTRA_DIRS_FILE = path.join(__dirname, '..', 'model-dirs.local.json');
+
+function readExtraModelDirs(): string[] {
+  const dirs: string[] = [];
+  const env = process.env.ARTIFEX_MODEL_DIRS;
+  if (env) dirs.push(...env.split(';').map(s => s.trim()).filter(Boolean));
+  if (fs.existsSync(EXTRA_DIRS_FILE)) {
+    try {
+      const fromFile = JSON.parse(fs.readFileSync(EXTRA_DIRS_FILE, 'utf-8'));
+      if (Array.isArray(fromFile)) dirs.push(...fromFile.filter((d): d is string => typeof d === 'string'));
+      else console.warn(`[Models] ${path.basename(EXTRA_DIRS_FILE)} must be a JSON array of directory strings`);
+    } catch (err) {
+      // A malformed config should be LOUD — common mistake is unescaped
+      // backslashes in Windows paths (use forward slashes or \\).
+      console.warn(`[Models] Failed to parse ${path.basename(EXTRA_DIRS_FILE)}: ${err}`);
+    }
+  }
+  const valid = dirs.filter(d => {
+    try { return fs.statSync(d).isDirectory(); } catch { return false; }
+  });
+  for (const d of dirs) {
+    if (!valid.includes(d)) console.warn(`[Models] Configured model dir not found: ${d}`);
+  }
+  return valid;
+}
+
+/** A resolved local model: a directory, optionally restricted to one file
+ *  (loose .gguf files and Ollama blobs get their own alias). displayName
+ *  is what the browser sees when the on-disk name is unfriendly (blobs). */
+interface LocalModelDir { dir: string; only?: string; displayName?: string }
+
+// ─── Ollama model store ──────────────────────────────────────────────────────
+// Ollama blobs ARE GGUF files under sha256 names. Manifests map name:tag →
+// model blob. Surfaced as 'ollama/<name>:<tag>' with a friendly .gguf
+// displayName; the blob path stays server-side like everything else.
+
+const OLLAMA_DIR = process.env.OLLAMA_MODELS
+  || path.join(process.env.USERPROFILE || process.env.HOME || '', '.ollama', 'models');
+
+function scanOllamaModels(): Map<string, LocalModelDir> {
+  const map = new Map<string, LocalModelDir>();
+  const manifestsRoot = path.join(OLLAMA_DIR, 'manifests');
+  const blobsDir = path.join(OLLAMA_DIR, 'blobs');
+  const walk = (dir: string, rel: string[]) => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        walk(p, [...rel, e.name]);
+      } else if (e.isFile()) {
+        // rel = [registry, namespace, ...nameParts], file name = tag
+        try {
+          const manifest = JSON.parse(fs.readFileSync(p, 'utf-8'));
+          const layer = (manifest.layers ?? []).find(
+            (l: any) => l.mediaType === 'application/vnd.ollama.image.model');
+          if (!layer?.digest) continue;
+          const blob = String(layer.digest).replace(':', '-');
+          if (!fs.existsSync(path.join(blobsDir, blob))) continue;
+          const namespace = rel[1] ?? 'library';
+          const name = rel.slice(2).join('/');
+          if (!name) continue;
+          const alias = (namespace === 'library' ? name : `${namespace}.${name.replace(/\//g, '.')}`) + ':' + e.name;
+          const displayName = `${namespace === 'library' ? '' : namespace + '-'}${name.replace(/\//g, '-')}-${e.name}.gguf`;
+          if (!map.has(alias)) map.set(alias, { dir: blobsDir, only: blob, displayName });
+        } catch {}
+      }
+    }
+  };
+  walk(manifestsRoot, []);
+  return map;
+}
+
+/** Scan the extra dirs: alias → location. Project models/ wins name collisions. */
+function scanExtraModels(): Map<string, LocalModelDir> {
+  const map = new Map<string, LocalModelDir>();
+  for (const dir of readExtraModelDirs()) {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (e.isFile() && e.name.toLowerCase().endsWith('.gguf')) {
+        const alias = e.name.replace(/\.gguf$/i, '');
+        if (!map.has(alias)) map.set(alias, { dir, only: e.name });
+      } else if (e.isDirectory()) {
+        const sub = path.join(dir, e.name);
+        try {
+          const files = fs.readdirSync(sub);
+          const isModel = files.includes('config.json') || files.some(f => f.toLowerCase().endsWith('.gguf'));
+          if (isModel && !map.has(e.name)) map.set(e.name, { dir: sub });
+        } catch {}
+      }
+    }
+  }
+  return map;
+}
+
+// During a model load the browser issues hundreds of range requests; scanning
+// the filesystem per request is wasteful AND fragile (a single transient fs
+// error under heavy streaming I/O would 404 a model that exists). Cache the
+// scans briefly.
+const SCAN_TTL_MS = 5000;
+let _extraScan: { at: number; map: Map<string, LocalModelDir> } | null = null;
+let _ollamaScan: { at: number; map: Map<string, LocalModelDir> } | null = null;
+
+function scanExtraModelsCached(): Map<string, LocalModelDir> {
+  if (_extraScan && Date.now() - _extraScan.at < SCAN_TTL_MS) return _extraScan.map;
+  const map = scanExtraModels();
+  // Keep serving the previous non-empty scan if a rescan transiently comes
+  // back empty (fs hiccup mid-load) — a model that existed 5s ago still does.
+  if (map.size === 0 && _extraScan && _extraScan.map.size > 0) {
+    _extraScan.at = Date.now();
+    return _extraScan.map;
+  }
+  _extraScan = { at: Date.now(), map };
+  return map;
+}
+
+function scanOllamaModelsCached(): Map<string, LocalModelDir> {
+  if (_ollamaScan && Date.now() - _ollamaScan.at < SCAN_TTL_MS) return _ollamaScan.map;
+  const map = scanOllamaModels();
+  if (map.size === 0 && _ollamaScan && _ollamaScan.map.size > 0) {
+    _ollamaScan.at = Date.now();
+    return _ollamaScan.map;
+  }
+  _ollamaScan = { at: Date.now(), map };
+  return map;
+}
+
+/** Resolve a repo ID to its local location (project models/ → extra dirs → Ollama → HF cache) */
+function resolveSnapshot(repo: string): LocalModelDir | null {
+  // 'local/<name>' maps to models/<name>/ or an extra-dir alias
   if (repo.startsWith('local/')) {
-    const dirName = repo.slice(6); // strip "local/"
-    const modelDir = path.join(LOCAL_MODELS_DIR, dirName);
-    if (fs.existsSync(modelDir)) return modelDir;
-    return null;
+    const name = repo.slice(6); // strip "local/"
+    const modelDir = path.join(LOCAL_MODELS_DIR, name);
+    if (fs.existsSync(modelDir)) return { dir: modelDir };
+    const hit = scanExtraModelsCached().get(name) ?? null;
+    if (!hit) console.warn(`[Models] Unresolved local alias: ${repo}`);
+    return hit;
+  }
+
+  // 'ollama/<name>:<tag>' maps to the model blob via the manifest
+  if (repo.startsWith('ollama/')) {
+    const hit = scanOllamaModelsCached().get(repo.slice(7)) ?? null;
+    if (!hit) console.warn(`[Models] Unresolved ollama alias: ${repo}`);
+    return hit;
   }
 
   // Check HF cache
@@ -120,9 +265,15 @@ function resolveSnapshot(repo: string): string | null {
   try {
     const hash = fs.readFileSync(refsPath, 'utf-8').trim();
     const snapDir = path.join(HF_CACHE_DIR, dirName, 'snapshots', hash);
-    if (fs.existsSync(snapDir)) return snapDir;
+    if (fs.existsSync(snapDir)) return { dir: snapDir };
   } catch {}
   return null;
+}
+
+/** Files visible for a resolved model (respects loose-file restriction). */
+function listModelFiles(loc: LocalModelDir): string[] {
+  if (loc.only) return [loc.displayName ?? loc.only];
+  try { return fs.readdirSync(loc.dir); } catch { return []; }
 }
 
 /** List all locally cached models (HF cache + project models/) */
@@ -130,43 +281,58 @@ app.get('/api/hf-cache/models', (_req, res) => {
   try {
     const models: Array<{ repo: string; files: string[]; totalSize: number }> = [];
 
+    const isModelFile = (f: string) =>
+      f.endsWith('.safetensors') || f.toLowerCase().endsWith('.gguf') || f === 'config.json';
+    const sizeOf = (dir: string, files: string[]) => files.reduce((s, f) => {
+      try { return s + fs.statSync(path.join(dir, f)).size; } catch { return s; }
+    }, 0);
+    const seen = new Set<string>();
+    const push = (repo: string, dir: string, allFiles: string[]) => {
+      if (seen.has(repo)) return;
+      const files = allFiles.filter(isModelFile);
+      if (files.length === 0) return;
+      seen.add(repo);
+      models.push({ repo, files, totalSize: sizeOf(dir, files) });
+    };
+
     // Scan HF cache
     try {
       const entries = fs.readdirSync(HF_CACHE_DIR).filter(d => d.startsWith('models--'));
       for (const dir of entries) {
         const repo = dir.replace('models--', '').replace(/--/g, '/');
         const snap = resolveSnapshot(repo);
-        if (!snap) continue;
-        const files = fs.readdirSync(snap).filter(f => f.endsWith('.safetensors') || f.endsWith('.gguf') || f === 'config.json');
-        const totalSize = files.reduce((s, f) => {
-          try { return s + fs.statSync(path.join(snap, f)).size; } catch { return s; }
-        }, 0);
-        if (files.length > 0) models.push({ repo, files, totalSize });
+        if (snap) push(repo, snap.dir, listModelFiles(snap));
       }
     } catch {}
 
     // Scan project models/ directory
     try {
-      const localEntries = fs.readdirSync(LOCAL_MODELS_DIR);
-      for (const dir of localEntries) {
+      for (const dir of fs.readdirSync(LOCAL_MODELS_DIR)) {
         const fullDir = path.join(LOCAL_MODELS_DIR, dir);
-        if (!fs.statSync(fullDir).isDirectory()) continue;
-        // A model dir has config.json (safetensors) or .gguf files
-        const allFiles = fs.readdirSync(fullDir);
-        const hasConfig = fs.existsSync(path.join(fullDir, 'config.json'));
-        const hasGguf = allFiles.some(f => f.endsWith('.gguf'));
-        if (!hasConfig && !hasGguf) continue;
-        const files = allFiles.filter(f => f.endsWith('.safetensors') || f.endsWith('.gguf') || f === 'config.json');
-        const totalSize = files.reduce((s, f) => {
-          try { return s + fs.statSync(path.join(fullDir, f)).size; } catch { return s; }
-        }, 0);
-        models.push({ repo: `local/${dir}`, files, totalSize });
+        try { if (!fs.statSync(fullDir).isDirectory()) continue; } catch { continue; }
+        push(`local/${dir}`, fullDir, fs.readdirSync(fullDir));
       }
     } catch {}
 
+    // Scan configured extra dirs (loose .gguf files + model subdirectories)
+    // and the Ollama store. Only aliases are sent to the browser — never the
+    // underlying paths.
+    const pushLoc = (repo: string, loc: LocalModelDir) => {
+      if (!loc.only) { push(repo, loc.dir, listModelFiles(loc)); return; }
+      if (seen.has(repo)) return;
+      try {
+        const size = fs.statSync(path.join(loc.dir, loc.only)).size;
+        seen.add(repo);
+        models.push({ repo, files: [loc.displayName ?? loc.only], totalSize: size });
+      } catch {}
+    };
+    for (const [alias, loc] of scanExtraModelsCached()) pushLoc(`local/${alias}`, loc);
+    for (const [alias, loc] of scanOllamaModelsCached()) pushLoc(`ollama/${alias}`, loc);
+
     res.json(models);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to read cache', paths: [HF_CACHE_DIR, LOCAL_MODELS_DIR] });
+    // Do NOT echo directory paths to the client — machine info stays server-side.
+    res.status(500).json({ error: 'Failed to read local model directories' });
   }
 });
 
@@ -176,9 +342,19 @@ app.get('/api/hf-cache/:org/:model/tree/main', (req, res) => {
   const snap = resolveSnapshot(repo);
   if (!snap) return res.status(404).json({ error: `Model not found in local cache: ${repo}` });
 
-  const files = fs.readdirSync(snap).map(f => {
+  // Single-file aliases (loose .gguf, Ollama blobs): stat the real file but
+  // report the friendly name.
+  if (snap.only) {
     try {
-      const stat = fs.statSync(path.join(snap, f));
+      const stat = fs.statSync(path.join(snap.dir, snap.only));
+      return res.json([{ path: snap.displayName ?? snap.only, size: stat.size, type: 'file' as const }]);
+    } catch {
+      return res.json([]);
+    }
+  }
+  const files = listModelFiles(snap).map(f => {
+    try {
+      const stat = fs.statSync(path.join(snap.dir, f));
       return { path: f, size: stat.size, type: 'file' as const };
     } catch { return null; }
   }).filter(Boolean);
@@ -192,7 +368,20 @@ app.get('/api/hf-cache/:org/:model/:action(resolve|raw)/main/*', (req, res) => {
   const snap = resolveSnapshot(repo);
   if (!snap) return res.status(404).json({ error: `Model not found: ${repo}` });
 
-  const filePath = path.join(snap, filename);
+  // Single-file aliases serve exactly one file (requested by real or display
+  // name); everything else in the directory stays hidden.
+  let realName = filename;
+  if (snap.only) {
+    if (filename !== snap.only && filename !== (snap.displayName ?? snap.only)) {
+      return res.status(404).json({ error: `File not found: ${filename}` });
+    }
+    realName = snap.only;
+  }
+  // Containment: reject path traversal out of the model directory.
+  const filePath = path.resolve(snap.dir, realName);
+  if (!filePath.startsWith(path.resolve(snap.dir) + path.sep)) {
+    return res.status(404).json({ error: `File not found: ${filename}` });
+  }
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: `File not found: ${filename}` });
 
   const stat = fs.statSync(filePath);
@@ -245,6 +434,17 @@ app.get('/api/hf-cache/:org/:model/:action(resolve|raw)/main/*', (req, res) => {
     return;
   }
 
+  // A read stream that errors mid-flight (transient EBUSY/EIO under heavy
+  // concurrent I/O, antivirus interference) must close the socket cleanly —
+  // an unhandled stream error leaves the client request hanging.
+  const streamWithErrorHandling = (stream: fs.ReadStream) => {
+    stream.on('error', (err) => {
+      console.error(`[Serve] read stream error for ${path.basename(filePath)}: ${err}`);
+      res.destroy();
+    });
+    stream.pipe(res);
+  };
+
   const rangeHeader = req.headers.range;
   if (rangeHeader) {
     const [startStr, endStr] = rangeHeader.replace('bytes=', '').split('-');
@@ -256,10 +456,10 @@ app.get('/api/hf-cache/:org/:model/:action(resolve|raw)/main/*', (req, res) => {
       'Content-Range': `bytes ${start}-${end}/${fileSize}`,
       'Content-Length': chunkSize,
     });
-    fs.createReadStream(filePath, { start, end }).pipe(res);
+    streamWithErrorHandling(fs.createReadStream(filePath, { start, end }));
   } else {
     res.setHeader('Content-Length', fileSize);
-    fs.createReadStream(filePath).pipe(res);
+    streamWithErrorHandling(fs.createReadStream(filePath));
   }
 });
 
@@ -271,6 +471,13 @@ const server = http.createServer(app);
 const hub = new OrchestrationHub(server);
 
 server.listen(PORT, '127.0.0.1', () => {
+  // Model discovery summary — counts only, no paths (console may be shared in
+  // screenshots/issues). Misconfigured dirs warn loudly in readExtraModelDirs.
+  try {
+    const extra = scanExtraModelsCached().size;
+    const ollama = scanOllamaModelsCached().size;
+    console.log(`\x1b[33m[Models]\x1b[0m extra-dir aliases: ${extra} | ollama models: ${ollama} (plus project models/ + HF cache)`);
+  } catch {}
   console.log(`\x1b[36m╔════════════════════════════════════════════╗\x1b[0m`);
   console.log(`\x1b[36m║  Artifex WebGPU Dev Server                 ║\x1b[0m`);
   console.log(`\x1b[36m║  Metrics endpoint: http://localhost:${PORT}   ║\x1b[0m`);

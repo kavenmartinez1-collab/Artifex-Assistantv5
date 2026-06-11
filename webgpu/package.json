@@ -19,6 +19,7 @@
     "ws": "^8.20.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/ws": "^8.18.1",

@@ -4,3 +4,6 @@
 .eval-callback-*.log
 .greedy35b.json
 .l0-reference.md
+
+# machine-local model directory config (absolute paths — never commit)
+model-dirs.local.json

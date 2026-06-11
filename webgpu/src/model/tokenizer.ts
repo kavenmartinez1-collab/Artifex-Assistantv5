@@ -56,12 +56,15 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
   let { modelId } = config;
   let localTokenizer: PreTrainedTokenizer | null = null;
 
-  // Local models (local/xxx) can't use HF CDN for tokenizer — fall back to base model
-  // The tokenizer is the same across quantization variants
-  if (modelId.startsWith('local/')) {
+  // Local aliases (local/xxx, ollama/name:tag) can't use HF CDN for the
+  // tokenizer — fall back to base model. The tokenizer is the same across
+  // quantization variants of a family.
+  const isLocalAlias = (id: string) => id.startsWith('local/') || id.startsWith('ollama/');
+  if (isLocalAlias(modelId)) {
     // Preferred: the model dir ships its own tokenizer files (e.g. Gemma 4
     // GGUF + tokenizer.json downloaded together) — construct directly from
     // the dev-server cache, no HF Hub round-trip (mirrors the D0 node test).
+    // (Ollama aliases 404 here — blobs don't carry tokenizer.json.)
     try {
       const [tjResp, tcResp] = await Promise.all([
         fetch(`/api/hf-cache/${modelId}/raw/main/tokenizer.json`),
@@ -73,7 +76,7 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
       }
     } catch { /* fall through to base-model heuristics */ }
   }
-  if (!localTokenizer && modelId.startsWith('local/')) {
+  if (!localTokenizer && isLocalAlias(modelId)) {
     // Try to find the base model from the tokenizer_config.json served by local cache
     try {
       const resp = await fetch(`/api/hf-cache/${modelId}/raw/main/tokenizer_config.json`);
@@ -86,8 +89,8 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
         }
       }
     } catch {}
-    // If still local/, try a generic fallback based on known patterns
-    if (modelId.startsWith('local/')) {
+    // If still unresolved, try a generic fallback based on known name patterns
+    if (isLocalAlias(modelId)) {
       const name = modelId.toLowerCase();
       // Order matters: 'qwen3.6' also contains 'qwen3'. Qwen3.6 uses a NEW
       // 248320-token vocab (EOS 248046) — the Qwen3/3.5 tokenizers are NOT
@@ -96,6 +99,9 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
       else if (name.includes('qwen3.5')) modelId = 'Qwen/Qwen3.5-9B';
       else if (name.includes('qwen3')) modelId = 'Qwen/Qwen3-8B';
       else if (name.includes('qwen2.5')) modelId = 'Qwen/Qwen2.5-0.5B-Instruct';
+      // Gemma 4 family shares one tokenizer; google/ repos are gated (401),
+      // the unsloth mirror ships tokenizer.json ungated.
+      else if (name.includes('gemma4') || name.includes('gemma-4')) modelId = 'unsloth/gemma-4-e4b-it';
       console.log(`[Tokenizer] Local model fallback, using tokenizer from: ${modelId}`);
     }
   }

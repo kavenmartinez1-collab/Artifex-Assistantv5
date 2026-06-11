@@ -72,21 +72,59 @@ export function resetToRemote(): void {
   console.log(`[HF Hub] Using remote CDN`);
 }
 
-/** Fetch with local-first, CDN-fallback. If local returns 404, retry from CDN. */
+/** True for repos that exist ONLY on this machine (local/ aliases, Ollama
+ *  blobs). Falling back to the HF CDN for these is never meaningful — it
+ *  turns a transient local error into a confusing remote 401/404. */
+function isMachineLocalUrl(url: string): boolean {
+  return _localBase !== ''
+    && (url.startsWith(`${_localBase}/local/`) || url.startsWith(`${_localBase}/ollama/`));
+}
+
+/** Fetch with local-first, CDN-fallback. If local returns 404, retry from CDN —
+ *  except for machine-local repos, which retry locally with backoff and never
+ *  go remote (transient fs/socket hiccups under heavy streaming are real on
+ *  Windows; a remote fallback for these only manufactures phantom 401/404s). */
 async function fetchLocalFirst(localUrl: string, remoteUrl: string, init?: RequestInit): Promise<Response> {
   const rangeHeader = (init?.headers as Record<string, string>)?.Range ?? '';
+  const shortName = localUrl.split('/').slice(-1)[0];
   if (_localBase) {
+    const localOnly = isMachineLocalUrl(localUrl);
+
+    if (localOnly) {
+      const LOCAL_ATTEMPTS = 4;       // 1 try + 3 retries
+      const BACKOFF_MS = [0, 300, 1000, 3000];
+      let lastErr: unknown = null;
+      let lastResp: Response | null = null;
+      for (let attempt = 0; attempt < LOCAL_ATTEMPTS; attempt++) {
+        if (BACKOFF_MS[attempt] > 0) await new Promise(r => setTimeout(r, BACKOFF_MS[attempt]));
+        try {
+          if (attempt > 0) console.warn(`[HF Hub] Local retry ${attempt}/${LOCAL_ATTEMPTS - 1}: ${shortName} ${rangeHeader}`);
+          const resp = await fetch(localUrl, init);
+          if (resp.ok || resp.status === 206) return resp;
+          console.warn(`[HF Hub] Local non-OK: ${resp.status} for ${shortName}`);
+          lastResp = resp;
+          lastErr = null;
+        } catch (err) {
+          console.warn(`[HF Hub] Local fetch threw for ${shortName} ${rangeHeader}:`, err);
+          lastErr = err;
+          lastResp = null;
+        }
+      }
+      if (lastResp) return lastResp;
+      throw lastErr;
+    }
+
     try {
-      console.log(`[HF Hub] Local fetch: ${localUrl.split('/').slice(-1)[0]} ${rangeHeader}`);
+      console.log(`[HF Hub] Local fetch: ${shortName} ${rangeHeader}`);
       const resp = await fetch(localUrl, init);
       if (resp.ok || resp.status === 206) return resp;
-      console.warn(`[HF Hub] Local non-OK: ${resp.status} for ${localUrl.split('/').slice(-1)[0]}`);
+      console.warn(`[HF Hub] Local non-OK: ${resp.status} for ${shortName}`);
       if (resp.status === 404) {
         console.log(`[HF Hub] Local miss, falling back to CDN: ${remoteUrl.split('/').slice(-1)[0]}`);
         return fetchWithRetry(remoteUrl, init);
       }
     } catch (err) {
-      console.error(`[HF Hub] Local fetch THREW for ${localUrl.split('/').slice(-1)[0]} ${rangeHeader}:`, err);
+      console.error(`[HF Hub] Local fetch THREW for ${shortName} ${rangeHeader}:`, err);
       console.log(`[HF Hub] Falling back to CDN: ${remoteUrl}`);
       return fetchWithRetry(remoteUrl, init);
     }
@@ -291,7 +329,12 @@ export async function fetchRange(
   const resp = await fetchLocalFirst(url, remoteUrl, init);
 
   if (!resp.ok && resp.status !== 206) {
-    throw new Error(`Range request failed: ${resp.status} ${resp.statusText}`);
+    let detail = '';
+    try {
+      const body = await resp.text();
+      detail = body ? ` — ${body.slice(0, 200)}` : '';
+    } catch { /* body unreadable */ }
+    throw new Error(`Range request failed: ${resp.status} ${resp.statusText}${detail} (${url.split('/').slice(-1)[0]})`);
   }
 
   return resp.arrayBuffer();
