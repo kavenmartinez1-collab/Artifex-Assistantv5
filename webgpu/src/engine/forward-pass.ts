@@ -290,9 +290,20 @@ export interface ForwardOutput {
 
 // ── Forward Pass Engine ──────────────────────────────────────────────────
 
+/** Per-call options for forward(). */
+export interface ForwardOptions {
+  /** Precomputed hidden-state rows for this chunk (seqLen × hiddenSize f32),
+   *  e.g. image-patch embeddings from a vision encoder. Bypasses the token
+   *  embed stage entirely — the caller is responsible for any model-specific
+   *  embedding scaling. tokenIds are still required for cache bookkeeping
+   *  (and Gemma PLE row-gather, which is why Gemma vision needs more than
+   *  this hook). */
+  embeddings?: Float32Array;
+}
+
 export interface ForwardPassEngine {
   /** Run one forward pass step (prefill or single-token decode). */
-  forward(tokenIds: Uint32Array, kvCache: KVCache): Promise<ForwardOutput>;
+  forward(tokenIds: Uint32Array, kvCache: KVCache, opts?: ForwardOptions): Promise<ForwardOutput>;
 
   /** Create an empty KV cache for the given max sequence length.
    *  @param compressed — Use TurboQuant compression (saves ~80% KV memory) */
@@ -1426,7 +1437,7 @@ export function createForwardPassEngine(
 
   // ── Forward Pass ───────────────────────────────────────────────────
 
-  async function forward(tokenIds: Uint32Array, kvCache: KVCache): Promise<ForwardOutput> {
+  async function forward(tokenIds: Uint32Array, kvCache: KVCache, opts?: ForwardOptions): Promise<ForwardOutput> {
     const seqLen = tokenIds.length;
     const pos = kvCache.position;
     const cacheLen = pos + seqLen;
@@ -1510,8 +1521,18 @@ export function createForwardPassEngine(
       };
     }
 
-    // ── Embedding (CPU BF16, split BF16, single BF16/f32, or GPTQ INT4) ──
-    if (weights.global.embedGG) {
+    // ── Embedding (injected, CPU BF16, split BF16, single BF16/f32, GPTQ INT4) ──
+    if (opts?.embeddings) {
+      // Multimodal injection: the caller computed this chunk's hidden rows
+      // (e.g. vision-encoder image patches) — skip the token embed stage.
+      const injected = opts.embeddings;
+      if (injected.length !== seqLen * H) {
+        throw new Error(`[forward] injected embeddings: ${injected.length} floats != seqLen*H = ${seqLen * H}`);
+      }
+      device.queue.writeBuffer(
+        hiddenBuf, 0,
+        injected.buffer as ArrayBuffer, injected.byteOffset, injected.byteLength);
+    } else if (weights.global.embedGG) {
       // GGUF embed: CPU row-gather + k-quant dequant of the token's row
       const { data, ggmlType, rowBytes } = weights.global.embedGG;
       const f32 = new Float32Array(seqLen * H);

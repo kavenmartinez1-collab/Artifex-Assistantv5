@@ -117,6 +117,26 @@ export interface GenerateOptions {
   kvSession?: KVSessionState;
 }
 
+// ── Multimodal prompts ───────────────────────────────────────────────────
+
+/** One image's patch embeddings, occupying a span of placeholder tokens
+ *  (e.g. Qwen-VL's <|image_pad|> run) inside the prompt. */
+export interface PromptImage {
+  /** Index of the first placeholder position in tokenIds. */
+  start: number;
+  /** Number of placeholder positions (= embedding rows). */
+  count: number;
+  /** count × hiddenSize f32 rows from the vision encoder. */
+  embeddings: Float32Array;
+}
+
+/** Pre-tokenized prompt with image spans. Text positions embed normally;
+ *  image spans inject precomputed rows via ForwardOptions.embeddings. */
+export interface MultimodalPrompt {
+  tokenIds: number[];
+  images: PromptImage[];
+}
+
 function commonPrefixLen(a: number[], b: number[]): number {
   const n = Math.min(a.length, b.length);
   let i = 0;
@@ -486,7 +506,7 @@ export function generate(
   device: GPUDevice,
   engine: ForwardPassEngine,
   tokenizer: Tokenizer,
-  prompt: string | number[],
+  prompt: string | number[] | MultimodalPrompt,
   sampling: SamplingConfig = {},
   onToken?: OnTokenCallback,
   opts?: GenerateOptions,
@@ -517,7 +537,12 @@ export function generate(
     const startTime = performance.now();
 
     // ── Step 1: Tokenize ─────────────────────────────────────────────
-    const promptIds = typeof prompt === 'string' ? tokenizer.encode(prompt) : prompt;
+    const mm: MultimodalPrompt | null =
+      typeof prompt === 'object' && !Array.isArray(prompt) ? prompt : null;
+    const promptIds = typeof prompt === 'string'
+      ? tokenizer.encode(prompt)
+      : mm ? mm.tokenIds : prompt as number[];
+    const hasImages = mm !== null && mm.images.length > 0;
     const promptTokens = promptIds.length;
     const parityLog: { promptIds: number[]; steps: Array<{ top5: Array<[number, number]>; chosen: number }> } | null =
       (globalThis as any).__DEBUG_PARITY__ ? { promptIds: [...promptIds], steps: [] } : null;
@@ -564,6 +589,8 @@ export function generate(
       const prefixLen = commonPrefixLen(sess.cachedTokenIds, promptIds);
       const pureExtension =
         sess.kvCache !== null
+        && !hasImages                  // image pads are textually identical across
+                                       // different images — token prefix match is unsound
         && sess.compressed === config.useCompressedKV
         && sess.kvCache.position === sess.cachedTokenIds.length  // sanity: tracker matches cache
         && prefixLen === sess.cachedTokenIds.length
@@ -634,15 +661,44 @@ export function generate(
       (globalThis as any).__DEBUG_DUMP_RESULT__ = {};  // reset accumulator
       console.log(`[Probe] enabled; decode dump steps: [${decodeDumpSteps.join(', ')}]`);
     }
-    const prefillCount = prefillIds.length;
-    for (let i = 0; i < prefillCount; i += PREFILL_CHUNK) {
-      const chunkEnd = Math.min(i + PREFILL_CHUNK, prefillCount);
-      const chunk = new Uint32Array(prefillIds.slice(i, chunkEnd));
-      const isLastChunk = chunkEnd >= prefillCount;
-      if (probeEnabled && isLastChunk) {
-        (globalThis as any).__DEBUG_DUMP_STATS__ = 'prefill-end';
+    // Build prefill segments: text runs embed normally; image spans inject
+    // precomputed rows. Chunks never straddle a segment boundary. (With
+    // images, KV reuse is off, so prefillIds === promptIds.)
+    const Hdim = engine.config.hiddenSize;
+    const segments: Array<{ ids: number[]; embeds?: Float32Array }> = [];
+    if (hasImages) {
+      const imgs = [...mm!.images].sort((a, b) => a.start - b.start);
+      let cursor = 0;
+      for (const img of imgs) {
+        if (img.embeddings.length !== img.count * Hdim) {
+          throw new Error(
+            `[Generate] image at ${img.start}: ${img.embeddings.length} floats != count*H = ${img.count * Hdim}`);
+        }
+        if (img.start < cursor) throw new Error('[Generate] overlapping image spans');
+        if (img.start > cursor) segments.push({ ids: promptIds.slice(cursor, img.start) });
+        segments.push({ ids: promptIds.slice(img.start, img.start + img.count), embeds: img.embeddings });
+        cursor = img.start + img.count;
       }
-      prefillOutput = await engine.forward(chunk, kvCache);
+      if (cursor < promptIds.length) segments.push({ ids: promptIds.slice(cursor) });
+    } else {
+      segments.push({ ids: prefillIds });
+    }
+
+    const prefillCount = segments.reduce((s, seg) => s + seg.ids.length, 0);
+    for (let s = 0; s < segments.length; s++) {
+      const seg = segments[s];
+      for (let i = 0; i < seg.ids.length; i += PREFILL_CHUNK) {
+        const chunkEnd = Math.min(i + PREFILL_CHUNK, seg.ids.length);
+        const chunk = new Uint32Array(seg.ids.slice(i, chunkEnd));
+        const isLastChunk = s === segments.length - 1 && chunkEnd >= seg.ids.length;
+        if (probeEnabled && isLastChunk) {
+          (globalThis as any).__DEBUG_DUMP_STATS__ = 'prefill-end';
+        }
+        const fwdOpts = seg.embeds
+          ? { embeddings: seg.embeds.subarray(i * Hdim, chunkEnd * Hdim) }
+          : undefined;
+        prefillOutput = await engine.forward(chunk, kvCache, fwdOpts);
+      }
     }
     await device.queue.onSubmittedWorkDone();
     // The cache now holds every prompt token (cached prefix + the delta we just prefilled).
@@ -658,6 +714,22 @@ export function generate(
     let stopReason: 'eos' | 'max_length' | 'aborted' = 'max_length';
     const decodeStart = performance.now();
 
+    // Streaming decode: decoding one token at a time splits multi-byte
+    // characters (emoji stream as U+FFFD). Decode the full sequence each
+    // step, hold back a trailing replacement char (possibly an incomplete
+    // codepoint), and emit only the stable delta.
+    let emittedText = '';
+    const emitDelta = (tokenId: number, index: number) => {
+      if (!onToken) return;
+      let full = tokenizer.decode(generatedIds);
+      if (full.endsWith('�')) full = full.slice(0, -1);
+      if (full.length > emittedText.length && full.startsWith(emittedText)) {
+        const delta = full.slice(emittedText.length);
+        emittedText = full;
+        onToken(delta, tokenId, index);
+      }
+    };
+
     // Read logits from the last prefill step
     const firstLogitsRaw = await readBuffer(
       device, prefillOutput!.logitsBuffer, engine.config.vocabSize * 4,
@@ -672,9 +744,7 @@ export function generate(
       stopReason = 'eos';
     } else {
       generatedIds.push(lastTokenId);
-      if (onToken) {
-        onToken(tokenizer.decode([lastTokenId]), lastTokenId, 0);
-      }
+      emitDelta(lastTokenId, 0);
 
       // ── Step 5: Decode loop ──────────────────────────────────────
       // Step 1 (perf measurement): per-step CPU/GPU/readback/sample breakdown
@@ -799,10 +869,7 @@ export function generate(
       generatedIds.push(nextId);
       lastTokenId = nextId;
 
-      if (onToken) {
-        const tokenText = tokenizer.decode([nextId]);
-        onToken(tokenText, nextId, step);
-      }
+      emitDelta(nextId, step);
 
       // Stop if stuck in a repeating loop (saves wasted tokens)
       if (detectRepetition(generatedIds, 3, 4) || detectRepetition(generatedIds, 2, 6)) {
@@ -876,10 +943,17 @@ export function generate(
 
     // ── Step 5: Detokenize ───────────────────────────────────────────
     const text = generatedIds.length > 0 ? tokenizer.decode(generatedIds) : '';
+    // Flush any held-back tail (e.g. a final emoji that completed at EOS).
+    if (onToken && text.length > emittedText.length && text.startsWith(emittedText)) {
+      onToken(text.slice(emittedText.length), -1, generatedIds.length);
+    }
 
     // Clean up KV cache buffers — unless a session owns the cache (multi-turn
     // reuse). Session caches are destroyed by the owner (reset/unload).
     if (!sess) engine.destroyKVCache(kvCache);
+    // Image turns poison prefix reuse: a future prompt with the SAME pad
+    // tokens but a DIFFERENT image would false-match the token prefix.
+    if (sess && hasImages) sess.cachedTokenIds = [];
 
     return {
       text,
