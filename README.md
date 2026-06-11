@@ -89,7 +89,8 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 - **Agent tools** — shell execution, Python runner, web search, codebase analysis (grep, glob, architecture), file I/O, edit-in-place
 - **RAG knowledge base** — per-workspace knowledge entries with lifecycle classification, action keys, loop detection
 - **Session persistence** — save/load conversations with full metadata (model, backend, mode)
-- **WebGPU engine** — browser-based LLM inference with custom WGSL compute kernels (matmul, attention, RMSNorm, RoPE, softmax, SiLU, embedding), TurboQuant KV cache compression (3-4 bit, ~80% memory savings) with asymmetric attention for near-lossless compressed scores, batch prefill, GPTQ INT4 weight support, full transformer forward pass, and autoregressive generation with streaming. Loads any HuggingFace SafeTensors model directly in the browser with retry logic and parallel chunk prefetch.
+- **WebGPU engine** — browser-based LLM inference with custom WGSL compute kernels (matmul, attention, LayerNorm, RMSNorm, RoPE, softmax, SiLU, embedding), TurboQuant KV cache compression (3-4 bit, ~80% memory savings) with asymmetric attention for near-lossless compressed scores, batch prefill, GPTQ INT4 weight support, full transformer forward pass, and autoregressive generation with streaming. Loads HuggingFace SafeTensors, GGUF (including Ollama-store blobs), and 35B-class MoE directly in the browser with retry logic and parallel chunk prefetch.
+- **WebGPU chat & multimodal** — multi-turn conversation with KV-prefix reuse, sliding-window context management and key-point compression, session save/load (interchangeable with the desktop session format), and automatic model discovery across the Ollama store, HuggingFace cache, and user-configured directories. Browser-native vision: a from-scratch WGSL vision transformer encodes images for Qwen3-VL (parity-verified vs HuggingFace transformers to ~1e-4) and Qwen3.6 multimodal, with drag-drop / paste / file attach and per-card auto-configuration of the VRAM budget and attention limits.
 - **Secure web search** — SearXNG + Web Gateway with content sanitization, prompt injection detection, tmpfs quarantine, and network isolation
 - **Docker support** — GPU-enabled container with health checks, optional Ollama sidecar, and web gateway proxy
 - **Multi-GPU** — device selection for multi-GPU systems
@@ -118,6 +119,11 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 | WebGPU 35B MoE decode | PASS | Qwen3.6-35B-A3B at 8.08 tok/s (32 CPU workers) / ~7.5 tok/s (default 16) on 8 GB VRAM + 32 GB RAM |
 | WebGPU 35B MoE prefill | PASS | 11 tok/s — token-batched worker protocol, one expert pass per layer per 16-token chunk |
 | WebGPU 35B MoE parity | PASS | 320 teacher-forced greedy steps vs llama-server: 1.6% mismatch, all top-2 near-tie swaps (quant noise, no corruption) |
+| WebGPU 27B dense | PASS | Qwen3.6-27B UD-Q4_K_XL (64-layer DeltaNet hybrid) at ~6.6 tok/s, 16.1 GB VRAM, on a consumer GPU in the browser |
+| WebGPU vision (Qwen3-VL) | PASS | From-scratch WGSL ViT, parity vs HF transformers: preprocessing bit-exact, tower+merger mean-abs-diff ~8e-5, DeepStack taps ~2e-4 |
+| WebGPU vision (Qwen3.6 GGUF) | PASS | 27B + mmproj reads fine print off a trading card (set code, serial, 1st-edition stamp) on a consumer GPU |
+| WebGPU multi-turn chat | PASS | Sliding-window context + compression + sessions, 29/29 byte-identical vs the Python reference implementations |
+| WebGPU TurboQuant on 27B | PASS | Greedy exact-f32 vs 3-bit compressed KV: 42/64 tokens identical, first divergence a top-2 near-tie (acceptable lossy KV) |
 | Localhost binding | PASS | Confirmed NOT accessible on LAN IP |
 
 ## Supported GPU Tiers
