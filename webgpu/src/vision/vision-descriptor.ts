@@ -311,10 +311,14 @@ function gemmaDescriptorFromGGUF(file: GGUFFile): VisionDescriptor {
     },
     deepstackIndexes: [],
     placeholder: {
-      imageTokenId: 0,  // resolved via tokenizer ('<image_soft_token>')
-      startText: '<start_of_image>',
-      padText: '<image_soft_token>',
-      endText: '<end_of_image>',
+      // Gemma 4 renamed its multimodal tokens to the turn-bracket convention
+      // (verified against the blob vocab): <|image> opens, <|image|> is the
+      // repeated soft token, <image|> closes. imageTokenId resolved via the
+      // tokenizer at load.
+      imageTokenId: 0,
+      startText: '<|image>',
+      padText: '<|image|>',
+      endText: '<image|>',
       bidirectional: true,
     },
     preprocess: {

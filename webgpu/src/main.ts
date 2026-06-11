@@ -559,20 +559,28 @@ const chipsEl = $('image-chips') as HTMLDivElement;
 const SUPPORTED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/bmp'];
 const SUPPORTED_IMAGE_LABEL = 'PNG, JPEG, WebP, GIF, BMP';
 
+// The 📎 button is never hard-disabled — a dead-feeling button is worse than
+// one that explains itself. visionAvailable gates the file picker; the
+// button's title doubles as the explanation shown on click when unavailable.
+let visionAvailable = false;
+
+function setAttachState(available: boolean, title: string) {
+  visionAvailable = available;
+  attachBtn.title = title;
+  attachBtn.style.opacity = available ? '1' : '0.4';
+}
+
 function setVisionDesc(desc: VisionDescriptor | null) {
   activeVisionDesc = desc;
   if (!desc) {
-    attachBtn.disabled = true;
-    attachBtn.title = 'Load a vision model to attach images';
+    setAttachState(false, 'This model does not support images — load a vision model (e.g. local/qwen3-vl-4b-instruct).');
   } else if (!desc.verified) {
-    attachBtn.disabled = false;
-    attachBtn.title = `Attach images (${SUPPORTED_IMAGE_LABEL}) — ${desc.family} vision is EXPERIMENTAL`;
+    setAttachState(true, `Attach images (${SUPPORTED_IMAGE_LABEL}) — ${desc.family} vision is EXPERIMENTAL`);
     addMessage('system',
       `Vision detected (${desc.family}) — EXPERIMENTAL: this family hasn't passed a parity run yet. `
       + `Attach images with 📎 to try it; judge the output accordingly.`);
   } else {
-    attachBtn.disabled = false;
-    attachBtn.title = `Attach images (${SUPPORTED_IMAGE_LABEL}) — or paste / drag-drop`;
+    setAttachState(true, `Attach images (${SUPPORTED_IMAGE_LABEL}) — or paste / drag-drop`);
     addMessage('system',
       `Vision model detected — attach images with 📎, paste, or drag-drop. Supported: ${SUPPORTED_IMAGE_LABEL}.`);
   }
@@ -589,8 +597,7 @@ function resetVision() {
 // setVisionDesc(null) without the announcement (used on unload)
 function setVisionDescQuiet(desc: VisionDescriptor | null) {
   activeVisionDesc = desc;
-  attachBtn.disabled = true;
-  attachBtn.title = 'Load a vision model to attach images';
+  setAttachState(false, 'This model does not support images — load a vision model (e.g. local/qwen3-vl-4b-instruct).');
 }
 
 function renderChips() {
@@ -612,9 +619,8 @@ function renderChips() {
 }
 
 async function addPendingImage(blob: Blob, name: string) {
-  if (!activeVisionDesc || attachBtn.disabled) {
-    addMessage('system',
-      'This model does not support images. Load a vision model (e.g. local/qwen3-vl-4b-instruct) to use them.');
+  if (!activeVisionDesc || !visionAvailable) {
+    addMessage('system', attachBtn.title);
     return;
   }
   if (blob.type && blob.type.startsWith('image/') && !SUPPORTED_IMAGE_TYPES.includes(blob.type)) {
@@ -667,7 +673,13 @@ async function ensureVisionEncoder(): Promise<VisionEncoder> {
   return visionEncoderLoading;
 }
 
-attachBtn.addEventListener('click', () => imageInput.click());
+attachBtn.addEventListener('click', () => {
+  if (!visionAvailable) {
+    addMessage('system', attachBtn.title);
+    return;
+  }
+  imageInput.click();
+});
 imageInput.addEventListener('change', async (e) => {
   const input = e.target as HTMLInputElement;
   for (const f of Array.from(input.files ?? [])) await addPendingImage(f, f.name);
