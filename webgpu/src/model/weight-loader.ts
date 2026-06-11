@@ -317,6 +317,14 @@ export async function loadModel(
 
     let tensorIdx = 0;
     for (const [name, tensorInfo] of header.tensors) {
+      // Vision tower / MTP guard: multimodal checkpoints (Qwen-VL) carry the
+      // ViT under model.visual.* and Qwen3.6 ships mtp.* next-token blocks —
+      // text generation never dispatches either. Skip the VRAM until the
+      // vision path (M2) loads them deliberately.
+      if (name.startsWith('model.visual.') || name.startsWith('visual.')
+          || name.startsWith('vision_tower.') || name.startsWith('mtp.')) {
+        continue;
+      }
       // g_idx tensors are now loaded for actorder GPTQ support
       // Get raw tensor bytes — either from full shard or via chunked range requests
       let rawData: ArrayBuffer;

@@ -185,6 +185,12 @@ export async function loadGGUFModel(
   };
   const isCPUOnly = (name: string): boolean => cpuNames.has(name) || SHEXP_GATE_RE.test(name);
 
+  // Vision tower guard: multimodal GGUFs (Ollama-packed Gemma 4, Qwen-VL)
+  // carry the ViT under 'v.' and the multimodal projector under 'mm.'.
+  // Text generation never dispatches them — skip the VRAM until the vision
+  // path (M2) loads them deliberately.
+  const isVision = (name: string): boolean => name.startsWith('v.') || name.startsWith('mm.');
+
   // KV-sharing guard (gemma4): layers ≥ kvFromStart read another layer's KV
   // cache; their own k/v projection weights ship in the GGUF but are dead.
   const sharedKvLayers = archKV<number>(file, 'attention.shared_kv_layers', 0);
@@ -200,10 +206,12 @@ export async function loadGGUFModel(
   let cpuBytesPlanned = 0;
   let expertBytes = 0;
   let totalFileBytes = 0;
+  let visionBytesSkipped = 0;
   for (const t of file.tensors.values()) {
     if (FUSED_EXPERT_RE.test(t.name)) {
       throw new Error(`[GGUF] "${t.name}": fused gate+up expert tensors unsupported — expected split ffn_gate_exps/ffn_up_exps`);
     }
+    if (isVision(t.name)) { visionBytesSkipped += t.byteLength; continue; }
     if (isMTP(t.name) || isDeadKV(t.name)) continue;
     if (EXPERT_RE.test(t.name)) {
       expertBytes += t.byteLength;
@@ -241,9 +249,13 @@ export async function loadGGUFModel(
   let doneBytes = 0;
   let idx = 0;
 
+  if (visionBytesSkipped > 0) {
+    console.log(`[GGUF] Skipping vision tower: ${(visionBytesSkipped / 1e9).toFixed(2)} GB (text-only load)`);
+  }
+
   for (const t of file.tensors.values()) {
     idx++;
-    if (isMTP(t.name) || isDeadKV(t.name)) continue;
+    if (isVision(t.name) || isMTP(t.name) || isDeadKV(t.name)) continue;
     if (EXPERT_RE.test(t.name)) {
       expertTensors.set(t.name, t); // worker fleet fetches these itself
       continue;

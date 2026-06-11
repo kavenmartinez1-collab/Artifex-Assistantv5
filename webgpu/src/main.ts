@@ -619,6 +619,16 @@ sendBtn.addEventListener('click', async () => {
     if (!isRaw) {
       chatHistory.push({ role: 'assistant', content: stripThinking(result.text) });
       autoSave(chatHistory, { model: currentModel?.repo ?? 'unknown', backend: 'webgpu' });
+
+      // Final render: a non-thinking model never emits think markers, so the
+      // stream rendered everything dimmed under assumeThinkingOpen. If the
+      // model finished cleanly with no markers anywhere, settle to a normal
+      // answer. (On max_length/abort with assumeOpen, it really was thought.)
+      const sawMarker = THINK_MARKERS.some(
+        m => result.text.includes(m.open) || result.text.includes(m.close));
+      if (!sawMarker && result.stopReason === 'eos' && result.text) {
+        responseDiv.textContent = result.text;
+      }
     }
 
     // If no streaming happened (e.g., empty response), show the full text
