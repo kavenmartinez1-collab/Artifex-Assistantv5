@@ -29,8 +29,10 @@ class TestAttentionCacheLenLimit:
     def _read_ts_max_attn_cache(self):
         with open(TS_PATH, "r") as f:
             text = f.read()
-        match = re.search(r'const\s+MAX_ATTN_CACHE\s*=\s*(\d+)', text)
-        assert match, "Could not find MAX_ATTN_CACHE constant in forward-pass.ts"
+        # The literal lives in the exported MAX_ATTN_SEQ_LEN (KV sessions clamp
+        # to it); the dispatch guards keep MAX_ATTN_CACHE as a local alias.
+        match = re.search(r'const\s+MAX_ATTN_SEQ_LEN\s*=\s*(\d+)', text)
+        assert match, "Could not find MAX_ATTN_SEQ_LEN constant in forward-pass.ts"
         return int(match.group(1))
 
     def test_constants_match(self):
