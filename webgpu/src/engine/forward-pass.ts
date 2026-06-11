@@ -2910,6 +2910,30 @@ export function createForwardPassEngine(
         `Cap maxSeqLen at ${MAX_ATTN_CACHE} or rebuild attention.wgsl with a larger workgroup array.`,
       );
     }
+    // TurboQuant audit guard: the compressed branch reconstructs full K/V into
+    // global-kvDim scratch and attends without sliding-window / KV-sharing /
+    // per-layer-head-dim awareness. Those features (Gemma 4) would silently
+    // produce wrong output under compression. Refuse rather than mislead —
+    // TQ is supported on uniform full-attention models (dense Qwen2.5/3) and
+    // the full-attention layers of DeltaNet hybrids (Qwen3.5/3.6).
+    if (compressed) {
+      const offenders = config.layers
+        .map((d, i) => ({ d, i }))
+        .filter(({ d }) =>
+          d.kvSourceLayer !== undefined
+          || (d.slidingWindow ?? 0) > 0
+          || (d.headDim !== undefined && d.headDim !== dHead));
+      if (offenders.length > 0) {
+        const kinds = [...new Set(offenders.map(({ d }) =>
+          d.kvSourceLayer !== undefined ? 'kv-sharing'
+            : (d.slidingWindow ?? 0) > 0 ? 'sliding-window' : 'per-layer-head-dim'))];
+        throw new Error(
+          `[KVCache] TurboQuant compression is not supported for this model: `
+          + `${offenders.length} layer(s) use ${kinds.join(' / ')}, which the compressed `
+          + `attention path does not yet honor. Disable TurboQuant for this model `
+          + `(${config.modelType}) or extend the compressed branch.`);
+      }
+    }
     // For hybrid models, allocate SSM state for linear attention layers
     let ssmState: SSMState | undefined;
     if (config.isHybrid) {
@@ -2982,24 +3006,34 @@ export function createForwardPassEngine(
     const residualNormsK: GPUBuffer[] = [];
     const residualNormsV: GPUBuffer[] = [];
 
+    // Only full-attention layers touch the compressed cache. In a DeltaNet
+    // hybrid, the linear-attention layers go through the SSM path and never
+    // index these buffers — allocate a 4-byte placeholder for them so the
+    // arrays stay layer-indexed without wasting hundreds of MB (e.g. 54 of
+    // the 27B's 64 layers are linear).
+    let tqLayers = 0;
     for (let l = 0; l < L; l++) {
-      quantizedK.push(createStorageBuffer(device, null, quantBufSize, `tq-qk-${l}`, false));
-      quantizedV.push(createStorageBuffer(device, null, quantBufSize, `tq-qv-${l}`, false));
-      signBitsK.push(createStorageBuffer(device, null, signBufSize, `tq-sk-${l}`, false));
-      signBitsV.push(createStorageBuffer(device, null, signBufSize, `tq-sv-${l}`, false));
-      normsK.push(createStorageBuffer(device, null, normBufSize, `tq-nk-${l}`, false));
-      normsV.push(createStorageBuffer(device, null, normBufSize, `tq-nv-${l}`, false));
-      residualNormsK.push(createStorageBuffer(device, null, normBufSize, `tq-rnk-${l}`, false));
-      residualNormsV.push(createStorageBuffer(device, null, normBufSize, `tq-rnv-${l}`, false));
+      const usesKV = config.layers[l].kind !== 'linear_attention';
+      const sz = (bytes: number) => usesKV ? bytes : 4;
+      quantizedK.push(createStorageBuffer(device, null, sz(quantBufSize), `tq-qk-${l}`, false));
+      quantizedV.push(createStorageBuffer(device, null, sz(quantBufSize), `tq-qv-${l}`, false));
+      signBitsK.push(createStorageBuffer(device, null, sz(signBufSize), `tq-sk-${l}`, false));
+      signBitsV.push(createStorageBuffer(device, null, sz(signBufSize), `tq-sv-${l}`, false));
+      normsK.push(createStorageBuffer(device, null, sz(normBufSize), `tq-nk-${l}`, false));
+      normsV.push(createStorageBuffer(device, null, sz(normBufSize), `tq-nv-${l}`, false));
+      residualNormsK.push(createStorageBuffer(device, null, sz(normBufSize), `tq-rnk-${l}`, false));
+      residualNormsV.push(createStorageBuffer(device, null, sz(normBufSize), `tq-rnv-${l}`, false));
+      if (usesKV) tqLayers++;
     }
 
     // Shared scratch f32 buffers (reused across layers during decode)
     const scratchK = createStorageBuffer(device, null, maxSeqLen * kvDim * 4, 'tq-scratch-k', true);
     const scratchV = createStorageBuffer(device, null, maxSeqLen * kvDim * 4, 'tq-scratch-v', true);
 
-    const compressedBytes = L * (quantBufSize + signBufSize + normBufSize * 2) * 2;
-    const f32Bytes = L * maxSeqLen * kvDim * 4 * 2;
+    const compressedBytes = tqLayers * (quantBufSize + signBufSize + normBufSize * 2) * 2;
+    const f32Bytes = tqLayers * maxSeqLen * kvDim * 4 * 2;
     console.log(`[KVCache] TurboQuant ${TQ_BITS}-bit: ${(compressedBytes / 1024 / 1024).toFixed(1)} MB ` +
+      `over ${tqLayers} full-attention layer(s) ` +
       `(vs ${(f32Bytes / 1024 / 1024).toFixed(1)} MB f32, saving ${((1 - compressedBytes / f32Bytes) * 100).toFixed(0)}%)`);
 
     return {

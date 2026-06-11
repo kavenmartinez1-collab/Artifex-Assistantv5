@@ -752,6 +752,47 @@ document.addEventListener('drop', async (e) => {
   console.log('[parity] done — preprocessing should be ~1e-6; tower f32-vs-f32 ~1e-3 or better');
 };
 
+// ─── TurboQuant parity harness (console: __TQ_PARITY__("prompt", N)) ───────
+// Greedy-decodes the same prompt twice — exact f32 KV vs TurboQuant
+// compressed KV — and reports the first divergent token. The honest gate
+// before trusting compression on a given model: a few divergences late in a
+// long decode is expected (lossy KV); early/frequent divergence means the
+// compressed path is wrong for this family.
+(globalThis as any).__TQ_PARITY__ = async (prompt = 'Explain how a rainbow forms, step by step.', maxNew = 64) => {
+  if (!session) { console.error('Load a model first'); return; }
+  const greedy = { temperature: 0, maxNewTokens: maxNew } as any;
+  const collect = async (useCompressedKV: boolean) => {
+    const ids: number[] = [];
+    const messages = [{ role: 'user', content: prompt }];
+    const h = (session as any).chat(messages, { ...greedy, useCompressedKV },
+      (_t: string, id: number) => ids.push(id));
+    await h.result;
+    return ids;
+  };
+  console.log('[tq-parity] decoding exact (f32 KV)...');
+  const exact = await collect(false);
+  console.log('[tq-parity] decoding compressed (TurboQuant KV)...');
+  let comp: number[];
+  try {
+    comp = await collect(true);
+  } catch (err) {
+    console.error('[tq-parity] compressed decode refused/failed:', err);
+    return;
+  }
+  const n = Math.min(exact.length, comp.length);
+  let firstDiff = -1;
+  for (let i = 0; i < n; i++) if (exact[i] !== comp[i]) { firstDiff = i; break; }
+  if (firstDiff === -1 && exact.length === comp.length) {
+    console.log(`[tq-parity] IDENTICAL across all ${n} tokens — TurboQuant is exact-match on ${session.config.modelType}`);
+  } else {
+    const at = firstDiff === -1 ? n : firstDiff;
+    console.log(`[tq-parity] first divergence at token ${at}/${n} (${((at / n) * 100).toFixed(0)}% in) — `
+      + `exact="${session.tokenizer.decode(exact.slice(Math.max(0, at - 2), at + 1))}" `
+      + `comp="${session.tokenizer.decode(comp.slice(Math.max(0, at - 2), at + 1))}"`);
+    console.log('[tq-parity] late single-token divergence = acceptable lossy KV; early/frequent = compressed path bug');
+  }
+};
+
 /** Resolve the VRAM budget for model loading. Priority: manual override
  *  (localStorage 'vramBudgetGB') → driver-reported free memory on the
  *  display GPU minus a compositor/safety reserve → undefined (loader's
