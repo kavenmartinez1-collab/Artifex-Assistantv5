@@ -565,10 +565,11 @@ function setVisionDesc(desc: VisionDescriptor | null) {
     attachBtn.disabled = true;
     attachBtn.title = 'Load a vision model to attach images';
   } else if (!desc.verified) {
-    attachBtn.disabled = true;
-    attachBtn.title = `${desc.family} vision support is not parity-verified yet`;
+    attachBtn.disabled = false;
+    attachBtn.title = `Attach images (${SUPPORTED_IMAGE_LABEL}) — ${desc.family} vision is EXPERIMENTAL`;
     addMessage('system',
-      `This model has a ${desc.family} vision tower, but that family isn't parity-verified yet — image input stays disabled.`);
+      `Vision detected (${desc.family}) — EXPERIMENTAL: this family hasn't passed a parity run yet. `
+      + `Attach images with 📎 to try it; judge the output accordingly.`);
   } else {
     attachBtn.disabled = false;
     attachBtn.title = `Attach images (${SUPPORTED_IMAGE_LABEL}) — or paste / drag-drop`;
@@ -642,12 +643,16 @@ async function ensureVisionEncoder(): Promise<VisionEncoder> {
       const isLocalRepo = repo.startsWith('local/') || repo.startsWith('ollama/');
       if (isLocalRepo) useLocalCache();
       try {
+        const desc = activeVisionDesc!;
         const weights = activeVisionSource.kind === 'gguf'
-          ? await (await import('./vision/vision-loader-gguf')).loadVisionWeightsGGUF(
-              gpu!.device, repo, activeVisionSource.file, activeVisionDesc!, (m) => setStatus(m))
+          ? desc.towerVariant === 'gemma4'
+            ? await (await import('./vision/vision-loader-gguf')).loadGemmaVisionWeightsGGUF(
+                gpu!.device, repo, activeVisionSource.file, desc, (m) => setStatus(m))
+            : await (await import('./vision/vision-loader-gguf')).loadVisionWeightsGGUF(
+                gpu!.device, repo, activeVisionSource.file, desc, (m) => setStatus(m))
           : await loadVisionWeights(
-              gpu!.device, repo, activeVisionDesc!, (m) => setStatus(m));
-        visionEncoder = createVisionEncoder(gpu!.device, activeVisionDesc!, weights);
+              gpu!.device, repo, desc, (m) => setStatus(m));
+        visionEncoder = createVisionEncoder(gpu!.device, desc, weights);
         addMessage('system',
           `Vision tower loaded: ${(weights.totalGPUBytes / 1e9).toFixed(2)} GB GPU.`, 'vision ready');
         return visionEncoder;
@@ -855,8 +860,11 @@ sendBtn.addEventListener('click', async () => {
           setStatus(`Encoding ${img.name}...`);
           encoded.push(await encoder.encode(img.pre));
         }
-        const padBlock = encoded.map(e =>
-          `<|vision_start|>${'<|image_pad|>'.repeat(e.numTokens)}<|vision_end|>`).join('');
+        const ph = activeVisionDesc.placeholder;
+        const startT = ph.startText ?? '<|vision_start|>';
+        const padT = ph.padText ?? '<|image_pad|>';
+        const endT = ph.endText ?? '<|vision_end|>';
+        const padBlock = encoded.map(e => `${startT}${padT.repeat(e.numTokens)}${endT}`).join('');
         const mmMessages = sendMessages.map((m, idx) =>
           idx === sendMessages.length - 1 && m.role === 'user'
             ? { ...m, content: padBlock + m.content }
@@ -1332,6 +1340,26 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
     } catch (err) {
       console.warn('[Vision] mmproj parse failed:', err);
     }
+  } else {
+    // No sibling mmproj — Ollama-packed multimodal blobs (Gemma 4) carry the
+    // tower inline in the text GGUF.
+    try {
+      const { visionDescriptorFromGGUF } = await import('./vision/vision-descriptor');
+      const vdesc = visionDescriptorFromGGUF(model.file);
+      if (vdesc) {
+        const padIds = tokenizer.encode(vdesc.placeholder.padText ?? '<|image_pad|>');
+        if (padIds.length === 1) {
+          vdesc.placeholder.imageTokenId = padIds[0];
+          activeVisionSource = { kind: 'gguf', file: ggufFile };
+          setVisionDesc(vdesc);
+          visionConfigured = true;
+        } else {
+          console.warn('[Vision] tokenizer lacks the image placeholder special token — vision disabled');
+        }
+      }
+    } catch (err) {
+      console.warn('[Vision] inline vision probe failed:', err);
+    }
   }
   resetToRemote();
   if (!visionConfigured) setVisionDescQuiet(null);
@@ -1376,6 +1404,7 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
           start: s.start, count: s.count,
           embeddings: encoded[k].embeddings,
           deepstack: encoded[k].deepstack,
+          bidirectional: activeVisionDesc!.placeholder.bidirectional,
         };
       });
       return generate(gpu!.device, engine, tokenizer, { tokenIds, images }, sampling, onToken, { kvSession });

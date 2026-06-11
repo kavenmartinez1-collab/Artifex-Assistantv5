@@ -156,8 +156,11 @@ export async function preprocessImage(
     }
   }
 
+  // Tokens per image: qwen merger divides by merge², gemma's pooler by
+  // poolKernel² — unless the family pins a fixed count.
+  const tokenDiv = desc.projector.kind === 'qwen_merger' ? merge : (desc.gemma?.poolKernel ?? 1);
   const numTokens = desc.placeholder.fixedTokens
-    ?? Math.floor(numPatches / (merge * merge));
+    ?? Math.floor(numPatches / (tokenDiv * tokenDiv));
 
   return { patches, gridH, gridW, numTokens };
 }

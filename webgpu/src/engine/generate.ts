@@ -131,6 +131,9 @@ export interface PromptImage {
   /** Qwen3-VL DeepStack features: one count × hiddenSize array per early
    *  text layer, added to that layer's output at this image's positions. */
   deepstack?: Float32Array[];
+  /** This image's span attends bidirectionally (Gemma text-side semantics).
+   *  Requires the span to fit one prefill chunk. */
+  bidirectional?: boolean;
 }
 
 /** Pre-tokenized prompt with image spans. Text positions embed normally;
@@ -668,7 +671,9 @@ export function generate(
     // precomputed rows. Chunks never straddle a segment boundary. (With
     // images, KV reuse is off, so prefillIds === promptIds.)
     const Hdim = engine.config.hiddenSize;
-    const segments: Array<{ ids: number[]; embeds?: Float32Array; deepstack?: Float32Array[] }> = [];
+    const segments: Array<{
+      ids: number[]; embeds?: Float32Array; deepstack?: Float32Array[]; bidirectional?: boolean;
+    }> = [];
     if (hasImages) {
       const imgs = [...mm!.images].sort((a, b) => a.start - b.start);
       let cursor = 0;
@@ -683,6 +688,7 @@ export function generate(
           ids: promptIds.slice(img.start, img.start + img.count),
           embeds: img.embeddings,
           deepstack: img.deepstack,
+          bidirectional: img.bidirectional,
         });
         cursor = img.start + img.count;
       }
@@ -701,10 +707,16 @@ export function generate(
         if (probeEnabled && isLastChunk) {
           (globalThis as any).__DEBUG_DUMP_STATS__ = 'prefill-end';
         }
+        if (seg.bidirectional && seg.ids.length > PREFILL_CHUNK) {
+          throw new Error(
+            `[Generate] bidirectional image span (${seg.ids.length} tokens) exceeds the `
+            + `prefill chunk (${PREFILL_CHUNK}) — bidirectionality cannot span chunks`);
+        }
         const fwdOpts = seg.embeds
           ? {
               embeddings: seg.embeds.subarray(i * Hdim, chunkEnd * Hdim),
               deepstackFeatures: seg.deepstack?.map(f => f.subarray(i * Hdim, chunkEnd * Hdim)),
+              bidirectional: seg.bidirectional,
             }
           : undefined;
         prefillOutput = await engine.forward(chunk, kvCache, fwdOpts);

@@ -16,11 +16,43 @@
  */
 
 import { fetchRange, resolveFileUrl } from '../model/hf-hub';
-import { parseGGUF, type GGUFTensorInfo } from '../model/gguf';
+import { parseGGUF, type GGUFFile, type GGUFTensorInfo } from '../model/gguf';
 import { dequantGGML } from '../model/gguf-dequant';
 import { createStorageBuffer } from '../engine/buffers';
 import type { VisionDescriptor } from './vision-descriptor';
 import type { VisionWeights, VisionBlockWeights, VisionMergerWeights } from './vision-loader';
+
+// ── Gemma 4 tower weights (separate shape from the qwen-clip tower) ─────
+
+/** Gemma4ClippableLinear calibration ranges — clamp x before the matmul and
+ *  the output after. Values are tiny f32[1] tensors, read CPU-side. */
+export interface ClampRange { inLo: number; inHi: number; outLo: number; outHi: number }
+
+export interface GemmaBlockWeights {
+  ln1: GPUBuffer;
+  q: GPUBuffer; k: GPUBuffer; v: GPUBuffer;
+  qClamp?: ClampRange; kClamp?: ClampRange; vClamp?: ClampRange;
+  qNorm: GPUBuffer; kNorm: GPUBuffer;        // per-head RMS [head_dim]
+  attnOut: GPUBuffer; attnOutClamp?: ClampRange;
+  attnPostNorm: GPUBuffer;
+  ln2: GPUBuffer;
+  gate: GPUBuffer; gateClamp?: ClampRange;
+  up: GPUBuffer; upClamp?: ClampRange;
+  down: GPUBuffer; downClamp?: ClampRange;
+  ffnPostNorm: GPUBuffer;
+}
+
+export interface GemmaVisionWeights {
+  variant: 'gemma4';
+  patchEmbed: GPUBuffer;          // [hidden, C·P·P] flattened conv, no bias
+  /** Factorized position tables, CPU-side: x then y, each [posSize, hidden]. */
+  posTableX: Float32Array;
+  posTableY: Float32Array;
+  blocks: GemmaBlockWeights[];
+  inputProjection: GPUBuffer;     // [textHidden, hidden]
+  totalGPUBytes: number;
+  destroy(): void;
+}
 
 export async function loadVisionWeightsGGUF(
   device: GPUDevice,
@@ -106,6 +138,101 @@ export async function loadVisionWeightsGGUF(
   return {
     patchEmbed, patchEmbedBias, posEmbedCPU,
     blocks, merger, deepstack: [], totalGPUBytes,
+    destroy() { for (const b of allBuffers) b.destroy(); },
+  };
+}
+
+/** Load the Gemma 4 tower from an Ollama-packed GGUF (v. and mm. tensors inline). */
+export async function loadGemmaVisionWeightsGGUF(
+  device: GPUDevice,
+  repo: string,
+  filename: string,
+  desc: VisionDescriptor,
+  onProgress?: (msg: string) => void,
+): Promise<GemmaVisionWeights> {
+  const url = resolveFileUrl(repo, filename);
+  const file: GGUFFile = await parseGGUF((s, e) => fetchRange(url, s, e));
+
+  let totalGPUBytes = 0;
+  const allBuffers: GPUBuffer[] = [];
+
+  function info(name: string): GGUFTensorInfo {
+    const t = file.tensors.get(name);
+    if (!t) throw new Error(`[Vision] gemma blob missing tensor: ${name}`);
+    return t;
+  }
+  async function fetchF32(name: string): Promise<Float32Array> {
+    const t = info(name);
+    const raw = await fetchRange(url, t.offset, t.offset + t.byteLength);
+    const n = t.ne.reduce((a, b) => a * b, 1);
+    return dequantGGML(t.ggmlType, raw, n);
+  }
+  function upload(f32: Float32Array, label: string): GPUBuffer {
+    const buf = createStorageBuffer(device, f32, f32.byteLength, `vis-gm-${label}`);
+    totalGPUBytes += f32.byteLength;
+    allBuffers.push(buf);
+    return buf;
+  }
+  async function gpu(name: string, label: string): Promise<GPUBuffer> {
+    return upload(await fetchF32(name), label);
+  }
+  /** Read the four Gemma4ClippableLinear scalars; undefined when absent. */
+  async function clampOf(base: string): Promise<ClampRange | undefined> {
+    if (!file.tensors.has(`${base}.input_min`)) return undefined;
+    const one = async (s: string) => (await fetchF32(`${base}.${s}`))[0];
+    return {
+      inLo: await one('input_min'), inHi: await one('input_max'),
+      outLo: await one('output_min'), outHi: await one('output_max'),
+    };
+  }
+
+  onProgress?.(`Loading Gemma vision tower: ${filename}...`);
+
+  const patchEmbed = await gpu('v.patch_embd.weight', 'patch');
+
+  // v.position_embd.weight ne [hidden, posSize, 2] → two tables, x then y
+  const posT = info('v.position_embd.weight');
+  const posAll = await fetchF32('v.position_embd.weight');
+  const posSize = posT.ne[1];
+  const H = posT.ne[0];
+  const posTableX = posAll.subarray(0, posSize * H);
+  const posTableY = posAll.subarray(posSize * H, 2 * posSize * H);
+
+  const blocks: GemmaBlockWeights[] = [];
+  for (let i = 0; i < desc.depth; i++) {
+    onProgress?.(`Gemma vision block ${i + 1}/${desc.depth}...`);
+    const base = `v.blk.${i}`;
+    blocks.push({
+      ln1: await gpu(`${base}.ln1.weight`, `ln1-${i}`),
+      q: await gpu(`${base}.attn_q.weight`, `q-${i}`),
+      k: await gpu(`${base}.attn_k.weight`, `k-${i}`),
+      v: await gpu(`${base}.attn_v.weight`, `v-${i}`),
+      qClamp: await clampOf(`${base}.attn_q`),
+      kClamp: await clampOf(`${base}.attn_k`),
+      vClamp: await clampOf(`${base}.attn_v`),
+      qNorm: await gpu(`${base}.attn_q_norm.weight`, `qn-${i}`),
+      kNorm: await gpu(`${base}.attn_k_norm.weight`, `kn-${i}`),
+      attnOut: await gpu(`${base}.attn_out.weight`, `ao-${i}`),
+      attnOutClamp: await clampOf(`${base}.attn_out`),
+      attnPostNorm: await gpu(`${base}.attn_post_norm.weight`, `apn-${i}`),
+      ln2: await gpu(`${base}.ln2.weight`, `ln2-${i}`),
+      gate: await gpu(`${base}.ffn_gate.weight`, `g-${i}`),
+      gateClamp: await clampOf(`${base}.ffn_gate`),
+      up: await gpu(`${base}.ffn_up.weight`, `u-${i}`),
+      upClamp: await clampOf(`${base}.ffn_up`),
+      down: await gpu(`${base}.ffn_down.weight`, `d-${i}`),
+      downClamp: await clampOf(`${base}.ffn_down`),
+      ffnPostNorm: await gpu(`${base}.ffn_post_norm.weight`, `fpn-${i}`),
+    });
+  }
+
+  const inputProjection = await gpu('mm.input_projection.weight', 'proj');
+
+  onProgress?.(`Gemma vision tower loaded: ${(totalGPUBytes / 1e9).toFixed(2)} GB GPU`);
+
+  return {
+    variant: 'gemma4',
+    patchEmbed, posTableX, posTableY, blocks, inputProjection, totalGPUBytes,
     destroy() { for (const b of allBuffers) b.destroy(); },
   };
 }

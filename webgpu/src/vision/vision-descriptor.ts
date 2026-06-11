@@ -23,8 +23,20 @@ import type { GGUFFile } from '../model/gguf';
 
 export interface VisionDescriptor {
   family: 'qwen3_vl' | 'qwen_vl_siglip' | 'gemma4' | 'unknown';
+  /** Which compute graph the encoder runs. qwen_clip = LayerNorm tower with
+   *  fused/split QKV + interleaved 2D RoPE + merger MLP. gemma4 = RMS-norm
+   *  tower with QAT clamps, per-head QK norms, x/y-half RoPE, avg-pool
+   *  projector (spec: llama.cpp clip_graph_gemma4v). */
+  towerVariant: 'qwen_clip' | 'gemma4';
   /** Builder confidence: false = best-effort defaults, needs parity run. */
   verified: boolean;
+
+  /** gemma4 tower constants (present when towerVariant === 'gemma4'). */
+  gemma?: {
+    ropeTheta: number;   // 100 — yes, one hundred
+    attnScale: number;   // 1.0 (not 1/sqrt(d))
+    poolKernel: number;  // projector.scale_factor (3)
+  };
 
   // ── Tower ──────────────────────────────────────────────────────────
   depth: number;
@@ -67,6 +79,13 @@ export interface VisionDescriptor {
     endTokenId?: number;
     /** Fixed token count per image (Gemma). Undefined = grid-derived. */
     fixedTokens?: number;
+    /** Template strings for building the pad block (family-specific).
+     *  Defaults to the Qwen literals when absent. */
+    startText?: string;
+    padText?: string;
+    endText?: string;
+    /** Image spans attend bidirectionally on the text side (Gemma). */
+    bidirectional?: boolean;
   };
 
   // ── Preprocessing ──────────────────────────────────────────────────
@@ -99,6 +118,7 @@ export function visionDescriptorFromHFConfig(
     const factor = patch * merge;
     return {
       family: 'qwen3_vl',
+      towerVariant: 'qwen_clip',
       verified: true,
       depth: vc.depth ?? 24,
       hiddenSize: vc.hidden_size ?? 1024,
@@ -148,6 +168,7 @@ export function visionDescriptorFromHFConfig(
     const merge = vc.spatial_merge_size ?? 2;
     return {
       family: 'qwen_vl_siglip',
+      towerVariant: 'qwen_clip',
       verified: false,
       depth: vc.depth ?? 27,
       hiddenSize: vc.hidden_size ?? 1152,
@@ -201,6 +222,12 @@ export function visionDescriptorFromHFConfig(
  * text vocab; the caller resolves '<|image_pad|>' through the tokenizer.
  */
 export function visionDescriptorFromGGUF(file: GGUFFile): VisionDescriptor | null {
+  // Ollama-packed Gemma 4: vision rides inline in the text GGUF under
+  // gemma4.vision.* — no clip.* section, no separate mmproj file.
+  if (file.kv.get('general.architecture') === 'gemma4'
+      && Number(file.kv.get('gemma4.vision.block_count') ?? 0) > 0) {
+    return gemmaDescriptorFromGGUF(file);
+  }
   if (file.kv.get('clip.has_vision_encoder') !== true) return null;
   const kv = <T>(k: string, fb: T): T => (file.kv.get(k) as T) ?? fb;
   const projType = kv<string>('clip.projector_type', '');
@@ -216,6 +243,7 @@ export function visionDescriptorFromGGUF(file: GGUFFile): VisionDescriptor | nul
   const posCount = posT ? posT.shape[0] : 0;
   return {
     family: 'qwen3_vl',
+    towerVariant: 'qwen_clip',
     // Same compute graph as the parity-verified HF qwen3-vl tower; dims are
     // checkpoint-declared. End-to-end quality still owed a reference check.
     verified: true,
@@ -251,6 +279,58 @@ export function visionDescriptorFromGGUF(file: GGUFFile): VisionDescriptor | nul
   };
 }
 
+/** Gemma 4 from an Ollama-packed GGUF (spec: llama.cpp clip_graph_gemma4v).
+ *  verified stays false until an e2e/parity pass — the UI allows attaching
+ *  with an "experimental" warning rather than silently trusting it. */
+function gemmaDescriptorFromGGUF(file: GGUFFile): VisionDescriptor {
+  const kv = <T>(k: string, fb: T): T => (file.kv.get(k) as T) ?? fb;
+  const patch = kv('gemma4.vision.patch_size', 16);
+  const poolKernel = kv('gemma4.vision.projector.scale_factor', 3);
+  const factor = patch * poolKernel;
+  return {
+    family: 'gemma4',
+    towerVariant: 'gemma4',
+    gemma: { ropeTheta: 100, attnScale: 1.0, poolKernel },
+    verified: false,
+    depth: kv('gemma4.vision.block_count', 16),
+    hiddenSize: kv('gemma4.vision.embedding_length', 768),
+    numHeads: kv('gemma4.vision.attention.head_count', 12),
+    intermediateSize: kv('gemma4.vision.feed_forward_length', 3072),
+    activation: 'gelu_tanh',
+    norm: 'rmsnorm',
+    hasBias: false,
+    fusedQKV: false,
+    patchSize: patch,
+    temporalPatchSize: 1,
+    inChannels: kv('gemma4.vision.num_channels', 3),
+    posEmbed: { kind: 'none' },  // factorized x/y tables — gemma loader handles them
+    projector: {
+      kind: 'pool_linear',
+      outTokens: 0,  // dynamic: (grid/poolKernel)²
+      outHiddenSize: kv('gemma4.embedding_length', 2560),
+    },
+    deepstackIndexes: [],
+    placeholder: {
+      imageTokenId: 0,  // resolved via tokenizer ('<image_soft_token>')
+      startText: '<start_of_image>',
+      padText: '<image_soft_token>',
+      endText: '<end_of_image>',
+      bidirectional: true,
+    },
+    preprocess: {
+      imageMean: [0.5, 0.5, 0.5],   // llama.cpp scales x*2-1 ≡ (x-0.5)/0.5
+      imageStd: [0.5, 0.5, 0.5],
+      // bilinear into the 252-280-token band (tokens × factor² pixels)
+      resize: {
+        kind: 'smart',
+        minPixels: 252 * factor * factor,
+        maxPixels: 280 * factor * factor,
+        factor,
+      },
+    },
+  };
+}
+
 function visionDescriptorFromGemmaHF(
   hfConfig: Record<string, any>,
   vc: Record<string, any>,
@@ -261,6 +341,8 @@ function visionDescriptorFromGemmaHF(
   if (modelType.startsWith('gemma')) {
     return {
       family: 'gemma4',
+      towerVariant: 'gemma4',
+      gemma: { ropeTheta: 100, attnScale: 1.0, poolKernel: 3 },
       verified: false,
       depth: vc.num_hidden_layers ?? vc.depth ?? 27,
       hiddenSize: vc.hidden_size ?? 1152,

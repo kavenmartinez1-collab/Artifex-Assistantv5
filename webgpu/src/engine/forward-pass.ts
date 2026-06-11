@@ -303,6 +303,8 @@ export interface ForwardOptions {
    *  text layer k's output for this chunk. Callers pass this only on
    *  image-segment chunks, so every row is an image row by construction. */
   deepstackFeatures?: Float32Array[];
+  /** Image-span chunks attend bidirectionally within the chunk (Gemma). */
+  bidirectional?: boolean;
 }
 
 export interface ForwardPassEngine {
@@ -2206,7 +2208,10 @@ export function createForwardPassEngine(
         }
 
         // Write new K, V to cache and run attention
-        const isCausal = seqLen > 1;
+        // Gemma image spans attend bidirectionally: when the caller marks a
+        // multimodal chunk bidirectional, its queries see the whole chunk
+        // (plus the full cache prefix) instead of the causal triangle.
+        const isCausal = seqLen > 1 && !opts?.bidirectional;
 
         if (kvCache.compressed) {
           const c = kvCache.compressed;

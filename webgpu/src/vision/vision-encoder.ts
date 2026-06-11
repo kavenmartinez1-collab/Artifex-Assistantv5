@@ -31,9 +31,12 @@ import type { PreprocessedImage } from './preprocess';
 
 import matmulWGSL from '../shaders/matmul.wgsl?raw';
 import layernormWGSL from '../shaders/layernorm.wgsl?raw';
+import rmsnormWGSL from '../shaders/rmsnorm.wgsl?raw';
 import elementwiseWGSL from '../shaders/elementwise.wgsl?raw';
 import attentionWGSL from '../shaders/attention.wgsl?raw';
 import visionRopeWGSL from '../shaders/vision_rope.wgsl?raw';
+import visionOpsWGSL from '../shaders/vision_ops.wgsl?raw';
+import type { GemmaVisionWeights, ClampRange } from './vision-loader-gguf';
 
 /** attention.wgsl shared-memory ceiling — patches per image must fit. */
 export const MAX_VIT_PATCHES = 3840;
@@ -54,10 +57,21 @@ export interface VisionEncoder {
 export function createVisionEncoder(
   device: GPUDevice,
   desc: VisionDescriptor,
+  weights: VisionWeights | GemmaVisionWeights,
+): VisionEncoder {
+  if (desc.towerVariant === 'gemma4') {
+    return createGemmaVisionEncoder(device, desc, weights as GemmaVisionWeights);
+  }
+  return createQwenVisionEncoder(device, desc, weights as VisionWeights);
+}
+
+function createQwenVisionEncoder(
+  device: GPUDevice,
+  desc: VisionDescriptor,
   weights: VisionWeights,
 ): VisionEncoder {
   if (!desc.fusedQKV) {
-    throw new Error('[Vision] split-QKV (GGUF clip) towers land in M2 — fused QKV only for now');
+    throw new Error('[Vision] split-QKV qwen-clip towers not yet wired — fused QKV only');
   }
   const H = desc.hiddenSize;
   const heads = desc.numHeads;
@@ -375,5 +389,306 @@ export function createVisionEncoder(
   return {
     encode,
     destroy() { weights.destroy(); },
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Gemma 4 tower (spec: llama.cpp clip_graph_gemma4v — see vision_ops.wgsl
+// header and the descriptor builder for the extracted constants).
+//
+// Per block: RMS ln1 → clamped Q/K/V matmuls → per-head RMS Q/K norms →
+// x/y-half RoPE (θ=100) → weightless RMS on V → attention (scale 1.0) →
+// clamped out-proj → RMS attn_post_norm → residual → RMS ln2 → clamped
+// gated-GELU FFN → RMS ffn_post_norm → residual.
+// Projector: 3×3 avg pool (×√H folded in) → clamp-free input projection →
+// weightless RMS. Pos embeds: integer x/y table lookups summed on CPU.
+// ─────────────────────────────────────────────────────────────────────────
+
+function createGemmaVisionEncoder(
+  device: GPUDevice,
+  desc: VisionDescriptor,
+  weights: GemmaVisionWeights,
+): VisionEncoder {
+  const H = desc.hiddenSize;
+  const heads = desc.numHeads;
+  const headDim = H / heads;
+  const I = desc.intermediateSize;
+  const pk = desc.gemma?.poolKernel ?? 3;
+  const ropeTheta = desc.gemma?.ropeTheta ?? 100;
+  const attnScale = desc.gemma?.attnScale ?? 1.0;
+  const outH = desc.projector.outHiddenSize;
+  const patchDim = desc.inChannels * desc.patchSize * desc.patchSize;
+
+  const matmulBT = createComputePipeline(device, matmulWGSL, 'matmul_bt', 'gm-matmul');
+  const rmsPipe = createComputePipeline(device, rmsnormWGSL, 'rmsnorm', 'gm-rms');
+  const gateGeluPipe = createComputePipeline(device, elementwiseWGSL, 'gate_gelu', 'gm-gate-gelu');
+  const attnPipe = createComputePipeline(device, attentionWGSL, 'attention', 'gm-attention', { USE_SOFTPICK: 0 });
+  const clampPipe = createComputePipeline(device, visionOpsWGSL, 'clamp_op', 'gm-clamp');
+  const poolPipe = createComputePipeline(device, visionOpsWGSL, 'avgpool2d', 'gm-pool');
+  const ropeXYPipe = createComputePipeline(device, visionOpsWGSL, 'vision_rope_xy', 'gm-rope-xy');
+  const addPipe = createComputePipeline(device, elementwiseWGSL, 'add', 'gm-add');
+
+  /** out = a + b (distinct buffers — no aliasing). */
+  function addInto(a: GPUBuffer, b: GPUBuffer, out: GPUBuffer, n: number) {
+    const p = new ArrayBuffer(28);
+    new Uint32Array(p)[0] = n;
+    const pbuf = createUniformBuffer(device, new Uint32Array(p), 'gm-add-p');
+    const bg = createBindGroup(device, addPipe, 0, [
+      { binding: 0, resource: { buffer: a } },
+      { binding: 1, resource: { buffer: out } },
+      { binding: 2, resource: { buffer: pbuf } },
+      { binding: 3, resource: { buffer: b } },
+    ], 'gm-add');
+    dispatch(device, addPipe, [bg], [workgroupCount(n, 256)], 'gm-add');
+  }
+
+  // Weightless RMS needs a bound weight buffer even when skipped
+  const dummyWeight = createStorageBuffer(device, new Float32Array([1]), 4, 'gm-dummy-w');
+
+  function mm(A: GPUBuffer, B: GPUBuffer, C: GPUBuffer, M: number, N: number, K: number) {
+    const params = createUniformBuffer(device, new Uint32Array([M, N, K]), 'gm-mm-p');
+    const bg = createBindGroup(device, matmulBT, 0, [
+      { binding: 0, resource: { buffer: A } },
+      { binding: 1, resource: { buffer: B } },
+      { binding: 2, resource: { buffer: C } },
+      { binding: 3, resource: { buffer: params } },
+    ], 'gm-mm');
+    dispatch(device, matmulBT, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], 'gm-mm');
+  }
+
+  /** RMS norm: rows × hidden. weightless=true skips the weight multiply. */
+  function rms(x: GPUBuffer, out: GPUBuffer, w: GPUBuffer | null, rows: number, hidden: number) {
+    const p = new ArrayBuffer(16);
+    const u = new Uint32Array(p);
+    new Uint32Array(p, 0, 1)[0] = hidden;
+    new Float32Array(p, 4, 1)[0] = 1e-6;
+    u[2] = 0;                      // use_residual_weight = 0 (plain ×w)
+    u[3] = w === null ? 1 : 0;     // skip_weight (weightless RMS)
+    const pbuf = createUniformBuffer(device, new Uint32Array(p), 'gm-rms-p');
+    const bg = createBindGroup(device, rmsPipe, 0, [
+      { binding: 0, resource: { buffer: x } },
+      { binding: 1, resource: { buffer: out } },
+      { binding: 2, resource: { buffer: w ?? dummyWeight } },
+      { binding: 3, resource: { buffer: pbuf } },
+    ], 'gm-rms');
+    dispatch(device, rmsPipe, [bg], [rows], 'gm-rms');
+  }
+
+  function clampOp(x: GPUBuffer, out: GPUBuffer, n: number, lo: number, hi: number) {
+    const p = new ArrayBuffer(12);
+    new Uint32Array(p, 0, 1)[0] = n;
+    new Float32Array(p, 4, 1)[0] = lo;
+    new Float32Array(p, 8, 1)[0] = hi;
+    const pbuf = createUniformBuffer(device, new Uint32Array(p), 'gm-clamp-p');
+    const bg = createBindGroup(device, clampPipe, 0, [
+      { binding: 0, resource: { buffer: x } },
+      { binding: 1, resource: { buffer: out } },
+      { binding: 2, resource: { buffer: pbuf } },
+    ], 'gm-clamp');
+    dispatch(device, clampPipe, [bg], [workgroupCount(n, 256)], 'gm-clamp');
+  }
+
+  /** Gemma4ClippableLinear: clamp input, matmul, clamp output.
+   *  scratch must hold M×K floats; out and post share M×N. */
+  function clampedMM(
+    inBuf: GPUBuffer, W: GPUBuffer, outBuf: GPUBuffer, postBuf: GPUBuffer,
+    M: number, N: number, K: number, clamp: ClampRange | undefined, scratch: GPUBuffer,
+  ): GPUBuffer {
+    if (!clamp) {
+      mm(inBuf, W, outBuf, M, N, K);
+      return outBuf;
+    }
+    clampOp(inBuf, scratch, M * K, clamp.inLo, clamp.inHi);
+    mm(scratch, W, outBuf, M, N, K);
+    clampOp(outBuf, postBuf, M * N, clamp.outLo, clamp.outHi);
+    return postBuf;
+  }
+
+  /** out = up * gelu(gate) — elementwise gate_gelu (a=up, b=gate). */
+  function gateGelu(up: GPUBuffer, gate: GPUBuffer, out: GPUBuffer, n: number) {
+    const p = new ArrayBuffer(28);
+    new Uint32Array(p)[0] = n;
+    const pbuf = createUniformBuffer(device, new Uint32Array(p), 'gm-gg-p');
+    const bg = createBindGroup(device, gateGeluPipe, 0, [
+      { binding: 0, resource: { buffer: up } },
+      { binding: 1, resource: { buffer: out } },
+      { binding: 2, resource: { buffer: pbuf } },
+      { binding: 3, resource: { buffer: gate } },
+    ], 'gm-gg');
+    dispatch(device, gateGeluPipe, [bg], [workgroupCount(n, 256)], 'gm-gg');
+  }
+
+  function attention(q: GPUBuffer, k: GPUBuffer, v: GPUBuffer, out: GPUBuffer, seqLen: number) {
+    const p = new ArrayBuffer(48);
+    const u = new Uint32Array(p);
+    const f = new Float32Array(p);
+    u[0] = heads; u[1] = heads; u[2] = headDim;
+    u[3] = seqLen; u[4] = seqLen;
+    f[5] = attnScale;            // gemma4v: 1.0, not 1/sqrt(d)
+    u[6] = 0; u[7] = 0; u[8] = 0;
+    const pbuf = createUniformBuffer(device, new Uint32Array(p), 'gm-attn-p');
+    const bg = createBindGroup(device, attnPipe, 0, [
+      { binding: 0, resource: { buffer: q } },
+      { binding: 1, resource: { buffer: k } },
+      { binding: 2, resource: { buffer: v } },
+      { binding: 3, resource: { buffer: out } },
+      { binding: 4, resource: { buffer: pbuf } },
+    ], 'gm-attn');
+    dispatch(device, attnPipe, [bg], [seqLen, heads], 'gm-attn');
+  }
+
+  function ropeXY(x: GPUBuffer, out: GPUBuffer, phases: GPUBuffer, rows: number) {
+    const pbuf = createUniformBuffer(device, new Uint32Array([rows, H, headDim]), 'gm-rope-p');
+    const bg = createBindGroup(device, ropeXYPipe, 0, [
+      { binding: 6, resource: { buffer: x } },
+      { binding: 7, resource: { buffer: out } },
+      { binding: 8, resource: { buffer: phases } },
+      { binding: 9, resource: { buffer: pbuf } },
+    ], 'gm-rope');
+    dispatch(device, ropeXYPipe, [bg], [workgroupCount(rows * H, 256)], 'gm-rope');
+  }
+
+  async function encode(pre: PreprocessedImage): Promise<VisionEncodeResult> {
+    const N = pre.gridH * pre.gridW;
+    if (N > MAX_VIT_PATCHES) {
+      throw new Error(`[Vision] ${N} patches exceeds attention limit ${MAX_VIT_PATCHES}`);
+    }
+    if (pre.patches.length !== N * patchDim) {
+      throw new Error(`[Vision] patch matrix ${pre.patches.length} != N*patchDim ${N * patchDim}`);
+    }
+    if (pre.gridH % pk !== 0 || pre.gridW % pk !== 0) {
+      throw new Error(`[Vision] grid ${pre.gridH}x${pre.gridW} not divisible by pool kernel ${pk}`);
+    }
+    const outW = pre.gridW / pk, outHrows = pre.gridH / pk;
+    const R = outW * outHrows;
+    const t0 = performance.now();
+
+    const bufs: GPUBuffer[] = [];
+    const sb = (bytes: number, label: string) => {
+      const b = createStorageBuffer(device, null, bytes, label, true);
+      bufs.push(b);
+      return b;
+    };
+    const patchBuf = createStorageBuffer(device, pre.patches, pre.patches.byteLength, 'gm-patches');
+    bufs.push(patchBuf);
+    const xBuf = sb(N * H * 4, 'gm-x');
+    const x2Buf = sb(N * H * 4, 'gm-x2');
+    const normBuf = sb(N * H * 4, 'gm-norm');
+    const scratchH = sb(N * H * 4, 'gm-scratch');     // clamp input scratch (K=H)
+    const qa = sb(N * H * 4, 'gm-qa'); const qb = sb(N * H * 4, 'gm-qb');
+    const ka = sb(N * H * 4, 'gm-ka'); const kb = sb(N * H * 4, 'gm-kb');
+    const va = sb(N * H * 4, 'gm-va'); const vb = sb(N * H * 4, 'gm-vb');
+    const attnBuf = sb(N * H * 4, 'gm-attn-o');
+    const hBuf = sb(N * H * 4, 'gm-h');
+    const h2Buf = sb(N * H * 4, 'gm-h2');
+    const gateA = sb(N * I * 4, 'gm-gate-a'); const gateB = sb(N * I * 4, 'gm-gate-b');
+    const upA = sb(N * I * 4, 'gm-up-a'); const upB = sb(N * I * 4, 'gm-up-b');
+    const mlpBuf = sb(N * I * 4, 'gm-mlp');
+    const scratchI = sb(N * I * 4, 'gm-scratch-i');   // clamp scratch for down (K=I)
+    const poolBuf = sb(R * H * 4, 'gm-pool');
+    const projBuf = sb(R * outH * 4, 'gm-proj');
+    const outBuf = sb(R * outH * 4, 'gm-out');
+
+    try {
+      // Patch embed (no bias)
+      mm(patchBuf, weights.patchEmbed, xBuf, N, H, patchDim);
+
+      // Factorized pos embeds: CPU gather tbl_x[col] + tbl_y[row], raster order
+      {
+        const pos = new Float32Array(N * H);
+        for (let i = 0; i < N; i++) {
+          const px = i % pre.gridW, py = Math.floor(i / pre.gridW);
+          const xr = px * H, yr = py * H, dst = i * H;
+          for (let c = 0; c < H; c++) {
+            pos[dst + c] = weights.posTableX[xr + c] + weights.posTableY[yr + c];
+          }
+        }
+        const posBuf = createStorageBuffer(device, pos, pos.byteLength, 'gm-pos');
+        bufs.push(posBuf);
+        addInto(xBuf, posBuf, x2Buf, N * H);
+        const enc = device.createCommandEncoder();
+        enc.copyBufferToBuffer(x2Buf, 0, xBuf, 0, N * H * 4);
+        device.queue.submit([enc.finish()]);
+      }
+
+      // RoPE phases: raster (col=x, row=y), θ_j = pos · theta^(-2j/half)
+      const half = headDim / 2, qFreqs = half / 2;
+      const inv = new Float32Array(qFreqs);
+      for (let j = 0; j < qFreqs; j++) inv[j] = 1 / Math.pow(ropeTheta, (2 * j) / half);
+      const ph = new Float32Array(N * half);
+      for (let i = 0; i < N; i++) {
+        const px = i % pre.gridW, py = Math.floor(i / pre.gridW);
+        for (let j = 0; j < qFreqs; j++) {
+          ph[i * half + j] = px * inv[j];
+          ph[i * half + qFreqs + j] = py * inv[j];
+        }
+      }
+      const phasesBuf = createStorageBuffer(device, ph, ph.byteLength, 'gm-phases');
+      bufs.push(phasesBuf);
+
+      for (let l = 0; l < desc.depth; l++) {
+        const blk = weights.blocks[l];
+        rms(xBuf, normBuf, blk.ln1, N, H);
+        const qOut = clampedMM(normBuf, blk.q, qa, qb, N, H, H, blk.qClamp, scratchH);
+        const kOut = clampedMM(normBuf, blk.k, ka, kb, N, H, H, blk.kClamp, scratchH);
+        const vOut = clampedMM(normBuf, blk.v, va, vb, N, H, H, blk.vClamp, scratchH);
+        // Per-head RMS norms (rows = N·heads over head_dim) + weightless V norm
+        const qN = qOut === qa ? qb : qa;
+        const kN = kOut === ka ? kb : ka;
+        const vN = vOut === va ? vb : va;
+        rms(qOut, qN, blk.qNorm, N * heads, headDim);
+        rms(kOut, kN, blk.kNorm, N * heads, headDim);
+        rms(vOut, vN, null, N * heads, headDim);
+        // x/y-half RoPE on Q/K (back into the other buffer of each pair)
+        ropeXY(qN, qOut, phasesBuf, N);
+        ropeXY(kN, kOut, phasesBuf, N);
+        attention(qOut, kOut, vN, attnBuf, N);
+        const oOut = clampedMM(attnBuf, blk.attnOut, hBuf, h2Buf, N, H, H, blk.attnOutClamp, scratchH);
+        const oNormed = oOut === hBuf ? h2Buf : hBuf;
+        rms(oOut, oNormed, blk.attnPostNorm, N, H);
+        // residual → x2
+        addInto(xBuf, oNormed, x2Buf, N * H);
+        rms(x2Buf, normBuf, blk.ln2, N, H);
+        const gOut = clampedMM(normBuf, blk.gate, gateA, gateB, N, I, H, blk.gateClamp, scratchH);
+        const uOut = clampedMM(normBuf, blk.up, upA, upB, N, I, H, blk.upClamp, scratchH);
+        gateGelu(uOut, gOut, mlpBuf, N * I);
+        const dOut = clampedMM(mlpBuf, blk.down, hBuf, h2Buf, N, H, I, blk.downClamp, scratchI);
+        const dNormed = dOut === hBuf ? h2Buf : hBuf;
+        rms(dOut, dNormed, blk.ffnPostNorm, N, H);
+        addInto(x2Buf, dNormed, xBuf, N * H);
+      }
+
+      // Pooler: kernel×kernel avg, ×√H — then projection and weightless RMS
+      {
+        const p = new ArrayBuffer(28);
+        const u = new Uint32Array(p);
+        u[0] = pre.gridW; u[1] = pre.gridH; u[2] = H; u[3] = pk; u[4] = outW; u[5] = outHrows;
+        new Float32Array(p, 24, 1)[0] = Math.sqrt(H);
+        const pbuf = createUniformBuffer(device, new Uint32Array(p), 'gm-pool-p');
+        const bg = createBindGroup(device, poolPipe, 0, [
+          { binding: 3, resource: { buffer: xBuf } },
+          { binding: 4, resource: { buffer: poolBuf } },
+          { binding: 5, resource: { buffer: pbuf } },
+        ], 'gm-pool');
+        dispatch(device, poolPipe, [bg], [workgroupCount(R * H, 256)], 'gm-pool');
+      }
+      mm(poolBuf, weights.inputProjection, projBuf, R, outH, H);
+      rms(projBuf, outBuf, null, R, outH);
+
+      await device.queue.onSubmittedWorkDone();
+      const raw = await readBuffer(device, outBuf, R * outH * 4);
+      console.log(`[Vision] gemma encoded ${N} patches → ${R} tokens in ${(performance.now() - t0).toFixed(0)}ms`);
+      return { embeddings: new Float32Array(raw), deepstack: [], numTokens: R };
+    } finally {
+      for (const b of bufs) b.destroy();
+    }
+  }
+
+  return {
+    encode,
+    destroy() {
+      weights.destroy();
+      dummyWeight.destroy();
+    },
   };
 }
