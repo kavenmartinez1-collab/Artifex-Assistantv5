@@ -10,3 +10,13 @@ model-dirs.local.json
 
 # vision parity golden (16MB, regenerate via scripts/gen_vision_fixture.py)
 test-fixtures/vision-qwen3vl-golden.json
+test-fixtures/vision-gemma4-golden.json
+
+# repo-local model drop dir — keep the README, ignore the weights
+models/*
+!models/README.md
+
+# build + runtime artifacts (standalone repo)
+dist/
+metrics.jsonl
+node_modules/

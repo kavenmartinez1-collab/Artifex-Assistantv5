@@ -130,7 +130,14 @@ const HF_CACHE_DIR = process.env.HF_HOME
   : path.join(process.env.USERPROFILE || process.env.HOME || '', '.cache', 'huggingface', 'hub');
 
 // Project's local models directory (for custom quantized models)
-const LOCAL_MODELS_DIR = path.resolve(__dirname, '..', '..', 'models');
+// Project model directories, in priority order. The repo-local `models/`
+// works standalone; the parent `../models` keeps the in-Artifex layout
+// working unchanged. Either can be overridden with ARTIFEX_PROJECT_MODELS.
+const PROJECT_MODELS_DIRS: string[] = (
+  process.env.ARTIFEX_PROJECT_MODELS
+    ? process.env.ARTIFEX_PROJECT_MODELS.split(path.delimiter)
+    : [path.resolve(__dirname, '..', 'models'), path.resolve(__dirname, '..', '..', 'models')]
+).filter(d => { try { return fs.statSync(d).isDirectory(); } catch { return false; } });
 
 // ─── Extra model directories (private to this machine) ──────────────────────
 // Two config sources, both server-side only:
@@ -274,8 +281,10 @@ function resolveSnapshot(repo: string): LocalModelDir | null {
   // 'local/<name>' maps to models/<name>/ or an extra-dir alias
   if (repo.startsWith('local/')) {
     const name = repo.slice(6); // strip "local/"
-    const modelDir = path.join(LOCAL_MODELS_DIR, name);
-    if (fs.existsSync(modelDir)) return { dir: modelDir };
+    for (const base of PROJECT_MODELS_DIRS) {
+      const modelDir = path.join(base, name);
+      if (fs.existsSync(modelDir)) return { dir: modelDir };
+    }
     const hit = scanExtraModelsCached().get(name) ?? null;
     if (!hit) console.warn(`[Models] Unresolved local alias: ${repo}`);
     return hit;
@@ -334,14 +343,16 @@ app.get('/api/hf-cache/models', (_req, res) => {
       }
     } catch {}
 
-    // Scan project models/ directory
-    try {
-      for (const dir of fs.readdirSync(LOCAL_MODELS_DIR)) {
-        const fullDir = path.join(LOCAL_MODELS_DIR, dir);
-        try { if (!fs.statSync(fullDir).isDirectory()) continue; } catch { continue; }
-        push(`local/${dir}`, fullDir, fs.readdirSync(fullDir));
-      }
-    } catch {}
+    // Scan project models/ directories (repo-local + optional parent)
+    for (const base of PROJECT_MODELS_DIRS) {
+      try {
+        for (const dir of fs.readdirSync(base)) {
+          const fullDir = path.join(base, dir);
+          try { if (!fs.statSync(fullDir).isDirectory()) continue; } catch { continue; }
+          push(`local/${dir}`, fullDir, fs.readdirSync(fullDir));
+        }
+      } catch {}
+    }
 
     // Scan configured extra dirs (loose .gguf files + model subdirectories)
     // and the Ollama store. Only aliases are sent to the browser — never the

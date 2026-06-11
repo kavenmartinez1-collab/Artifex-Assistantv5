@@ -113,8 +113,6 @@ export default defineConfig({
           });
         },
       },
-      // Proxy Artifex API calls
-      '/v1': 'http://127.0.0.1:8000',
       // WebSocket proxy to orchestration hub
       '/ws': {
         target: 'http://127.0.0.1:3001',
