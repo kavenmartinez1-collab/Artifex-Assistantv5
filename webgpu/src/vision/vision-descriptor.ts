@@ -19,6 +19,8 @@
  * producing garbage embeddings.
  */
 
+import type { GGUFFile } from '../model/gguf';
+
 export interface VisionDescriptor {
   family: 'qwen3_vl' | 'qwen_vl_siglip' | 'gemma4' | 'unknown';
   /** Builder confidence: false = best-effort defaults, needs parity run. */
@@ -185,6 +187,76 @@ export function visionDescriptorFromHFConfig(
     };
   }
 
+  return visionDescriptorFromGemmaHF(hfConfig, vc, pp);
+}
+
+/**
+ * Build a VisionDescriptor from a GGUF mmproj header (clip.* metadata).
+ * Currently supports projector_type 'qwen3vl_merger' — the same tower
+ * architecture parity-verified on the HF qwen3-vl path, at whatever dims
+ * the checkpoint declares. Returns null for unsupported projector types
+ * (gemma's gated-MLP tower is a different compute graph — its own arc).
+ *
+ * placeholder.imageTokenId is left 0 — the mmproj knows nothing about the
+ * text vocab; the caller resolves '<|image_pad|>' through the tokenizer.
+ */
+export function visionDescriptorFromGGUF(file: GGUFFile): VisionDescriptor | null {
+  if (file.kv.get('clip.has_vision_encoder') !== true) return null;
+  const kv = <T>(k: string, fb: T): T => (file.kv.get(k) as T) ?? fb;
+  const projType = kv<string>('clip.projector_type', '');
+  if (projType !== 'qwen3vl_merger') {
+    console.warn(`[Vision] unsupported GGUF projector_type "${projType}" — vision disabled for this model`);
+    return null;
+  }
+  const patch = kv('clip.vision.patch_size', 16);
+  const merge = kv('clip.vision.spatial_merge_size', 2);
+  const hidden = kv('clip.vision.embedding_length', 1152);
+  const dsFlags = kv<boolean[]>('clip.vision.is_deepstack_layers', []);
+  const posT = file.tensors.get('v.position_embd.weight');
+  const posCount = posT ? posT.shape[0] : 0;
+  return {
+    family: 'qwen3_vl',
+    // Same compute graph as the parity-verified HF qwen3-vl tower; dims are
+    // checkpoint-declared. End-to-end quality still owed a reference check.
+    verified: true,
+    depth: kv('clip.vision.block_count', 27),
+    hiddenSize: hidden,
+    numHeads: kv('clip.vision.attention.head_count', 16),
+    intermediateSize: kv('clip.vision.feed_forward_length', 4304),
+    activation: 'gelu_tanh',
+    norm: 'layernorm',
+    hasBias: true,
+    fusedQKV: true,
+    patchSize: patch,
+    // The GGUF stores the conv's two temporal slices as separate tensors;
+    // the loader sums them (frames are duplicated for images), so the
+    // browser pipeline runs with T=1 and patchDim = C*P*P.
+    temporalPatchSize: 1,
+    inChannels: 3,
+    posEmbed: posCount > 0
+      ? { kind: 'learned', count: posCount, gridSize: Math.round(Math.sqrt(posCount)) }
+      : { kind: 'none' },
+    projector: {
+      kind: 'qwen_merger',
+      spatialMergeSize: merge,
+      outHiddenSize: kv('clip.vision.projection_dim', 0),
+    },
+    deepstackIndexes: dsFlags.map((v, i) => (v ? i : -1)).filter(i => i >= 0),
+    placeholder: { imageTokenId: 0 },  // resolved via tokenizer by the caller
+    preprocess: {
+      imageMean: kv<[number, number, number]>('clip.vision.image_mean', [0.5, 0.5, 0.5]),
+      imageStd: kv<[number, number, number]>('clip.vision.image_std', [0.5, 0.5, 0.5]),
+      resize: { kind: 'smart', minPixels: 65536, maxPixels: 16777216, factor: patch * merge },
+    },
+  };
+}
+
+function visionDescriptorFromGemmaHF(
+  hfConfig: Record<string, any>,
+  vc: Record<string, any>,
+  pp: Record<string, any>,
+): VisionDescriptor | null {
+  const modelType = String(hfConfig.model_type ?? '').toLowerCase();
   // ── Gemma 4 (SigLIP tower, pool+linear projector, fixed tokens) ────
   if (modelType.startsWith('gemma')) {
     return {

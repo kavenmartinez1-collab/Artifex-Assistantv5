@@ -10,7 +10,7 @@ import { initWebGPU, discoverAdapters, type GPUContext, type DiscoveredAdapter }
 import { reportMetric, reportError, timed } from './utils/metrics';
 import { runKernelTests } from './engine/kernel-tests';
 import { loadModel, unloadModel, previewModel, formatBytes, getCacheStats, clearCache, type LoadedModel } from './model';
-import { setAuthToken, useLocalCache, resetToRemote, resolveFileUrl } from './model/hf-hub';
+import { setAuthToken, useLocalCache, resetToRemote, resolveFileUrl, fetchRange } from './model/hf-hub';
 import { visionDescriptorFromHFConfig, type VisionDescriptor } from './vision/vision-descriptor';
 import { preprocessImage, type PreprocessedImage } from './vision/preprocess';
 import type { VisionEncoder, VisionEncodeResult } from './vision/vision-encoder';
@@ -40,6 +40,9 @@ let chatHistory: ChatMessage[] = [];
 // loads lazily on first image; pending images preprocess at attach time so
 // their token cost shows in the chip before sending.
 let activeVisionDesc: VisionDescriptor | null = null;
+/** Where the tower weights live: HF safetensors (model.visual.*) or a GGUF
+ *  mmproj file alongside the text GGUF. */
+let activeVisionSource: { kind: 'hf' } | { kind: 'gguf'; file: string } = { kind: 'hf' };
 let visionEncoder: VisionEncoder | null = null;
 let visionEncoderLoading: Promise<VisionEncoder> | null = null;
 interface PendingImage { name: string; pre: PreprocessedImage }
@@ -639,8 +642,11 @@ async function ensureVisionEncoder(): Promise<VisionEncoder> {
       const isLocalRepo = repo.startsWith('local/') || repo.startsWith('ollama/');
       if (isLocalRepo) useLocalCache();
       try {
-        const weights = await loadVisionWeights(
-          gpu!.device, repo, activeVisionDesc!, (m) => setStatus(m));
+        const weights = activeVisionSource.kind === 'gguf'
+          ? await (await import('./vision/vision-loader-gguf')).loadVisionWeightsGGUF(
+              gpu!.device, repo, activeVisionSource.file, activeVisionDesc!, (m) => setStatus(m))
+          : await loadVisionWeights(
+              gpu!.device, repo, activeVisionDesc!, (m) => setStatus(m));
         visionEncoder = createVisionEncoder(gpu!.device, activeVisionDesc!, weights);
         addMessage('system',
           `Vision tower loaded: ${(weights.totalGPUBytes / 1e9).toFixed(2)} GB GPU.`, 'vision ready');
@@ -1034,7 +1040,7 @@ function startAutoTestPoller() {
 // Loads a GGUF-only model dir (no config.json). K-quant weights stay in native
 // llama.cpp block format on GPU (matmul_gguf kernels); token_embd stays in RAM
 // and row-gathers on CPU per token.
-async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTMLElement): Promise<void> {
+async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTMLElement, mmprojFile?: string): Promise<void> {
   const { loadGGUFModel } = await import('./model/gguf-loader');
   const { descriptorFromGGUF, applyRopeFreqFactors } = await import('./model/model-descriptor');
   const { ggufArchitecture } = await import('./model/gguf');
@@ -1267,8 +1273,36 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
       `Tokenizer/model vocab mismatch: tokenizer ${tokenizer.modelId} has ${tokenizer.vocabSize} tokens ` +
       `but model expects ${config.vocabSize}. Wrong tokenizer fallback?`);
   }
+  // Vision: a sibling mmproj GGUF carries the tower (Qwen3-VL-style clip).
+  // Parse it while hf-hub still points at the local cache.
+  let visionConfigured = false;
+  if (mmprojFile) {
+    try {
+      const { visionDescriptorFromGGUF } = await import('./vision/vision-descriptor');
+      const { parseGGUF } = await import('./model/gguf');
+      const mmUrl = resolveFileUrl(repo, mmprojFile);
+      const mmFile = await parseGGUF((s, e) => fetchRange(mmUrl, s, e));
+      const vdesc = visionDescriptorFromGGUF(mmFile);
+      if (vdesc) {
+        // The mmproj knows nothing about the text vocab — resolve the
+        // placeholder ids through the tokenizer's special tokens.
+        const padIds = tokenizer.encode('<|image_pad|>');
+        const startIds = tokenizer.encode('<|vision_start|>');
+        if (padIds.length === 1 && startIds.length === 1) {
+          vdesc.placeholder.imageTokenId = padIds[0];
+          activeVisionSource = { kind: 'gguf', file: mmprojFile };
+          setVisionDesc(vdesc);
+          visionConfigured = true;
+        } else {
+          console.warn('[Vision] tokenizer lacks <|image_pad|>/<|vision_start|> special tokens — vision disabled');
+        }
+      }
+    } catch (err) {
+      console.warn('[Vision] mmproj parse failed:', err);
+    }
+  }
   resetToRemote();
-  setVisionDescQuiet(null);  // GGUF vision (mmproj / v.* towers) lands in M2
+  if (!visionConfigured) setVisionDescQuiet(null);
 
   const kvSession = createKVSession(Math.min(config.maxPositionEmbeddings || 8192, 8192, MAX_ATTN_SEQ_LEN));
   const resetKV = () => {
@@ -1282,13 +1316,45 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
       const tokenIds = applyChatTemplate(tokenizer, messages, opts);
       return generate(gpu!.device, engine, tokenizer, tokenIds, sampling, onToken, { kvSession });
     },
+    chatMM: (
+      messages: Array<{role: string; content: string}>,
+      encoded: VisionEncodeResult[],
+      sampling: any, onToken: any, opts?: { enableThinking?: boolean },
+    ) => {
+      const tokenIds = applyChatTemplate(tokenizer, messages, opts);
+      const padId = activeVisionDesc!.placeholder.imageTokenId;
+      const spans: Array<{ start: number; count: number }> = [];
+      let i = 0;
+      while (i < tokenIds.length) {
+        if (tokenIds[i] === padId) {
+          let j = i;
+          while (j < tokenIds.length && tokenIds[j] === padId) j++;
+          spans.push({ start: i, count: j - i });
+          i = j;
+        } else i++;
+      }
+      if (spans.length !== encoded.length) {
+        throw new Error(`Image span mismatch: ${spans.length} pad runs in prompt vs ${encoded.length} encoded images`);
+      }
+      const images = spans.map((s, k) => {
+        if (s.count !== encoded[k].numTokens) {
+          throw new Error(`Image ${k}: ${s.count} pad tokens vs ${encoded[k].numTokens} embedding rows`);
+        }
+        return {
+          start: s.start, count: s.count,
+          embeddings: encoded[k].embeddings,
+          deepstack: encoded[k].deepstack,
+        };
+      });
+      return generate(gpu!.device, engine, tokenizer, { tokenIds, images }, sampling, onToken, { kvSession });
+    },
     kvSession,
     resetKV,
     config,
     tokenizer,
     gpu: gpu!,
     vramEstimate: estimateVRAM(config),
-    destroy: () => { resetKV(); moe?.backend.destroy(); unloadModel(currentModel!); session = null; },
+    destroy: () => { resetVision(); resetKV(); moe?.backend.destroy(); unloadModel(currentModel!); session = null; },
   } as InferenceSession;
 
   promptEl.disabled = false;
@@ -1374,8 +1440,9 @@ loadBtn.addEventListener('click', async () => {
 
     // GGUF-only model dir (no config.json): native GGUF load path
     const ggufFiles = (localFiles ?? []).filter(f => f.endsWith('.gguf') && !f.toLowerCase().includes('mmproj'));
+    const mmprojFile = (localFiles ?? []).find(f => f.toLowerCase().includes('mmproj') && f.toLowerCase().endsWith('.gguf'));
     if (ggufFiles.length > 0 && !(localFiles ?? []).includes('config.json')) {
-      await buildGGUFSession(repo, ggufFiles[0], progressEl);
+      await buildGGUFSession(repo, ggufFiles[0], progressEl, mmprojFile);
       updateFooter({ model: repo.split('/').pop() || repo });
       return;
     }
@@ -1928,6 +1995,7 @@ loadBtn.addEventListener('click', async () => {
       // Vision support: multimodal checkpoints get a descriptor → 📎 enabled
       try {
         const pp = await fetchPreprocessorConfig(repo);
+        activeVisionSource = { kind: 'hf' };
         setVisionDesc(visionDescriptorFromHFConfig(currentModel!.config as Record<string, any>, pp));
       } catch {
         setVisionDescQuiet(null);
