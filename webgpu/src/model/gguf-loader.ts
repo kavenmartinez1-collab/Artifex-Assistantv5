@@ -44,7 +44,15 @@ export interface GGUFTensorGPU {
 }
 
 export interface GGUFTensorCPU {
+  /** Raw blocks. Empty (length 0) when the tensor is sharded into `parts`. */
   data: Uint8Array;
+  /**
+   * Row-aligned shards for tensors whose byteLength exceeds the JS
+   * ArrayBuffer cap (2^31-1) — e.g. Gemma 4's 2.31 GB PLE table.
+   * Row r lives in parts[floor(r / rowsPerPart)] at (r % rowsPerPart) * rowBytes.
+   */
+  parts?: Uint8Array[];
+  rowsPerPart?: number;
   ggmlType: number;
   ne: number[];
   /** Bytes per tensor row (ne[0] elements) in raw GGUF block layout. */
@@ -79,6 +87,8 @@ const QUANT_GPU_TYPES = new Set<number>([
 ]);
 
 const MAX_CHUNK = 128 * 1024 * 1024;
+/** Shard CPU-resident tensors above this size (JS ArrayBuffer cap is 2^31-1). */
+const MAX_CPU_PART = 1 << 30;
 
 // MoE expert placement (Phase C): expert slabs stay in the file, fetched by
 // the CPU worker fleet; the per-layer shared-expert router gate vector stays
@@ -242,6 +252,33 @@ export async function loadGGUFModel(
       message: `[${idx}/${file.tensorCount}] ${t.name} (${t.typeName}, ${(t.byteLength / 1e6).toFixed(1)} MB)`,
       overallProgress: doneBytes / totalFileBytes,
     });
+
+    // Oversized CPU-only tensors (> ArrayBuffer cap, e.g. Gemma 4's 2.31 GB
+    // PLE table): fetch into row-aligned ≤1 GiB shards instead of one buffer.
+    if (isCPUOnly(t.name) && !alsoGPU.has(t.name) && t.byteLength > MAX_CPU_PART) {
+      const { blockSize, typeSize } = ggmlTypeTraits(t.ggmlType);
+      const rowBytes = (t.ne[0] / blockSize) * typeSize;
+      const totalRows = t.byteLength / rowBytes;
+      if (!Number.isInteger(totalRows)) {
+        throw new Error(`[GGUF] "${t.name}": byteLength ${t.byteLength} not a multiple of rowBytes ${rowBytes}`);
+      }
+      const rowsPerPart = Math.floor(MAX_CPU_PART / rowBytes);
+      const parts: Uint8Array[] = [];
+      for (let r0 = 0; r0 < totalRows; r0 += rowsPerPart) {
+        const rows = Math.min(rowsPerPart, totalRows - r0);
+        parts.push(await fetchTensorBytes(url, t.offset + r0 * rowBytes, rows * rowBytes));
+      }
+      cpuTensors.set(t.name, {
+        data: new Uint8Array(0),
+        parts,
+        rowsPerPart,
+        ggmlType: t.ggmlType,
+        ne: t.ne,
+        rowBytes,
+      });
+      doneBytes += t.byteLength;
+      continue;
+    }
 
     const raw = await fetchTensorBytes(url, t.offset, t.byteLength);
 

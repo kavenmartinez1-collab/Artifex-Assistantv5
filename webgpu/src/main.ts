@@ -823,7 +823,10 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
   if (config.perLayerEmbed) {
     const pleCpu = model.cpuTensors.get('per_layer_token_embd.weight');
     if (!pleCpu) throw new Error('GGUF bridge: per_layer_token_embd.weight missing from CPU store');
-    global.pleTokenEmbedGG = { data: pleCpu.data, ggmlType: pleCpu.ggmlType, rowBytes: pleCpu.rowBytes };
+    global.pleTokenEmbedGG = {
+      data: pleCpu.data, parts: pleCpu.parts, rowsPerPart: pleCpu.rowsPerPart,
+      ggmlType: pleCpu.ggmlType, rowBytes: pleCpu.rowBytes,
+    };
     const mpName = loc.locate('pleModelProj');
     const mpT = mpName ? model.tensors.get(mpName) : undefined;
     if (!mpT) throw new Error(`GGUF bridge: missing tensor for role "pleModelProj" (name: ${mpName ?? 'unmapped'})`);

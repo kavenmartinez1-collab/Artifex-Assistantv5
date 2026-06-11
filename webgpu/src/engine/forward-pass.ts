@@ -203,8 +203,15 @@ export interface GlobalWeights {
   embedGG?: { data: Uint8Array; ggmlType: number; rowBytes: number };
   /** GGUF lm_head: repacked k-quant blocks on GPU (matmul_gguf kernel). */
   lmHeadGG?: GGUFWeight;
-  /** Gemma 4 PLE: per-layer token table, CPU row-gather like embedGG. */
-  pleTokenEmbedGG?: { data: Uint8Array; ggmlType: number; rowBytes: number };
+  /**
+   * Gemma 4 PLE: per-layer token table, CPU row-gather like embedGG.
+   * Sharded into `parts` when the raw blocks exceed the ArrayBuffer cap
+   * (E4B Q6_K table is 2.31 GB): row r is in parts[floor(r / rowsPerPart)].
+   */
+  pleTokenEmbedGG?: {
+    data: Uint8Array; parts?: Uint8Array[]; rowsPerPart?: number;
+    ggmlType: number; rowBytes: number;
+  };
   /** Gemma 4 PLE: hidden → [n_layer * ple_dim] projection. */
   pleModelProj?: GPUBuffer;
   pleModelProj_gg?: GGUFWeight;
@@ -1649,11 +1656,18 @@ export function createForwardPassEngine(
     // we instead use a strided slice view in the per-layer gate_gelu).
     if (pleDim > 0 && weights.global.pleTokenEmbedGG
         && pleInpBuf && pleProjBuf && pleCombinedBuf && pleProjScaleBuf) {
-      const { data, ggmlType, rowBytes } = weights.global.pleTokenEmbedGG;
+      const { data, parts, rowsPerPart, ggmlType, rowBytes } = weights.global.pleTokenEmbedGG;
       const tokScale = Math.sqrt(dPle);
       const pleF32 = new Float32Array(seqLen * pleDim);
       for (let t = 0; t < seqLen; t++) {
-        const row = data.subarray(tokenIds[t] * rowBytes, (tokenIds[t] + 1) * rowBytes);
+        let row: Uint8Array;
+        if (parts && rowsPerPart) {
+          const r = tokenIds[t] % rowsPerPart;
+          row = parts[Math.floor(tokenIds[t] / rowsPerPart)]
+            .subarray(r * rowBytes, (r + 1) * rowBytes);
+        } else {
+          row = data.subarray(tokenIds[t] * rowBytes, (tokenIds[t] + 1) * rowBytes);
+        }
         if (row.byteLength !== rowBytes) {
           throw new Error(`[PLE GGUF] token ${tokenIds[t]}: row slice ${row.byteLength} != ${rowBytes} bytes`);
         }
