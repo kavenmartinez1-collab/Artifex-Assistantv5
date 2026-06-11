@@ -12,6 +12,7 @@ import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
+import { execFile } from 'child_process';
 import { fileURLToPath } from 'url';
 import { OrchestrationHub } from './ws-hub.js';
 
@@ -90,6 +91,34 @@ app.get('/metrics/recent', (_req, res) => {
   } catch {
     res.json({ metrics: [] });
   }
+});
+
+// ─── GPU info (VRAM auto-budget) ─────────────────────────────────────────────
+// WebGPU never exposes VRAM size, but the dev server shares the machine with
+// the driver. The browser picks the entry with displayActive (Chrome's GPU
+// process runs on the display adapter) to size its load budget. Localhost
+// only — this never leaves the machine. Non-NVIDIA boxes return [] and the
+// loader falls back to its conservative default.
+
+app.get('/api/gpu-info', (_req, res) => {
+  execFile(
+    'nvidia-smi',
+    ['--query-gpu=name,memory.total,memory.free,display_active', '--format=csv,noheader,nounits'],
+    { timeout: 5000 },
+    (err, stdout) => {
+      if (err) return res.json({ gpus: [] });
+      const gpus = stdout.trim().split('\n').filter(Boolean).map(line => {
+        const parts = line.split(',').map(s => s.trim());
+        return {
+          name: parts[0],
+          totalMB: Number(parts[1]) || 0,
+          freeMB: Number(parts[2]) || 0,
+          displayActive: /enabled/i.test(parts[3] ?? ''),
+        };
+      });
+      res.json({ gpus });
+    },
+  );
 });
 
 // ─── Local HuggingFace Cache ─────────────────────────────────────────────────

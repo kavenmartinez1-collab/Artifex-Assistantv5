@@ -721,6 +721,29 @@ document.addEventListener('drop', async (e) => {
   console.log('[parity] done — preprocessing should be ~1e-6; tower f32-vs-f32 ~1e-3 or better');
 };
 
+/** Resolve the VRAM budget for model loading. Priority: manual override
+ *  (localStorage 'vramBudgetGB') → driver-reported free memory on the
+ *  display GPU minus a compositor/safety reserve → undefined (loader's
+ *  conservative default). Chrome's GPU process runs on the display adapter,
+ *  so the displayActive entry is the one WebGPU is using. */
+async function resolveVRAMBudget(): Promise<number | undefined> {
+  const manual = Number(localStorage.getItem('vramBudgetGB'));
+  if (manual > 0) return manual * 1e9;
+  try {
+    const resp = await fetch('/api/gpu-info');
+    if (resp.ok) {
+      const { gpus } = await resp.json() as { gpus: Array<{ name: string; freeMB: number; displayActive: boolean }> };
+      const pick = gpus.find(g => g.displayActive) ?? gpus[0];
+      if (pick && pick.freeMB > 0) {
+        const budget = Math.max(2e9, (pick.freeMB - 1024) * 1e6);
+        console.log(`[VRAM] auto budget: ${(budget / 1e9).toFixed(1)} GB (driver-reported free minus 1 GB reserve)`);
+        return budget;
+      }
+    }
+  } catch { /* no driver info — fall through */ }
+  return undefined;
+}
+
 /** Fetch preprocessor_config.json — optional. Machine-local repos go to the
  *  dev-server cache directly (resolveFileUrl may point at the CDN by now). */
 async function fetchPreprocessorConfig(repo: string): Promise<Record<string, any> | undefined> {
@@ -1050,12 +1073,13 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
   const { generate, createKVSession } = await import('./engine/generate');
 
   addMessage('system', `Loading GGUF: ${repo}/${ggufFile} ...`);
+  const vramBudgetBytes = await resolveVRAMBudget();
   const model = await loadGGUFModel(gpu!.device, repo, ggufFile, (p) => {
     progressEl.textContent = p.message;
     if (p.overallProgress !== undefined) {
       setStatus(`Loading ${repo}... ${Math.round(p.overallProgress * 100)}%`);
     }
-  });
+  }, vramBudgetBytes !== undefined ? { vramBudgetBytes } : undefined);
   currentModel = model as unknown as LoadedModel;
 
   addMessage('system',
