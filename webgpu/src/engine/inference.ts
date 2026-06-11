@@ -18,8 +18,8 @@
  */
 
 import { initWebGPU, type GPUContext } from './gpu-device';
-import { createForwardPassEngine, type ModelWeights, type LayerWeights, type GlobalWeights } from './forward-pass';
-import { generate, type SamplingConfig, type GenerationResult, type GenerationHandle, type OnTokenCallback } from './generate';
+import { createForwardPassEngine, MAX_ATTN_SEQ_LEN, type ModelWeights, type LayerWeights, type GlobalWeights } from './forward-pass';
+import { generate, createKVSession, type KVSessionState, type SamplingConfig, type GenerationResult, type GenerationHandle, type OnTokenCallback } from './generate';
 import { loadModel, unloadModel, type LoadedModel, type LoadProgress } from '../model/weight-loader';
 import { createTokenizer, applyChatTemplate, type Tokenizer } from '../model/tokenizer';
 import { getWeightNameMap, resolveLayerWeightName, estimateVRAM, type ModelConfig } from '../model/model-config';
@@ -41,12 +41,20 @@ export interface InferenceSession {
   /** Generate text from a plain prompt. */
   run(prompt: string, sampling?: SamplingConfig, onToken?: OnTokenCallback): GenerationHandle;
 
-  /** Generate text from chat messages (applies chat template). */
+  /** Generate text from chat messages (applies chat template). Multi-turn
+   *  calls share the session's persistent KV cache (prefix reuse). */
   chat(
     messages: Array<{ role: string; content: string }>,
     sampling?: SamplingConfig,
     onToken?: OnTokenCallback,
+    opts?: { enableThinking?: boolean },
   ): GenerationHandle;
+
+  /** Persistent KV session backing chat() turns. */
+  readonly kvSession: KVSessionState;
+
+  /** Drop the multi-turn KV cache (start a new conversation). */
+  resetKV(): void;
 
   /** Get the model descriptor. */
   readonly config: ModelDescriptor;
@@ -155,6 +163,17 @@ export async function createInferenceSession(
 
   // ── API ────────────────────────────────────────────────────────────
 
+  // Persistent multi-turn KV session — sized to the model's context (capped;
+  // generate() grows it on demand). Chat turns that extend the previous token
+  // sequence prefill only the delta.
+  const kvSession = createKVSession(Math.min(config.maxPositionEmbeddings || 8192, 8192, MAX_ATTN_SEQ_LEN));
+
+  function resetKV() {
+    if (kvSession.kvCache) engine.destroyKVCache(kvSession.kvCache);
+    kvSession.kvCache = null;
+    kvSession.cachedTokenIds = [];
+  }
+
   function run(
     prompt: string,
     sampling?: SamplingConfig,
@@ -167,12 +186,14 @@ export async function createInferenceSession(
     messages: Array<{ role: string; content: string }>,
     sampling?: SamplingConfig,
     onToken?: OnTokenCallback,
+    opts?: { enableThinking?: boolean },
   ): GenerationHandle {
-    const prompt = applyChatTemplate(tokenizer, messages);
-    return generate(gpu.device, engine, tokenizer, prompt, sampling, onToken);
+    const prompt = applyChatTemplate(tokenizer, messages, opts);
+    return generate(gpu.device, engine, tokenizer, prompt, sampling, onToken, { kvSession });
   }
 
   function destroy() {
+    resetKV();
     unloadModel(loadedModel);
     status('Model unloaded — GPU memory freed');
   }
@@ -180,6 +201,8 @@ export async function createInferenceSession(
   return {
     run,
     chat,
+    kvSession,
+    resetKV,
     config,
     tokenizer,
     gpu,

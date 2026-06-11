@@ -1,0 +1,1874 @@
+{
+ "extract_key_point": [
+  {
+   "input": {
+    "role": "user",
+    "content": "How do I fix the CUDA device ordering?\nIt keeps flipping."
+   },
+   "expected": "How do I fix the CUDA device ordering?"
+  },
+  {
+   "input": {
+    "role": "user",
+    "content": "short"
+   },
+   "expected": "short"
+  },
+  {
+   "input": {
+    "role": "assistant",
+    "content": "The fix is to set CUDA_DEVICE_ORDER=PCI_BUS_ID. That aligns indices with nvidia-smi."
+   },
+   "expected": "The fix is to set CUDA_DEVICE_ORDER=PCI_BUS_ID"
+  },
+  {
+   "input": {
+    "role": "assistant",
+    "content": "## Header\n* bullet point that is long enough to extract\nMore text follows here."
+   },
+   "expected": "bullet point that is long enough to extract"
+  },
+  {
+   "input": {
+    "role": "assistant",
+    "content": "ok. no! hm?"
+   },
+   "expected": "ok. no! hm?"
+  },
+  {
+   "input": {
+    "role": "assistant",
+    "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+   },
+   "expected": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  },
+  {
+   "input": {
+    "role": "user",
+    "content": "[TOOL OUTPUT]\nFunction: parse_config(path) -> dict\nbody text"
+   },
+   "expected": "Read: Function: parse_config(path) -> dict"
+  },
+  {
+   "input": {
+    "role": "user",
+    "content": "[TOOL OUTPUT]\nThe ARCHITECTURE overview follows\nstuff"
+   },
+   "expected": "Ran: @architecture() — full project map generated"
+  },
+  {
+   "input": {
+    "role": "user",
+    "content": "[TOOL RESULT]\nSKELETON VIEW\nFile: core/engine.py\nmore"
+   },
+   "expected": "Read skeleton: File: core/engine.py"
+  },
+  {
+   "input": {
+    "role": "user",
+    "content": "[TOOL OUTPUT]\nFile: webgpu/src/main.ts\ncontents here"
+   },
+   "expected": "Read: File: webgpu/src/main.ts"
+  },
+  {
+   "input": {
+    "role": "user",
+    "content": "[TOOL OUTPUT]\nFound 17 matches in 4 files\n..."
+   },
+   "expected": "Found 17 matches in 4 files"
+  },
+  {
+   "input": {
+    "role": "user",
+    "content": "[TOOL OUTPUT]\n$ git status --short\nM core/engine.py"
+   },
+   "expected": "Ran: $ git status --short"
+  },
+  {
+   "input": {
+    "role": "user",
+    "content": "[TOOL OUTPUT]\njust some plain first line that is quite long and should be cut to eighty characters exactly here\nsecond"
+   },
+   "expected": "[TOOL OUTPUT]"
+  },
+  {
+   "input": {
+    "role": "user",
+    "content": "[TOOL OUTPUT]\n"
+   },
+   "expected": "[TOOL OUTPUT]"
+  }
+ ],
+ "compress_history": [
+  {
+   "history": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 4: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 5: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 6: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 7: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 8: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 9: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 10: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 11: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 12: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 13: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 14: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 15: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 16: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 17: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 18: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 19: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 20: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 21: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "context_window": 6,
+   "expected": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "[EARLIER CONVERSATION — key points]\nA: turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nQ: turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nA: turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nQ: turn 4: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nA: turn 5: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet\nQ: turn 6: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nA: turn 7: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nQ: turn 8: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nA: turn 9: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nQ: turn 10: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet\nA: turn 11: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsu\nQ: turn 12: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsu\nA: turn 13: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsu\nQ: turn 14: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsu\nA: turn 15: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet\nQ: turn 16: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsu\nA: turn 17: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsu\nQ: turn 18: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsu"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 19: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 20: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 21: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ]
+  },
+  {
+   "history": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 4: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 5: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 6: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 7: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 8: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 9: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 10: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 11: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 12: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 13: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 14: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 15: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 16: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 17: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 18: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 19: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 20: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 21: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "context_window": 10,
+   "expected": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "[EARLIER CONVERSATION — key points]\nA: turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nQ: turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nA: turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nQ: turn 4: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nA: turn 5: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet\nQ: turn 6: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nA: turn 7: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nQ: turn 8: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nA: turn 9: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nQ: turn 10: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet\nA: turn 11: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsu\nQ: turn 12: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsu\nA: turn 13: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsu\nQ: turn 14: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsu"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 15: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 16: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 17: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 18: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 19: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 20: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 21: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ]
+  },
+  {
+   "history": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "context_window": 10,
+   "expected": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ]
+  },
+  {
+   "history": [
+    {
+     "role": "system",
+     "content": "sys"
+    },
+    {
+     "role": "assistant",
+     "content": "I begin."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 4: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 5: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "context_window": 2,
+   "expected": [
+    {
+     "role": "system",
+     "content": "sys"
+    },
+    {
+     "role": "user",
+     "content": "[EARLIER CONVERSATION — key points]\nA: I begin.\nQ: turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet\nA: turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nQ: turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nA: turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum\nQ: turn 4: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 5: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ]
+  }
+ ],
+ "build_active_messages": [
+  {
+   "history": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 4: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 5: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 6: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 7: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 8: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 9: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 10: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 11: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 12: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 13: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 14: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 15: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 16: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 17: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 18: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 19: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 20: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 21: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "context_window": 10,
+   "engine_ctx": 8192,
+   "expected_history": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 4: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 5: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 6: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 7: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 8: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 9: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 10: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 11: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 12: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 13: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 14: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 15: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 16: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 17: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 18: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 19: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 20: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 21: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "expected_active": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "assistant",
+     "content": "turn 13: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 14: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 15: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 16: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 17: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 18: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 19: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 20: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 21: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ]
+  },
+  {
+   "history": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "big 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 4: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 5: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 6: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 7: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 8: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 9: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 10: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 11: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 12: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 13: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 14: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 15: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 16: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 17: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 18: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 19: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 20: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 21: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 24: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 25: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 26: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 27: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 28: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 29: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 30: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 31: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 32: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 33: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 34: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 35: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 36: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 37: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 38: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 39: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "context_window": 10,
+   "engine_ctx": 4096,
+   "expected_history": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "big 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 4: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 5: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 6: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 7: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 8: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 9: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 10: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 11: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 12: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 13: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 14: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 15: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 16: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 17: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 18: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 19: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 20: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 21: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 24: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 25: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 26: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 27: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 28: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 29: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 30: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 31: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 32: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 33: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 34: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 35: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 36: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 37: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 38: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 39: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "expected_active": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "big 30: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 31: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 32: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 33: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 34: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 35: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 36: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 37: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 38: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 39: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ]
+  },
+  {
+   "history": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "big 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 4: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 5: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 6: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 7: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 8: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 9: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 10: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 11: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 12: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 13: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 14: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 15: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 16: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 17: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 18: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 19: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 20: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 21: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 24: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 25: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 26: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 27: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 28: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 29: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 30: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 31: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 32: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 33: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 34: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 35: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 36: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 37: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 38: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 39: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "context_window": 6,
+   "engine_ctx": 0,
+   "max_history_tokens": 300,
+   "expected_history": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "big 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 4: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 5: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 6: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 7: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 8: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 9: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 10: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 11: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 12: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 13: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 14: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 15: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 16: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 17: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 18: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 19: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 20: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 21: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 24: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 25: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 26: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 27: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 28: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 29: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 30: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 31: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 32: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 33: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 34: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 35: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 36: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 37: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 38: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 39: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "expected_active": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "big 34: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 35: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 36: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 37: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "big 38: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "big 39: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ]
+  },
+  {
+   "history": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "context_window": 10,
+   "engine_ctx": 8192,
+   "expected_history": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "expected_active": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ]
+  }
+ ],
+ "trim_messages_to_context": [
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 4: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 5: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 6: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 7: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 8: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 9: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 10: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 11: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 12: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 13: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 14: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 15: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 16: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 17: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 18: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 19: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 20: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 21: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "max_input_tokens": 200,
+   "expected": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "assistant",
+     "content": "turn 19: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 20: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 21: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 4: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 5: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 6: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 7: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 8: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 9: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 10: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 11: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 12: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 13: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 14: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 15: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 16: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 17: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 18: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 19: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 20: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 21: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "max_input_tokens": 50,
+   "expected": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 22: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 23: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ],
+   "max_input_tokens": 10000,
+   "expected": [
+    {
+     "role": "system",
+     "content": "You are Artifex, a helpful AI assistant."
+    },
+    {
+     "role": "user",
+     "content": "turn 0: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 1: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "user",
+     "content": "turn 2: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    },
+    {
+     "role": "assistant",
+     "content": "turn 3: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet"
+    }
+   ]
+  }
+ ]
+}

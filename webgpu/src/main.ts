@@ -15,12 +15,57 @@ import { createInferenceSession, type InferenceSession } from './engine/inferenc
 import { parseModelConfig, estimateVRAM } from './model/model-config';
 import { descriptorFromHFConfig } from './model/model-descriptor';
 import type { TensorRole } from './model/tensor-locator';
+import { MAX_ATTN_SEQ_LEN } from './engine/forward-pass';
+import { buildActiveMessages, type ChatMessage } from './chat/context';
+import {
+  autoSave, saveSession, listSessions, loadSession,
+  buildSessionState, exportSessionFile, importSessionFile, type SessionFile,
+} from './chat/sessions';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
 let gpu: GPUContext | null = null;
 let currentModel: LoadedModel | null = null;
 let session: InferenceSession | null = null;
+
+// Conversation history (user/assistant only — system prompt is read live from
+// the UI each turn). Source of truth for windowing, sessions, and autosave.
+let chatHistory: ChatMessage[] = [];
+
+// Thinking markers by model family. Qwen emits <think>...</think> (the opener
+// usually lives in the PROMPT, so generated text may contain only the closer);
+// Gemma 4 emits <|channel>thought ... <channel|> entirely in the generation.
+const THINK_MARKERS = [
+  { open: '<think>', close: '</think>' },
+  { open: '<|channel>thought', close: '<channel|>' },
+];
+
+/** Split generated text into in-progress/completed thinking and the answer.
+ *  assumeOpen: treat marker-less text as thinking (Qwen-style templates end
+ *  the prompt with an opener, so generation starts mid-thought). */
+function splitThinking(text: string, assumeOpen: boolean): { thinking: string; answer: string } {
+  for (const m of THINK_MARKERS) {
+    const closeIdx = text.indexOf(m.close);
+    if (closeIdx !== -1) {
+      const thinking = text.slice(0, closeIdx).replace(m.open, '').trim();
+      const answer = text.slice(closeIdx + m.close.length).replace(/^\s+/, '');
+      return { thinking, answer };
+    }
+  }
+  for (const m of THINK_MARKERS) {
+    if (text.includes(m.open)) {
+      return { thinking: text.replace(m.open, '').trim(), answer: '' };
+    }
+  }
+  return assumeOpen ? { thinking: text.trim(), answer: '' } : { thinking: '', answer: text };
+}
+
+/** Reasoning stays out of history (matches Artifex GUI semantics + Qwen
+ *  multi-turn guidance). On a mid-thought cutoff, keep what we have. */
+function stripThinking(text: string): string {
+  const { thinking, answer } = splitThinking(text, false);
+  return answer || thinking;
+}
 
 // ─── DOM Elements ────────────────────────────────────────────────────────────
 
@@ -170,10 +215,11 @@ browseBtn.addEventListener('click', async () => {
       return;
     }
 
-    // Sort: local/ models first, then by size descending
+    // Sort: machine-local models (local/, ollama/) first, then by size descending
+    const isLocalRepo = (r: string) => r.startsWith('local/') || r.startsWith('ollama/');
     models.sort((a, b) => {
-      const aLocal = a.repo.startsWith('local/') ? 0 : 1;
-      const bLocal = b.repo.startsWith('local/') ? 0 : 1;
+      const aLocal = isLocalRepo(a.repo) ? 0 : 1;
+      const bLocal = isLocalRepo(b.repo) ? 0 : 1;
       if (aLocal !== bLocal) return aLocal - bLocal;
       return b.totalSize - a.totalSize;
     });
@@ -183,11 +229,16 @@ browseBtn.addEventListener('click', async () => {
       const el = document.createElement('div');
       const sizeGB = (m.totalSize / 1024 / 1024 / 1024).toFixed(1);
       const safetensors = m.files.filter(f => f.endsWith('.safetensors')).length;
-      const isLocal = m.repo.startsWith('local/');
+      const ggufs = m.files.filter(f => f.toLowerCase().endsWith('.gguf')).length;
+      const isLocal = isLocalRepo(m.repo);
+      const icon = m.repo.startsWith('ollama/') ? '🦙 ' : isLocal ? '📁 ' : '';
+      const kind = safetensors === 0 && ggufs > 0
+        ? `${ggufs} gguf`
+        : `${safetensors} shard${safetensors !== 1 ? 's' : ''}`;
       el.style.cssText = 'padding:6px 8px;cursor:pointer;border-bottom:1px solid #222;display:flex;justify-content:space-between;align-items:center';
       el.innerHTML = `
-        <span style="color:${isLocal ? 'var(--accent)' : 'var(--text)'}">${isLocal ? '📁 ' : ''}${m.repo}</span>
-        <span style="color:var(--dim);font-size:10px;white-space:nowrap;margin-left:8px">${sizeGB} GB · ${safetensors} shard${safetensors !== 1 ? 's' : ''}</span>
+        <span style="color:${isLocal ? 'var(--accent)' : 'var(--text)'}">${icon}${m.repo}</span>
+        <span style="color:var(--dim);font-size:10px;white-space:nowrap;margin-left:8px">${sizeGB} GB · ${kind}</span>
       `;
       el.addEventListener('mouseenter', () => { el.style.background = '#1a1e33'; });
       el.addEventListener('mouseleave', () => { el.style.background = 'none'; });
@@ -521,20 +572,17 @@ sendBtn.addEventListener('click', async () => {
       temperature, topP, topK, minP, repetitionPenalty, dryMultiplier,
       maxNewTokens, useCompressedKV,
     };
-    let thinkingDone = false;
+    // Gemma emits its thinking opener in the generation; Qwen-style templates
+    // put the opener in the prompt, so marker-less text counts as thinking.
+    const assumeThinkingOpen = !(session.config.modelType ?? '').toLowerCase().includes('gemma');
     const onToken = (token: string) => {
       fullText += token;
 
-      // Show thinking content dimmed, final answer bold
-      if (fullText.includes('</think>')) {
-        thinkingDone = true;
-        const parts = fullText.split('</think>');
-        const thinking = parts[0].replace('<think>', '').trim();
-        const answer = parts.slice(1).join('</think>').trimStart();
+      // Show thinking content dimmed, final answer normal
+      const { thinking, answer } = splitThinking(fullText, assumeThinkingOpen);
+      if (answer) {
         responseDiv.innerHTML = (thinking ? `<span style="opacity:0.4;font-size:0.85em">${thinking}</span><br><br>` : '') + answer;
       } else {
-        // Still thinking — show content with dim styling
-        const thinking = fullText.replace('<think>', '').trim();
         responseDiv.innerHTML = `<span style="opacity:0.4;font-size:0.85em">💭 ${thinking}</span>`;
       }
       messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -547,15 +595,31 @@ sendBtn.addEventListener('click', async () => {
       handle = session.run(rawText, sampling, onToken);
     } else {
       const systemPrompt = ($('system-prompt') as HTMLTextAreaElement).value.trim();
-      const messages: Array<{ role: string; content: string }> = [];
-      if (systemPrompt) {
-        messages.push({ role: 'system', content: systemPrompt });
-      }
-      messages.push({ role: 'user', content: text });
-      handle = (session as any).chat(messages, sampling, onToken, { enableThinking: true });
+      // Window the conversation: system pinned at [0] (context.ts contract),
+      // recent turns kept within the KV budget, older turns compressed to
+      // key points. The possibly-compressed history is written back as the
+      // new source of truth — same flow as the Artifex GUI.
+      const fullHistory: ChatMessage[] = [
+        { role: 'system', content: systemPrompt },
+        ...chatHistory,
+        { role: 'user', content: text },
+      ];
+      const countTokens = (t: string) => session!.tokenizer.encode(t).length;
+      const { history: updated, active } = buildActiveMessages(fullHistory, {
+        engineCtx: session.kvSession?.capacity ?? 8192,
+        countTokens,
+      });
+      chatHistory = updated.slice(1);  // write back, minus the system slot
+      const sendMessages = active[0].content ? active : active.slice(1);  // drop empty system
+      handle = (session as any).chat(sendMessages, sampling, onToken, { enableThinking: true });
     }
 
     const result = await handle.result;
+
+    if (!isRaw) {
+      chatHistory.push({ role: 'assistant', content: stripThinking(result.text) });
+      autoSave(chatHistory, { model: currentModel?.repo ?? 'unknown', backend: 'webgpu' });
+    }
 
     // If no streaming happened (e.g., empty response), show the full text
     if (!fullText && result.text) {
@@ -751,7 +815,7 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
   const { createGGUFLocator } = await import('./model/tensor-locator');
   const { createForwardPassEngine } = await import('./engine/forward-pass');
   const { createTokenizer, applyChatTemplate } = await import('./model/tokenizer');
-  const { generate } = await import('./engine/generate');
+  const { generate, createKVSession } = await import('./engine/generate');
 
   addMessage('system', `Loading GGUF: ${repo}/${ggufFile} ...`);
   const model = await loadGGUFModel(gpu!.device, repo, ggufFile, (p) => {
@@ -979,17 +1043,25 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
   }
   resetToRemote();
 
+  const kvSession = createKVSession(Math.min(config.maxPositionEmbeddings || 8192, 8192, MAX_ATTN_SEQ_LEN));
+  const resetKV = () => {
+    if (kvSession.kvCache) engine.destroyKVCache(kvSession.kvCache);
+    kvSession.kvCache = null;
+    kvSession.cachedTokenIds = [];
+  };
   session = {
     run: (prompt, sampling, onToken) => generate(gpu!.device, engine, tokenizer, prompt, sampling, onToken),
     chat: (messages: Array<{role: string; content: string}>, sampling: any, onToken: any, opts?: { enableThinking?: boolean }) => {
       const tokenIds = applyChatTemplate(tokenizer, messages, opts);
-      return generate(gpu!.device, engine, tokenizer, tokenIds, sampling, onToken);
+      return generate(gpu!.device, engine, tokenizer, tokenIds, sampling, onToken, { kvSession });
     },
+    kvSession,
+    resetKV,
     config,
     tokenizer,
     gpu: gpu!,
     vramEstimate: estimateVRAM(config),
-    destroy: () => { moe?.backend.destroy(); unloadModel(currentModel!); session = null; },
+    destroy: () => { resetKV(); moe?.backend.destroy(); unloadModel(currentModel!); session = null; },
   } as InferenceSession;
 
   promptEl.disabled = false;
@@ -1148,7 +1220,7 @@ loadBtn.addEventListener('click', async () => {
       const { createForwardPassEngine } = await import('./engine/forward-pass');
       const { createTokenizer } = await import('./model/tokenizer');
       const { createHFLocator } = await import('./model/tensor-locator');
-      const { generate } = await import('./engine/generate');
+      const { generate, createKVSession } = await import('./engine/generate');
 
       // Bridge weight tensors by canonical role (locator auto-detects prefix)
       const loc = createHFLocator(config.modelType, currentModel!.tensors);
@@ -1570,17 +1642,25 @@ loadBtn.addEventListener('click', async () => {
       const { applyChatTemplate } = await import('./model/tokenizer');
 
       // Store session for the send button
+      const kvSession = createKVSession(Math.min(config.maxPositionEmbeddings || 8192, 8192, MAX_ATTN_SEQ_LEN));
+      const resetKV = () => {
+        if (kvSession.kvCache) engine.destroyKVCache(kvSession.kvCache);
+        kvSession.kvCache = null;
+        kvSession.cachedTokenIds = [];
+      };
       session = {
         run: (prompt, sampling, onToken) => generate(gpu!.device, engine, tokenizer, prompt, sampling, onToken),
         chat: (messages: Array<{role: string; content: string}>, sampling: any, onToken: any, opts?: { enableThinking?: boolean }) => {
           const tokenIds = applyChatTemplate(tokenizer, messages, opts);
-          return generate(gpu!.device, engine, tokenizer, tokenIds, sampling, onToken);
+          return generate(gpu!.device, engine, tokenizer, tokenIds, sampling, onToken, { kvSession });
         },
+        kvSession,
+        resetKV,
         config,
         tokenizer,
         gpu: gpu!,
         vramEstimate: estimateVRAM(config),
-        destroy: () => { unloadModel(currentModel!); session = null; },
+        destroy: () => { resetKV(); unloadModel(currentModel!); session = null; },
       } as InferenceSession;
 
       // Enable chat input
@@ -1627,7 +1707,67 @@ loadBtn.addEventListener('click', async () => {
 
 clearBtn.addEventListener('click', () => {
   messagesEl.innerHTML = '';
+  chatHistory = [];
+  session?.resetKV?.();
   addMessage('system', 'Chat cleared.');
+});
+
+// ─── Sessions (save / load — session.py-compatible format) ──────────────────
+
+function applyLoadedSession(state: SessionFile) {
+  chatHistory = state.messages.filter(
+    (m): m is ChatMessage => m.role === 'user' || m.role === 'assistant');
+  session?.resetKV?.();  // history changed — next send does a full prefill
+  messagesEl.innerHTML = '';
+  for (const m of chatHistory) addMessage(m.role, m.content);
+  const model = state.metadata?.model ? ` (saved with ${state.metadata.model})` : '';
+  addMessage('system', `Session "${state.name}" loaded — ${chatHistory.length} messages${model}.`);
+}
+
+($('save-session-btn') as HTMLButtonElement)?.addEventListener('click', () => {
+  if (chatHistory.length === 0) {
+    addMessage('system', 'Nothing to save yet.');
+    return;
+  }
+  const name = window.prompt('Session name:', 'chat');
+  if (!name) return;
+  const metadata = { model: currentModel?.repo ?? 'unknown', backend: 'webgpu' };
+  const key = saveSession(name, chatHistory, metadata);
+  exportSessionFile(buildSessionState(name, chatHistory, metadata));
+  addMessage('system', `Session saved (${key.split(':')[1]}) and downloaded as .json — drop it in Artifex's sessions/ to continue there.`);
+});
+
+($('load-session-btn') as HTMLButtonElement)?.addEventListener('click', () => {
+  const fileInput = $('session-file-input') as HTMLInputElement;
+  const sessions = listSessions();
+  if (sessions.length === 0) {
+    fileInput.click();
+    return;
+  }
+  const menu = sessions.slice(0, 10)
+    .map((s, i) => `${i + 1}. ${s.name} — ${s.message_count} msgs (${s.timestamp})`)
+    .join('\n');
+  const choice = window.prompt(
+    `Enter a session number to load, or leave empty to pick a .json file:\n${menu}`);
+  if (choice === null) return;  // cancelled
+  const idx = parseInt(choice, 10);
+  if (!choice.trim() || Number.isNaN(idx)) {
+    fileInput.click();
+    return;
+  }
+  const picked = sessions[idx - 1];
+  const state = picked ? loadSession(picked.key) : null;
+  if (state) applyLoadedSession(state);
+  else addMessage('system', 'Could not load that session.');
+});
+
+($('session-file-input') as HTMLInputElement)?.addEventListener('change', async (e) => {
+  const file = (e.target as HTMLInputElement).files?.[0];
+  if (!file) return;
+  const state = await importSessionFile(file);
+  if (state) applyLoadedSession(state);
+  else addMessage('system', `Could not parse ${file.name} as a session file.`);
+  (e.target as HTMLInputElement).value = '';
 });
 
 exportBtn.addEventListener('click', () => {

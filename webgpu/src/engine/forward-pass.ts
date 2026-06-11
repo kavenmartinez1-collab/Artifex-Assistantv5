@@ -64,6 +64,15 @@ import { GGML_TYPES } from '../model/gguf';
 import { dequantGGML } from '../model/gguf-dequant';
 import { topKSoftmax, MOE_MAX_TOKENS, type MoEBackend } from './moe-cpu';
 
+// ── Limits ───────────────────────────────────────────────────────────────
+
+/** Longest KV sequence the attention kernels can read: attention.wgsl (and
+ *  attention_tq.wgsl) hold per-position scores in `var<workgroup> scores:
+ *  array<f32, 3840>` — 3840*4 + 256*4 = 16384 bytes, exactly the default
+ *  WebGPU workgroup-storage limit. KV caches must not exceed this; callers
+ *  sizing persistent chat sessions must clamp to it. */
+export const MAX_ATTN_SEQ_LEN = 3840;
+
 // ── CPU embed helpers (BF16 → F32 decode) ──────────────────────────────
 const _cpuEmbedBuf = new ArrayBuffer(4);
 const _cpuEmbedU32 = new Uint32Array(_cpuEmbedBuf);
@@ -1266,8 +1275,7 @@ export function createForwardPassEngine(
     bd(ropePipeline, [bg], [workgroupCount(totalPairs, 256)], label);
   }
 
-  // attention.wgsl uses var<workgroup> scores: array<f32, 3840> — hard ceiling
-  const MAX_ATTN_CACHE = 3840;
+  const MAX_ATTN_CACHE = MAX_ATTN_SEQ_LEN;
 
   function dispatchAttention(
     qBuf: GPUBuffer, kCacheBuf: GPUBuffer, vCacheBuf: GPUBuffer,

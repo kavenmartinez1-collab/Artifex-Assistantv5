@@ -13,7 +13,7 @@
  */
 
 import { readBuffer } from './buffers';
-import type { ForwardPassEngine, KVCache } from './forward-pass';
+import { MAX_ATTN_SEQ_LEN, type ForwardPassEngine, type KVCache } from './forward-pass';
 import type { Tokenizer } from '../model/tokenizer';
 
 // ── Sampling Configuration ───────────────────────────────────────────────
@@ -79,6 +79,49 @@ export interface GenerationHandle {
   result: Promise<GenerationResult>;
   /** Call to stop generation early. */
   abort: () => void;
+}
+
+// ── Persistent KV session (multi-turn chat) ──────────────────────────────
+
+/**
+ * Holds a KV cache that survives across generate() calls so consecutive chat
+ * turns don't re-prefill the whole conversation.
+ *
+ * Reuse rule: the new prompt's token ids must EXTEND cachedTokenIds exactly
+ * (common prefix === full cached sequence). Then only the delta is prefilled.
+ * Anything else — divergence, TurboQuant toggle, capacity overflow — resets
+ * the cache and re-prefills from scratch. No rewind: hybrid models carry SSM
+ * state (a running recurrence with no per-position history), so partial
+ * rollback is unsound there; extension-or-reset is the rule for all models.
+ *
+ * cachedTokenIds tracks exactly what's IN the cache: prompt tokens plus every
+ * generated token that was actually forwarded (the final sampled token of a
+ * max_length/abort exit never enters the cache).
+ */
+export interface KVSessionState {
+  kvCache: KVCache | null;
+  cachedTokenIds: number[];
+  /** Cache allocation in tokens. Grows when a turn needs more. */
+  capacity: number;
+  /** TurboQuant flag the current cache was created with. */
+  compressed: boolean;
+}
+
+export function createKVSession(capacity: number): KVSessionState {
+  return { kvCache: null, cachedTokenIds: [], capacity, compressed: false };
+}
+
+export interface GenerateOptions {
+  /** Persistent KV session for multi-turn reuse. When set, generate() keeps
+   *  the cache alive across calls instead of destroying it. */
+  kvSession?: KVSessionState;
+}
+
+function commonPrefixLen(a: number[], b: number[]): number {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a[i] === b[i]) i++;
+  return i;
 }
 
 // ── Sampling Functions ───────────────────────────────────────────────────
@@ -446,6 +489,7 @@ export function generate(
   prompt: string | number[],
   sampling: SamplingConfig = {},
   onToken?: OnTokenCallback,
+  opts?: GenerateOptions,
 ): GenerationHandle {
   let aborted = false;
 
@@ -492,9 +536,58 @@ export function generate(
       };
     }
 
-    // ── Step 2: Create KV cache ──────────────────────────────────────
-    const maxSeq = promptTokens + config.maxNewTokens;
-    const kvCache = engine.createKVCache(maxSeq, config.useCompressedKV);
+    // ── Step 2: Create or reuse KV cache ─────────────────────────────
+    const sess = opts?.kvSession ?? null;
+    let kvCache: KVCache;
+    let prefillIds = promptIds;
+    if (sess) {
+      // The attention kernels can read at most MAX_ATTN_SEQ_LEN positions —
+      // clamp the cache size AND the generation budget to it. The sliding
+      // window (chat/context.ts) keys its token budget off sess.capacity, so
+      // prompts stay under this by construction; the clamp is the backstop.
+      if (promptTokens >= MAX_ATTN_SEQ_LEN) {
+        throw new Error(
+          `Prompt is ${promptTokens} tokens but the attention kernel supports at most `
+          + `${MAX_ATTN_SEQ_LEN - 1} prompt tokens. Shorten the input or enable history compression.`);
+      }
+      const effectiveMaxNew = Math.min(config.maxNewTokens, MAX_ATTN_SEQ_LEN - promptTokens);
+      if (effectiveMaxNew < config.maxNewTokens) {
+        console.warn(
+          `[Generate] maxNewTokens clamped ${config.maxNewTokens} -> ${effectiveMaxNew} `
+          + `(attention kernel limit ${MAX_ATTN_SEQ_LEN})`);
+        config.maxNewTokens = effectiveMaxNew;
+      }
+      sess.capacity = Math.min(Math.max(sess.capacity, promptTokens + config.maxNewTokens), MAX_ATTN_SEQ_LEN);
+    }
+    const needed = promptTokens + config.maxNewTokens;
+    if (sess) {
+      const prefixLen = commonPrefixLen(sess.cachedTokenIds, promptIds);
+      const pureExtension =
+        sess.kvCache !== null
+        && sess.compressed === config.useCompressedKV
+        && sess.kvCache.position === sess.cachedTokenIds.length  // sanity: tracker matches cache
+        && prefixLen === sess.cachedTokenIds.length
+        && prefixLen > 0
+        && promptTokens > prefixLen                              // non-empty delta to prefill
+        && needed <= sess.kvCache.maxSeqLen;
+      if (pureExtension) {
+        kvCache = sess.kvCache!;
+        prefillIds = promptIds.slice(prefixLen);
+        console.log(`[Generate] KV reuse: ${prefixLen} cached tokens, prefilling ${prefillIds.length} new`);
+      } else {
+        const hadTokens = sess.cachedTokenIds.length;
+        if (sess.kvCache) engine.destroyKVCache(sess.kvCache);
+        kvCache = engine.createKVCache(sess.capacity, config.useCompressedKV);
+        sess.kvCache = kvCache;
+        sess.compressed = config.useCompressedKV;
+        sess.cachedTokenIds = [];
+        if (hadTokens > 0) {
+          console.log(`[Generate] KV reset: prefix match ${prefixLen}/${hadTokens} — full prefill`);
+        }
+      }
+    } else {
+      kvCache = engine.createKVCache(needed, config.useCompressedKV);
+    }
     if (config.useCompressedKV) {
       console.log(`[Generate] Using TurboQuant compressed KV cache`);
     }
@@ -541,21 +634,24 @@ export function generate(
       (globalThis as any).__DEBUG_DUMP_RESULT__ = {};  // reset accumulator
       console.log(`[Probe] enabled; decode dump steps: [${decodeDumpSteps.join(', ')}]`);
     }
-    for (let i = 0; i < promptTokens; i += PREFILL_CHUNK) {
-      const chunkEnd = Math.min(i + PREFILL_CHUNK, promptTokens);
-      const chunk = new Uint32Array(promptIds.slice(i, chunkEnd));
-      const isLastChunk = chunkEnd >= promptTokens;
+    const prefillCount = prefillIds.length;
+    for (let i = 0; i < prefillCount; i += PREFILL_CHUNK) {
+      const chunkEnd = Math.min(i + PREFILL_CHUNK, prefillCount);
+      const chunk = new Uint32Array(prefillIds.slice(i, chunkEnd));
+      const isLastChunk = chunkEnd >= prefillCount;
       if (probeEnabled && isLastChunk) {
         (globalThis as any).__DEBUG_DUMP_STATS__ = 'prefill-end';
       }
       prefillOutput = await engine.forward(chunk, kvCache);
     }
     await device.queue.onSubmittedWorkDone();
+    // The cache now holds every prompt token (cached prefix + the delta we just prefilled).
+    if (sess) sess.cachedTokenIds = [...promptIds];
 
     const prefillEnd = performance.now();
     const prefillMs = prefillEnd - startTime;
-    const chunks = Math.ceil(promptTokens / PREFILL_CHUNK);
-    console.log(`[Generate] Prefill: ${promptTokens} tokens in ${chunks} chunk(s), ${prefillMs.toFixed(0)}ms (${(promptTokens / prefillMs * 1000).toFixed(0)} tok/s)`);
+    const chunks = Math.ceil(prefillCount / PREFILL_CHUNK);
+    console.log(`[Generate] Prefill: ${prefillCount} tokens in ${chunks} chunk(s), ${prefillMs.toFixed(0)}ms (${(prefillCount / prefillMs * 1000).toFixed(0)} tok/s)`);
 
     // ── Step 4: Sample first token from prefill logits ───────────────
     const generatedIds: number[] = [];
@@ -608,6 +704,7 @@ export function generate(
         const input = new Uint32Array([lastTokenId]);
         const __tFwdStart = performance.now();
         const output = await engine.forward(input, kvCache);
+        if (sess) sess.cachedTokenIds.push(lastTokenId);  // token is now IN the cache
         const __tFwdEnd = performance.now();
 
         // Read logits back from GPU
@@ -780,8 +877,9 @@ export function generate(
     // ── Step 5: Detokenize ───────────────────────────────────────────
     const text = generatedIds.length > 0 ? tokenizer.decode(generatedIds) : '';
 
-    // Clean up KV cache buffers
-    engine.destroyKVCache(kvCache);
+    // Clean up KV cache buffers — unless a session owns the cache (multi-turn
+    // reuse). Session caches are destroyed by the owner (reset/unload).
+    if (!sess) engine.destroyKVCache(kvCache);
 
     return {
       text,
