@@ -10,7 +10,7 @@
  *   const text = tok.decode(ids);
  */
 
-import { AutoTokenizer, type PreTrainedTokenizer } from '@huggingface/transformers';
+import { AutoTokenizer, PreTrainedTokenizer } from '@huggingface/transformers';
 
 export interface Tokenizer {
   /** Convert text to token IDs. */
@@ -54,10 +54,26 @@ export interface TokenizerConfig {
  */
 export async function createTokenizer(config: TokenizerConfig): Promise<Tokenizer> {
   let { modelId } = config;
+  let localTokenizer: PreTrainedTokenizer | null = null;
 
   // Local models (local/xxx) can't use HF CDN for tokenizer — fall back to base model
   // The tokenizer is the same across quantization variants
   if (modelId.startsWith('local/')) {
+    // Preferred: the model dir ships its own tokenizer files (e.g. Gemma 4
+    // GGUF + tokenizer.json downloaded together) — construct directly from
+    // the dev-server cache, no HF Hub round-trip (mirrors the D0 node test).
+    try {
+      const [tjResp, tcResp] = await Promise.all([
+        fetch(`/api/hf-cache/${modelId}/raw/main/tokenizer.json`),
+        fetch(`/api/hf-cache/${modelId}/raw/main/tokenizer_config.json`),
+      ]);
+      if (tjResp.ok && tcResp.ok) {
+        localTokenizer = new PreTrainedTokenizer(await tjResp.json(), await tcResp.json());
+        console.log(`[Tokenizer] Loaded from local model dir: ${modelId}`);
+      }
+    } catch { /* fall through to base-model heuristics */ }
+  }
+  if (!localTokenizer && modelId.startsWith('local/')) {
     // Try to find the base model from the tokenizer_config.json served by local cache
     try {
       const resp = await fetch(`/api/hf-cache/${modelId}/raw/main/tokenizer_config.json`);
@@ -84,7 +100,7 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
     }
   }
 
-  const hfTokenizer = await AutoTokenizer.from_pretrained(modelId, {
+  const hfTokenizer = localTokenizer ?? await AutoTokenizer.from_pretrained(modelId, {
     progress_callback: config.onProgress
       ? (progress: any) => {
           if (progress && typeof progress.loaded === 'number') {
