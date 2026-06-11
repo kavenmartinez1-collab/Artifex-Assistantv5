@@ -128,6 +128,9 @@ export interface PromptImage {
   count: number;
   /** count × hiddenSize f32 rows from the vision encoder. */
   embeddings: Float32Array;
+  /** Qwen3-VL DeepStack features: one count × hiddenSize array per early
+   *  text layer, added to that layer's output at this image's positions. */
+  deepstack?: Float32Array[];
 }
 
 /** Pre-tokenized prompt with image spans. Text positions embed normally;
@@ -665,7 +668,7 @@ export function generate(
     // precomputed rows. Chunks never straddle a segment boundary. (With
     // images, KV reuse is off, so prefillIds === promptIds.)
     const Hdim = engine.config.hiddenSize;
-    const segments: Array<{ ids: number[]; embeds?: Float32Array }> = [];
+    const segments: Array<{ ids: number[]; embeds?: Float32Array; deepstack?: Float32Array[] }> = [];
     if (hasImages) {
       const imgs = [...mm!.images].sort((a, b) => a.start - b.start);
       let cursor = 0;
@@ -676,7 +679,11 @@ export function generate(
         }
         if (img.start < cursor) throw new Error('[Generate] overlapping image spans');
         if (img.start > cursor) segments.push({ ids: promptIds.slice(cursor, img.start) });
-        segments.push({ ids: promptIds.slice(img.start, img.start + img.count), embeds: img.embeddings });
+        segments.push({
+          ids: promptIds.slice(img.start, img.start + img.count),
+          embeds: img.embeddings,
+          deepstack: img.deepstack,
+        });
         cursor = img.start + img.count;
       }
       if (cursor < promptIds.length) segments.push({ ids: promptIds.slice(cursor) });
@@ -695,7 +702,10 @@ export function generate(
           (globalThis as any).__DEBUG_DUMP_STATS__ = 'prefill-end';
         }
         const fwdOpts = seg.embeds
-          ? { embeddings: seg.embeds.subarray(i * Hdim, chunkEnd * Hdim) }
+          ? {
+              embeddings: seg.embeds.subarray(i * Hdim, chunkEnd * Hdim),
+              deepstackFeatures: seg.deepstack?.map(f => f.subarray(i * Hdim, chunkEnd * Hdim)),
+            }
           : undefined;
         prefillOutput = await engine.forward(chunk, kvCache, fwdOpts);
       }

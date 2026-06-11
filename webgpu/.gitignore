@@ -7,3 +7,6 @@
 
 # machine-local model directory config (absolute paths — never commit)
 model-dirs.local.json
+
+# vision parity golden (16MB, regenerate via scripts/gen_vision_fixture.py)
+test-fixtures/vision-qwen3vl-golden.json

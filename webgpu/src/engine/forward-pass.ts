@@ -299,6 +299,10 @@ export interface ForwardOptions {
    *  (and Gemma PLE row-gather, which is why Gemma vision needs more than
    *  this hook). */
   embeddings?: Float32Array;
+  /** Qwen3-VL DeepStack: features[k] (seqLen × hiddenSize f32) is added to
+   *  text layer k's output for this chunk. Callers pass this only on
+   *  image-segment chunks, so every row is an image row by construction. */
+  deepstackFeatures?: Float32Array[];
 }
 
 export interface ForwardPassEngine {
@@ -746,6 +750,9 @@ export function createForwardPassEngine(
   const tokenIdBuf = createStorageBuffer(device, null, MAX_PREFILL * 4, 'token-ids', true);
   // Small buffer for extracting last token's hidden state (for LM head after batch prefill)
   const lastHiddenBuf = createStorageBuffer(device, null, H * 4, 'last-hidden', true);
+
+  // DeepStack feature staging buffers — one per tap layer, lazily created.
+  const dsFeatBufs: GPUBuffer[] = [];
 
   // Option A (chunked-prefill for hybrid models): per-token scratch buffers used
   // to wrap the existing single-token SSM block in a per-token JS loop while the
@@ -2573,6 +2580,25 @@ export function createForwardPassEngine(
         } else {
           batchCopy(attnProjBuf, 0, hiddenBuf, 0, seqLen * H * 4);
         }
+      }
+
+      // ── DeepStack injection (Qwen3-VL) ─────────────────────────────
+      // Vision features from the tower's intermediate mergers are added to
+      // the first text layers' outputs at image positions. One buffer per
+      // tap layer: all writeBuffers execute before this forward()'s single
+      // batched submit, so a shared buffer would be overwritten.
+      if (opts?.deepstackFeatures && l < opts.deepstackFeatures.length) {
+        const feat = opts.deepstackFeatures[l];
+        if (feat.length !== seqLen * H) {
+          throw new Error(`[forward] deepstack[${l}]: ${feat.length} floats != seqLen*H = ${seqLen * H}`);
+        }
+        if (!dsFeatBufs[l]) {
+          dsFeatBufs[l] = createStorageBuffer(device, null, MAX_PREFILL * H * 4, `deepstack-feat-${l}`, true);
+        }
+        device.queue.writeBuffer(dsFeatBufs[l], 0, feat.buffer as ArrayBuffer, feat.byteOffset, feat.byteLength);
+        // hidden += feat (ping-pong through normedBuf — no read+write aliasing)
+        batchCopy(hiddenBuf, 0, normedBuf, 0, seqLen * H * 4);
+        dispatchElementwise(addPipeline, normedBuf, hiddenBuf, seqLen * H, `L${l}-deepstack`, dsFeatBufs[l]);
       }
 
       // Dump hidden state after every layer for comparison with PyTorch reference

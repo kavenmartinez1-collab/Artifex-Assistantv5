@@ -10,7 +10,10 @@ import { initWebGPU, discoverAdapters, type GPUContext, type DiscoveredAdapter }
 import { reportMetric, reportError, timed } from './utils/metrics';
 import { runKernelTests } from './engine/kernel-tests';
 import { loadModel, unloadModel, previewModel, formatBytes, getCacheStats, clearCache, type LoadedModel } from './model';
-import { setAuthToken, useLocalCache, resetToRemote } from './model/hf-hub';
+import { setAuthToken, useLocalCache, resetToRemote, resolveFileUrl } from './model/hf-hub';
+import { visionDescriptorFromHFConfig, type VisionDescriptor } from './vision/vision-descriptor';
+import { preprocessImage, type PreprocessedImage } from './vision/preprocess';
+import type { VisionEncoder, VisionEncodeResult } from './vision/vision-encoder';
 import { createInferenceSession, type InferenceSession } from './engine/inference';
 import { parseModelConfig, estimateVRAM } from './model/model-config';
 import { descriptorFromHFConfig } from './model/model-descriptor';
@@ -31,6 +34,16 @@ let session: InferenceSession | null = null;
 // Conversation history (user/assistant only — system prompt is read live from
 // the UI each turn). Source of truth for windowing, sessions, and autosave.
 let chatHistory: ChatMessage[] = [];
+
+// ─── Vision state ────────────────────────────────────────────────────────────
+// Set when the loaded model is a (verified) multimodal checkpoint. The tower
+// loads lazily on first image; pending images preprocess at attach time so
+// their token cost shows in the chip before sending.
+let activeVisionDesc: VisionDescriptor | null = null;
+let visionEncoder: VisionEncoder | null = null;
+let visionEncoderLoading: Promise<VisionEncoder> | null = null;
+interface PendingImage { name: string; pre: PreprocessedImage }
+let pendingImages: PendingImage[] = [];
 
 // Thinking markers by model family. Qwen emits <think>...</think> (the opener
 // usually lives in the PROMPT, so generated text may contain only the closer);
@@ -535,7 +548,173 @@ testBtn.addEventListener('click', async () => {
   }
 });
 
-// ─── Chat (placeholder — functional once model loading is implemented) ───────
+// ─── Vision: attach / paste / drop ───────────────────────────────────────────
+
+const attachBtn = $('attach-btn') as HTMLButtonElement;
+const imageInput = $('image-input') as HTMLInputElement;
+const chipsEl = $('image-chips') as HTMLDivElement;
+const SUPPORTED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/bmp'];
+const SUPPORTED_IMAGE_LABEL = 'PNG, JPEG, WebP, GIF, BMP';
+
+function setVisionDesc(desc: VisionDescriptor | null) {
+  activeVisionDesc = desc;
+  if (!desc) {
+    attachBtn.disabled = true;
+    attachBtn.title = 'Load a vision model to attach images';
+  } else if (!desc.verified) {
+    attachBtn.disabled = true;
+    attachBtn.title = `${desc.family} vision support is not parity-verified yet`;
+    addMessage('system',
+      `This model has a ${desc.family} vision tower, but that family isn't parity-verified yet — image input stays disabled.`);
+  } else {
+    attachBtn.disabled = false;
+    attachBtn.title = `Attach images (${SUPPORTED_IMAGE_LABEL}) — or paste / drag-drop`;
+    addMessage('system',
+      `Vision model detected — attach images with 📎, paste, or drag-drop. Supported: ${SUPPORTED_IMAGE_LABEL}.`);
+  }
+}
+
+function resetVision() {
+  visionEncoder?.destroy();
+  visionEncoder = null;
+  visionEncoderLoading = null;
+  pendingImages = [];
+  renderChips();
+  setVisionDescQuiet(null);
+}
+// setVisionDesc(null) without the announcement (used on unload)
+function setVisionDescQuiet(desc: VisionDescriptor | null) {
+  activeVisionDesc = desc;
+  attachBtn.disabled = true;
+  attachBtn.title = 'Load a vision model to attach images';
+}
+
+function renderChips() {
+  chipsEl.style.display = pendingImages.length > 0 ? 'flex' : 'none';
+  chipsEl.innerHTML = '';
+  pendingImages.forEach((img, i) => {
+    const chip = document.createElement('span');
+    chip.style.cssText =
+      'display:inline-flex;align-items:center;gap:4px;background:#1a1e33;border:1px solid #333;'
+      + 'border-radius:12px;padding:2px 8px;font-size:11px';
+    chip.textContent = `🖼 ${img.name} (~${img.pre.numTokens} tok)`;
+    const x = document.createElement('button');
+    x.textContent = '✕';
+    x.style.cssText = 'background:none;border:none;color:var(--dim);cursor:pointer;font-size:11px';
+    x.addEventListener('click', () => { pendingImages.splice(i, 1); renderChips(); });
+    chip.appendChild(x);
+    chipsEl.appendChild(chip);
+  });
+}
+
+async function addPendingImage(blob: Blob, name: string) {
+  if (!activeVisionDesc || attachBtn.disabled) {
+    addMessage('system',
+      'This model does not support images. Load a vision model (e.g. local/qwen3-vl-4b-instruct) to use them.');
+    return;
+  }
+  if (blob.type && blob.type.startsWith('image/') && !SUPPORTED_IMAGE_TYPES.includes(blob.type)) {
+    addMessage('system', `Unsupported image type "${blob.type}". Supported: ${SUPPORTED_IMAGE_LABEL}.`);
+    return;
+  }
+  try {
+    const pre = await preprocessImage(blob, activeVisionDesc);
+    pendingImages.push({ name, pre });
+    renderChips();
+  } catch (err) {
+    addMessage('system', `Could not read image "${name}": ${err}`);
+  }
+}
+
+async function ensureVisionEncoder(): Promise<VisionEncoder> {
+  if (visionEncoder) return visionEncoder;
+  if (!visionEncoderLoading) {
+    visionEncoderLoading = (async () => {
+      const { loadVisionWeights } = await import('./vision/vision-loader');
+      const { createVisionEncoder } = await import('./vision/vision-encoder');
+      const weights = await loadVisionWeights(
+        gpu!.device, currentModel!.repo, activeVisionDesc!, (m) => setStatus(m));
+      visionEncoder = createVisionEncoder(gpu!.device, activeVisionDesc!, weights);
+      addMessage('system',
+        `Vision tower loaded: ${(weights.totalGPUBytes / 1e9).toFixed(2)} GB GPU.`, 'vision ready');
+      return visionEncoder;
+    })().catch((err) => {
+      visionEncoderLoading = null;  // allow retry after a failure
+      throw err;
+    });
+  }
+  return visionEncoderLoading;
+}
+
+attachBtn.addEventListener('click', () => imageInput.click());
+imageInput.addEventListener('change', async (e) => {
+  const input = e.target as HTMLInputElement;
+  for (const f of Array.from(input.files ?? [])) await addPendingImage(f, f.name);
+  input.value = '';
+});
+promptEl.addEventListener('paste', async (e) => {
+  const items = Array.from(e.clipboardData?.items ?? []).filter(it => it.type.startsWith('image/'));
+  if (items.length === 0) return;
+  e.preventDefault();
+  for (const it of items) {
+    const f = it.getAsFile();
+    if (f) await addPendingImage(f, f.name || 'pasted-image');
+  }
+});
+document.addEventListener('dragover', (e) => {
+  if (e.dataTransfer?.types.includes('Files')) e.preventDefault();
+});
+document.addEventListener('drop', async (e) => {
+  const files = Array.from(e.dataTransfer?.files ?? []).filter(f => f.type.startsWith('image/'));
+  if (files.length === 0) return;
+  e.preventDefault();
+  for (const f of files) await addPendingImage(f, f.name);
+});
+
+// ─── Vision parity harness (console: __VISION_PARITY__()) ──────────────────
+// Compares the browser pipeline stage-by-stage against the Python golden
+// fixture (webgpu/scripts/gen_vision_fixture.py): preprocessing patch matrix,
+// then tower output + deepstack features. Requires a vision model loaded.
+(globalThis as any).__VISION_PARITY__ = async () => {
+  if (!activeVisionDesc) { console.error('Load a vision model first'); return; }
+  const resp = await fetch('/test-fixtures/vision-qwen3vl-golden.json');
+  if (!resp.ok) { console.error('Fixture missing — run webgpu/scripts/gen_vision_fixture.py'); return; }
+  const fx = await resp.json();
+  const png = Uint8Array.from(atob(fx.png_base64), c => c.charCodeAt(0));
+  const pre = await preprocessImage(new Blob([png], { type: 'image/png' }), activeVisionDesc);
+
+  const diff = (name: string, ours: Float32Array | number[], ref: number[]) => {
+    if (ours.length !== ref.length) {
+      console.error(`[parity] ${name}: LENGTH ${ours.length} vs ${ref.length}`);
+      return;
+    }
+    let maxAbs = 0, sumAbs = 0, at = -1;
+    for (let i = 0; i < ref.length; i++) {
+      const d = Math.abs((ours as any)[i] - ref[i]);
+      if (d > maxAbs) { maxAbs = d; at = i; }
+      sumAbs += d;
+    }
+    console.log(`[parity] ${name}: maxAbsDiff=${maxAbs.toExponential(3)} (at ${at}) meanAbsDiff=${(sumAbs / ref.length).toExponential(3)}`);
+  };
+
+  diff('pixel_values (preprocess)', pre.patches, fx.pixel_values);
+  const encoder = await ensureVisionEncoder();
+  const out = await encoder.encode(pre);
+  diff('image_embeds (tower+merger)', out.embeddings, fx.image_embeds);
+  out.deepstack.forEach((ds, i) => diff(`deepstack[${i}]`, ds, fx.deepstack[i] ?? []));
+  console.log('[parity] done — preprocessing should be ~1e-6; tower f32-vs-f32 ~1e-3 or better');
+};
+
+/** Fetch preprocessor_config.json (local cache or CDN) — optional. */
+async function fetchPreprocessorConfig(repo: string): Promise<Record<string, any> | undefined> {
+  try {
+    const resp = await fetch(resolveFileUrl(repo, 'preprocessor_config.json'));
+    if (resp.ok) return await resp.json();
+  } catch { /* optional file */ }
+  return undefined;
+}
+
+// ─── Chat ─────────────────────────────────────────────────────────────────────
 
 sendBtn.addEventListener('click', async () => {
   const text = promptEl.value.trim();
@@ -611,7 +790,30 @@ sendBtn.addEventListener('click', async () => {
       });
       chatHistory = updated.slice(1);  // write back, minus the system slot
       const sendMessages = active[0].content ? active : active.slice(1);  // drop empty system
-      handle = (session as any).chat(sendMessages, sampling, onToken, { enableThinking: true });
+
+      if (pendingImages.length > 0 && activeVisionDesc && (session as any).chatMM) {
+        // Multimodal turn: encode pending images, prefix the user message
+        // with placeholder spans, and send via the MultimodalPrompt path.
+        // History keeps the plain text — images are per-turn in v1.
+        const encoder = await ensureVisionEncoder();
+        const images = pendingImages;
+        pendingImages = [];
+        renderChips();
+        const encoded: VisionEncodeResult[] = [];
+        for (const img of images) {
+          setStatus(`Encoding ${img.name}...`);
+          encoded.push(await encoder.encode(img.pre));
+        }
+        const padBlock = encoded.map(e =>
+          `<|vision_start|>${'<|image_pad|>'.repeat(e.numTokens)}<|vision_end|>`).join('');
+        const mmMessages = sendMessages.map((m, idx) =>
+          idx === sendMessages.length - 1 && m.role === 'user'
+            ? { ...m, content: padBlock + m.content }
+            : m);
+        handle = (session as any).chatMM(mmMessages, encoded, sampling, onToken, { enableThinking: true });
+      } else {
+        handle = (session as any).chat(sendMessages, sampling, onToken, { enableThinking: true });
+      }
     }
 
     const result = await handle.result;
@@ -1052,6 +1254,7 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
       `but model expects ${config.vocabSize}. Wrong tokenizer fallback?`);
   }
   resetToRemote();
+  setVisionDescQuiet(null);  // GGUF vision (mmproj / v.* towers) lands in M2
 
   const kvSession = createKVSession(Math.min(config.maxPositionEmbeddings || 8192, 8192, MAX_ATTN_SEQ_LEN));
   const resetKV = () => {
@@ -1108,6 +1311,7 @@ loadBtn.addEventListener('click', async () => {
 
   // Unload previous model if loaded
   if (currentModel) {
+    resetVision();
     unloadModel(currentModel);
     currentModel = null;
   }
@@ -1664,14 +1868,56 @@ loadBtn.addEventListener('click', async () => {
           const tokenIds = applyChatTemplate(tokenizer, messages, opts);
           return generate(gpu!.device, engine, tokenizer, tokenIds, sampling, onToken, { kvSession });
         },
+        // Multimodal turn: template with placeholder spans already in the
+        // user content, locate the pad runs, pair them with encoded images.
+        chatMM: (
+          messages: Array<{role: string; content: string}>,
+          encoded: VisionEncodeResult[],
+          sampling: any, onToken: any, opts?: { enableThinking?: boolean },
+        ) => {
+          const tokenIds = applyChatTemplate(tokenizer, messages, opts);
+          const padId = activeVisionDesc!.placeholder.imageTokenId;
+          const spans: Array<{ start: number; count: number }> = [];
+          let i = 0;
+          while (i < tokenIds.length) {
+            if (tokenIds[i] === padId) {
+              let j = i;
+              while (j < tokenIds.length && tokenIds[j] === padId) j++;
+              spans.push({ start: i, count: j - i });
+              i = j;
+            } else i++;
+          }
+          if (spans.length !== encoded.length) {
+            throw new Error(`Image span mismatch: ${spans.length} pad runs in prompt vs ${encoded.length} encoded images`);
+          }
+          const images = spans.map((s, k) => {
+            if (s.count !== encoded[k].numTokens) {
+              throw new Error(`Image ${k}: ${s.count} pad tokens vs ${encoded[k].numTokens} embedding rows`);
+            }
+            return {
+              start: s.start, count: s.count,
+              embeddings: encoded[k].embeddings,
+              deepstack: encoded[k].deepstack,
+            };
+          });
+          return generate(gpu!.device, engine, tokenizer, { tokenIds, images }, sampling, onToken, { kvSession });
+        },
         kvSession,
         resetKV,
         config,
         tokenizer,
         gpu: gpu!,
         vramEstimate: estimateVRAM(config),
-        destroy: () => { resetKV(); unloadModel(currentModel!); session = null; },
+        destroy: () => { resetVision(); resetKV(); unloadModel(currentModel!); session = null; },
       } as InferenceSession;
+
+      // Vision support: multimodal checkpoints get a descriptor → 📎 enabled
+      try {
+        const pp = await fetchPreprocessorConfig(repo);
+        setVisionDesc(visionDescriptorFromHFConfig(currentModel!.config as Record<string, any>, pp));
+      } catch {
+        setVisionDescQuiet(null);
+      }
 
       // Enable chat input
       promptEl.disabled = false;
@@ -1801,6 +2047,7 @@ unloadBtn.addEventListener('click', async () => {
   if (currentModel) {
     const name = currentModel.repo;
     const freed = formatBytes(currentModel.totalGPUBytes);
+    resetVision();
     unloadModel(currentModel);
     currentModel = null;
     session = null;

@@ -347,7 +347,13 @@
           Load a model from HuggingFace to begin, or run kernel tests to verify GPU compute.
         </div>
       </div>
+      <div id="image-chips" style="display:none;gap:6px;flex-wrap:wrap;padding:4px 8px"></div>
       <div class="input-bar">
+        <button class="btn btn-dim" id="attach-btn" disabled
+                title="Load a vision model to attach images"
+                style="align-self:flex-end">📎</button>
+        <input type="file" id="image-input" multiple style="display:none"
+               accept="image/png,image/jpeg,image/webp,image/gif,image/bmp">
         <textarea id="prompt" rows="1" placeholder="Type a message..." disabled></textarea>
         <button class="send-btn" id="send-btn" disabled>Send</button>
       </div>
