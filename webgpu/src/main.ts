@@ -710,8 +710,22 @@ document.addEventListener('drop', async (e) => {
 // then tower output + deepstack features. Requires a vision model loaded.
 (globalThis as any).__VISION_PARITY__ = async () => {
   if (!activeVisionDesc) { console.error('Load a vision model first'); return; }
-  const resp = await fetch('/test-fixtures/vision-qwen3vl-golden.json');
-  if (!resp.ok) { console.error('Fixture missing — run webgpu/scripts/gen_vision_fixture.py'); return; }
+  // Each family has its own golden fixture — comparing across families is
+  // meaningless (different patch counts, hidden sizes). Pick by family.
+  const fixtureByFamily: Record<string, string> = {
+    qwen3_vl: 'vision-qwen3vl-golden.json',
+    gemma4: 'vision-gemma4-golden.json',
+  };
+  const fixtureName = fixtureByFamily[activeVisionDesc.family];
+  if (!fixtureName) {
+    console.error(`[parity] no golden fixture for family "${activeVisionDesc.family}"`);
+    return;
+  }
+  const resp = await fetch(`/test-fixtures/${fixtureName}`);
+  if (!resp.ok) {
+    console.error(`[parity] fixture ${fixtureName} missing — run the matching scripts/gen_*_fixture.py`);
+    return;
+  }
   const fx = await resp.json();
   const png = Uint8Array.from(atob(fx.png_base64), c => c.charCodeAt(0));
   const pre = await preprocessImage(new Blob([png], { type: 'image/png' }), activeVisionDesc);
