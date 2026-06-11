@@ -390,6 +390,8 @@ export function createForwardPassEngine(
   // GGUF k-quant dequantizing GEMV/GEMM — one workgroup per output element
   const matmulGgufPipelines: Record<number, GPUComputePipeline> | null =
     config.sourceFormat === 'gguf' ? {
+      [GGML_TYPES.Q4_0]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q4_0', 'matmul-gguf-q4_0'),
+      [GGML_TYPES.Q5_0]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_0', 'matmul-gguf-q5_0'),
       [GGML_TYPES.Q8_0]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q8_0', 'matmul-gguf-q8_0'),
       [GGML_TYPES.Q4_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q4_k', 'matmul-gguf-q4_k'),
       [GGML_TYPES.Q5_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_k', 'matmul-gguf-q5_k'),

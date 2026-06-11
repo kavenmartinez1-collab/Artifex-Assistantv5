@@ -83,6 +83,7 @@ export interface GGUFLoadProgress {
 }
 
 const QUANT_GPU_TYPES = new Set<number>([
+  GGML_TYPES.Q4_0, GGML_TYPES.Q5_0,
   GGML_TYPES.Q8_0, GGML_TYPES.Q4_K, GGML_TYPES.Q5_K, GGML_TYPES.Q6_K,
 ]);
 
@@ -208,6 +209,7 @@ export async function loadGGUFModel(
   // tell the user exactly what to download instead.
   const SUPPORTED_GPU = new Set<number>([
     GGML_TYPES.F32, GGML_TYPES.F16, GGML_TYPES.BF16,
+    GGML_TYPES.Q4_0, GGML_TYPES.Q5_0,
     GGML_TYPES.Q8_0, GGML_TYPES.Q4_K, GGML_TYPES.Q5_K, GGML_TYPES.Q6_K,
   ]);
   const unsupportedTypes = new Map<string, number>();
@@ -221,9 +223,9 @@ export async function loadGGUFModel(
     const list = [...unsupportedTypes.entries()].map(([n, c]) => `${n} (${c} tensors)`).join(', ');
     throw new Error(
       `This GGUF uses quantization the WebGPU engine can't run yet: ${list}. `
-      + `Supported: Q4_K, Q5_K, Q6_K, Q8_0 (and F16/F32/BF16). `
+      + `Supported: Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K (and F16/F32/BF16). `
       + `Download a K-quant build instead — e.g. a *-Q4_K_M.gguf or *-Q5_K_M.gguf. `
-      + `(Legacy Q4_0/Q5_0 and IQ-imatrix quants aren't supported.)`);
+      + `(IQ-imatrix and Q4_1/Q5_1/Q2_K/Q3_K quants aren't supported.)`);
   }
 
   // ── VRAM + RAM gates: refuse before downloading anything ──

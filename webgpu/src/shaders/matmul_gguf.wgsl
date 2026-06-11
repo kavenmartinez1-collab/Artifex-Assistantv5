@@ -79,6 +79,77 @@ fn reduce_and_store(tid: u32, n: u32, m: u32, sum: f32) {
   }
 }
 
+// ── Q4_0: 32-elem blocks, 5 u32 each (f16 d | pad | qs[16]) ────────────
+// x[j] = d·((qs[j]&0xF)-8), x[j+16] = d·((qs[j]>>4)-8), j in 0..15.
+
+@compute @workgroup_size(WG_SIZE, 1, 1)
+fn matmul_gguf_q4_0(@builtin(local_invocation_id) lid: vec3u,
+                    @builtin(workgroup_id) wid: vec3u) {
+  let n = wid.x + wid.z * 65535u;
+  let m = wid.y;
+  let tid = lid.x;
+  let K = params.K;
+  let nBlocks = K / 32u;
+
+  var sum: f32 = 0.0;
+  var comp: f32 = 0.0;
+  for (var blk = tid; blk < nBlocks; blk = blk + WG_SIZE) {
+    let base = (n * nBlocks + blk) * 5u;          // u32 words
+    let d = unpack2x16float(W[base]).x;
+    let qsByte = (base + 1u) * 4u;                // qs[16] start, in bytes
+    let aBase = m * K + blk * 32u;
+    var dot: f32 = 0.0;
+    for (var j = 0u; j < 16u; j = j + 1u) {
+      let q = wbyte(qsByte + j);
+      let lo = f32(i32(q & 0x0Fu) - 8);
+      let hi = f32(i32(q >> 4u) - 8);
+      dot = dot + A[aBase + j] * lo + A[aBase + 16u + j] * hi;
+    }
+    let y = d * dot - comp;
+    let t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+  }
+  reduce_and_store(tid, n, m, sum);
+}
+
+// ── Q5_0: 32-elem blocks, 6 u32 each (f16 d | pad | qh:u32 | qs[16]) ────
+// 5th bit per value from qh; x[j] = d·((4-bit | hi-bit) - 16).
+
+@compute @workgroup_size(WG_SIZE, 1, 1)
+fn matmul_gguf_q5_0(@builtin(local_invocation_id) lid: vec3u,
+                    @builtin(workgroup_id) wid: vec3u) {
+  let n = wid.x + wid.z * 65535u;
+  let m = wid.y;
+  let tid = lid.x;
+  let K = params.K;
+  let nBlocks = K / 32u;
+
+  var sum: f32 = 0.0;
+  var comp: f32 = 0.0;
+  for (var blk = tid; blk < nBlocks; blk = blk + WG_SIZE) {
+    let base = (n * nBlocks + blk) * 6u;          // u32 words
+    let d = unpack2x16float(W[base]).x;
+    let qh = W[base + 1u];                         // 32 high bits
+    let qsByte = (base + 2u) * 4u;                 // qs[16] start, in bytes
+    let aBase = m * K + blk * 32u;
+    var dot: f32 = 0.0;
+    for (var j = 0u; j < 16u; j = j + 1u) {
+      let q = wbyte(qsByte + j);
+      let loBit = (qh >> j) & 1u;
+      let hiBit = (qh >> (j + 16u)) & 1u;
+      let lo = f32(i32((q & 0x0Fu) | (loBit << 4u)) - 16);
+      let hi = f32(i32((q >> 4u) | (hiBit << 4u)) - 16);
+      dot = dot + A[aBase + j] * lo + A[aBase + 16u + j] * hi;
+    }
+    let y = d * dot - comp;
+    let t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+  }
+  reduce_and_store(tid, n, m, sum);
+}
+
 // ── Q8_0: 32-elem blocks, 9 u32 each ──────────────────────────────────
 
 @compute @workgroup_size(WG_SIZE, 1, 1)

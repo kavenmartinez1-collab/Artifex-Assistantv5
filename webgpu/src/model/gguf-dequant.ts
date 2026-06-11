@@ -6,6 +6,8 @@
  * ggml-quants.c dequantize_row_* exactly — bit layouts below.
  *
  * Block layouts (little-endian):
+ *   Q4_0 (32 elems, 18 B):  f16 d | u8 qs[16] (4-bit)       x = d·(q-8)
+ *   Q5_0 (32 elems, 22 B):  f16 d | u8 qh[4] | u8 qs[16]     x = d·(q5-16)
  *   Q8_0 (32 elems, 34 B):  f16 d | i8 qs[32]              x = d·qs
  *   Q4_K (256, 144 B):      f16 d, dmin | u8 scales[12] | u8 qs[128] (4-bit pairs)
  *   Q5_K (256, 176 B):      f16 d, dmin | u8 scales[12] | u8 qh[32] | u8 qs[128]
@@ -19,7 +21,7 @@
 
 // GGML type ids (spec constants, duplicated from gguf.ts so this file has
 // zero imports and runs standalone under node --strip-types for validation)
-const T_F32 = 0, T_F16 = 1, T_Q8_0 = 8, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_BF16 = 30;
+const T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q5_0 = 6, T_Q8_0 = 8, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_BF16 = 30;
 
 // ── f16 / bf16 → f32 ───────────────────────────────────────────────────
 
@@ -64,6 +66,49 @@ export function dequantBF16(data: ArrayBuffer | Uint8Array, n: number): Float32A
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   const out = new Float32Array(n);
   for (let i = 0; i < n; i++) out[i] = bf16ToF32(dv.getUint16(i * 2, true));
+  return out;
+}
+
+/** Q4_0: 18-byte blocks of 32 elements. x[j] = d·((qs[j]&0xF)-8),
+ *  x[j+16] = d·((qs[j]>>4)-8) for j in 0..15. */
+export function dequantQ4_0(data: ArrayBuffer | Uint8Array, n: number): Float32Array {
+  const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  if (n % 32 !== 0) throw new Error(`[Q4_0] n=${n} not divisible by 32`);
+  const nb = n / 32;
+  const out = new Float32Array(n);
+  for (let b = 0; b < nb; b++) {
+    const base = b * 18;
+    const d = f16ToF32(dv.getUint16(base, true));
+    for (let j = 0; j < 16; j++) {
+      const q = u8[base + 2 + j];
+      out[b * 32 + j] = d * ((q & 0xF) - 8);
+      out[b * 32 + j + 16] = d * ((q >> 4) - 8);
+    }
+  }
+  return out;
+}
+
+/** Q5_0: 22-byte blocks of 32 elements. 5th bit from qh (u32 little-endian).
+ *  x[j] = d·(((qs[j]&0xF)|((qh>>j&1)<<4))-16), and similarly for j+16. */
+export function dequantQ5_0(data: ArrayBuffer | Uint8Array, n: number): Float32Array {
+  const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  if (n % 32 !== 0) throw new Error(`[Q5_0] n=${n} not divisible by 32`);
+  const nb = n / 32;
+  const out = new Float32Array(n);
+  for (let b = 0; b < nb; b++) {
+    const base = b * 22;
+    const d = f16ToF32(dv.getUint16(base, true));
+    const qh = dv.getUint32(base + 2, true);
+    for (let j = 0; j < 16; j++) {
+      const q = u8[base + 6 + j];
+      const lo = (q & 0xF) | (((qh >>> j) & 1) << 4);
+      const hi = (q >> 4) | (((qh >>> (j + 16)) & 1) << 4);
+      out[b * 32 + j] = d * (lo - 16);
+      out[b * 32 + j + 16] = d * (hi - 16);
+    }
+  }
   return out;
 }
 
@@ -195,6 +240,8 @@ export function dequantQ6_K(data: ArrayBuffer | Uint8Array, n: number): Float32A
 
 /** Per-type GPU layout: block element count and u32 stride after repack. */
 export const GGUF_GPU_LAYOUT: Record<number, { blockElems: number; strideU32: number }> = {
+  [T_Q4_0]: { blockElems: 32, strideU32: 5 },    // 18 B → 20 B (d|pad|qs[16])
+  [T_Q5_0]: { blockElems: 32, strideU32: 6 },    // 22 B → 24 B (d|pad|qh|qs[16])
   [T_Q8_0]: { blockElems: 32, strideU32: 9 },    // 34 B → 36 B
   [T_Q4_K]: { blockElems: 256, strideU32: 36 },  // raw 144 B
   [T_Q5_K]: { blockElems: 256, strideU32: 44 },  // raw 176 B
@@ -207,6 +254,41 @@ function asU8(data: ArrayBuffer | Uint8Array): Uint8Array {
 
 function assertBytes(label: string, got: number, want: number): void {
   if (got !== want) throw new Error(`[${label}] byteLength ${got} != expected ${want}`);
+}
+
+/** Q4_0 18 B/block → 20 B/block: f16 d @ 0-1, pad @ 2-3, qs[16] @ 4-19. */
+export function repackQ4_0(data: ArrayBuffer | Uint8Array, n: number): Uint32Array {
+  const u8 = asU8(data);
+  if (n % 32 !== 0) throw new Error(`[repackQ4_0] n=${n} not divisible by 32`);
+  const nb = n / 32;
+  assertBytes('repackQ4_0', u8.byteLength, nb * 18);
+  const out = new Uint32Array(nb * 5);
+  const o8 = new Uint8Array(out.buffer);
+  for (let b = 0; b < nb; b++) {
+    const src = b * 18, dst = b * 20;
+    o8[dst] = u8[src];
+    o8[dst + 1] = u8[src + 1];
+    o8.set(u8.subarray(src + 2, src + 18), dst + 4);
+  }
+  return out;
+}
+
+/** Q5_0 22 B/block → 24 B/block: f16 d @ 0-1, pad @ 2-3, qh @ 4-7, qs[16] @ 8-23. */
+export function repackQ5_0(data: ArrayBuffer | Uint8Array, n: number): Uint32Array {
+  const u8 = asU8(data);
+  if (n % 32 !== 0) throw new Error(`[repackQ5_0] n=${n} not divisible by 32`);
+  const nb = n / 32;
+  assertBytes('repackQ5_0', u8.byteLength, nb * 22);
+  const out = new Uint32Array(nb * 6);
+  const o8 = new Uint8Array(out.buffer);
+  for (let b = 0; b < nb; b++) {
+    const src = b * 22, dst = b * 24;
+    o8[dst] = u8[src];
+    o8[dst + 1] = u8[src + 1];
+    o8.set(u8.subarray(src + 2, src + 6), dst + 4);    // qh
+    o8.set(u8.subarray(src + 6, src + 22), dst + 8);   // qs[16]
+  }
+  return out;
 }
 
 /** Q8_0 34 B/block → 36 B/block: f16 d @ bytes 0-1, pad @ 2-3, qs[32] @ 4-35. */
@@ -246,6 +328,8 @@ export function repackQ6_K(data: ArrayBuffer | Uint8Array, n: number): Uint32Arr
  */
 export function repackGGUFForGPU(ggmlType: number, data: ArrayBuffer | Uint8Array, n: number): Uint32Array {
   switch (ggmlType) {
+    case T_Q4_0: return repackQ4_0(data, n);
+    case T_Q5_0: return repackQ5_0(data, n);
     case T_Q8_0: return repackQ8_0(data, n);
     case T_Q6_K: return repackQ6_K(data, n);
     case T_Q4_K:
@@ -271,6 +355,8 @@ export function dequantGGML(ggmlType: number, data: ArrayBuffer | Uint8Array, n:
     case T_F32:  return dequantF32(data, n);
     case T_F16:  return dequantF16(data, n);
     case T_BF16: return dequantBF16(data, n);
+    case T_Q4_0: return dequantQ4_0(data, n);
+    case T_Q5_0: return dequantQ5_0(data, n);
     case T_Q8_0: return dequantQ8_0(data, n);
     case T_Q4_K: return dequantQ4_K(data, n);
     case T_Q5_K: return dequantQ5_K(data, n);
