@@ -120,7 +120,9 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
   if (eosTokenId !== null) eosTokenIds.add(eosTokenId);
 
   // Also add the EOS token by encoding known stop strings
-  const stopStrings = ['<|endoftext|>', '<|im_end|>', '</s>', '<|eot_id|>'];
+  // '<turn|>' is Gemma 4's end-of-turn (id 106) — its eos_token <eos> (id 1)
+  // is NOT what the model emits to close a chat turn.
+  const stopStrings = ['<|endoftext|>', '<|im_end|>', '</s>', '<|eot_id|>', '<turn|>'];
   for (const s of stopStrings) {
     try {
       const ids = hfTokenizer.encode(s);
@@ -184,12 +186,54 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
  * Returns token IDs, NOT a string — this correctly handles special tokens
  * like <|im_start|> as single tokens instead of encoding them as text.
  */
+/** True if `s` is a single special token in this tokenizer's vocab. */
+function isSingleToken(tokenizer: Tokenizer, s: string): boolean {
+  try {
+    const ids = (tokenizer.inner as any).encode(s, { add_special_tokens: false });
+    return ids.length === 1;
+  } catch {
+    return false;
+  }
+}
+
 export function applyChatTemplate(
   tokenizer: Tokenizer,
   messages: Array<{ role: string; content: string }>,
   options?: { enableThinking?: boolean },
 ): number[] {
   const enableThinking = options?.enableThinking ?? true;
+
+  // ── Gemma 4: <|turn>role\n ... <turn|>\n turns ─────────────────────────
+  // Simplified from the GGUF's official template (no tools/multimodal):
+  // thinking is enabled by a <|think|> token at the top of the FIRST system
+  // turn (opened even without a system message); assistant renders as
+  // 'model'; generation prompt is '<|turn>model\n'.
+  if (isSingleToken(tokenizer, '<|turn>')) {
+    const msgs = messages.map((m) => ({
+      role: m.role === 'assistant' ? 'model' : m.role,
+      content: m.content,
+    }));
+    if (enableThinking && msgs[0]?.role !== 'system') {
+      msgs.unshift({ role: 'system', content: '' });
+    }
+    const think = enableThinking ? '<|think|>\\n' : '';
+    const tpl =
+      `{{ bos_token }}{% for message in messages %}`
+      + `{% if loop.first and message['role'] == 'system' %}`
+      + `{{ '<|turn>system\\n${think}' + message['content'] + '<turn|>\\n' }}`
+      + `{% else %}`
+      + `{{ '<|turn>' + message['role'] + '\\n' + message['content'] + '<turn|>\\n' }}`
+      + `{% endif %}{% endfor %}`
+      + `{% if add_generation_prompt %}{{ '<|turn>model\\n' }}{% endif %}`;
+    const result = (tokenizer.inner as any).apply_chat_template(msgs, {
+      add_generation_prompt: true,
+      tokenize: true,
+      return_tensor: false,
+      chat_template: tpl,
+    });
+    console.log(`[Tokenizer] Gemma template applied (thinking=${enableThinking})`);
+    return Array.from(result as ArrayLike<number | bigint>).map(Number);
+  }
 
   // Use a clean ChatML template — Qwen3.5's built-in template adds empty <think></think>
   // blocks when thinking is disabled, which confuses smaller models. We control thinking
