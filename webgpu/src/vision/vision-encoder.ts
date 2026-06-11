@@ -33,6 +33,7 @@ import matmulWGSL from '../shaders/matmul.wgsl?raw';
 import layernormWGSL from '../shaders/layernorm.wgsl?raw';
 import elementwiseWGSL from '../shaders/elementwise.wgsl?raw';
 import attentionWGSL from '../shaders/attention.wgsl?raw';
+import visionRopeWGSL from '../shaders/vision_rope.wgsl?raw';
 
 /** attention.wgsl shared-memory ceiling — patches per image must fit. */
 export const MAX_VIT_PATCHES = 3840;
@@ -73,6 +74,7 @@ export function createVisionEncoder(
   const addPipe = createComputePipeline(device, elementwiseWGSL, 'add', 'vis-add');
   const geluPipe = createComputePipeline(device, elementwiseWGSL, 'gelu', 'vis-gelu');
   const attnPipe = createComputePipeline(device, attentionWGSL, 'attention', 'vis-attention', { USE_SOFTPICK: 0 });
+  const ropePipe = createComputePipeline(device, visionRopeWGSL, 'vision_rope', 'vis-rope');
 
   // ── Dispatch helpers (immediate submits; per-image one-shot) ────────
   function mm(
@@ -165,6 +167,47 @@ export function createVisionEncoder(
     device.queue.submit([enc.finish()]);
   }
 
+  /** Apply 2D vision RoPE to a Q or K buffer using precomputed phases. */
+  function visionRope(x: GPUBuffer, out: GPUBuffer, phases: GPUBuffer, rows: number) {
+    const pbuf = createUniformBuffer(device, new Uint32Array([rows, H, headDim]), 'vis-rope-p');
+    const bg = createBindGroup(device, ropePipe, 0, [
+      { binding: 0, resource: { buffer: x } },
+      { binding: 1, resource: { buffer: out } },
+      { binding: 2, resource: { buffer: phases } },
+      { binding: 3, resource: { buffer: pbuf } },
+    ], 'vis-rope');
+    dispatch(device, ropePipe, [bg], [workgroupCount(rows * H, 256)], 'vis-rope');
+  }
+
+  /** Per-patch 2D RoPE phases, merge-grouped to match patch row order.
+   *  Layout per row: [r·f_0..r·f_{q-1}, c·f_0..c·f_{q-1}], q = headDim/4 —
+   *  matches HF rot_pos_emb (freq_table[pos_ids].flatten(1)), theta 10000. */
+  function buildRopePhases(gridH: number, gridW: number): Float32Array {
+    const half = headDim / 2;           // phases per patch (32 for headDim 64)
+    const q = half / 2;                 // freqs per axis (16)
+    const invFreq = new Float32Array(q);
+    for (let k = 0; k < q; k++) invFreq[k] = 1 / Math.pow(10000, (2 * k) / half);
+    const out = new Float32Array(gridH * gridW * half);
+    let row = 0;
+    const writePhases = (gy: number, gx: number) => {
+      const base = row * half;
+      row++;
+      for (let k = 0; k < q; k++) {
+        out[base + k] = gy * invFreq[k];
+        out[base + q + k] = gx * invFreq[k];
+      }
+    };
+    const mh = Math.floor(gridH / merge), mw = Math.floor(gridW / merge);
+    if (merge > 1) {
+      for (let by = 0; by < mh; by++) for (let bx = 0; bx < mw; bx++)
+        for (let wy = 0; wy < merge; wy++) for (let wx = 0; wx < merge; wx++)
+          writePhases(by * merge + wy, bx * merge + wx);
+    } else {
+      for (let gy = 0; gy < gridH; gy++) for (let gx = 0; gx < gridW; gx++) writePhases(gy, gx);
+    }
+    return out;
+  }
+
   /** Bilinearly interpolate the learned pos table (gridSize² × H, raster
    *  order) to gridH×gridW, emitted merge-window-grouped to match patch
    *  rows. align_corners=False convention — parity-checked in the harness. */
@@ -175,8 +218,9 @@ export function createVisionEncoder(
     const out = new Float32Array(gridH * gridW * H);
     let outRow = 0;
     const writePos = (gy: number, gx: number) => {
-      const sy = ((gy + 0.5) * S) / gridH - 0.5;
-      const sx = ((gx + 0.5) * S) / gridW - 0.5;
+      // HF fast_pos_embed_interpolate: linspace(0, S-1, grid) — align-corners
+      const sy = gridH === 1 ? 0 : (gy * (S - 1)) / (gridH - 1);
+      const sx = gridW === 1 ? 0 : (gx * (S - 1)) / (gridW - 1);
       const y0 = Math.max(0, Math.min(S - 1, Math.floor(sy)));
       const x0 = Math.max(0, Math.min(S - 1, Math.floor(sx)));
       const y1 = Math.min(S - 1, y0 + 1);
@@ -278,6 +322,11 @@ export function createVisionEncoder(
         copyBuf(x2Buf, xBuf, N * H * 4);
       }
 
+      // 2D RoPE phases — applied to Q/K inside every block
+      const phases = buildRopePhases(pre.gridH, pre.gridW);
+      const phasesBuf = createStorageBuffer(device, phases, phases.byteLength, 'vis-rope-phases');
+      bufs.push(phasesBuf);
+
       // Tower blocks
       const Hbytes = H * H * 4;
       for (let l = 0; l < desc.depth; l++) {
@@ -290,7 +339,10 @@ export function createVisionEncoder(
         add(qBuf, blk.qkvBias, q2Buf, N * H, H, 0, H * 4);
         add(kBuf, blk.qkvBias, k2Buf, N * H, H, H * 4, H * 4);
         add(vBuf, blk.qkvBias, v2Buf, N * H, H, 2 * H * 4, H * 4);
-        attention(q2Buf, k2Buf, v2Buf, attnBuf, N);
+        // 2D RoPE on Q/K (rotated back into qBuf/kBuf — free post-bias)
+        visionRope(q2Buf, qBuf, phasesBuf, N);
+        visionRope(k2Buf, kBuf, phasesBuf, N);
+        attention(qBuf, kBuf, v2Buf, attnBuf, N);
         mm(attnBuf, blk.attnOut, hBuf, N, H, H);
         add(hBuf, blk.attnOutBias, h2Buf, N * H, H);
         add(xBuf, h2Buf, x2Buf, N * H, 0);                 // residual → x2

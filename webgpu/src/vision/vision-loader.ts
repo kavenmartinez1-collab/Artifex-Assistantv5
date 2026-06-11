@@ -61,7 +61,8 @@ export async function loadVisionWeights(
     const url = resolveFileUrl(repo, f.path);
     const first8 = await fetchRange(url, 0, 8);
     const headerLen = parseHeaderLength(first8);
-    const headerBytes = await fetchRange(url, 8, 8 + headerLen);
+    // parseHeader expects the buffer INCLUDING the 8-byte length prefix
+    const headerBytes = await fetchRange(url, 0, 8 + headerLen);
     const header = parseHeader(headerBytes);
     for (const [name, info] of header.tensors) {
       if (name.startsWith('model.visual.') || name.startsWith('visual.')) {

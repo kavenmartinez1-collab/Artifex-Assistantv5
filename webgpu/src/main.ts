@@ -632,12 +632,22 @@ async function ensureVisionEncoder(): Promise<VisionEncoder> {
     visionEncoderLoading = (async () => {
       const { loadVisionWeights } = await import('./vision/vision-loader');
       const { createVisionEncoder } = await import('./vision/vision-encoder');
-      const weights = await loadVisionWeights(
-        gpu!.device, currentModel!.repo, activeVisionDesc!, (m) => setStatus(m));
-      visionEncoder = createVisionEncoder(gpu!.device, activeVisionDesc!, weights);
-      addMessage('system',
-        `Vision tower loaded: ${(weights.totalGPUBytes / 1e9).toFixed(2)} GB GPU.`, 'vision ready');
-      return visionEncoder;
+      // The text load path resets hf-hub to the CDN once the model is up;
+      // machine-local repos must switch back to the dev-server cache for the
+      // lazy tower fetch (the CDN answers 401/404 for local/ and ollama/).
+      const repo = currentModel!.repo;
+      const isLocalRepo = repo.startsWith('local/') || repo.startsWith('ollama/');
+      if (isLocalRepo) useLocalCache();
+      try {
+        const weights = await loadVisionWeights(
+          gpu!.device, repo, activeVisionDesc!, (m) => setStatus(m));
+        visionEncoder = createVisionEncoder(gpu!.device, activeVisionDesc!, weights);
+        addMessage('system',
+          `Vision tower loaded: ${(weights.totalGPUBytes / 1e9).toFixed(2)} GB GPU.`, 'vision ready');
+        return visionEncoder;
+      } finally {
+        if (isLocalRepo) resetToRemote();
+      }
     })().catch((err) => {
       visionEncoderLoading = null;  // allow retry after a failure
       throw err;
@@ -705,10 +715,14 @@ document.addEventListener('drop', async (e) => {
   console.log('[parity] done — preprocessing should be ~1e-6; tower f32-vs-f32 ~1e-3 or better');
 };
 
-/** Fetch preprocessor_config.json (local cache or CDN) — optional. */
+/** Fetch preprocessor_config.json — optional. Machine-local repos go to the
+ *  dev-server cache directly (resolveFileUrl may point at the CDN by now). */
 async function fetchPreprocessorConfig(repo: string): Promise<Record<string, any> | undefined> {
+  const url = repo.startsWith('local/') || repo.startsWith('ollama/')
+    ? `/api/hf-cache/${repo}/raw/main/preprocessor_config.json`
+    : resolveFileUrl(repo, 'preprocessor_config.json');
   try {
-    const resp = await fetch(resolveFileUrl(repo, 'preprocessor_config.json'));
+    const resp = await fetch(url);
     if (resp.ok) return await resp.json();
   } catch { /* optional file */ }
   return undefined;
