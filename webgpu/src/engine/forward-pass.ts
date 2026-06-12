@@ -61,7 +61,7 @@ import deinterleaveWGSL from '../shaders/deinterleave.wgsl?raw';
 import hadamardWGSL from '../shaders/hadamard.wgsl?raw';
 import dequantQ4BF16WGSL from '../shaders/dequant_q4_bf16.wgsl?raw';
 import matmulGgufWGSL from '../shaders/matmul_gguf.wgsl?raw';
-import { GGML_TYPES } from '../model/gguf';
+import { GGML_TYPES, ggmlTypeTraits } from '../model/gguf';
 import { dequantGGML } from '../model/gguf-dequant';
 import { topKSoftmax, MOE_MAX_TOKENS, type MoEBackend } from './moe-cpu';
 
@@ -617,6 +617,15 @@ export function createForwardPassEngine(
   registerCat(deinterleavePipeline, 'deinterleave');
   registerCat(conv1dSiluPipeline, 'conv1d_fused');
   registerCat(gateSigmoidPipeline, 'gate_sigmoid');
+  // GEMV lever 4 Phase 0: per-quant-type aggregation for GGUF matmuls.
+  // Without a category, bd() falls back to the per-site dispatch label
+  // (L12-gate, ...) so per-type time never aggregates in __perfTimingRows.
+  for (const [t, p] of Object.entries(matmulGgufPipelines ?? {})) {
+    registerCat(p, `gguf_${ggmlTypeTraits(+t).name}`);
+  }
+  for (const [t, p] of Object.entries(matmulGgufTiledPipelines ?? {})) {
+    registerCat(p, `gguf_${ggmlTypeTraits(+t).name}_tiled`);
+  }
 
   // ── Matmul-Q4 GEMV pipeline selection ──────────────────────────────
   // Cached-scales variants are parameterized by (MAX_GROUPS, WG_SIZE). The

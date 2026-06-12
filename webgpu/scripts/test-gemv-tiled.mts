@@ -228,6 +228,35 @@ function tiledGemvRow(
   return sum;
 }
 
+// No-stage GEMV (lever 4, *_tiled_ns): identical chunk loop and lane = unit
+// ownership, but each lane reads A directly (A4 global vec4 loads) instead of
+// the staged a_tile. aTile[lane*32+l] == A[u*32+l] for every valid unit
+// (units never cross K), so the accumulation expressions are identical →
+// must equal tiledGemvRow EXACTLY (gate 3).
+function nsGemvRow(
+  W: Uint32Array, A: Float32Array, n: number, K: number,
+  decode: (W: Uint32Array, n: number, nSB: number, u: number) => Float64Array,
+  TPR: number,
+): number {
+  const nSB = K / 256;
+  const nUnits = nSB * 8;
+  const nChunks = Math.ceil(nUnits / TPR);
+  const laneAcc = new Float64Array(TPR);
+  for (let c = 0; c < nChunks; c++) {
+    for (let lane = 0; lane < TPR; lane++) {
+      const u = c * TPR + lane;
+      if (u >= nUnits) continue;
+      const vals = decode(W, n, nSB, u);
+      let dq = 0;
+      for (let l = 0; l < 32; l++) dq += A[u * 32 + l] * Math.fround(vals[l]);
+      laneAcc[lane] += dq;
+    }
+  }
+  let sum = 0;
+  for (let lane = 0; lane < TPR; lane++) sum += laneAcc[lane];
+  return sum;
+}
+
 // ── test driver ────────────────────────────────────────────────────────
 let failures = 0;
 
@@ -287,6 +316,19 @@ function runFormat(
         check(`${name} K=${K} TPR=${TPR} gemv`, rel < 1e-9, `n=${n} rel=${rel}`);
       }
       console.log(`  ok   ${name} K=${K} TPR=${TPR}: gemv maxRel=${maxRel.toExponential(2)}`);
+
+      // Gate 3 (lever 4): no-stage GEMV must equal the staged tiled GEMV
+      // EXACTLY — same expressions, only the A read path differs.
+      let nsOK = true;
+      for (let n = 0; n < N; n++) {
+        const staged = tiledGemvRow(W, A, n, K, decode, TPR);
+        const ns = nsGemvRow(W, A, n, K, decode, TPR);
+        if (ns !== staged) {
+          check(`${name} K=${K} TPR=${TPR} ns`, false, `n=${n}: ${ns} != ${staged}`);
+          nsOK = false;
+        }
+      }
+      if (nsOK) console.log(`  ok   ${name} K=${K} TPR=${TPR}: no-stage == staged (exact)`);
     }
   }
 }

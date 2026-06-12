@@ -417,6 +417,39 @@ export async function loadGGUFModel(
     + `${(loadTimeMs / 1000).toFixed(1)}s${tied ? ' (tied embeddings)' : ''}`,
   );
 
+  // GEMV lever 4 Phase 0: per-quant-type inventory on the console (the
+  // per-tensor type only goes to the progress callback, invisible to
+  // headless drivers), plus which layers carry off-majority types — needed
+  // to correlate per-type GPU timing (gguf_* categories) with what's loaded.
+  const byType = new Map<string, { n: number; mb: number }>();
+  for (const t of tensors.values()) {
+    const e = byType.get(t.dtype) ?? { n: 0, mb: 0 };
+    e.n++; e.mb += t.byteLength / 1e6;
+    byType.set(t.dtype, e);
+  }
+  console.log('[GGUF-Loader] GPU tensors by type: '
+    + [...byType.entries()].sort((a, b) => b[1].mb - a[1].mb)
+      .map(([k, v]) => `${k} x${v.n} (${v.mb.toFixed(0)} MB)`).join(', '));
+  const kinds = new Map<string, Map<string, number[]>>();
+  for (const t of tensors.values()) {
+    const m = /^blk\.(\d+)\.(.+)$/.exec(t.name);
+    if (!m) continue;
+    const k = kinds.get(m[2]) ?? new Map<string, number[]>();
+    kinds.set(m[2], k);
+    let arr = k.get(t.dtype);
+    if (!arr) { arr = []; k.set(t.dtype, arr); }
+    arr.push(+m[1]);
+  }
+  for (const [kind, types] of kinds) {
+    if (types.size < 2) continue;
+    console.log(`[GGUF-Loader] mixed types for ${kind}: `
+      + [...types.entries()].map(([ty, ls]) => {
+        ls.sort((a, b) => a - b);
+        const span = ls.length <= 12 ? ls.join(',') : `${ls.length} layers L${ls[0]}..L${ls[ls.length - 1]}`;
+        return `${ty}@[${span}]`;
+      }).join(' | '));
+  }
+
   return {
     repo,
     file,
