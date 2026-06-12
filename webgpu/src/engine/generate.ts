@@ -13,8 +13,13 @@
  */
 
 import { readBuffer } from './buffers';
+import { createGpuArgmax, type GpuArgmax } from './argmax';
 import { MAX_ATTN_SEQ_LEN, type ForwardPassEngine, type KVCache } from './forward-pass';
 import type { Tokenizer } from '../model/tokenizer';
+
+// One GPU-argmax instance per device, reused across generations (pipelines
+// and the 4-byte staging buffer persist for the life of the device).
+const gpuArgmaxByDevice = new WeakMap<GPUDevice, GpuArgmax>();
 
 // ── Sampling Configuration ───────────────────────────────────────────────
 
@@ -556,6 +561,29 @@ export function generate(
       (globalThis as any).__PARITY_LOG__ = parityLog;
       console.log('[Parity] capture armed — dump with copy(JSON.stringify(__PARITY_LOG__))');
     }
+
+    // ── GPU argmax eligibility (lever: 4-byte readback instead of 600 KB) ──
+    // Only when sampling is exactly the greedy strict-`>` scan with NO logit
+    // mutation beforehand: temp 0, no repetition penalty, no DRY, and no
+    // debug probe that needs the full logits on the CPU. Toggle ?gpuArgmax=0.
+    const __argmaxSearch = typeof window === 'undefined'
+      ? null : new URLSearchParams(window.location.search);
+    const gpuArgmaxEligible =
+      __argmaxSearch?.get('gpuArgmax') !== '0'
+      && config.temperature === 0
+      && config.repetitionPenalty === 1.0
+      && config.dryMultiplier <= 0
+      && !parityLog
+      && !((globalThis as any).__DEBUG_LOGIT_TOPK__ > 0);
+    let gpuArgmax: GpuArgmax | null = null;
+    if (gpuArgmaxEligible) {
+      gpuArgmax = gpuArgmaxByDevice.get(device) ?? null;
+      if (!gpuArgmax) {
+        gpuArgmax = createGpuArgmax(device);
+        gpuArgmaxByDevice.set(device, gpuArgmax);
+      }
+      console.log('[Generate] GPU argmax active (greedy, 4-byte readback)');
+    }
     console.log(`[Generate] Prompt: ${promptTokens} tokens, first 5: [${promptIds.slice(0, 5).join(', ')}]`);
     // Debug: decode the full prompt to see what the model actually sees
     console.log(`[Generate] Decoded prompt: "${tokenizer.decode(promptIds)}"`);
@@ -799,36 +827,29 @@ export function generate(
         if (sess) sess.cachedTokenIds.push(lastTokenId);  // token is now IN the cache
         const __tFwdEnd = performance.now();
 
-        // Read logits back from GPU
+        // Read result back from GPU: either a 4-byte GPU-argmax index (greedy
+        // fast path) or the full logits buffer for CPU sampling.
         await device.queue.onSubmittedWorkDone();
         const __tGpuDone = performance.now();
-        const logitsRaw = await readBuffer(
-          device,
-          output.logitsBuffer,
-          engine.config.vocabSize * 4,
-        );
-        const __tReadback = performance.now();
-        const logits = new Float32Array(logitsRaw);
-
-      // Debug: log top-5 logits on first decode step
-      if (step === 0) {
-        const indexed = Array.from(logits).map((v, i) => [i, v] as [number, number]);
-        indexed.sort((a, b) => b[1] - a[1]);
-        const top5 = indexed.slice(0, 5);
-        console.log(`[DEBUG logits] top 5:`, top5.map(([id, v]) => `${id}(${v.toFixed(2)})`).join(', '));
-        let lo = Infinity, hi = -Infinity, sum = 0;
-        for (let i = 0; i < logits.length; i++) { lo = Math.min(lo, logits[i]); hi = Math.max(hi, logits[i]); sum += logits[i]; }
-        console.log(`[DEBUG logits] min=${lo.toFixed(2)}, max=${hi.toFixed(2)}, mean=${(sum / logits.length).toFixed(4)}`);
-        // Decode top token
-        const topText = tokenizer.decode([top5[0][0]]);
-        console.log(`[DEBUG logits] top token: "${topText}" (id=${top5[0][0]})`);
-      }
-
-      // Sample next token
-      if (parityLog) parityLog.steps.push({ top5: parityTop5(logits), chosen: -1 });
-      const nextId = sampleFromLogits(logits, config, generatedIds);
-      if (parityLog) parityLog.steps[parityLog.steps.length - 1].chosen = nextId;
-      const __tSample = performance.now();
+        let nextId: number;
+        let __tReadback: number;
+        if (gpuArgmax) {
+          nextId = await gpuArgmax.run(output.logitsBuffer, engine.config.vocabSize);
+          __tReadback = performance.now();
+        } else {
+          const logitsRaw = await readBuffer(
+            device,
+            output.logitsBuffer,
+            engine.config.vocabSize * 4,
+          );
+          __tReadback = performance.now();
+          const logits = new Float32Array(logitsRaw);
+          // Sample next token
+          if (parityLog) parityLog.steps.push({ top5: parityTop5(logits), chosen: -1 });
+          nextId = sampleFromLogits(logits, config, generatedIds);
+          if (parityLog) parityLog.steps[parityLog.steps.length - 1].chosen = nextId;
+        }
+        const __tSample = performance.now();
 
       // ── Per-step perf accounting (Step 1 measurement layer) ──────────
       // fwdCpu  = wall time inside engine.forward (encoder build + submit)
