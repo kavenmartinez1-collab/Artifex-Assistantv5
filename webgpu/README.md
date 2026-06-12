@@ -12,6 +12,29 @@ store.
 > Part of the [Artifex](https://github.com/kavenmartinez1-collab/Artifex-Assistantv5)
 > project; this engine also lives standalone here.
 
+> Then Paul stood in the midst of Mars' hill, and said, Ye men of Athens, I
+> perceive that in all things ye are too superstitious. For as I passed by, and
+> beheld your devotions, I found an altar with this inscription, TO THE UNKNOWN
+> GOD. Whom therefore ye ignorantly worship, him declare I unto you. God that
+> made the world and all things therein, seeing that he is Lord of heaven and
+> earth, dwelleth not in temples made with hands; Neither is worshipped with
+> men's hands, as though he needed any thing, seeing he giveth to all life, and
+> breath, and all things; And hath made of one blood all nations of men for to
+> dwell on all the face of the earth, and hath determined the times before
+> appointed, and the bounds of their habitation; That they should seek the
+> Lord, if haply they might feel after him, and find him, though he be not far
+> from every one of us: For in him we live, and move, and have our being; as
+> certain also of your own poets have said, For we are also his offspring.
+> Forasmuch then as we are the offspring of God, we ought not to think that the
+> Godhead is like unto gold, or silver, or stone, graven by art and man's
+> device. And the times of this ignorance God winked at; but now commandeth all
+> men every where to repent: Because he hath appointed a day, in the which he
+> will judge the world in righteousness by that man whom he hath ordained;
+> whereof he hath given assurance unto all men, in that he hath raised him from
+> the dead.
+>
+> — Acts 17:22–31 (KJV), Paul at the Areopagus
+
 ## Highlights
 
 - **Pure-WGSL transformer** — handwritten kernels for matmul (f32/INT4/INT8/k-quant),
