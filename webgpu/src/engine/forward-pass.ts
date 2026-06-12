@@ -57,6 +57,7 @@ import conv1dWGSL from '../shaders/conv1d.wgsl?raw';
 import groupNormWGSL from '../shaders/group_norm.wgsl?raw';
 import ssmStepWGSL from '../shaders/ssm_step.wgsl?raw';
 import l2normWGSL from '../shaders/l2norm.wgsl?raw';
+import deinterleaveWGSL from '../shaders/deinterleave.wgsl?raw';
 import hadamardWGSL from '../shaders/hadamard.wgsl?raw';
 import dequantQ4BF16WGSL from '../shaders/dequant_q4_bf16.wgsl?raw';
 import matmulGgufWGSL from '../shaders/matmul_gguf.wgsl?raw';
@@ -485,6 +486,9 @@ export function createForwardPassEngine(
     ? createComputePipeline(device, conv1dWGSL, 'conv1d', 'conv1d') : null;
   const conv1dUpdatePipeline = isHybrid
     ? createComputePipeline(device, conv1dWGSL, 'conv1d_update_state', 'conv1d-update') : null;
+  // Fusion lever F4: conv + state update + SiLU in one dispatch. A/B: ?fuseConv=0.
+  const conv1dSiluPipeline = isHybrid && gemvSearch?.get('fuseConv') !== '0'
+    ? createComputePipeline(device, conv1dWGSL, 'conv1d_silu_update', 'conv1d-silu-update') : null;
   const groupNormPipeline = isHybrid
     ? createComputePipeline(device, groupNormWGSL, 'group_norm', 'group-norm') : null;
   const ssmStepPipeline = isHybrid
@@ -511,6 +515,30 @@ export function createForwardPassEngine(
     ? createComputePipeline(device, elementwiseWGSL, 'decay_compute', 'decay') : null;
   const l2NormPipeline = isHybrid
     ? createComputePipeline(device, l2normWGSL, 'l2_normalize', 'l2-norm') : null;
+  // Fusion lever F7: attn output gate a*sigmoid(b) in one dispatch. A/B: ?fuseGate=0.
+  const gateSigmoidPipeline = config.attnOutputGate && gemvSearch?.get('fuseGate') !== '0'
+    ? createComputePipeline(device, elementwiseWGSL, 'gate_sigmoid', 'gate-sigmoid') : null;
+
+  // Fusion lever F1: GPU Q/gate deinterleave for attnOutputGate models
+  // (Qwen3.5 interleaves Q and gate per head in the Q projection output).
+  // Replaces the per-head CPU copy loop — 57 copies/attn-layer at decode,
+  // each breaking the fused compute pass. A/B: ?deint=0 falls back.
+  const deinterleavePipeline =
+    config.attnOutputGate && gemvSearch?.get('deint') !== '0'
+      ? createComputePipeline(device, deinterleaveWGSL, 'deinterleave_qgate', 'deinterleave-qgate')
+      : null;
+
+  // Fusion lever F2/F3: in the DeltaNet path, skip the post-conv QKV split
+  // and the sigmoid/l2norm copy-backs by binding 256-B-aligned sections of
+  // linQKVBuf / normedBuf / attnProjBuf directly (storage-buffer binding
+  // offsets must be 256-aligned — verified here, else legacy copies).
+  // GGUF/f32/bf16 matmuls accept binding windows; exotic quant paths do not,
+  // so this is additionally gated on sourceFormat. A/B: ?fuseOff=0.
+  const ssmOffsetBindings = isHybrid
+    && config.sourceFormat === 'gguf'
+    && gemvSearch?.get('fuseOff') !== '0'
+    && (H * 4) % 256 === 0
+    && (linNKH * linKD * 4) % 256 === 0;
 
   // ── On-the-fly Q4 → BF16 dequant for SSM projections (hybrid + quantized) ──
   // GGUF models never need this — k-quant weights dispatch via matmul_gguf directly.
@@ -582,6 +610,9 @@ export function createForwardPassEngine(
   registerCat(sigmoidPipeline, 'sigmoid');
   registerCat(decayPipeline, 'decay');
   registerCat(l2NormPipeline, 'l2norm');
+  registerCat(deinterleavePipeline, 'deinterleave');
+  registerCat(conv1dSiluPipeline, 'conv1d_fused');
+  registerCat(gateSigmoidPipeline, 'gate_sigmoid');
 
   // ── Matmul-Q4 GEMV pipeline selection ──────────────────────────────
   // Cached-scales variants are parameterized by (MAX_GROUPS, WG_SIZE). The
@@ -805,6 +836,10 @@ export function createForwardPassEngine(
   const linConvOutBuf = isHybrid ? createStorageBuffer(device, null, linQKVDim * 4, 'lin-conv-out', true) : null;
   const linDecayBuf = isHybrid ? createStorageBuffer(device, null, linNVH * 4, 'lin-decay', true) : null;
   const linDtBuf = isHybrid ? createStorageBuffer(device, null, Math.max(linNVH, linNKH) * 4, 'lin-dt', true) : null;
+  // F3: sigmoid(beta) lands here directly. The legacy path wrote it to
+  // linDtBuf and copied back into linBBuf because linDtBuf is reused by
+  // softplus before ssm_step consumes beta.
+  const linBetaBuf = isHybrid ? createStorageBuffer(device, null, linNVH * 4, 'lin-beta', true) : null;
 
   // ── Uniform Buffer Cache ──────────────────────────────────────────────
   // During M=1 generation, dispatch parameters are identical every token.
@@ -996,19 +1031,29 @@ export function createForwardPassEngine(
 
   }
 
+  /** Optional byte-offset windows into the A (input) and C (output) buffers.
+   *  Offsets must be 256-B aligned (WebGPU minStorageBufferOffsetAlignment).
+   *  Lets fusion-lever call sites bind a token/section slice of a larger
+   *  buffer instead of staging it through a copy. */
+  interface MatmulIO { aOffset?: number; cOffset?: number }
+  function ioRes(buf: GPUBuffer, offset?: number): GPUBindingResource {
+    return offset ? { buffer: buf, offset } : { buffer: buf };
+  }
+
   /** C[M,N] = A[M,K] @ dequant_gguf(W)^T — native GGUF k-quant blocks. */
   function dispatchMatmulGGUF(
     aBuf: GPUBuffer, gg: GGUFWeight, cBuf: GPUBuffer,
     M: number, N: number, K: number, label: string,
+    io?: MatmulIO,
   ) {
     const tiled = matmulGgufTiledPipelines?.[gg.ggmlType] ?? null;
     const pipeline = tiled ?? matmulGgufPipelines?.[gg.ggmlType];
     if (!pipeline) throw new Error(`matmul_gguf "${label}": no pipeline for ggml type ${gg.ggmlType}`);
     const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);
     const bg = cachedBindGroup(pipeline, 0, [
-      { binding: 0, resource: { buffer: aBuf } },
+      { binding: 0, resource: ioRes(aBuf, io?.aOffset) },
       { binding: 1, resource: { buffer: gg.data } },
-      { binding: 2, resource: { buffer: cBuf } },
+      { binding: 2, resource: ioRes(cBuf, io?.cOffset) },
       { binding: 3, resource: { buffer: params } },
     ], label);
     if (tiled) {
@@ -1055,13 +1100,22 @@ export function createForwardPassEngine(
     inputBuf: GPUBuffer, lw: LayerWeights, proj: string,
     outputBuf: GPUBuffer, M: number, N: number, K: number, label: string,
     gpuDequant = false,
+    io?: MatmulIO,
   ) {
     // Priority: GGUF k-quant > E8 2-bit > INT8 > INT4 GPTQ > BF16 > f32
     const ggKey = `${proj}_gg` as keyof LayerWeights;
     const gg = lw[ggKey] as GGUFWeight | undefined;
     if (gg) {
-      dispatchMatmulGGUF(inputBuf, gg, outputBuf, M, N, K, label);
+      dispatchMatmulGGUF(inputBuf, gg, outputBuf, M, N, K, label, io);
       return;
+    }
+    // io windows are only supported on paths whose kernels take plain A/C
+    // storage bindings (GGUF above, f32/BF16 below). The exotic quant paths
+    // never co-occur with the ssmOffsetBindings gate (GGUF-only).
+    if (io && (io.aOffset || io.cOffset)) {
+      const wkeyIO = proj as keyof LayerWeights;
+      const wBufIO = lw[wkeyIO] as GPUBuffer | undefined;
+      if (!wBufIO) throw new Error(`dispatchProjection "${label}": io windows unsupported for quantized non-GGUF path`);
     }
 
     const e8key = `${proj}_e8` as keyof LayerWeights;
@@ -1090,9 +1144,9 @@ export function createForwardPassEngine(
       const wkey = proj as keyof LayerWeights;
       const wBuf = lw[wkey] as GPUBuffer;
       if (bf16Set.has(wBuf)) {
-        dispatchMatmulBTBF16(inputBuf, wBuf, outputBuf, M, N, K, label);
+        dispatchMatmulBTBF16(inputBuf, wBuf, outputBuf, M, N, K, label, io);
       } else {
-        dispatchMatmulBT(inputBuf, wBuf, outputBuf, M, N, K, label);
+        dispatchMatmulBT(inputBuf, wBuf, outputBuf, M, N, K, label, io);
       }
     }
   }
@@ -1253,12 +1307,13 @@ export function createForwardPassEngine(
   function dispatchMatmulBT(
     aBuf: GPUBuffer, bBuf: GPUBuffer, cBuf: GPUBuffer,
     M: number, N: number, K: number, label: string,
+    io?: MatmulIO,
   ) {
     const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);
     const bg = cachedBindGroup(matmulBTPipeline, 0, [
-      { binding: 0, resource: { buffer: aBuf } },
+      { binding: 0, resource: ioRes(aBuf, io?.aOffset) },
       { binding: 1, resource: { buffer: bBuf } },
-      { binding: 2, resource: { buffer: cBuf } },
+      { binding: 2, resource: ioRes(cBuf, io?.cOffset) },
       { binding: 3, resource: { buffer: params } },
     ], label);
     bd(matmulBTPipeline, [bg], [Math.ceil(M / 16), Math.ceil(N / 16)], label);
@@ -1268,11 +1323,12 @@ export function createForwardPassEngine(
   function dispatchMatmulBTBF16(
     aBuf: GPUBuffer, bBuf: GPUBuffer, cBuf: GPUBuffer,
     M: number, N: number, K: number, label: string,
+    io?: MatmulIO,
   ) {
     const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);
     const bg = cachedBindGroup(matmulBTBF16Pipeline, 0, [
-      { binding: 0, resource: { buffer: aBuf } },
-      { binding: 2, resource: { buffer: cBuf } },
+      { binding: 0, resource: ioRes(aBuf, io?.aOffset) },
+      { binding: 2, resource: ioRes(cBuf, io?.cOffset) },
       { binding: 3, resource: { buffer: params } },
       { binding: 5, resource: { buffer: bBuf } },
     ], label);
@@ -1843,17 +1899,23 @@ export function createForwardPassEngine(
         // normedBuf; ssmOutBuf is the per-token output written back into
         // attnProjBuf at offset ssmT*H*4 so downstream stages see all tokens.
         for (let ssmT = 0; ssmT < seqLen; ssmT++) {
-          // Slice this token's normed input out of the multi-token buffer.
-          batchCopy(normedBuf, ssmT * H * 4, ssmInputBuf!, 0, H * 4);
+          // F2: bind this token's slice of normedBuf directly via a 256-B-
+          // aligned offset window instead of staging it through ssmInputBuf.
+          const ssmInSrc = ssmOffsetBindings ? normedBuf : ssmInputBuf!;
+          const ssmInIO = ssmOffsetBindings ? { aOffset: ssmT * H * 4 } : undefined;
+          if (!ssmOffsetBindings) {
+            // Slice this token's normed input out of the multi-token buffer.
+            batchCopy(normedBuf, ssmT * H * 4, ssmInputBuf!, 0, H * 4);
+          }
 
           // Debug: normed input before projections (first token only to keep logs sane)
           if (isDebug && l === 0 && ssmT === 0) {
             flushBatch();
-            await debugRead(ssmInputBuf!, 'L0-normed-input', 8);
+            await debugRead(ssmInSrc, 'L0-normed-input', 8);
           }
 
           // 1. Fused QKV projection
-          dispatchProjection(ssmInputBuf!, lw, 'linearInProjQKV', linQKVBuf!, 1, linQKVDim, H, `L${l}-lin-qkv`, needsGpuDequant);
+          dispatchProjection(ssmInSrc, lw, 'linearInProjQKV', linQKVBuf!, 1, linQKVDim, H, `L${l}-lin-qkv`, needsGpuDequant, ssmInIO);
           if (ssmT === seqLen - 1) await maybeAudit(l, linQKVBuf!, `L${l}-lin-qkv-out`, 1, linQKVDim);
 
         // Debug: raw QKV projection output (before conv1d) — first token only
@@ -1873,7 +1935,23 @@ export function createForwardPassEngine(
 
         // 2. Conv1d on ENTIRE QKV (8192 channels) BEFORE split
         // Conv1d weight is [8192, 1, 4] — all channels go through causal conv
-        if (conv1dPipeline && conv1dUpdatePipeline) {
+        // F4: fused conv+state+SiLU writes to linConvOutBuf (it must not alias
+        // its input linQKVBuf), so downstream consumers read postConvQKV.
+        // Legacy path SiLUs back into linQKVBuf.
+        const postConvQKV = conv1dSiluPipeline ? linConvOutBuf! : linQKVBuf!;
+        if (conv1dSiluPipeline) {
+          const convParams = getCachedUniform(
+            new Uint32Array([linQKVDim, linConvK]), `L${l}-conv-p`);
+          const convBG = cachedBindGroup(conv1dSiluPipeline, 0, [
+            { binding: 0, resource: { buffer: linQKVBuf! } },
+            { binding: 1, resource: { buffer: csBuf } },
+            { binding: 2, resource: { buffer: lw.linearConv1dWeight! } },
+            { binding: 3, resource: { buffer: linConvOutBuf! } },
+            { binding: 4, resource: { buffer: convParams } },
+          ], `L${l}-conv-fused`);
+          bd(conv1dSiluPipeline, [convBG],
+            [workgroupCount(linQKVDim, 256)], `L${l}-conv1d-silu`);
+        } else if (conv1dPipeline && conv1dUpdatePipeline) {
           const convParams = getCachedUniform(
             new Uint32Array([linQKVDim, linConvK]), `L${l}-conv-p`);
           const convBG = cachedBindGroup(conv1dPipeline, 0, [
@@ -1900,18 +1978,24 @@ export function createForwardPassEngine(
         }
 
         // 3. Split QKV AFTER conv+silu
+        // F2: under offset bindings the split copies are skipped — the l2norm
+        // dispatches below read the Q/K sections of linQKVBuf via offset
+        // windows (writing normed Q/K into linQBuf/linKBuf), and ssm_step
+        // binds the V section of linQKVBuf directly.
         const qSize = linNKH * linKD * 4;
         const kSize = linNKH * linKD * 4;
         const vSize = linNVH * linVD * 4;
-        batchCopy(linQKVBuf!, 0, linQBuf!, 0, qSize);
-        batchCopy(linQKVBuf!, qSize, linKBuf!, 0, kSize);
-        batchCopy(linQKVBuf!, qSize + kSize, linVBuf!, 0, vSize);
+        if (!ssmOffsetBindings) {
+          batchCopy(postConvQKV, 0, linQBuf!, 0, qSize);
+          batchCopy(postConvQKV, qSize, linKBuf!, 0, kSize);
+          batchCopy(postConvQKV, qSize + kSize, linVBuf!, 0, vSize);
+        }
 
         // Debug: conv1d output and silu output — first token only
         if (isDebug && l === 0 && ssmT === 0) {
           flushBatch();
           await device.queue.onSubmittedWorkDone();
-          const qkvAfterSilu = new Float32Array(await readBuffer(device, linQKVBuf!, (4104) * 4));
+          const qkvAfterSilu = new Float32Array(await readBuffer(device, postConvQKV, (4104) * 4));
           console.log(`[REF] After conv+silu Q[0:8]: [${Array.from(qkvAfterSilu.slice(0, 8)).map(v => v.toFixed(6)).join(', ')}]`);
           console.log(`[REF] After conv+silu K[0:8]: [${Array.from(qkvAfterSilu.slice(2048, 2056)).map(v => v.toFixed(6)).join(', ')}]`);
           console.log(`[REF] After conv+silu V[0:8]: [${Array.from(qkvAfterSilu.slice(4096, 4104)).map(v => v.toFixed(6)).join(', ')}]`);
@@ -1923,9 +2007,9 @@ export function createForwardPassEngine(
         // 4. Project A, B, Z (these use the ORIGINAL normed input, not conv output)
         // NOTE: in_proj_b output is num_v_heads (32), NOT num_k_heads (16)!
         // Option A: read from per-token slice ssmInputBuf instead of multi-token normedBuf.
-        dispatchProjection(ssmInputBuf!, lw, 'linearInProjA', linABuf!, 1, linNVH, H, `L${l}-lin-a`, needsGpuDequant);
-        dispatchProjection(ssmInputBuf!, lw, 'linearInProjB', linBBuf!, 1, linNVH, H, `L${l}-lin-b`, needsGpuDequant);
-        dispatchProjection(ssmInputBuf!, lw, 'linearInProjZ', linZBuf!, 1, linZDim, H, `L${l}-lin-z`, needsGpuDequant);
+        dispatchProjection(ssmInSrc, lw, 'linearInProjA', linABuf!, 1, linNVH, H, `L${l}-lin-a`, needsGpuDequant, ssmInIO);
+        dispatchProjection(ssmInSrc, lw, 'linearInProjB', linBBuf!, 1, linNVH, H, `L${l}-lin-b`, needsGpuDequant, ssmInIO);
+        dispatchProjection(ssmInSrc, lw, 'linearInProjZ', linZBuf!, 1, linZDim, H, `L${l}-lin-z`, needsGpuDequant, ssmInIO);
         if (ssmT === seqLen - 1) {
           await maybeAudit(l, linABuf!, `L${l}-lin-a-out`, 1, linNVH);
           await maybeAudit(l, linBBuf!, `L${l}-lin-b-out`, 1, linNVH);
@@ -1950,9 +2034,16 @@ export function createForwardPassEngine(
         // NOTE: NO RoPE in linear attention layers! Only full attention uses RoPE.
 
         // 5. Sigmoid on beta (num_v_heads=32 scalars)
+        // F3: write sigmoid(beta) to its own buffer; the legacy copy-back to
+        // linBBuf existed only because linDtBuf is reused by softplus below.
+        const betaBuf = ssmOffsetBindings ? linBetaBuf! : linBBuf!;
         if (sigmoidPipeline) {
-          dispatchElementwise(sigmoidPipeline, linBBuf!, linDtBuf!, linNVH, `L${l}-sigmoid-beta`);
-          batchCopy(linDtBuf!, 0, linBBuf!, 0, linNVH * 4);
+          if (ssmOffsetBindings) {
+            dispatchElementwise(sigmoidPipeline, linBBuf!, linBetaBuf!, linNVH, `L${l}-sigmoid-beta`);
+          } else {
+            dispatchElementwise(sigmoidPipeline, linBBuf!, linDtBuf!, linNVH, `L${l}-sigmoid-beta`);
+            batchCopy(linDtBuf!, 0, linBBuf!, 0, linNVH * 4);
+          }
         }
 
         // 5c. L2-normalize Q and K (use_qk_l2norm_in_kernel=True in reference)
@@ -1961,34 +2052,66 @@ export function createForwardPassEngine(
           const qDim = linNKH * linKD;
           const kDim = linNKH * linKD;
 
-          const l2pQ = getCachedUniform(new Uint32Array([qDim, linKD]), `L${l}-l2q-p`);
-          const l2bgQ = cachedBindGroup(l2NormPipeline, 0, [
-            { binding: 0, resource: { buffer: linQBuf! } },
-            { binding: 1, resource: { buffer: linConvOutBuf! } },
-            { binding: 2, resource: { buffer: l2pQ } },
-          ], `L${l}-l2norm-q`);
-          bd(l2NormPipeline, [l2bgQ], [workgroupCount(qDim, 256)], `L${l}-l2norm-q`);
-          batchCopy(linConvOutBuf!, 0, linQBuf!, 0, qDim * 4);
+          if (ssmOffsetBindings) {
+            // F2+F3: read Q/K sections of postConvQKV via offset windows and
+            // write normed values straight into linQBuf/linKBuf — no split
+            // copies, no copy-backs through linConvOutBuf.
+            const l2pQ = getCachedUniform(new Uint32Array([qDim, linKD]), `L${l}-l2q-p`);
+            const l2bgQ = cachedBindGroup(l2NormPipeline, 0, [
+              { binding: 0, resource: { buffer: postConvQKV } },
+              { binding: 1, resource: { buffer: linQBuf! } },
+              { binding: 2, resource: { buffer: l2pQ } },
+            ], `L${l}-l2norm-q`);
+            bd(l2NormPipeline, [l2bgQ], [workgroupCount(qDim, 256)], `L${l}-l2norm-q`);
 
-          const l2pK = getCachedUniform(new Uint32Array([kDim, linKD]), `L${l}-l2k-p`);
-          const l2bgK = cachedBindGroup(l2NormPipeline, 0, [
-            { binding: 0, resource: { buffer: linKBuf! } },
-            { binding: 1, resource: { buffer: linConvOutBuf! } },
-            { binding: 2, resource: { buffer: l2pK } },
-          ], `L${l}-l2norm-k`);
-          bd(l2NormPipeline, [l2bgK], [workgroupCount(kDim, 256)], `L${l}-l2norm-k`);
+            const l2pK = getCachedUniform(new Uint32Array([kDim, linKD]), `L${l}-l2k-p`);
+            const l2bgK = cachedBindGroup(l2NormPipeline, 0, [
+              { binding: 0, resource: { buffer: postConvQKV, offset: qSize } },
+              { binding: 1, resource: { buffer: linKBuf! } },
+              { binding: 2, resource: { buffer: l2pK } },
+            ], `L${l}-l2norm-k`);
+            bd(l2NormPipeline, [l2bgK], [workgroupCount(kDim, 256)], `L${l}-l2norm-k`);
 
-          // Debug: verify L2 norm actually wrote to output — first token only
-          if (isDebug && l === 0 && ssmT === 0) {
-            flushBatch();
-            await device.queue.onSubmittedWorkDone();
-            const rawK = await readBuffer(device, linKBuf!, 8 * 4);
-            const normK = await readBuffer(device, linConvOutBuf!, 8 * 4);
-            console.log(`[L2 DEBUG] K input first 8: [${Array.from(new Float32Array(rawK)).map(v => v.toFixed(4)).join(', ')}]`);
-            console.log(`[L2 DEBUG] K output (linConvOutBuf) first 8: [${Array.from(new Float32Array(normK)).map(v => v.toFixed(4)).join(', ')}]`);
+            // Debug: verify L2 norm actually wrote to output — first token only
+            if (isDebug && l === 0 && ssmT === 0) {
+              flushBatch();
+              await device.queue.onSubmittedWorkDone();
+              const rawQKV = await readBuffer(device, postConvQKV, qSize + 8 * 4);
+              const rawK = new Float32Array(rawQKV).slice(qSize / 4, qSize / 4 + 8);
+              const normK = await readBuffer(device, linKBuf!, 8 * 4);
+              console.log(`[L2 DEBUG] K input first 8: [${Array.from(rawK).map(v => v.toFixed(4)).join(', ')}]`);
+              console.log(`[L2 DEBUG] K output (linKBuf) first 8: [${Array.from(new Float32Array(normK)).map(v => v.toFixed(4)).join(', ')}]`);
+            }
+          } else {
+            const l2pQ = getCachedUniform(new Uint32Array([qDim, linKD]), `L${l}-l2q-p`);
+            const l2bgQ = cachedBindGroup(l2NormPipeline, 0, [
+              { binding: 0, resource: { buffer: linQBuf! } },
+              { binding: 1, resource: { buffer: linConvOutBuf! } },
+              { binding: 2, resource: { buffer: l2pQ } },
+            ], `L${l}-l2norm-q`);
+            bd(l2NormPipeline, [l2bgQ], [workgroupCount(qDim, 256)], `L${l}-l2norm-q`);
+            batchCopy(linConvOutBuf!, 0, linQBuf!, 0, qDim * 4);
+
+            const l2pK = getCachedUniform(new Uint32Array([kDim, linKD]), `L${l}-l2k-p`);
+            const l2bgK = cachedBindGroup(l2NormPipeline, 0, [
+              { binding: 0, resource: { buffer: linKBuf! } },
+              { binding: 1, resource: { buffer: linConvOutBuf! } },
+              { binding: 2, resource: { buffer: l2pK } },
+            ], `L${l}-l2norm-k`);
+            bd(l2NormPipeline, [l2bgK], [workgroupCount(kDim, 256)], `L${l}-l2norm-k`);
+
+            // Debug: verify L2 norm actually wrote to output — first token only
+            if (isDebug && l === 0 && ssmT === 0) {
+              flushBatch();
+              await device.queue.onSubmittedWorkDone();
+              const rawK = await readBuffer(device, linKBuf!, 8 * 4);
+              const normK = await readBuffer(device, linConvOutBuf!, 8 * 4);
+              console.log(`[L2 DEBUG] K input first 8: [${Array.from(new Float32Array(rawK)).map(v => v.toFixed(4)).join(', ')}]`);
+              console.log(`[L2 DEBUG] K output (linConvOutBuf) first 8: [${Array.from(new Float32Array(normK)).map(v => v.toFixed(4)).join(', ')}]`);
+            }
+
+            batchCopy(linConvOutBuf!, 0, linKBuf!, 0, kDim * 4);
           }
-
-          batchCopy(linConvOutBuf!, 0, linKBuf!, 0, kDim * 4);
         }
 
         // 6. Decay per VALUE HEAD [32], not per key dim
@@ -2004,7 +2127,7 @@ export function createForwardPassEngine(
         if (isDebug && l === 0 && ssmT === 0) {
           flushBatch();
           await device.queue.onSubmittedWorkDone();
-          const betaRaw = await readBuffer(device, linBBuf!, linNKH * 4);
+          const betaRaw = await readBuffer(device, betaBuf, linNKH * 4);
           const beta = new Float32Array(betaRaw);
           console.log(`[SSM DEBUG] beta (sigmoid) first 4: [${Array.from(beta.slice(0, 4)).map(v => v.toFixed(4)).join(', ')}]`);
 
@@ -2016,8 +2139,10 @@ export function createForwardPassEngine(
           const kNorm = new Float32Array(kNormRaw);
           console.log(`[SSM DEBUG] K (L2-normed) first 8: [${Array.from(kNorm.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
 
-          const vRaw = await readBuffer(device, linVBuf!, 8 * 4);
-          const vVals = new Float32Array(vRaw);
+          const vVals = ssmOffsetBindings
+            ? new Float32Array(await readBuffer(device, postConvQKV, qSize + kSize + 8 * 4))
+              .slice((qSize + kSize) / 4, (qSize + kSize) / 4 + 8)
+            : new Float32Array(await readBuffer(device, linVBuf!, 8 * 4));
           console.log(`[SSM DEBUG] V first 8: [${Array.from(vVals.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
 
           const qRaw = await readBuffer(device, linQBuf!, 8 * 4);
@@ -2037,8 +2162,11 @@ export function createForwardPassEngine(
           const ssmBG0 = cachedBindGroup(ssmStepPipeline, 0, [
             { binding: 0, resource: { buffer: linQBuf! } },
             { binding: 1, resource: { buffer: linKBuf! } }, // K after conv1d + silu + L2 norm
-            { binding: 2, resource: { buffer: linVBuf! } },
-            { binding: 3, resource: { buffer: linBBuf! } },       // beta (after sigmoid)
+            // F2: V is never split out — bind its section of postConvQKV.
+            { binding: 2, resource: ssmOffsetBindings
+              ? { buffer: postConvQKV, offset: qSize + kSize }
+              : { buffer: linVBuf! } },
+            { binding: 3, resource: { buffer: betaBuf } },        // beta (after sigmoid)
             { binding: 4, resource: { buffer: linDecayBuf! } },   // decay = exp(-exp(A_log)*dt)
           ], `L${l}-ssm-g0`);
           const ssmBG1 = cachedBindGroup(ssmStepPipeline, 1, [
@@ -2176,23 +2304,34 @@ export function createForwardPassEngine(
           }
         }
 
-        // 9. Output projection → ssmOutBuf [1, H] (per-token scratch)
+        // 9. Output projection — F3: write straight into this token's slice of
+        // the multi-token attnProjBuf via an output offset window (legacy path
+        // staged through ssmOutBuf and copied). Downstream stages (residual
+        // add, post-attn norm, FFN) already process all seqLen tokens batched.
         const outDim = linNKH * linGroupedVD;
-        dispatchProjection(linOutBuf!, lw, 'linearOutProj', ssmOutBuf!, 1, H, outDim, `L${l}-lin-out`, needsGpuDequant);
-        if (ssmT === seqLen - 1) await maybeAudit(l, ssmOutBuf!, `L${l}-lin-out-out`, 1, H);
+        if (ssmOffsetBindings) {
+          dispatchProjection(linOutBuf!, lw, 'linearOutProj', attnProjBuf, 1, H, outDim, `L${l}-lin-out`, needsGpuDequant, { cOffset: ssmT * H * 4 });
+          // Audit reads tokens 0..ssmT from attnProjBuf; last row = this token.
+          if (ssmT === seqLen - 1) await maybeAudit(l, attnProjBuf, `L${l}-lin-out-out`, ssmT + 1, H);
+        } else {
+          dispatchProjection(linOutBuf!, lw, 'linearOutProj', ssmOutBuf!, 1, H, outDim, `L${l}-lin-out`, needsGpuDequant);
+          if (ssmT === seqLen - 1) await maybeAudit(l, ssmOutBuf!, `L${l}-lin-out-out`, 1, H);
+        }
 
-        // Q8 out_proj debug readback (first token only)
+        // Q8 out_proj debug readback (first token only — token 0 sits at
+        // offset 0 of attnProjBuf under offset bindings, so either read works)
         if (isDebug && l === 0 && ssmT === 0) {
           flushBatch();
           await device.queue.onSubmittedWorkDone();
-          const outData = new Float32Array(await readBuffer(device, ssmOutBuf!, 8 * 4));
+          const outData = new Float32Array(await readBuffer(device, ssmOffsetBindings ? attnProjBuf : ssmOutBuf!, 8 * 4));
           console.log(`[Q8 DEBUG] L0 out_proj output[0:8]: [${Array.from(outData).map(v => v.toFixed(6)).join(', ')}]`);
         }
 
-        // Option A: write this token's SSM output into the multi-token attnProjBuf
-        // at offset ssmT*H*4. Downstream stages (residual add, post-attn norm, FFN)
-        // already process all seqLen tokens in batched fashion.
-        batchCopy(ssmOutBuf!, 0, attnProjBuf, ssmT * H * 4, H * 4);
+        if (!ssmOffsetBindings) {
+          // Option A: write this token's SSM output into the multi-token attnProjBuf
+          // at offset ssmT*H*4.
+          batchCopy(ssmOutBuf!, 0, attnProjBuf, ssmT * H * 4, H * 4);
+        }
       } // end per-token SSM loop (Option A)
 
       } else {
@@ -2209,22 +2348,40 @@ export function createForwardPassEngine(
         const slidingWindow = config.layers[l].slidingWindow ?? 0;
 
         // Q, K, V projections (auto-selects f32 or INT4 matmul)
+        // F1: when the deinterleave kernel runs, Q lands in attnOutBuf (not
+        // qBuf); the qNorm below reads/writes in the opposite direction to
+        // land normed Q in qBuf without any copy-backs.
+        let qInAttnOut = false;
         if (config.attnOutputGate) {
           // Qwen3.5: Q proj outputs [nHeads, dHead*2] — interleaved [Q_h0, gate_h0, Q_h1, gate_h1, ...]
-          // Project to qBuf (sized 2x), then deinterleave in-place
+          // Project to qBuf (sized 2x), then deinterleave → attnOutBuf (Q) + attnGateBuf (gate)
           dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHead * 2, H, `L${l}-q`);
           await maybeAudit(l, qBuf, `L${l}-q-out`, seqLen, nHeads * dHead * 2);
-          // Deinterleave from qBuf → attnOutBuf (Q) + attnGateBuf (gate)
-          for (let s = 0; s < seqLen; s++) {
-            for (let h = 0; h < nHeads; h++) {
-              const srcOffset = (s * nHeads * dHead * 2 + h * dHead * 2) * 4;
-              const qDst = (s * nHeads * dHead + h * dHead) * 4;
-              batchCopy(qBuf, srcOffset, attnOutBuf, qDst, dHead * 4);
-              batchCopy(qBuf, srcOffset + dHead * 4, attnGateBuf!, qDst, dHead * 4);
+          if (deinterleavePipeline && attnGateBuf) {
+            const nElems = seqLen * nHeads * dHead;
+            const params = getCachedUniform(
+              new Uint32Array([nElems, dHead]), `L${l}-deint-p`);
+            const bg = cachedBindGroup(deinterleavePipeline, 0, [
+              { binding: 0, resource: { buffer: qBuf } },
+              { binding: 1, resource: { buffer: attnOutBuf } },
+              { binding: 2, resource: { buffer: attnGateBuf } },
+              { binding: 3, resource: { buffer: params } },
+            ], `L${l}-deint`);
+            bd(deinterleavePipeline, [bg], [workgroupCount(nElems, 256)], `L${l}-deint`);
+            qInAttnOut = true;
+          } else {
+            // Legacy CPU copy loop (?deint=0 fallback)
+            for (let s = 0; s < seqLen; s++) {
+              for (let h = 0; h < nHeads; h++) {
+                const srcOffset = (s * nHeads * dHead * 2 + h * dHead * 2) * 4;
+                const qDst = (s * nHeads * dHead + h * dHead) * 4;
+                batchCopy(qBuf, srcOffset, attnOutBuf, qDst, dHead * 4);
+                batchCopy(qBuf, srcOffset + dHead * 4, attnGateBuf!, qDst, dHead * 4);
+              }
             }
+            // Copy deinterleaved Q from attnOutBuf back to qBuf
+            batchCopy(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHead * 4);
           }
-          // Copy deinterleaved Q from attnOutBuf back to qBuf
-          batchCopy(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHead * 4);
         } else {
           dispatchProjection(normedBuf, lw, 'qProj', qBuf, seqLen, nHeads * dHeadL, H, `L${l}-q`);
           await maybeAudit(l, qBuf, `L${l}-q-out`, seqLen, nHeads * dHeadL);
@@ -2242,8 +2399,17 @@ export function createForwardPassEngine(
         // but no kNorm (attn_k_norm is dead weight, skipped by the loader).
         if (lw.qNorm) {
           // Q norm: treat [seqLen * nHeads, dHead] as rows of dHead
-          dispatchRMSNorm(qBuf, attnOutBuf, lw.qNorm, seqLen * nHeads, `L${l}-qnorm`, dHeadL);
-          batchCopy(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHeadL * 4);
+          if (qInAttnOut) {
+            // F1: Q is in attnOutBuf — norm it straight back into qBuf,
+            // eliminating the copy-back.
+            dispatchRMSNorm(attnOutBuf, qBuf, lw.qNorm, seqLen * nHeads, `L${l}-qnorm`, dHeadL);
+          } else {
+            dispatchRMSNorm(qBuf, attnOutBuf, lw.qNorm, seqLen * nHeads, `L${l}-qnorm`, dHeadL);
+            batchCopy(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHeadL * 4);
+          }
+        } else if (qInAttnOut) {
+          // No qNorm: move deinterleaved Q home in one bulk copy.
+          batchCopy(attnOutBuf, 0, qBuf, 0, seqLen * nHeads * dHead * 4);
         }
         if (lw.kNorm && kvSrc === undefined) {
           dispatchRMSNorm(kBuf, ffnTempBuf, lw.kNorm, seqLen * nKVHeads, `L${l}-knorm`, dHeadL);
@@ -2428,7 +2594,15 @@ export function createForwardPassEngine(
         // Qwen3.5: output gating — attn_output = attn_output * sigmoid(gate)
         // gate is in attnGateBuf (from Q projection split)
         // gate shape is [seqLen, nHeads * dHead] — reshaped from [seqLen, nHeads, dHead]
-        if (config.attnOutputGate && attnGateBuf && sigmoidPipeline) {
+        // F7: one gate_sigmoid dispatch (a * sigmoid(b)) → ffnTempBuf; o-proj
+        // reads it from there. Skipped under useHadamard (it scratches
+        // ffnTempBuf) — that path keeps the legacy 3-command sequence.
+        let attnGated = attnOutBuf;
+        if (config.attnOutputGate && attnGateBuf && gateSigmoidPipeline && !useHadamard) {
+          const gateDim = seqLen * nHeads * dHead;
+          dispatchElementwise(gateSigmoidPipeline, attnOutBuf, ffnTempBuf, gateDim, `L${l}-attn-gate`, attnGateBuf);
+          attnGated = ffnTempBuf;
+        } else if (config.attnOutputGate && attnGateBuf && sigmoidPipeline) {
           const gateDim = seqLen * nHeads * dHead;
           // sigmoid(gate) → normedBuf
           dispatchElementwise(sigmoidPipeline, attnGateBuf, normedBuf, gateDim, `L${l}-gate-sig`);
@@ -2439,7 +2613,7 @@ export function createForwardPassEngine(
 
         if (isDebug && (l === 23 || l === 27)) {
           flushBatch();
-          await debugRead(attnOutBuf, `L${l}-attn-out-postGate`, 8);
+          await debugRead(attnGated, `L${l}-attn-out-postGate`, 8);
         }
 
         // QuIP#/QuaRot: Hadamard rotation before o_proj (its weights were also rotated)
@@ -2452,7 +2626,7 @@ export function createForwardPassEngine(
         }
 
         // Output projection: [seq, nHeads*dHead] → [seq, H]
-        dispatchProjection(attnOutBuf, lw, 'oProj', attnProjBuf, seqLen, H, nHeads * dHeadL, `L${l}-o`);
+        dispatchProjection(attnGated, lw, 'oProj', attnProjBuf, seqLen, H, nHeads * dHeadL, `L${l}-o`);
         await maybeAudit(l, attnProjBuf, `L${l}-o-out`, seqLen, H);
 
         // O projection bias

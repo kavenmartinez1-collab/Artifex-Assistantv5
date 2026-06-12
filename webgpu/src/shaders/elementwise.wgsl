@@ -136,6 +136,19 @@ fn sigmoid_op(@builtin(global_invocation_id) gid: vec3u) {
   output[idx] = 1.0 / (1.0 + exp(-input_a[idx]));
 }
 
+// Fusion lever F7: gated sigmoid — output = a * sigmoid(b).
+// Qwen3.5 attention output gating (attn_out * sigmoid(gate)) in one dispatch
+// instead of sigmoid → copy → mul. The sigmoid value is computed with the
+// exact expression sigmoid_op uses (1/(1+exp(-x))) and then multiplied, so
+// the result is bit-identical to the legacy three-command sequence.
+@compute @workgroup_size(256)
+fn gate_sigmoid(@builtin(global_invocation_id) gid: vec3u) {
+  let idx = gid.x;
+  if (idx >= params.n) { return; }
+  let s = 1.0 / (1.0 + exp(-input_b[idx]));
+  output[idx] = input_a[idx] * s;
+}
+
 // Decay: output = exp(-exp(a) * b) where a=A_log, b=dt
 // Computes the SSM state decay factor. Always in (0, 1).
 @compute @workgroup_size(256)

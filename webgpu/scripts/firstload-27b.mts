@@ -2,15 +2,19 @@
  * First load of Qwen3.5-27B Q2_K on the RX 6700 XT (headless Chrome via
  * Playwright, vite dev server must already be running on 127.0.0.1:5173).
  * Greedy (Deterministic preset) per the sampler-before-kernel rule, so any
- * incoherence points at kernels/quant, not sampling. Q2_K/Q3_K currently run
- * on the LEGACY GEMV kernels (tiled covers only Q4_K/Q5_K/Q6_K) — expect
- * slower than the 9B until lever 3.5.
+ * incoherence points at kernels/quant, not sampling. Doubles as the fusion
+ * lever's bench + greedy-parity driver.
  *
  * Run: npx tsx scripts/firstload-27b.mts
+ *   OUT=path.txt   — also write the greedy response text to a file (for diff)
+ *   URLQ="deint=0" — extra query params appended to the page URL (A/B toggles)
  */
 import { chromium } from '@playwright/test';
+import { writeFileSync } from 'node:fs';
 
 const BASE = 'http://127.0.0.1:5173';
+const URLQ = process.env.URLQ ? `?${process.env.URLQ}` : '';
+const OUT = process.env.OUT ?? '';
 const REPO = 'local/qwen3.5-27b-gguf';
 const ADAPTER_RE = /radeon|6700|amd|rdna/i;
 const PROMPT =
@@ -37,7 +41,7 @@ const GEN_TIMEOUT = 900_000;
     // 6.5 GB default — too small for the 27B (~10.4 GB). Manual override:
     // 11 GB on the 12 GB card leaves ~1 GB for the compositor.
     await page.addInitScript(() => localStorage.setItem('vramBudgetGB', '11'));
-    await page.goto(`${BASE}/`);
+    await page.goto(`${BASE}/${URLQ}`);
 
     // Select the AMD adapter (headless label is "rdna-2").
     await page.waitForFunction(() => {
@@ -88,8 +92,14 @@ const GEN_TIMEOUT = 900_000;
       const t = (parent.textContent ?? '').replace(m.textContent ?? '', '');
       return { meta: m.textContent ?? '', text: t };
     });
+    const perf = await page.evaluate(() => (globalThis as any).__perfLastForward ?? null);
     console.log(`\n──── meta ────\n${meta}`);
+    console.log(`\n──── perfLastForward ────\n${JSON.stringify(perf)}`);
     console.log(`\n──── response (greedy) ────\n${text}`);
+    if (OUT) {
+      writeFileSync(OUT, text);
+      console.log(`\n[wrote ${text.length} chars to ${OUT}]`);
+    }
   } finally {
     await browser.close();
   }
