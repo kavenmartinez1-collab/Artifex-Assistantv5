@@ -8,6 +8,7 @@
  * Run: npx tsx scripts/firstload-27b.mts
  *   OUT=path.txt   — also write the greedy response text to a file (for diff)
  *   URLQ="deint=0" — extra query params appended to the page URL (A/B toggles)
+ *   MAXTOK=32      — override #max-tokens (short profiling runs)
  */
 import { chromium } from '@playwright/test';
 import { writeFileSync } from 'node:fs';
@@ -77,6 +78,8 @@ const GEN_TIMEOUT = 900_000;
     }, undefined, { timeout: LOAD_TIMEOUT });
     console.log(`loaded in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
 
+    if (process.env.MAXTOK) await page.fill('#max-tokens', process.env.MAXTOK);
+
     const metasBefore = await page.locator('.meta').count();
     await page.fill('#prompt', PROMPT);
     await page.click('#send-btn');
@@ -93,8 +96,17 @@ const GEN_TIMEOUT = 900_000;
       return { meta: m.textContent ?? '', text: t };
     });
     const perf = await page.evaluate(() => (globalThis as any).__perfLastForward ?? null);
+    const timing = await page.evaluate(() => (globalThis as any).__perfTimingRows ?? null);
     console.log(`\n──── meta ────\n${meta}`);
     console.log(`\n──── perfLastForward ────\n${JSON.stringify(perf)}`);
+    if (timing) {
+      console.log(`\n──── GPU per-category (last profiled forward) ────`);
+      for (const r of timing) {
+        console.log(`${r.category.padEnd(28)} n=${String(r.count).padStart(4)} ` +
+          `${r.total_ms.toFixed(3).padStart(8)} ms  ${r.pct.toFixed(1).padStart(5)}%  ` +
+          `avg ${r.avg_us.toFixed(1)} us`);
+      }
+    }
     console.log(`\n──── response (greedy) ────\n${text}`);
     if (OUT) {
       writeFileSync(OUT, text);

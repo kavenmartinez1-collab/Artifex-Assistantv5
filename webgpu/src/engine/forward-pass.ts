@@ -493,6 +493,9 @@ export function createForwardPassEngine(
     ? createComputePipeline(device, groupNormWGSL, 'group_norm', 'group-norm') : null;
   const ssmStepPipeline = isHybrid
     ? createComputePipeline(device, ssmStepWGSL, 'ssm_step', 'ssm-step') : null;
+  // Fusion lever F5: beta/decay prologue inside ssm_step. A/B: ?fuseSsm=0.
+  const ssmStepFusedPipeline = isHybrid && gemvSearch?.get('fuseSsm') !== '0'
+    ? createComputePipeline(device, ssmStepWGSL, 'ssm_step_fused', 'ssm-step-fused') : null;
 
   // Linear attention dimensions (only for hybrid models)
   const linKD = config.linearKeyHeadDim ?? 0;
@@ -607,6 +610,7 @@ export function createForwardPassEngine(
   registerCat(conv1dUpdatePipeline, 'conv1d_update');
   registerCat(groupNormPipeline, 'group_norm');
   registerCat(ssmStepPipeline, 'ssm_step');
+  registerCat(ssmStepFusedPipeline, 'ssm_step_fused');
   registerCat(sigmoidPipeline, 'sigmoid');
   registerCat(decayPipeline, 'decay');
   registerCat(l2NormPipeline, 'l2norm');
@@ -2036,8 +2040,11 @@ export function createForwardPassEngine(
         // 5. Sigmoid on beta (num_v_heads=32 scalars)
         // F3: write sigmoid(beta) to its own buffer; the legacy copy-back to
         // linBBuf existed only because linDtBuf is reused by softplus below.
+        // F5: sigmoid/softplus/decay fold into the ssm_step_fused prologue —
+        // skip all three elementwise dispatches.
+        const fuseSsm = !!(ssmStepFusedPipeline && lw.linearDtBias && lw.linearALog);
         const betaBuf = ssmOffsetBindings ? linBetaBuf! : linBBuf!;
-        if (sigmoidPipeline) {
+        if (sigmoidPipeline && !fuseSsm) {
           if (ssmOffsetBindings) {
             dispatchElementwise(sigmoidPipeline, linBBuf!, linBetaBuf!, linNVH, `L${l}-sigmoid-beta`);
           } else {
@@ -2116,10 +2123,10 @@ export function createForwardPassEngine(
 
         // 6. Decay per VALUE HEAD [32], not per key dim
         // A_log is [32], dt_bias is [32], in_proj_a output is [32]
-        if (softplusPipeline && lw.linearDtBias) {
+        if (softplusPipeline && lw.linearDtBias && !fuseSsm) {
           dispatchElementwise(softplusPipeline, linABuf!, linDtBuf!, linNVH, `L${l}-softplus`, lw.linearDtBias);
         }
-        if (decayPipeline && lw.linearALog) {
+        if (decayPipeline && lw.linearALog && !fuseSsm) {
           dispatchElementwise(decayPipeline, lw.linearALog, linDecayBuf!, linNVH, `L${l}-decay`, linDtBuf!);
         }
 
@@ -2127,13 +2134,15 @@ export function createForwardPassEngine(
         if (isDebug && l === 0 && ssmT === 0) {
           flushBatch();
           await device.queue.onSubmittedWorkDone();
-          const betaRaw = await readBuffer(device, betaBuf, linNKH * 4);
-          const beta = new Float32Array(betaRaw);
-          console.log(`[SSM DEBUG] beta (sigmoid) first 4: [${Array.from(beta.slice(0, 4)).map(v => v.toFixed(4)).join(', ')}]`);
+          if (!fuseSsm) {
+            const betaRaw = await readBuffer(device, betaBuf, linNKH * 4);
+            const beta = new Float32Array(betaRaw);
+            console.log(`[SSM DEBUG] beta (sigmoid) first 4: [${Array.from(beta.slice(0, 4)).map(v => v.toFixed(4)).join(', ')}]`);
 
-          const decayRaw = await readBuffer(device, linDecayBuf!, Math.min(linNVH, 8) * 4);
-          const decay = new Float32Array(decayRaw);
-          console.log(`[SSM DEBUG] decay (per vh, ${linNVH} total) first 8: [${Array.from(decay.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+            const decayRaw = await readBuffer(device, linDecayBuf!, Math.min(linNVH, 8) * 4);
+            const decay = new Float32Array(decayRaw);
+            console.log(`[SSM DEBUG] decay (per vh, ${linNVH} total) first 8: [${Array.from(decay.slice(0, 8)).map(v => v.toFixed(4)).join(', ')}]`);
+          }
 
           const kNormRaw = await readBuffer(device, linKBuf!, 8 * 4);
           const kNorm = new Float32Array(kNormRaw);
@@ -2159,24 +2168,34 @@ export function createForwardPassEngine(
           const ssmLayoutTiled = config.sourceFormat === 'gguf' ? 1 : 0;
           const ssmParams = getCachedUniform(
             new Uint32Array([linNKH, linNVH, linKD, linGroupedVD, ssmLayoutTiled, 0, 0, 0]), `L${l}-ssm-p`);
-          const ssmBG0 = cachedBindGroup(ssmStepPipeline, 0, [
+          // F5: fused entry takes RAW B (binding 3) / RAW A (binding 4) plus
+          // dt_bias/A_log and computes beta/decay in its prologue.
+          const ssmPipe = fuseSsm ? ssmStepFusedPipeline! : ssmStepPipeline;
+          const ssmBG0 = cachedBindGroup(ssmPipe, 0, [
             { binding: 0, resource: { buffer: linQBuf! } },
             { binding: 1, resource: { buffer: linKBuf! } }, // K after conv1d + silu + L2 norm
             // F2: V is never split out — bind its section of postConvQKV.
             { binding: 2, resource: ssmOffsetBindings
               ? { buffer: postConvQKV, offset: qSize + kSize }
               : { buffer: linVBuf! } },
-            { binding: 3, resource: { buffer: betaBuf } },        // beta (after sigmoid)
-            { binding: 4, resource: { buffer: linDecayBuf! } },   // decay = exp(-exp(A_log)*dt)
-          ], `L${l}-ssm-g0`);
-          const ssmBG1 = cachedBindGroup(ssmStepPipeline, 1, [
+            ...(fuseSsm ? [
+              { binding: 3, resource: { buffer: linBBuf! } },         // raw B proj
+              { binding: 4, resource: { buffer: linABuf! } },         // raw A proj
+              { binding: 5, resource: { buffer: lw.linearDtBias! } },
+              { binding: 6, resource: { buffer: lw.linearALog! } },
+            ] : [
+              { binding: 3, resource: { buffer: betaBuf } },        // beta (after sigmoid)
+              { binding: 4, resource: { buffer: linDecayBuf! } },   // decay = exp(-exp(A_log)*dt)
+            ]),
+          ], `L${l}-ssm-g0${fuseSsm ? '-f' : ''}`);
+          const ssmBG1 = cachedBindGroup(ssmPipe, 1, [
             { binding: 0, resource: { buffer: hBuf } },
             { binding: 1, resource: { buffer: linOutBuf! } },
           ], `L${l}-ssm-g1`);
-          const ssmBG2 = cachedBindGroup(ssmStepPipeline, 2, [
+          const ssmBG2 = cachedBindGroup(ssmPipe, 2, [
             { binding: 0, resource: { buffer: ssmParams } },
           ], `L${l}-ssm-g2`);
-          bd(ssmStepPipeline, [ssmBG0, ssmBG1, ssmBG2],
+          bd(ssmPipe, [ssmBG0, ssmBG1, ssmBG2],
             [linNKH], `L${l}-ssm-step`);
         }
 
@@ -3079,6 +3098,8 @@ export function createForwardPassEngine(
         pct: r.pct.toFixed(1) + '%',
         avg_us: r.avg_us.toFixed(1),
       })));
+      // Headless drivers can't see console.table objects — stash for evaluate().
+      (globalThis as any).__perfTimingRows = rows;
     }
 
     // Divergence probe: dump full logits and stash collected results for
