@@ -479,6 +479,15 @@ export function createForwardPassEngine(
   const matmulGgufRPipeline = gemvREnabled
     ? createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q2_k_tiled_r', 'matmul-gguf-q2_k-tiled-r', gemvTileConsts)
     : null;
+  // ILP probe (lever E candidate): _r2 = _r with 2 units/lane and all 8
+  // weight words loaded before any decode ALU — tests the loads-in-flight
+  // hypothesis (the last unfalsified one for Q2_K's 28% BW efficiency).
+  // Bit-exact with _r (same per-lane unit order and acc expression).
+  // DEFAULT OFF — A/B: ?gemvR2=1.
+  const gemvR2Enabled = gemvREnabled && gemvSearch?.get('gemvR2') === '1';
+  const matmulGgufR2Pipeline = gemvR2Enabled
+    ? createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q2_k_tiled_r2', 'matmul-gguf-q2_k-tiled-r2', gemvTileConsts)
+    : null;
   if (gemvREnabled) {
     const repackPipeline = createComputePipeline(device, repackQ2kWGSL, 'repack_q2k', 'repack-q2k');
     const Q2K_REPACK_SLOTS = [
@@ -810,6 +819,7 @@ export function createForwardPassEngine(
     registerCat(p, `gguf_${ggmlTypeTraits(+t).name}_v4`);
   }
   registerCat(matmulGgufRPipeline, 'gguf_Q2_K_r');
+  registerCat(matmulGgufR2Pipeline, 'gguf_Q2_K_r2');
 
   // ── Matmul-Q4 GEMV pipeline selection ──────────────────────────────
   // Cached-scales variants are parameterized by (MAX_GROUPS, WG_SIZE). The
@@ -1251,7 +1261,7 @@ export function createForwardPassEngine(
       ? matmulGgufV4Pipelines?.[gg.ggmlType] ?? matmulGgufNsPipelines?.[gg.ggmlType] ?? null
       : null;
     const tiled = gg.repacked
-      ? matmulGgufRPipeline
+      ? (matmulGgufR2Pipeline ?? matmulGgufRPipeline)
       : fast ?? matmulGgufTiledPipelines?.[gg.ggmlType] ?? null;
     const pipeline = tiled ?? matmulGgufPipelines?.[gg.ggmlType];
     if (!pipeline) throw new Error(`matmul_gguf "${label}": no pipeline for ggml type ${gg.ggmlType}`);

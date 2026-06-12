@@ -942,6 +942,116 @@ fn matmul_gguf_q2_k_tiled_r(@builtin(local_invocation_id) lid: vec3u,
   tile_reduce_store(tid, lane, n, m, acc);
 }
 
+// ── Q2_K repacked, 2 units/lane (ILP probe — loads-in-flight) ────────────
+// Same math as matmul_gguf_q2_k_tiled_r; the ONLY change is scheduling.
+// Hypothesis: _r issues ~5 scalar loads per unit then runs a ~32-op serial
+// ALU chain, so memory idles during ALU and ALU idles during loads, with 10
+// barrier pairs/dispatch flushing any overlap (K=5120). Here each lane owns
+// TWO units per chunk (ua = c*2*TPR + lane, ub = ua + TPR) and ALL global
+// loads for both units are issued up front (8 independent words) before any
+// decode ALU — double the loads in flight, half the barriers.
+// Per-lane unit ORDER is unchanged (lane, lane+TPR, lane+2*TPR, ...) and the
+// per-unit acc expression is identical → bit-exact with _r/_tiled (gate:
+// byte-identical 2048-token A/B). Inactive units read superblock 0 (always
+// present) and their contribution is dropped via select().
+
+var<workgroup> a_tile2: array<vec4<f32>, (TWG / TN) * 16u>;
+
+/** tile_stage for the double-width chunk: 2*TPR units = TPR*16 vec4s. */
+fn tile_stage2(tid: u32, aRow: u32, elemBase: u32, K: u32) {
+  let nVec = (TWG / TN) * 16u;
+  for (var i = tid; i < nVec; i = i + TWG) {
+    let e = elemBase + i * 4u;
+    var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if (e < K) {
+      v = vec4<f32>(A[aRow + e], A[aRow + e + 1u], A[aRow + e + 2u], A[aRow + e + 3u]);
+    }
+    a_tile2[i] = v;
+  }
+}
+
+/** One repacked unit's acc contribution — the exact _r inner block, fed
+ *  from pre-loaded words. atBase = a_tile2 vec4 index of the unit's slice. */
+fn q2k_unit_acc(dmw: u32, scw: u32, sub: u32, w0: u32, w1: u32, atBase: u32) -> f32 {
+  let dm = unpack2x16float(dmw);
+  let sc0 = (scw >> ((sub & 3u) * 8u)) & 0xFFu;
+  let sc1 = (scw >> (((sub & 3u) + 1u) * 8u)) & 0xFFu; // sub even → same word
+  let dl0 = dm.x * f32(sc0 & 0x0Fu);
+  let ml0 = dm.y * f32(sc0 >> 4u);
+  let dl1 = dm.x * f32(sc1 & 0x0Fu);
+  let ml1 = dm.y * f32(sc1 >> 4u);
+  var dq0: f32 = 0.0;
+  var as0: f32 = 0.0;
+  var dq1: f32 = 0.0;
+  var as1: f32 = 0.0;
+  for (var w = 0u; w < 8u; w = w + 1u) {
+    let src = select(w1, w0, w < 4u);
+    let off = (w & 3u) * 8u;
+    let q2 = vec4<f32>(
+      f32(extractBits(src, off, 2u)),
+      f32(extractBits(src, off + 2u, 2u)),
+      f32(extractBits(src, off + 4u, 2u)),
+      f32(extractBits(src, off + 6u, 2u)),
+    );
+    let a4 = a_tile2[atBase + w];
+    let asum = a4.x + a4.y + a4.z + a4.w;
+    if (w < 4u) { dq0 = dq0 + dot(a4, q2); as0 = as0 + asum; }
+    else        { dq1 = dq1 + dot(a4, q2); as1 = as1 + asum; }
+  }
+  return (dl0 * dq0 - ml0 * as0) + (dl1 * dq1 - ml1 * as1);
+}
+
+@compute @workgroup_size(TWG, 1, 1)
+fn matmul_gguf_q2_k_tiled_r2(@builtin(local_invocation_id) lid: vec3u,
+                             @builtin(workgroup_id) wid: vec3u) {
+  let tid = lid.x;
+  let TPR = TWG / TN;
+  let lane = tid % TPR;
+  let row = tid / TPR;
+  let n = (wid.x + wid.z * 65535u) * TN + row;
+  let m = wid.y;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 8u;
+  let UPC = TPR * 2u;                       // units per chunk (whole row)
+  let nChunks = (nUnits + UPC - 1u) / UPC;
+  let aRow = m * K;
+  let valid = n < params.N;
+
+  var acc: f32 = 0.0;
+  for (var c = 0u; c < nChunks; c = c + 1u) {
+    workgroupBarrier();
+    tile_stage2(tid, aRow, c * UPC * 32u, K);
+    workgroupBarrier();
+
+    let ua = c * UPC + lane;
+    let ub = ua + TPR;
+    let okA = ua < nUnits && valid;
+    let okB = ub < nUnits && valid;
+    // ── all global loads, both units, before any decode ALU ─────────────
+    let pairA = ua % 8u;
+    let subA = pairA * 2u;
+    let baseA = select(0u, (n * nSB + ua / 8u) * 21u, okA);
+    let dmwA = W[baseA + 20u];
+    let scwA = W[baseA + (subA >> 2u)];
+    let wA0 = W[baseA + 4u + pairA * 2u];
+    let wA1 = W[baseA + 4u + pairA * 2u + 1u];
+    let pairB = ub % 8u;
+    let subB = pairB * 2u;
+    let baseB = select(0u, (n * nSB + ub / 8u) * 21u, okB);
+    let dmwB = W[baseB + 20u];
+    let scwB = W[baseB + (subB >> 2u)];
+    let wB0 = W[baseB + 4u + pairB * 2u];
+    let wB1 = W[baseB + 4u + pairB * 2u + 1u];
+    // ── decode + accumulate (per-lane order matches _r exactly) ─────────
+    let cA = q2k_unit_acc(dmwA, scwA, subA, wA0, wA1, lane * 8u);
+    acc = acc + select(0.0, cA, okA);
+    let cB = q2k_unit_acc(dmwB, scwB, subB, wB0, wB1, (TPR + lane) * 8u);
+    acc = acc + select(0.0, cB, okB);
+  }
+  tile_reduce_store(tid, lane, n, m, acc);
+}
+
 // ── Q3_K tiled: TN rows/workgroup, shared activation staging ───────────
 // Same superblock decode as matmul_gguf_q3_k (6-bit scale aux-shuffle, high
 // bit from hmask). Pair layout as Q2_K tiled: sub0=2p/sub1=2p+1 share

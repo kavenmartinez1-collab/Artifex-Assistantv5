@@ -613,6 +613,108 @@ for (const K of [256, 1280, 4096]) {
   }
 }
 
+// Gate 6 (ILP probe): _r2 = _r with 2 units/lane and a single scale-WORD
+// load (scw) instead of two wbyte() calls. (a) the scw extraction
+// `(scw >> ((sub&3)*8)) & 0xFF` must equal wbyte(byteBase+sub0) for every
+// unit (sub0 even → sc1 shares the word); (b) the 2-units-per-lane chunk
+// order (ua = c*2*TPR + lane, ub = ua + TPR) visits per lane the SAME unit
+// sequence as _r (lane, lane+TPR, lane+2*TPR, ...) so the GEMV must equal
+// tiledGemvRow on repacked data EXACTLY.
+function decodeUnitQ2KR2(W: Uint32Array, n: number, nSB: number, u: number): Float64Array {
+  const sb = (u / 8) | 0, pair = u % 8, sub = pair * 2;
+  const base = (n * nSB + sb) * 21;
+  const [d, dmin] = unpack2x16(W, base + 20);
+  const scw = W[base + (sub >>> 2)];
+  const sc0 = (scw >>> ((sub & 3) * 8)) & 0xFF;
+  const sc1 = (scw >>> (((sub & 3) + 1) * 8)) & 0xFF;
+  const dl0 = d * (sc0 & 0x0F), ml0 = dmin * (sc0 >>> 4);
+  const dl1 = d * (sc1 & 0x0F), ml1 = dmin * (sc1 >>> 4);
+  const qBase = base + 4 + pair * 2;
+  const w0 = W[qBase], w1 = W[qBase + 1];
+  const out = new Float64Array(32);
+  for (let w = 0; w < 8; w++) {
+    const src = w < 4 ? w0 : w1;
+    const off = (w & 3) * 8;
+    const dl = w < 4 ? dl0 : dl1, ml = w < 4 ? ml0 : ml1;
+    out[w * 4 + 0] = dl * ((src >>> off) & 3) - ml;
+    out[w * 4 + 1] = dl * ((src >>> (off + 2)) & 3) - ml;
+    out[w * 4 + 2] = dl * ((src >>> (off + 4)) & 3) - ml;
+    out[w * 4 + 3] = dl * ((src >>> (off + 6)) & 3) - ml;
+  }
+  return out;
+}
+
+/** Port of matmul_gguf_q2_k_tiled_r2's chunk loop: UPC = 2*TPR units per
+ *  chunk, each lane handles ua then ub = ua + TPR within the chunk. */
+function r2GemvRow(W: Uint32Array, A: Float32Array, n: number, K: number, TPR: number): number {
+  const nSB = K / 256;
+  const nUnits = nSB * 8;
+  const UPC = TPR * 2;
+  const nChunks = Math.ceil(nUnits / UPC);
+  const laneAcc = new Float64Array(TPR);
+  for (let c = 0; c < nChunks; c++) {
+    for (let lane = 0; lane < TPR; lane++) {
+      for (const u of [c * UPC + lane, c * UPC + lane + TPR]) {
+        if (u >= nUnits) continue;
+        const vals = decodeUnitQ2KR2(W, n, nSB, u);
+        let dq = 0;
+        for (let l = 0; l < 32; l++) dq += A[u * 32 + l] * Math.fround(vals[l]);
+        laneAcc[lane] += dq;
+      }
+    }
+  }
+  let sum = 0;
+  for (let lane = 0; lane < TPR; lane++) sum += laneAcc[lane];
+  return sum;
+}
+
+console.log('Q2_K repack 2-units/lane (_r2):');
+for (const K of [256, 1280, 4096, 5120]) {
+  for (const TPR of [16, 32]) {
+    const rng = mulberry32(0xD00D ^ K ^ (TPR << 8));
+    const N = 11;
+    const nSB = K / 256;
+    const raw = new Uint8Array(N * nSB * 84);
+    for (let i = 0; i < raw.length; i++) raw[i] = Math.floor(rng() * 256);
+    const dv = new DataView(raw.buffer, raw.byteOffset);
+    for (let b = 0; b < N * nSB; b++) {
+      dv.setUint16(b * 84 + 80, randF16Bits(rng), true);
+      dv.setUint16(b * 84 + 82, randF16Bits(rng), true);
+    }
+    const W = repackGGUFForGPU(GGML_TYPES.Q2_K, raw, N * K);
+    const Wr = repackQ2K(W);
+    const A = new Float32Array(K);
+    for (let i = 0; i < K; i++) A[i] = rng() * 2 - 1;
+
+    let dOK = true;
+    for (let n = 0; n < N && dOK; n++) {
+      for (let u = 0; u < nSB * 8 && dOK; u++) {
+        const a = decodeUnitQ2KR(Wr, n, nSB, u);
+        const b = decodeUnitQ2KR2(Wr, n, nSB, u);
+        for (let l = 0; l < 32; l++) {
+          if (a[l] !== b[l] && !(Number.isNaN(a[l]) && Number.isNaN(b[l]))) {
+            check(`Q2_K_r2 K=${K} elem`, false, `n=${n} u=${u} l=${l}: ${b[l]} != ${a[l]}`);
+            dOK = false;
+            break;
+          }
+        }
+      }
+    }
+    if (dOK) console.log(`  ok   Q2_K_r2 K=${K} TPR=${TPR}: scw decode == _r decode (exact)`);
+
+    let gOK = true;
+    for (let n = 0; n < N; n++) {
+      const orig = tiledGemvRow(Wr, A, n, K, decodeUnitQ2KR, TPR);
+      const r2 = r2GemvRow(Wr, A, n, K, TPR);
+      if (r2 !== orig) {
+        check(`Q2_K_r2 K=${K} TPR=${TPR} gemv`, false, `n=${n}: ${r2} != ${orig}`);
+        gOK = false;
+      }
+    }
+    if (gOK) console.log(`  ok   Q2_K_r2 K=${K} TPR=${TPR}: 2-unit/lane gemv == _r gemv (exact)`);
+  }
+}
+
 if (failures > 0) {
   console.log(`\n${failures} FAILURE(S)`);
   process.exit(1);
