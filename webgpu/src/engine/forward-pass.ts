@@ -401,6 +401,24 @@ export function createForwardPassEngine(
       [GGML_TYPES.IQ4_NL]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq4_nl', 'matmul-gguf-iq4_nl'),
       [GGML_TYPES.IQ4_XS]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq4_xs', 'matmul-gguf-iq4_xs'),
     } : null;
+  // Lever 2: multi-output tiled GEMV — TN output rows per workgroup share a
+  // staged activation tile (legacy kernels re-read the full activation vector
+  // per output row). Q4_K/Q5_K/Q6_K for now; other formats fall through to
+  // the legacy one-row kernels in dispatchMatmulGGUF.
+  // A/B: ?gemvTile=0 disables. Tile shape tunable via ?gemvTN= / ?gemvTWG=
+  // (pipeline-override constants; TWG/TN must be a power of two).
+  const gemvSearch = typeof window === 'undefined'
+    ? null : new URLSearchParams(window.location.search);
+  const gemvTileEnabled = gemvSearch?.get('gemvTile') !== '0';
+  const GEMV_TILE_N = Number(gemvSearch?.get('gemvTN') ?? 8);
+  const GEMV_TILE_WG = Number(gemvSearch?.get('gemvTWG') ?? 256);
+  const gemvTileConsts = { TN: GEMV_TILE_N, TWG: GEMV_TILE_WG };
+  const matmulGgufTiledPipelines: Record<number, GPUComputePipeline> | null =
+    config.sourceFormat === 'gguf' && gemvTileEnabled ? {
+      [GGML_TYPES.Q4_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q4_k_tiled', 'matmul-gguf-q4_k-tiled', gemvTileConsts),
+      [GGML_TYPES.Q5_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_k_tiled', 'matmul-gguf-q5_k-tiled', gemvTileConsts),
+      [GGML_TYPES.Q6_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q6_k_tiled', 'matmul-gguf-q6_k-tiled', gemvTileConsts),
+    } : null;
   // Hadamard transform for QuIP#/QuaRot incoherence processing
   const hadamardPipeline = config.isQuantized
     ? createComputePipeline(device, hadamardWGSL, 'hadamard', 'hadamard')
@@ -981,7 +999,8 @@ export function createForwardPassEngine(
     aBuf: GPUBuffer, gg: GGUFWeight, cBuf: GPUBuffer,
     M: number, N: number, K: number, label: string,
   ) {
-    const pipeline = matmulGgufPipelines?.[gg.ggmlType];
+    const tiled = matmulGgufTiledPipelines?.[gg.ggmlType] ?? null;
+    const pipeline = tiled ?? matmulGgufPipelines?.[gg.ggmlType];
     if (!pipeline) throw new Error(`matmul_gguf "${label}": no pipeline for ggml type ${gg.ggmlType}`);
     const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);
     const bg = cachedBindGroup(pipeline, 0, [
@@ -990,8 +1009,14 @@ export function createForwardPassEngine(
       { binding: 2, resource: { buffer: cBuf } },
       { binding: 3, resource: { buffer: params } },
     ], label);
-    // One workgroup per output element (n, m); z chunks n past the 65535 cap.
-    bd(pipeline, [bg], [Math.min(N, 65535), M, Math.ceil(N / 65535)], label);
+    if (tiled) {
+      // One workgroup per TN output elements; z chunks past the 65535 cap.
+      const nWG = Math.ceil(N / GEMV_TILE_N);
+      bd(pipeline, [bg], [Math.min(nWG, 65535), M, Math.ceil(nWG / 65535)], label);
+    } else {
+      // One workgroup per output element (n, m); z chunks n past the 65535 cap.
+      bd(pipeline, [bg], [Math.min(N, 65535), M, Math.ceil(N / 65535)], label);
+    }
   }
 
   // Set of GPU buffers stored as BF16 (need matmul_bt_bf16 kernel)
