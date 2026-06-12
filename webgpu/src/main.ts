@@ -794,10 +794,12 @@ document.addEventListener('drop', async (e) => {
 };
 
 /** Resolve the VRAM budget for model loading. Priority: manual override
- *  (localStorage 'vramBudgetGB') → driver-reported free memory on the
- *  display GPU minus a compositor/safety reserve → undefined (loader's
- *  conservative default). Chrome's GPU process runs on the display adapter,
- *  so the displayActive entry is the one WebGPU is using. */
+ *  (localStorage 'vramBudgetGB') → driver-reported free memory on the GPU
+ *  matching the ACTIVE WebGPU adapter's vendor, minus a compositor/safety
+ *  reserve → undefined (loader's conservative default). /api/gpu-info is
+ *  nvidia-smi-based, so when WebGPU runs on a non-NVIDIA adapter (e.g. the
+ *  Radeon via #gpu-select) there is no matching entry — fall back to the
+ *  loader default rather than budgeting against the wrong card. */
 async function resolveVRAMBudget(): Promise<number | undefined> {
   const manual = Number(localStorage.getItem('vramBudgetGB'));
   if (manual > 0) return manual * 1e9;
@@ -806,8 +808,19 @@ async function resolveVRAMBudget(): Promise<number | undefined> {
     const isJson = (resp.headers.get('content-type') ?? '').includes('json');
     if (resp.ok && isJson) {
       const { gpus } = await resp.json() as { gpus: Array<{ name: string; freeMB: number; displayActive: boolean }> };
-      const pick = gpus.find(g => g.displayActive) ?? gpus[0];
-      if (pick && pick.freeMB > 0) {
+      const vendor = (gpu?.adapterInfo?.vendor ?? '').toLowerCase();
+      const vendorRe: Record<string, RegExp> = {
+        nvidia: /nvidia|geforce|rtx|gtx|quadro/i,
+        amd: /amd|radeon/i,
+        intel: /intel|arc/i,
+      };
+      const re = vendorRe[vendor];
+      const pick = re ? gpus.find(g => re.test(g.name)) : (gpus.find(g => g.displayActive) ?? gpus[0]);
+      if (!pick) {
+        console.warn(`[VRAM] no /api/gpu-info entry matches active adapter vendor "${vendor}" — using loader default budget`);
+        return undefined;
+      }
+      if (pick.freeMB > 0) {
         const budget = Math.max(2e9, (pick.freeMB - 1024) * 1e6);
         console.log(`[VRAM] auto budget: ${(budget / 1e9).toFixed(1)} GB (driver-reported free minus 1 GB reserve)`);
         return budget;
