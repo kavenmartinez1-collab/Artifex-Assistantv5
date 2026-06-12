@@ -440,6 +440,17 @@ export function createForwardPassEngine(
       [GGML_TYPES.Q5_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_k_tiled_ns', 'matmul-gguf-q5_k-tiled-ns', gemvTileConsts),
       [GGML_TYPES.Q6_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q6_k_tiled_ns', 'matmul-gguf-q6_k-tiled-ns', gemvTileConsts),
     } : null;
+  // Lever 4 phase 2: vec4 weight loads on the staged tiled bodies — the W
+  // stream dominates decode bandwidth; 18-20 scalar u32 loads per unit
+  // become 5 vec4 loads. Bit-identical (gate 4, test-gemv-tiled.mts). Only
+  // strides ≡ 0 mod 4 qualify (Q3_K/Q4_K/Q5_K). M=1 only. A/B: ?gemvV4=0.
+  const gemvV4Enabled = gemvTileEnabled && gemvSearch?.get('gemvV4') !== '0';
+  const matmulGgufV4Pipelines: Record<number, GPUComputePipeline> | null =
+    config.sourceFormat === 'gguf' && gemvV4Enabled ? {
+      [GGML_TYPES.Q3_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q3_k_tiled_v4', 'matmul-gguf-q3_k-tiled-v4', gemvTileConsts),
+      [GGML_TYPES.Q4_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q4_k_tiled_v4', 'matmul-gguf-q4_k-tiled-v4', gemvTileConsts),
+      [GGML_TYPES.Q5_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_k_tiled_v4', 'matmul-gguf-q5_k-tiled-v4', gemvTileConsts),
+    } : null;
   // Hadamard transform for QuIP#/QuaRot incoherence processing
   const hadamardPipeline = config.isQuantized
     ? createComputePipeline(device, hadamardWGSL, 'hadamard', 'hadamard')
@@ -646,6 +657,9 @@ export function createForwardPassEngine(
   }
   for (const [t, p] of Object.entries(matmulGgufNsPipelines ?? {})) {
     registerCat(p, `gguf_${ggmlTypeTraits(+t).name}_ns`);
+  }
+  for (const [t, p] of Object.entries(matmulGgufV4Pipelines ?? {})) {
+    registerCat(p, `gguf_${ggmlTypeTraits(+t).name}_v4`);
   }
 
   // ── Matmul-Q4 GEMV pipeline selection ──────────────────────────────
@@ -1080,10 +1094,12 @@ export function createForwardPassEngine(
     M: number, N: number, K: number, label: string,
     io?: MatmulIO,
   ) {
-    // Decode (M=1): prefer no-stage; prefill keeps the staged tiled kernel
-    // (no-stage at M>1 would multiply A traffic ×TN). Same grid math.
-    const ns = M === 1 ? matmulGgufNsPipelines?.[gg.ggmlType] ?? null : null;
-    const tiled = ns ?? matmulGgufTiledPipelines?.[gg.ggmlType] ?? null;
+    // Decode (M=1): prefer vec4-W, then no-stage (opt-in), then staged
+    // tiled; prefill keeps staged tiled. Same grid math for all three.
+    const fast = M === 1
+      ? matmulGgufV4Pipelines?.[gg.ggmlType] ?? matmulGgufNsPipelines?.[gg.ggmlType] ?? null
+      : null;
+    const tiled = fast ?? matmulGgufTiledPipelines?.[gg.ggmlType] ?? null;
     const pipeline = tiled ?? matmulGgufPipelines?.[gg.ggmlType];
     if (!pipeline) throw new Error(`matmul_gguf "${label}": no pipeline for ggml type ${gg.ggmlType}`);
     const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);

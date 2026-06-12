@@ -192,6 +192,111 @@ function decodeUnitQ3K(W: Uint32Array, n: number, nSB: number, u: number): Float
   return out;
 }
 
+// ── vec4 W-load decode ports (lever 4 phase 2, *_tiled_v4) ──────────────
+// Same byte math as the tiled decoders, but every W access goes through a
+// vec4 view: v4() throws on any non-multiple-of-4 word index (alignment
+// gate), and Q4_K/Q5_K scales come from scaleMinK4W — a rewrite of
+// scaleMinK4 taking the three scale words as values (the WGSL v4 entries
+// cannot call wbyte(), which references the scalar W binding). Gate 4
+// asserts decodeV4 == decode exactly for every (n, u).
+
+function v4(W: Uint32Array, w: number): [number, number, number, number] {
+  if (w % 4 !== 0) throw new Error(`unaligned vec4 word index ${w}`);
+  return [W[w], W[w + 1], W[w + 2], W[w + 3]];
+}
+
+function scaleMinK4W(j: number, w1: number, w2: number, w3: number): [number, number] {
+  if (j < 4) {
+    return [(w1 >>> (j * 8)) & 63, (w2 >>> (j * 8)) & 63];
+  }
+  const b1 = (w1 >>> ((j - 4) * 8)) & 0xFF;
+  const b2 = (w2 >>> ((j - 4) * 8)) & 0xFF;
+  const b3 = (w3 >>> ((j - 4) * 8)) & 0xFF;
+  return [(b3 & 0x0F) | ((b1 >>> 6) << 4), (b3 >>> 4) | ((b2 >>> 6) << 4)];
+}
+
+function decodeUnitQ4Kv4(W: Uint32Array, n: number, nSB: number, u: number): Float64Array {
+  const sb = (u / 8) | 0, sub = u % 8;
+  const sbBase = (n * nSB + sb) * 36;
+  const [h0, h1, h2, h3] = v4(W, sbBase);          // d/dmin | scales[12]
+  const d = f16ToF32(h0 & 0xFFFF), dmin = f16ToF32(h0 >>> 16);
+  const [sc, mn] = scaleMinK4W(sub, h1, h2, h3);
+  const d1 = d * sc, min1 = dmin * mn;
+  const qsWord = sbBase + 4 + (sub >>> 1) * 8;
+  const qs = [...v4(W, qsWord), ...v4(W, qsWord + 4)];
+  const hi = (sub & 1) === 1;
+  const out = new Float64Array(32);
+  for (let w = 0; w < 8; w++) {
+    const word = qs[w];
+    const nib = hi ? (word >>> 4) & 0x0F0F0F0F : word & 0x0F0F0F0F;
+    out[w * 4 + 0] = d1 * (nib & 0xFF) - min1;
+    out[w * 4 + 1] = d1 * ((nib >>> 8) & 0xFF) - min1;
+    out[w * 4 + 2] = d1 * ((nib >>> 16) & 0xFF) - min1;
+    out[w * 4 + 3] = d1 * (nib >>> 24) - min1;
+  }
+  return out;
+}
+
+function decodeUnitQ5Kv4(W: Uint32Array, n: number, nSB: number, u: number): Float64Array {
+  const sb = (u / 8) | 0, sub = u % 8;
+  const sbBase = (n * nSB + sb) * 44;
+  const [h0, h1, h2, h3] = v4(W, sbBase);          // d/dmin | scales[12]
+  const d = f16ToF32(h0 & 0xFFFF), dmin = f16ToF32(h0 >>> 16);
+  const [sc, mn] = scaleMinK4W(sub, h1, h2, h3);
+  const d1 = d * sc, min1 = dmin * mn;
+  const qsWord = sbBase + 12 + (sub >>> 1) * 8;
+  const qs = [...v4(W, qsWord), ...v4(W, qsWord + 4)];
+  const qh = [...v4(W, sbBase + 4), ...v4(W, sbBase + 8)];
+  const hi = (sub & 1) === 1;
+  const out = new Float64Array(32);
+  for (let w = 0; w < 8; w++) {
+    const nib = hi ? (qs[w] >>> 4) & 0x0F0F0F0F : qs[w] & 0x0F0F0F0F;
+    const q = (nib | (((qh[w] >>> sub) & 0x01010101) << 4)) >>> 0;
+    out[w * 4 + 0] = d1 * (q & 0xFF) - min1;
+    out[w * 4 + 1] = d1 * ((q >>> 8) & 0xFF) - min1;
+    out[w * 4 + 2] = d1 * ((q >>> 16) & 0xFF) - min1;
+    out[w * 4 + 3] = d1 * ((q >>> 24) & 0xFF) - min1;
+  }
+  return out;
+}
+
+function decodeUnitQ3Kv4(W: Uint32Array, n: number, nSB: number, u: number): Float64Array {
+  const KM1 = 0x03030303, KM2 = 0x0f0f0f0f;
+  const sb = (u / 8) | 0, pair = u % 8, sub0 = pair * 2;
+  const wordBase = (n * nSB + sb) * 28;
+  const [s0, s1, tmp, dw] = v4(W, wordBase + 24);  // scales[12] | d
+  const dAll = f16ToF32(dw & 0xFFFF);
+  const widx = sub0 >>> 2;
+  let auxWord: number;
+  if (widx === 0) auxWord = ((s0 & KM2) | ((((tmp >>> 0) & KM1) << 4) >>> 0)) >>> 0;
+  else if (widx === 1) auxWord = ((s1 & KM2) | ((((tmp >>> 2) & KM1) << 4) >>> 0)) >>> 0;
+  else if (widx === 2) auxWord = (((s0 >>> 4) & KM2) | ((((tmp >>> 4) & KM1) << 4) >>> 0)) >>> 0;
+  else auxWord = (((s1 >>> 4) & KM2) | ((((tmp >>> 6) & KM1) << 4) >>> 0)) >>> 0;
+  const scB0 = (auxWord >>> ((sub0 & 3) * 8)) & 0xFF;
+  const scB1 = (auxWord >>> (((sub0 & 3) + 1) * 8)) & 0xFF;
+  const dl0 = dAll * (scB0 - 32);
+  const dl1 = dAll * (scB1 - 32);
+  const group = sub0 >= 8 ? 1 : 0;
+  const j = (sub0 & 7) >>> 1;
+  const shift = j * 2;
+  const hbitpos = group * 4 + j;
+  const qWord = wordBase + 8 + group * 8;          // qs @32 + group*32 B
+  const qs = [...v4(W, qWord), ...v4(W, qWord + 4)];
+  const hm = [...v4(W, wordBase), ...v4(W, wordBase + 4)];
+  const out = new Float64Array(32);
+  for (let w = 0; w < 8; w++) {
+    const q3 = (qs[w] >>> shift) & 0x03030303;
+    const hb = (hm[w] >>> hbitpos) & 0x01010101;
+    const q = (q3 + ((hb << 2) >>> 0)) >>> 0;
+    const dl = w < 4 ? dl0 : dl1;
+    out[w * 4 + 0] = dl * ((q & 0xFF) - 4);
+    out[w * 4 + 1] = dl * (((q >>> 8) & 0xFF) - 4);
+    out[w * 4 + 2] = dl * (((q >>> 16) & 0xFF) - 4);
+    out[w * 4 + 3] = dl * (((q >>> 24) & 0xFF) - 4);
+  }
+  return out;
+}
+
 // Full tiled GEMV simulation for one output row n: chunk loop, a_tile staging
 // map, lane = unit ownership — exactly the kernel's index structure, f64 accum.
 function tiledGemvRow(
@@ -271,6 +376,7 @@ function runFormat(
   name: string, ggmlType: number, rawBytesPerSB: number,
   fixupSB: (raw: Uint8Array, base: number, rng: () => number) => void,
   decode: (W: Uint32Array, n: number, nSB: number, u: number) => Float64Array,
+  decodeV4?: (W: Uint32Array, n: number, nSB: number, u: number) => Float64Array,
 ) {
   for (const K of [256, 1280, 4096]) {
     for (const TPR of [16, 32]) {           // TWG/TN: 128/8 and 256/8
@@ -329,6 +435,27 @@ function runFormat(
         }
       }
       if (nsOK) console.log(`  ok   ${name} K=${K} TPR=${TPR}: no-stage == staged (exact)`);
+
+      // Gate 4 (lever 4 phase 2): vec4 W-load decode must equal the scalar
+      // decode EXACTLY for every (n, u) — v4() also asserts every vec4 word
+      // index is a multiple of 4 (alignment gate).
+      if (decodeV4) {
+        let v4OK = true;
+        for (let n = 0; n < N && v4OK; n++) {
+          for (let u = 0; u < nSB * 8 && v4OK; u++) {
+            const a = decode(W, n, nSB, u);
+            const b = decodeV4(W, n, nSB, u);
+            for (let l = 0; l < 32; l++) {
+              if (a[l] !== b[l] && !(Number.isNaN(a[l]) && Number.isNaN(b[l]))) {
+                check(`${name} K=${K} v4`, false, `n=${n} u=${u} l=${l}: ${b[l]} != ${a[l]}`);
+                v4OK = false;
+                break;
+              }
+            }
+          }
+        }
+        if (v4OK) console.log(`  ok   ${name} K=${K} TPR=${TPR}: vec4 W decode == scalar (exact, aligned)`);
+      }
     }
   }
 }
@@ -339,7 +466,7 @@ runFormat('Q4_K', GGML_TYPES.Q4_K, 144, (raw, base, rng) => {
   const dv = new DataView(raw.buffer, raw.byteOffset);
   dv.setUint16(base, randF16Bits(rng), true);
   dv.setUint16(base + 2, randF16Bits(rng), true);
-}, decodeUnitQ4K);
+}, decodeUnitQ4K, decodeUnitQ4Kv4);
 
 console.log('Q5_K tiled:');
 runFormat('Q5_K', GGML_TYPES.Q5_K, 176, (raw, base, rng) => {
@@ -347,7 +474,7 @@ runFormat('Q5_K', GGML_TYPES.Q5_K, 176, (raw, base, rng) => {
   const dv = new DataView(raw.buffer, raw.byteOffset);
   dv.setUint16(base, randF16Bits(rng), true);
   dv.setUint16(base + 2, randF16Bits(rng), true);
-}, decodeUnitQ5K);
+}, decodeUnitQ5K, decodeUnitQ5Kv4);
 
 console.log('Q6_K tiled:');
 runFormat('Q6_K', GGML_TYPES.Q6_K, 210, (raw, base, rng) => {
@@ -369,7 +496,7 @@ runFormat('Q3_K', GGML_TYPES.Q3_K, 110, (raw, base, rng) => {
   // d @108 — controlled finite f16 (hmask/qs/scales stay random)
   const dv = new DataView(raw.buffer, raw.byteOffset);
   dv.setUint16(base + 108, randF16Bits(rng), true);
-}, decodeUnitQ3K);
+}, decodeUnitQ3K, decodeUnitQ3Kv4);
 
 if (failures > 0) {
   console.log(`\n${failures} FAILURE(S)`);
