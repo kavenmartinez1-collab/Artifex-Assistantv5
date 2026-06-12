@@ -150,6 +150,112 @@ fn matmul_gguf_q5_0(@builtin(local_invocation_id) lid: vec3u,
   reduce_and_store(tid, n, m, sum);
 }
 
+// ── Q2_K: 256-elem superblocks, 21 u32 each; unit = 16-elem sub-block ───
+// Layout: scales[16] @0 | qs[64] @16 | d(f16) @80 | dmin(f16) @82.
+// Mirrors dequantize_row_q2_K: 16 sub-blocks, each with a 4-bit scale + 4-bit
+// min byte; 2-bit quants selected by shift within two 128-element groups.
+
+@compute @workgroup_size(WG_SIZE, 1, 1)
+fn matmul_gguf_q2_k(@builtin(local_invocation_id) lid: vec3u,
+                    @builtin(workgroup_id) wid: vec3u) {
+  let n = wid.x + wid.z * 65535u;
+  let m = wid.y;
+  let tid = lid.x;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 16u;
+
+  var sum: f32 = 0.0;
+  var comp: f32 = 0.0;
+  for (var u = tid; u < nUnits; u = u + WG_SIZE) {
+    let sb = u / 16u;
+    let sub = u % 16u;                       // scale index (is)
+    let wordBase = (n * nSB + sb) * 21u;
+    let byteBase = wordBase * 4u;
+    let dm = unpack2x16float(W[wordBase + 20u]);   // d @80, dmin @82
+    let sc = wbyte(byteBase + sub);
+    let dl = dm.x * f32(sc & 0x0Fu);
+    let ml = dm.y * f32(sc >> 4u);
+    let group = select(0u, 1u, sub >= 8u);
+    let jhalf = sub & 7u;
+    let shift = (jhalf >> 1u) * 2u;
+    let half = jhalf & 1u;
+    let qBase = byteBase + 16u + group * 32u + half * 16u;
+    let aBase = m * K + sb * 256u + sub * 16u;
+    var dot: f32 = 0.0;
+    for (var l = 0u; l < 16u; l = l + 1u) {
+      let q2 = (wbyte(qBase + l) >> shift) & 3u;
+      dot = dot + A[aBase + l] * (dl * f32(q2) - ml);
+    }
+    let y = dot - comp; let t = sum + y; comp = (t - sum) - y; sum = t;
+  }
+  reduce_and_store(tid, n, m, sum);
+}
+
+// ── Q3_K: 256-elem superblocks, 28 u32 each; unit = 16-elem sub-block ───
+// Layout: hmask[32] @0 | qs[64] @32 | scales[12] @96 | d(f16) @108.
+// Mirrors dequantize_row_q3_K incl. the 6-bit scale aux-shuffle and the
+// per-element high bit from hmask (value = q_low2 - (hbit ? 0 : 4)).
+
+@compute @workgroup_size(WG_SIZE, 1, 1)
+fn matmul_gguf_q3_k(@builtin(local_invocation_id) lid: vec3u,
+                    @builtin(workgroup_id) wid: vec3u) {
+  let n = wid.x + wid.z * 65535u;
+  let m = wid.y;
+  let tid = lid.x;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 16u;
+  let KM1 = 0x03030303u;
+  let KM2 = 0x0f0f0f0fu;
+
+  var sum: f32 = 0.0;
+  var comp: f32 = 0.0;
+  for (var u = tid; u < nUnits; u = u + WG_SIZE) {
+    let sb = u / 16u;
+    let sub = u % 16u;
+    let wordBase = (n * nSB + sb) * 28u;
+    let byteBase = wordBase * 4u;
+    let dAll = unpack2x16float(W[wordBase + 27u]).x;   // d @108
+
+    // Unpack the 6-bit signed scale for sub-block `sub`.
+    let s0 = W[wordBase + 24u];
+    let s1 = W[wordBase + 25u];
+    let tmp = W[wordBase + 26u];
+    var auxWord: u32;
+    let widx = sub >> 2u;
+    if (widx == 0u) {
+      auxWord = (s0 & KM2) | (((tmp >> 0u) & KM1) << 4u);
+    } else if (widx == 1u) {
+      auxWord = (s1 & KM2) | (((tmp >> 2u) & KM1) << 4u);
+    } else if (widx == 2u) {
+      auxWord = ((s0 >> 4u) & KM2) | (((tmp >> 4u) & KM1) << 4u);
+    } else {
+      auxWord = ((s1 >> 4u) & KM2) | (((tmp >> 6u) & KM1) << 4u);
+    }
+    let scByte = (auxWord >> ((sub & 3u) * 8u)) & 0xFFu;
+    let dl = dAll * f32(i32(scByte) - 32);
+
+    let group = select(0u, 1u, sub >= 8u);
+    let jhalf = sub & 7u;
+    let j = jhalf >> 1u;
+    let shift = j * 2u;
+    let half = jhalf & 1u;
+    let mbit = 1u << (group * 4u + j);
+    let qBase = byteBase + 32u + group * 32u + half * 16u;
+    let hBase = byteBase + half * 16u;             // hmask @0
+    let aBase = m * K + sb * 256u + sub * 16u;
+    var dot: f32 = 0.0;
+    for (var l = 0u; l < 16u; l = l + 1u) {
+      let q3 = (wbyte(qBase + l) >> shift) & 3u;
+      let hoff = select(4.0, 0.0, (wbyte(hBase + l) & mbit) != 0u);
+      dot = dot + A[aBase + l] * (dl * (f32(q3) - hoff));
+    }
+    let y = dot - comp; let t = sum + y; comp = (t - sum) - y; sum = t;
+  }
+  reduce_and_store(tid, n, m, sum);
+}
+
 // ── Q8_0: 32-elem blocks, 9 u32 each ──────────────────────────────────
 
 @compute @workgroup_size(WG_SIZE, 1, 1)

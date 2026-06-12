@@ -21,7 +21,7 @@
 
 // GGML type ids (spec constants, duplicated from gguf.ts so this file has
 // zero imports and runs standalone under node --strip-types for validation)
-const T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q5_0 = 6, T_Q8_0 = 8, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_BF16 = 30;
+const T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q5_0 = 6, T_Q8_0 = 8, T_Q2_K = 10, T_Q3_K = 11, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_BF16 = 30;
 
 // ── f16 / bf16 → f32 ───────────────────────────────────────────────────
 
@@ -139,6 +139,82 @@ function getScaleMinK4(j: number, q: Uint8Array, base: number): [number, number]
   return [sc, m];
 }
 
+/** Q2_K: 84-byte superblocks of 256 elements.
+ *  Layout: scales[16] @0 | qs[64] @16 | d(f16) @80 | dmin(f16) @82.
+ *  Mirrors dequantize_row_q2_K (ggml-quants.c). */
+export function dequantQ2_K(data: ArrayBuffer | Uint8Array, n: number): Float32Array {
+  const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  if (n % 256 !== 0) throw new Error(`[Q2_K] n=${n} not divisible by 256`);
+  const nb = n / 256;
+  const out = new Float32Array(n);
+  for (let b = 0; b < nb; b++) {
+    const base = b * 84;
+    const d = f16ToF32(dv.getUint16(base + 80, true));
+    const min = f16ToF32(dv.getUint16(base + 82, true));
+    let oi = b * 256, is = 0;
+    for (let nn = 0; nn < 256; nn += 128) {
+      const qBase = base + 16 + (nn / 128) * 32;
+      let shift = 0;
+      for (let j = 0; j < 4; j++) {
+        let sc = u8[base + is]; is++;
+        let dl = d * (sc & 0xF), ml = min * (sc >> 4);
+        for (let l = 0; l < 16; l++) out[oi++] = dl * ((u8[qBase + l] >> shift) & 3) - ml;
+        sc = u8[base + is]; is++;
+        dl = d * (sc & 0xF); ml = min * (sc >> 4);
+        for (let l = 0; l < 16; l++) out[oi++] = dl * ((u8[qBase + 16 + l] >> shift) & 3) - ml;
+        shift += 2;
+      }
+    }
+  }
+  return out;
+}
+
+/** Q3_K: 110-byte superblocks of 256 elements.
+ *  Layout: hmask[32] @0 | qs[64] @32 | scales[12] @96 | d(f16) @108.
+ *  Mirrors dequantize_row_q3_K (ggml-quants.c) including the 6-bit scale
+ *  unpack and the per-element high-bit (hmask). */
+export function dequantQ3_K(data: ArrayBuffer | Uint8Array, n: number): Float32Array {
+  const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  if (n % 256 !== 0) throw new Error(`[Q3_K] n=${n} not divisible by 256`);
+  const nb = n / 256;
+  const out = new Float32Array(n);
+  const KM1 = 0x03030303, KM2 = 0x0f0f0f0f;
+  for (let b = 0; b < nb; b++) {
+    const base = b * 110;
+    const dAll = f16ToF32(dv.getUint16(base + 108, true));
+    // Unpack 12 scale bytes → 16 signed 6-bit scales (aux shuffle from ggml).
+    const s0 = dv.getUint32(base + 96, true) >>> 0;
+    const s1 = dv.getUint32(base + 100, true) >>> 0;
+    const tmp = dv.getUint32(base + 104, true) >>> 0;
+    const aux2 = (((s0 >>> 4) & KM2) | ((((tmp >>> 4) & KM1) << 4) >>> 0)) >>> 0;
+    const aux3 = (((s1 >>> 4) & KM2) | ((((tmp >>> 6) & KM1) << 4) >>> 0)) >>> 0;
+    const aux0 = ((s0 & KM2) | ((((tmp >>> 0) & KM1) << 4) >>> 0)) >>> 0;
+    const aux1 = ((s1 & KM2) | ((((tmp >>> 2) & KM1) << 4) >>> 0)) >>> 0;
+    const auxBytes = new Uint8Array(new Uint32Array([aux0, aux1, aux2, aux3]).buffer);
+    let oi = b * 256, is = 0, m = 1;
+    for (let nn = 0; nn < 256; nn += 128) {
+      const qBase = base + 32 + (nn / 128) * 32;
+      let shift = 0;
+      for (let j = 0; j < 4; j++) {
+        let dl = dAll * (auxBytes[is] - 32); is++;
+        for (let l = 0; l < 16; l++) {
+          const q3 = (u8[qBase + l] >> shift) & 3;
+          out[oi++] = dl * (q3 - ((u8[base + l] & m) ? 0 : 4));
+        }
+        dl = dAll * (auxBytes[is] - 32); is++;
+        for (let l = 0; l < 16; l++) {
+          const q3 = (u8[qBase + 16 + l] >> shift) & 3;
+          out[oi++] = dl * (q3 - ((u8[base + 16 + l] & m) ? 0 : 4));
+        }
+        shift += 2; m <<= 1;
+      }
+    }
+  }
+  return out;
+}
+
 /** Q4_K: 144-byte superblocks of 256 elements. */
 export function dequantQ4_K(data: ArrayBuffer | Uint8Array, n: number): Float32Array {
   const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
@@ -242,6 +318,8 @@ export function dequantQ6_K(data: ArrayBuffer | Uint8Array, n: number): Float32A
 export const GGUF_GPU_LAYOUT: Record<number, { blockElems: number; strideU32: number }> = {
   [T_Q4_0]: { blockElems: 32, strideU32: 5 },    // 18 B → 20 B (d|pad|qs[16])
   [T_Q5_0]: { blockElems: 32, strideU32: 6 },    // 22 B → 24 B (d|pad|qh|qs[16])
+  [T_Q2_K]: { blockElems: 256, strideU32: 21 },  // raw 84 B (4-aligned)
+  [T_Q3_K]: { blockElems: 256, strideU32: 28 },  // 110 B → 112 B (+2 pad)
   [T_Q8_0]: { blockElems: 32, strideU32: 9 },    // 34 B → 36 B
   [T_Q4_K]: { blockElems: 256, strideU32: 36 },  // raw 144 B
   [T_Q5_K]: { blockElems: 256, strideU32: 44 },  // raw 176 B
@@ -308,6 +386,18 @@ export function repackQ8_0(data: ArrayBuffer | Uint8Array, n: number): Uint32Arr
   return out;
 }
 
+/** Q3_K 110 B/block → 112 B/block: raw copy + 2 pad bytes (f16 d ends @ 109). */
+export function repackQ3_K(data: ArrayBuffer | Uint8Array, n: number): Uint32Array {
+  const u8 = asU8(data);
+  if (n % 256 !== 0) throw new Error(`[repackQ3_K] n=${n} not divisible by 256`);
+  const nb = n / 256;
+  assertBytes('repackQ3_K', u8.byteLength, nb * 110);
+  const out = new Uint32Array(nb * 28);
+  const o8 = new Uint8Array(out.buffer);
+  for (let b = 0; b < nb; b++) o8.set(u8.subarray(b * 110, (b + 1) * 110), b * 112);
+  return out;
+}
+
 /** Q6_K 210 B/block → 212 B/block: raw copy + 2 pad bytes (f16 d ends @ 209). */
 export function repackQ6_K(data: ArrayBuffer | Uint8Array, n: number): Uint32Array {
   const u8 = asU8(data);
@@ -331,12 +421,14 @@ export function repackGGUFForGPU(ggmlType: number, data: ArrayBuffer | Uint8Arra
     case T_Q4_0: return repackQ4_0(data, n);
     case T_Q5_0: return repackQ5_0(data, n);
     case T_Q8_0: return repackQ8_0(data, n);
+    case T_Q3_K: return repackQ3_K(data, n);
     case T_Q6_K: return repackQ6_K(data, n);
-    case T_Q4_K:
-    case T_Q5_K: {
+    case T_Q2_K:   // 84 B (4-aligned)
+    case T_Q4_K:   // 144 B
+    case T_Q5_K: { // 176 B — all 4-byte multiples: aligned copy only
       const u8 = asU8(data);
       if (n % 256 !== 0) throw new Error(`[repackGGUF] n=${n} not divisible by 256`);
-      const typeSize = ggmlType === T_Q4_K ? 144 : 176;
+      const typeSize = ggmlType === T_Q2_K ? 84 : ggmlType === T_Q4_K ? 144 : 176;
       assertBytes('repackGGUF', u8.byteLength, (n / 256) * typeSize);
       const out = new Uint32Array(u8.byteLength / 4);
       new Uint8Array(out.buffer).set(u8);
@@ -358,6 +450,8 @@ export function dequantGGML(ggmlType: number, data: ArrayBuffer | Uint8Array, n:
     case T_Q4_0: return dequantQ4_0(data, n);
     case T_Q5_0: return dequantQ5_0(data, n);
     case T_Q8_0: return dequantQ8_0(data, n);
+    case T_Q2_K: return dequantQ2_K(data, n);
+    case T_Q3_K: return dequantQ3_K(data, n);
     case T_Q4_K: return dequantQ4_K(data, n);
     case T_Q5_K: return dequantQ5_K(data, n);
     case T_Q6_K: return dequantQ6_K(data, n);

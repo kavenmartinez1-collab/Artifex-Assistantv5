@@ -392,6 +392,8 @@ export function createForwardPassEngine(
     config.sourceFormat === 'gguf' ? {
       [GGML_TYPES.Q4_0]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q4_0', 'matmul-gguf-q4_0'),
       [GGML_TYPES.Q5_0]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_0', 'matmul-gguf-q5_0'),
+      [GGML_TYPES.Q2_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q2_k', 'matmul-gguf-q2_k'),
+      [GGML_TYPES.Q3_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q3_k', 'matmul-gguf-q3_k'),
       [GGML_TYPES.Q8_0]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q8_0', 'matmul-gguf-q8_0'),
       [GGML_TYPES.Q4_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q4_k', 'matmul-gguf-q4_k'),
       [GGML_TYPES.Q5_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_k', 'matmul-gguf-q5_k'),

@@ -112,8 +112,8 @@ one or a lower quant. As a rough guide, a model needs a bit more free VRAM than
 its file size; an ~8 GB card comfortably runs 7–9B models at Q4_K_M.
 
 **GGUF quantization**: the engine runs `Q4_0`, `Q5_0`, `Q8_0`, and the
-K-quants `Q4_K_M`/`Q5_K_M`/`Q6_K` (plus F16/F32/BF16). `IQ*` (imatrix) and
-`Q4_1`/`Q5_1`/`Q2_K`/`Q3_K` aren't supported yet; the engine says so before
+K-quants `Q2_K`/`Q3_K`/`Q4_K_M`/`Q5_K_M`/`Q6_K` (plus F16/F32/BF16). `IQ*`
+(imatrix) and `Q4_1`/`Q5_1` aren't supported yet; the engine says so before
 downloading. When in doubt, grab a `*-Q4_K_M.gguf`.
 
 **Model families**: verified — Llama, Qwen3 / Qwen3.5 / Qwen3.6 (incl. the
