@@ -57,9 +57,10 @@ const TYPE_TRAITS: Record<number, { blockSize: number; typeSize: number; name: G
   [GGML_TYPES.Q5_K]: { blockSize: 256, typeSize: 176, name: 'Q5_K' },
   [GGML_TYPES.Q6_K]: { blockSize: 256, typeSize: 210, name: 'Q6_K' },
   [GGML_TYPES.Q8_K]: { blockSize: 256, typeSize: 292, name: 'Q8_K' },
-  // IQ (imatrix) quants — block sizes only, so any GGUF PARSES; the loader's
-  // pre-flight check reports them as unsupported-for-inference with guidance
-  // rather than crashing mid-parse with a cryptic type number.
+  // IQ quants. IQ4_NL/IQ4_XS (codebook, no grid) run natively on GPU; the
+  // grid-codebook types (IQ1/IQ2/IQ3) carry block sizes only so any GGUF
+  // PARSES — the loader's pre-flight check reports those as unsupported-for-
+  // inference with guidance rather than crashing mid-parse.
   [GGML_TYPES.IQ2_XXS]: { blockSize: 256, typeSize: 66,  name: 'IQ2_XXS' },
   [GGML_TYPES.IQ2_XS]:  { blockSize: 256, typeSize: 74,  name: 'IQ2_XS' },
   [GGML_TYPES.IQ3_XXS]: { blockSize: 256, typeSize: 98,  name: 'IQ3_XXS' },

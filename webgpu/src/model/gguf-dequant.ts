@@ -12,6 +12,8 @@
  *   Q4_K (256, 144 B):      f16 d, dmin | u8 scales[12] | u8 qs[128] (4-bit pairs)
  *   Q5_K (256, 176 B):      f16 d, dmin | u8 scales[12] | u8 qh[32] | u8 qs[128]
  *   Q6_K (256, 210 B):      u8 ql[128] | u8 qh[64] | i8 scales[16] | f16 d
+ *   IQ4_NL (32, 18 B):      f16 d | u8 qs[16] (4-bit)      x = d·kvalues[q]
+ *   IQ4_XS (256, 136 B):    f16 d | u16 scales_h | u8 scales_l[4] | u8 qs[128]
  *
  * Q4_K/Q5_K 6-bit scale/min packing (get_scale_min_k4, j in 0..7):
  *   j < 4:  sc = q[j] & 63;              m = q[j+4] & 63
@@ -21,7 +23,10 @@
 
 // GGML type ids (spec constants, duplicated from gguf.ts so this file has
 // zero imports and runs standalone under node --strip-types for validation)
-const T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q5_0 = 6, T_Q8_0 = 8, T_Q2_K = 10, T_Q3_K = 11, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_BF16 = 30;
+const T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q5_0 = 6, T_Q8_0 = 8, T_Q2_K = 10, T_Q3_K = 11, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_IQ4_NL = 20, T_IQ4_XS = 23, T_BF16 = 30;
+
+/** IQ4 non-linear codebook (kvalues_iq4nl, ggml-quants.c) — shared by IQ4_NL and IQ4_XS. */
+const KVALUES_IQ4NL = new Int8Array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]);
 
 // ── f16 / bf16 → f32 ───────────────────────────────────────────────────
 
@@ -279,6 +284,56 @@ export function dequantQ5_K(data: ArrayBuffer | Uint8Array, n: number): Float32A
   return out;
 }
 
+/** IQ4_NL: 18-byte blocks of 32 elements — Q4_0 layout, non-linear codebook.
+ *  x[j] = d·kvalues[qs[j]&0xF], x[j+16] = d·kvalues[qs[j]>>4] for j in 0..15.
+ *  Mirrors dequantize_row_iq4_nl (ggml-quants.c). */
+export function dequantIQ4_NL(data: ArrayBuffer | Uint8Array, n: number): Float32Array {
+  const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  if (n % 32 !== 0) throw new Error(`[IQ4_NL] n=${n} not divisible by 32`);
+  const nb = n / 32;
+  const out = new Float32Array(n);
+  for (let b = 0; b < nb; b++) {
+    const base = b * 18;
+    const d = f16ToF32(dv.getUint16(base, true));
+    for (let j = 0; j < 16; j++) {
+      const q = u8[base + 2 + j];
+      out[b * 32 + j] = d * KVALUES_IQ4NL[q & 0xF];
+      out[b * 32 + j + 16] = d * KVALUES_IQ4NL[q >> 4];
+    }
+  }
+  return out;
+}
+
+/** IQ4_XS: 136-byte superblocks of 256 elements.
+ *  Layout: d(f16) @0 | scales_h(u16) @2 | scales_l[4] @4 | qs[128] @8.
+ *  Per-32-elem 6-bit sub-scale: low 4 bits from a scales_l nibble, high 2
+ *  bits from scales_h; x = d·(ls-32)·kvalues[q]. Mirrors
+ *  dequantize_row_iq4_xs (ggml-quants.c). */
+export function dequantIQ4_XS(data: ArrayBuffer | Uint8Array, n: number): Float32Array {
+  const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  if (n % 256 !== 0) throw new Error(`[IQ4_XS] n=${n} not divisible by 256`);
+  const nb = n / 256;
+  const out = new Float32Array(n);
+  for (let b = 0; b < nb; b++) {
+    const base = b * 136;
+    const d = f16ToF32(dv.getUint16(base, true));
+    const sh = dv.getUint16(base + 2, true);
+    let y = b * 256, qs = base + 8;
+    for (let ib = 0; ib < 8; ib++) {
+      const ls = ((u8[base + 4 + (ib >> 1)] >> (4 * (ib & 1))) & 0xF) | (((sh >> (2 * ib)) & 3) << 4);
+      const dl = d * (ls - 32);
+      for (let j = 0; j < 16; j++) {
+        out[y + j] = dl * KVALUES_IQ4NL[u8[qs + j] & 0xF];
+        out[y + j + 16] = dl * KVALUES_IQ4NL[u8[qs + j] >> 4];
+      }
+      y += 32; qs += 16;
+    }
+  }
+  return out;
+}
+
 /** Q6_K: 210-byte superblocks of 256 elements. */
 export function dequantQ6_K(data: ArrayBuffer | Uint8Array, n: number): Float32Array {
   const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
@@ -324,6 +379,8 @@ export const GGUF_GPU_LAYOUT: Record<number, { blockElems: number; strideU32: nu
   [T_Q4_K]: { blockElems: 256, strideU32: 36 },  // raw 144 B
   [T_Q5_K]: { blockElems: 256, strideU32: 44 },  // raw 176 B
   [T_Q6_K]: { blockElems: 256, strideU32: 53 },  // 210 B → 212 B
+  [T_IQ4_NL]: { blockElems: 32, strideU32: 5 },  // 18 B → 20 B (Q4_0-shaped)
+  [T_IQ4_XS]: { blockElems: 256, strideU32: 34 }, // raw 136 B (4-aligned)
 };
 
 function asU8(data: ArrayBuffer | Uint8Array): Uint8Array {
@@ -419,16 +476,18 @@ export function repackQ6_K(data: ArrayBuffer | Uint8Array, n: number): Uint32Arr
 export function repackGGUFForGPU(ggmlType: number, data: ArrayBuffer | Uint8Array, n: number): Uint32Array {
   switch (ggmlType) {
     case T_Q4_0: return repackQ4_0(data, n);
+    case T_IQ4_NL: return repackQ4_0(data, n);  // identical 18 B layout (f16 d | qs[16])
     case T_Q5_0: return repackQ5_0(data, n);
     case T_Q8_0: return repackQ8_0(data, n);
     case T_Q3_K: return repackQ3_K(data, n);
     case T_Q6_K: return repackQ6_K(data, n);
     case T_Q2_K:   // 84 B (4-aligned)
     case T_Q4_K:   // 144 B
-    case T_Q5_K: { // 176 B — all 4-byte multiples: aligned copy only
+    case T_Q5_K:   // 176 B
+    case T_IQ4_XS: { // 136 B — all 4-byte multiples: aligned copy only
       const u8 = asU8(data);
       if (n % 256 !== 0) throw new Error(`[repackGGUF] n=${n} not divisible by 256`);
-      const typeSize = ggmlType === T_Q2_K ? 84 : ggmlType === T_Q4_K ? 144 : 176;
+      const typeSize = ggmlType === T_Q2_K ? 84 : ggmlType === T_Q4_K ? 144 : ggmlType === T_Q5_K ? 176 : 136;
       assertBytes('repackGGUF', u8.byteLength, (n / 256) * typeSize);
       const out = new Uint32Array(u8.byteLength / 4);
       new Uint8Array(out.buffer).set(u8);
@@ -455,6 +514,8 @@ export function dequantGGML(ggmlType: number, data: ArrayBuffer | Uint8Array, n:
     case T_Q4_K: return dequantQ4_K(data, n);
     case T_Q5_K: return dequantQ5_K(data, n);
     case T_Q6_K: return dequantQ6_K(data, n);
+    case T_IQ4_NL: return dequantIQ4_NL(data, n);
+    case T_IQ4_XS: return dequantIQ4_XS(data, n);
     default:
       throw new Error(`[GGUF-dequant] No CPU reference for ggml type ${ggmlType}`);
   }

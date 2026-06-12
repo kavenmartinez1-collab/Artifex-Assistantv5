@@ -6,8 +6,8 @@
  *     dequants per token — embedCPU precedent, saves ~0.5-2 GB VRAM)
  *   - F32 tensors (norms, biases, ssm_a, conv1d, dt_bias) → f32 buffers
  *   - F16/BF16 tensors → dequant to f32 at load (small tensors only)
- *   - Q8_0/Q4_K/Q5_K/Q6_K matrices → repackGGUFForGPU → u32 buffers,
- *     dispatched via shaders/matmul_gguf.wgsl
+ *   - k-quant/legacy/IQ4 matrices (Q2_K…Q6_K, Q4_0/Q5_0/Q8_0, IQ4_NL/IQ4_XS)
+ *     → repackGGUFForGPU → u32 buffers, dispatched via shaders/matmul_gguf.wgsl
  *
  * Tied embeddings (no output.weight): token_embd is kept on CPU for embed
  * AND uploaded repacked to GPU so the lm_head matmul has a buffer.
@@ -85,6 +85,7 @@ export interface GGUFLoadProgress {
 const QUANT_GPU_TYPES = new Set<number>([
   GGML_TYPES.Q4_0, GGML_TYPES.Q5_0, GGML_TYPES.Q2_K, GGML_TYPES.Q3_K,
   GGML_TYPES.Q8_0, GGML_TYPES.Q4_K, GGML_TYPES.Q5_K, GGML_TYPES.Q6_K,
+  GGML_TYPES.IQ4_NL, GGML_TYPES.IQ4_XS,
 ]);
 
 const MAX_CHUNK = 128 * 1024 * 1024;
@@ -203,14 +204,16 @@ export async function loadGGUFModel(
   };
 
   // ── Pre-flight quant check — fail fast with guidance, before any download ──
-  // The GPU path dequantizes Q4_K/Q5_K/Q6_K/Q8_0 (+ F16/F32/BF16) natively.
-  // Legacy (Q4_0/Q4_1/Q5_0/Q5_1) and IQ-imatrix quants aren't wired yet, so a
-  // model in those would fail tensor-by-tensor mid-load. Catch it up front and
-  // tell the user exactly what to download instead.
+  // The GPU path dequantizes the k-quants (Q2_K…Q6_K), legacy Q4_0/Q5_0/Q8_0,
+  // and the IQ4 codebook pair (IQ4_NL/IQ4_XS) natively. The grid-codebook IQ
+  // quants (IQ1/IQ2/IQ3) and Q4_1/Q5_1 aren't wired, so a model in those would
+  // fail tensor-by-tensor mid-load. Catch it up front and tell the user what
+  // to download instead.
   const SUPPORTED_GPU = new Set<number>([
     GGML_TYPES.F32, GGML_TYPES.F16, GGML_TYPES.BF16,
     GGML_TYPES.Q4_0, GGML_TYPES.Q5_0, GGML_TYPES.Q2_K, GGML_TYPES.Q3_K,
     GGML_TYPES.Q8_0, GGML_TYPES.Q4_K, GGML_TYPES.Q5_K, GGML_TYPES.Q6_K,
+    GGML_TYPES.IQ4_NL, GGML_TYPES.IQ4_XS,
   ]);
   const unsupportedTypes = new Map<string, number>();
   for (const t of file.tensors.values()) {
@@ -223,9 +226,9 @@ export async function loadGGUFModel(
     const list = [...unsupportedTypes.entries()].map(([n, c]) => `${n} (${c} tensors)`).join(', ');
     throw new Error(
       `This GGUF uses quantization the WebGPU engine can't run yet: ${list}. `
-      + `Supported: Q2_K, Q3_K, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K (and F16/F32/BF16). `
-      + `Download a K-quant build instead — e.g. a *-Q4_K_M.gguf or *-Q5_K_M.gguf. `
-      + `(IQ-imatrix and Q4_1/Q5_1 quants aren't supported.)`);
+      + `Supported: Q2_K, Q3_K, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS (and F16/F32/BF16). `
+      + `Download a K-quant or IQ4 build instead — e.g. a *-Q4_K_M.gguf or *-IQ4_XS.gguf. `
+      + `(IQ1/IQ2/IQ3 grid-codebook quants and Q4_1/Q5_1 aren't supported.)`);
   }
 
   // ── VRAM + RAM gates: refuse before downloading anything ──

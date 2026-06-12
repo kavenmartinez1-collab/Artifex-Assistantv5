@@ -19,7 +19,7 @@ store.
 - **Runs real models** — dense Qwen2.5/3, DeltaNet hybrids (Qwen3.5/3.6), and
   Qwen3.6-35B-A3B MoE with experts held in CPU RAM across a WASM worker fleet.
 - **Three weight sources** — HuggingFace SafeTensors (streamed via HTTP range),
-  GGUF (Q4_K/Q5_K/Q6_K), and Ollama-store blobs — all auto-discovered.
+  GGUF (k-quants + IQ4), and Ollama-store blobs — all auto-discovered.
 - **Browser-native vision** — a from-scratch WGSL vision transformer encodes
   images for Qwen3-VL (parity-verified against HuggingFace transformers to ~1e-4)
   and Qwen3.6 multimodal. Drag-drop, paste, or attach.
@@ -111,10 +111,12 @@ RAM). It tells you up front if a model won't fit on your GPU — pick a smaller
 one or a lower quant. As a rough guide, a model needs a bit more free VRAM than
 its file size; an ~8 GB card comfortably runs 7–9B models at Q4_K_M.
 
-**GGUF quantization**: the engine runs `Q4_0`, `Q5_0`, `Q8_0`, and the
-K-quants `Q2_K`/`Q3_K`/`Q4_K_M`/`Q5_K_M`/`Q6_K` (plus F16/F32/BF16). `IQ*`
-(imatrix) and `Q4_1`/`Q5_1` aren't supported yet; the engine says so before
-downloading. When in doubt, grab a `*-Q4_K_M.gguf`.
+**GGUF quantization**: the engine runs `Q4_0`, `Q5_0`, `Q8_0`, the K-quants
+`Q2_K`/`Q3_K`/`Q4_K_M`/`Q5_K_M`/`Q6_K`, and the IQ4 pair `IQ4_XS`/`IQ4_NL`
+(plus F16/F32/BF16). The grid-codebook IQ quants (`IQ1*`/`IQ2*`/`IQ3*`) and
+`Q4_1`/`Q5_1` aren't supported yet; the engine says so before downloading.
+When in doubt, grab a `*-Q4_K_M.gguf` (or `*-IQ4_XS.gguf` to save VRAM —
+same 4-bit class, slightly better quality per byte).
 
 **Model families**: verified — Llama, Qwen3 / Qwen3.5 / Qwen3.6 (incl. the
 35B MoE), Gemma 4. Experimental (recognized, attempted, not yet fully

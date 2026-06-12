@@ -10,6 +10,8 @@
 //   Q4_K: 36 u32 (raw 144 B: f16 d,dmin | scales[12] | qs[128])
 //   Q5_K: 44 u32 (raw 176 B: f16 d,dmin | scales[12] | qh[32] | qs[128])
 //   Q6_K: 53 u32 (repacked 210→212 B: ql[128] | qh[64] | i8 scales[16] | f16 d)
+//   IQ4_NL: 5 u32 (repacked 18→20 B like Q4_0; non-linear codebook)
+//   IQ4_XS: 34 u32 (raw 136 B: f16 d | u16 scales_h | scales_l[4] | qs[128])
 //
 // Bit decoding mirrors gguf-dequant.ts (the CPU reference validated bit-exact
 // against the official Python gguf package) — kernel-audit rule.
@@ -60,6 +62,14 @@ fn scale_min_k4(j: u32, sbyte: u32) -> vec2<f32> {
 /** Sign-extended i8 from byte j (0..3) of a u32 word. */
 fn i8_byte(word: u32, j: u32) -> f32 {
   return f32(bitcast<i32>(word << ((3u - j) * 8u)) >> 24u);
+}
+
+/** IQ4 non-linear codebook value (kvalues_iq4nl, ggml-quants.c), q in 0..15.
+ *  Values: -127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113 —
+ *  packed here as i8 bytes in 4 u32 words, extracted via i8_byte. */
+fn iq4nl_val(q: u32) -> f32 {
+  var kv = array<u32, 4>(0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u);
+  return i8_byte(kv[q >> 2u], q & 3u);
 }
 
 /** Tree-reduce wg_partial and write C[m*N + n] from thread 0. */
@@ -143,6 +153,84 @@ fn matmul_gguf_q5_0(@builtin(local_invocation_id) lid: vec3u,
       dot = dot + A[aBase + j] * lo + A[aBase + 16u + j] * hi;
     }
     let y = d * dot - comp;
+    let t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+  }
+  reduce_and_store(tid, n, m, sum);
+}
+
+// ── IQ4_NL: 32-elem blocks, 5 u32 each (f16 d | pad | qs[16]) ──────────
+// Q4_0-shaped repack with the non-linear iq4nl codebook: x = d·kvalues[q4].
+
+@compute @workgroup_size(WG_SIZE, 1, 1)
+fn matmul_gguf_iq4_nl(@builtin(local_invocation_id) lid: vec3u,
+                      @builtin(workgroup_id) wid: vec3u) {
+  let n = wid.x + wid.z * 65535u;
+  let m = wid.y;
+  let tid = lid.x;
+  let K = params.K;
+  let nBlocks = K / 32u;
+
+  var sum: f32 = 0.0;
+  var comp: f32 = 0.0;
+  for (var blk = tid; blk < nBlocks; blk = blk + WG_SIZE) {
+    let base = (n * nBlocks + blk) * 5u;          // u32 words
+    let d = unpack2x16float(W[base]).x;
+    let qsByte = (base + 1u) * 4u;                // qs[16] start, in bytes
+    let aBase = m * K + blk * 32u;
+    var dot: f32 = 0.0;
+    for (var j = 0u; j < 16u; j = j + 1u) {
+      let q = wbyte(qsByte + j);
+      dot = dot + A[aBase + j] * iq4nl_val(q & 0x0Fu)
+                + A[aBase + 16u + j] * iq4nl_val(q >> 4u);
+    }
+    let y = d * dot - comp;
+    let t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+  }
+  reduce_and_store(tid, n, m, sum);
+}
+
+// ── IQ4_XS: 256-elem superblocks, 34 u32 each; unit = 32 elems ─────────
+// Layout (raw 136 B): d(f16) @0 | scales_h(u16) @2 | scales_l[4] @4 | qs[128] @8.
+// 6-bit sub-scale per 32 elems: low nibble from scales_l, 2 high bits from
+// scales_h; dl = d·(ls-32), values via the iq4nl codebook.
+// Mirrors dequantize_row_iq4_xs (gguf-dequant.ts dequantIQ4_XS).
+
+@compute @workgroup_size(WG_SIZE, 1, 1)
+fn matmul_gguf_iq4_xs(@builtin(local_invocation_id) lid: vec3u,
+                      @builtin(workgroup_id) wid: vec3u) {
+  let n = wid.x + wid.z * 65535u;
+  let m = wid.y;
+  let tid = lid.x;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 8u;
+
+  var sum: f32 = 0.0;
+  var comp: f32 = 0.0;
+  for (var u = tid; u < nUnits; u = u + WG_SIZE) {
+    let sb = u / 8u;
+    let sub = u % 8u;                        // 32-elem chunk index (ib)
+    let wordBase = (n * nSB + sb) * 34u;
+    let byteBase = wordBase * 4u;
+    let w0 = W[wordBase];
+    let d = unpack2x16float(w0).x;           // f16 d @ bytes 0-1
+    let scalesH = w0 >> 16u;                 // u16 scales_h @ bytes 2-3
+    let slByte = wbyte(byteBase + 4u + (sub >> 1u));
+    let ls = ((slByte >> (4u * (sub & 1u))) & 0x0Fu) | (((scalesH >> (2u * sub)) & 3u) << 4u);
+    let dl = d * f32(i32(ls) - 32);
+    let qBase = byteBase + 8u + sub * 16u;   // 16 qs bytes for this chunk
+    let aBase = m * K + sb * 256u + sub * 32u;
+    var dot: f32 = 0.0;
+    for (var j = 0u; j < 16u; j = j + 1u) {
+      let q = wbyte(qBase + j);
+      dot = dot + A[aBase + j] * iq4nl_val(q & 0x0Fu)
+                + A[aBase + 16u + j] * iq4nl_val(q >> 4u);
+    }
+    let y = dl * dot - comp;
     let t = sum + y;
     comp = (t - sum) - y;
     sum = t;

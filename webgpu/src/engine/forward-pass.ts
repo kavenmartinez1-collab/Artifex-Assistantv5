@@ -398,6 +398,8 @@ export function createForwardPassEngine(
       [GGML_TYPES.Q4_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q4_k', 'matmul-gguf-q4_k'),
       [GGML_TYPES.Q5_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_k', 'matmul-gguf-q5_k'),
       [GGML_TYPES.Q6_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q6_k', 'matmul-gguf-q6_k'),
+      [GGML_TYPES.IQ4_NL]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq4_nl', 'matmul-gguf-iq4_nl'),
+      [GGML_TYPES.IQ4_XS]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq4_xs', 'matmul-gguf-iq4_xs'),
     } : null;
   // Hadamard transform for QuIP#/QuaRot incoherence processing
   const hadamardPipeline = config.isQuantized
