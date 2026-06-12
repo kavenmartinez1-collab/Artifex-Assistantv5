@@ -251,11 +251,41 @@ export async function loadGGUFModel(
     }
     gpuBytesPlanned += plannedGPUBytes(t);
   }
+  // ── Runtime GPU headroom: KV cache + compute buffers ──
+  // The gate used to check weights only, so a model could pass, load, say
+  // "ready", then OOM on the FIRST forward when the KV cache and activation
+  // buffers allocate. Estimate that headroom and include it, so the gate
+  // either refuses clearly at load or the model actually runs.
+  const MAX_SEQ = 3840;        // KV clamp (MAX_ATTN_SEQ_LEN)
+  const MAX_PREFILL = 512;     // engine's batch-prefill width
+  const headCount = archKV<number>(file, 'attention.head_count', 8);
+  const hiddenSize = archKV<number>(file, 'embedding_length', headCount * 128);
+  const isHybrid = archKV<number>(file, 'ssm.conv_kernel', 0) > 0;
+  const fullAttnInterval = archKV<number>(file, 'full_attention_interval', 1);
+  let nKV = archKV<number | number[]>(file, 'attention.head_count_kv', headCount);
+  if (Array.isArray(nKV)) { const nz = nKV.filter(v => v > 0); nKV = nz.length ? Math.max(...nz) : headCount; }
+  const kLen = archKV<number>(file, 'attention.key_length', Math.floor(hiddenSize / headCount));
+  const vLen = archKV<number>(file, 'attention.value_length', kLen);
+  // Count layers that allocate their OWN KV cache: attention (non-linear)
+  // layers, minus the trailing shared-KV layers that reuse another's.
+  let attnLayers = 0;
+  for (let i = 0; i < numLayers; i++) {
+    if (!isHybrid || (i + 1) % fullAttnInterval === 0) attnLayers++;
+  }
+  const kvCacheLayers = Math.max(0, attnLayers - sharedKvLayers);
+  const kvBytes = kvCacheLayers * MAX_SEQ * (nKV as number) * (kLen + vLen) * 4;
+  const vocab = (file.tensors.get('token_embd.weight')?.shape?.[0]) ?? 152064;
+  const computeBytes = MAX_PREFILL * hiddenSize * 4 * 12 + vocab * 4;  // activations + logits
+  const runtimeBytes = kvBytes + computeBytes;
+
   const budget = opts?.vramBudgetBytes ?? 6.5e9;
-  if (gpuBytesPlanned > budget) {
+  if (gpuBytesPlanned + runtimeBytes > budget) {
     throw new Error(
-      `Model needs ~${(gpuBytesPlanned / 1e9).toFixed(1)} GB VRAM for weights but only `
-      + `~${(budget / 1e9).toFixed(1)} GB is available on this GPU — refusing to load. `
+      `Model needs ~${(gpuBytesPlanned / 1e9).toFixed(1)} GB for weights + `
+      + `~${(runtimeBytes / 1e9).toFixed(1)} GB for the KV cache and compute buffers `
+      + `(~${((gpuBytesPlanned + runtimeBytes) / 1e9).toFixed(1)} GB total), but only `
+      + `~${(budget / 1e9).toFixed(1)} GB is free on this GPU — refusing to load. `
+      + `Close other GPU apps to free VRAM, or use a smaller model/quant. `
       + `(${file.tensorCount} tensors, ${(totalFileBytes / 1e9).toFixed(1)} GB on disk)`,
     );
   }
