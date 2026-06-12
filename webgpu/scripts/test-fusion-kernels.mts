@@ -207,6 +207,126 @@ function f5Test() {
   if (ok) console.log(`  ok   F5 beta/decay prologue nvh=${nvh}: bit-exact`);
 }
 
+// ── Occupancy split: ssm_step_split vs ssm_step_fused ──────────────────
+// The fused kernel runs 5 array-wide passes separated by barriers, but every
+// (kh, v) column of h is fully independent: each step only touches
+// h[h_base + k*gvd + v] for its own v, and the per-column k-loop order is
+// identical. The split kernel assigns one thread per column with grid
+// (nkh, ceil(gvd/WG)) and fuses steps 1+2 and 4+5 in registers:
+//   pass A: hk = d*h[k]; h[k] = hk; kv_mem += hk*K[k]
+//   pass B: hk = h[k] + K[k]*delta; h[k] = hk; dot += hk*Q[k]
+// The fused kernel reads h back from memory between steps — an f32
+// store/load roundtrip, which is exact — so register chaining is
+// bit-identical. beta/decay move from the LDS prologue to per-thread
+// registers (same expressions, same inputs → same f32 results).
+function ssmSplitTest() {
+  const sigmoid = (x: number) => fr(1 / fr(1 + fr(Math.exp(-x))));
+  const softplus = (x: number) => x > 20 ? x : fr(Math.log(fr(1 + fr(Math.exp(x)))));
+
+  for (const [nkh, nvh, kd, gvd] of [[16, 32, 128, 256], [4, 8, 32, 64]]) {
+    for (const tiled of [true, false]) {
+      for (const WG of [64, 48]) { // 48 doesn't divide gvd → exercises the v guard
+        const rng = mulberry32(0x55 ^ (nkh << 2) ^ kd ^ (tiled ? 1 : 0) ^ (WG << 8));
+        const vhPerKh = nvh / nkh;
+        const vhd = gvd / vhPerKh;
+        const Q = new Float32Array(nkh * kd), K = new Float32Array(nkh * kd);
+        const V = new Float32Array(nvh * vhd);
+        const B = new Float32Array(nvh), A = new Float32Array(nvh);
+        const dtBias = new Float32Array(nvh), ALog = new Float32Array(nvh);
+        const h0 = new Float32Array(nkh * kd * gvd);
+        for (let i = 0; i < Q.length; i++) { Q[i] = fr(rng() * 2 - 1); K[i] = fr(rng() * 2 - 1); }
+        for (let i = 0; i < V.length; i++) V[i] = fr(rng() * 2 - 1);
+        for (let i = 0; i < nvh; i++) {
+          B[i] = fr(rng() * 8 - 4);
+          A[i] = fr(rng() * 30 - 5); // exercise softplus x>20 branch
+          dtBias[i] = fr(rng() * 2 - 1);
+          ALog[i] = fr(rng() * 4 - 2);
+        }
+        for (let i = 0; i < h0.length; i++) h0[i] = fr(rng() * 2 - 1);
+        const scale = fr(1 / Math.sqrt(kd));
+        const vhOf = (kh: number, v: number) =>
+          tiled ? Math.floor(v / vhd) * nkh + kh : kh * vhPerKh + Math.floor(v / vhd);
+        const vIdxOf = (kh: number, v: number, vh: number) =>
+          tiled ? vh * vhd + (v % vhd) : kh * gvd + v;
+
+        // ── Fused port (ssm_step_fused): prologue → 5 barrier-separated passes
+        const wgBeta = new Float32Array(nvh), wgDecay = new Float32Array(nvh);
+        for (let i = 0; i < nvh; i++) {
+          wgBeta[i] = sigmoid(B[i]);
+          const dt = softplus(fr(A[i] + dtBias[i]));
+          wgDecay[i] = fr(Math.exp(fr(fr(-Math.exp(ALog[i])) * dt)));
+        }
+        const hF = h0.slice();
+        const outF = new Float32Array(nkh * gvd);
+        for (let kh = 0; kh < nkh; kh++) {
+          const hBase = kh * kd * gvd;
+          for (let v = 0; v < gvd; v++) { // step 1
+            const d = wgDecay[vhOf(kh, v)];
+            for (let k = 0; k < kd; k++) hF[hBase + k * gvd + v] = fr(d * hF[hBase + k * gvd + v]);
+          }
+          for (let v = 0; v < gvd; v++) { // steps 2-4
+            let kvMem = 0;
+            for (let k = 0; k < kd; k++) kvMem = fr(kvMem + fr(hF[hBase + k * gvd + v] * K[kh * kd + k]));
+            const vh = vhOf(kh, v);
+            const delta = fr(fr(V[vIdxOf(kh, v, vh)] - kvMem) * wgBeta[vh]);
+            for (let k = 0; k < kd; k++) {
+              const hi = hBase + k * gvd + v;
+              hF[hi] = fr(hF[hi] + fr(K[kh * kd + k] * delta));
+            }
+          }
+          for (let v = 0; v < gvd; v++) { // step 5
+            let dot = 0;
+            for (let k = 0; k < kd; k++) dot = fr(dot + fr(hF[hBase + k * gvd + v] * Q[kh * kd + k]));
+            outF[vIdxOf(kh, v, vhOf(kh, v))] = fr(dot * scale);
+          }
+        }
+
+        // ── Split port (ssm_step_split): grid (nkh, ceil(gvd/WG)), thread/column
+        const hS = h0.slice();
+        const outS = new Float32Array(nkh * gvd);
+        for (let kh = 0; kh < nkh; kh++) {
+          for (let wy = 0; wy < Math.ceil(gvd / WG); wy++) {
+            for (let tid = 0; tid < WG; tid++) {
+              const v = wy * WG + tid;
+              if (v >= gvd) continue;
+              const hBase = kh * kd * gvd;
+              const vh = vhOf(kh, v);
+              const betaVal = sigmoid(B[vh]);
+              const dt = softplus(fr(A[vh] + dtBias[vh]));
+              const d = fr(Math.exp(fr(fr(-Math.exp(ALog[vh])) * dt)));
+              let kvMem = 0; // pass A: steps 1+2 fused
+              for (let k = 0; k < kd; k++) {
+                const hi = hBase + k * gvd + v;
+                const hk = fr(d * hS[hi]);
+                hS[hi] = hk;
+                kvMem = fr(kvMem + fr(hk * K[kh * kd + k]));
+              }
+              const delta = fr(fr(V[vIdxOf(kh, v, vh)] - kvMem) * betaVal);
+              let dot = 0; // pass B: steps 4+5 fused
+              for (let k = 0; k < kd; k++) {
+                const hi = hBase + k * gvd + v;
+                const hk = fr(hS[hi] + fr(K[kh * kd + k] * delta));
+                hS[hi] = hk;
+                dot = fr(dot + fr(hk * Q[kh * kd + k]));
+              }
+              outS[vIdxOf(kh, v, vh)] = fr(dot * scale);
+            }
+          }
+        }
+
+        let ok = true;
+        for (let i = 0; i < outF.length && ok; i++) {
+          if (outS[i] !== outF[i]) { check('split out', false, `nkh=${nkh} tiled=${tiled} WG=${WG} i=${i}: ${outS[i]} != ${outF[i]}`); ok = false; }
+        }
+        for (let i = 0; i < hF.length && ok; i++) {
+          if (hS[i] !== hF[i]) { check('split h', false, `nkh=${nkh} tiled=${tiled} WG=${WG} i=${i}: ${hS[i]} != ${hF[i]}`); ok = false; }
+        }
+        if (ok) console.log(`  ok   ssm_step_split nkh=${nkh} kd=${kd} gvd=${gvd} tiled=${tiled} WG=${WG}: h+output bit-exact`);
+      }
+    }
+  }
+}
+
 console.log('F1 deinterleave_qgate:');
 f1Test();
 console.log('F4 conv1d_silu_update:');
@@ -215,6 +335,8 @@ console.log('F7 gate_sigmoid:');
 f7Test();
 console.log('F5 beta/decay prologue:');
 f5Test();
+console.log('ssm_step_split (occupancy lever):');
+ssmSplitTest();
 
 if (failures > 0) {
   console.log(`\n${failures} FAILURE(S)`);

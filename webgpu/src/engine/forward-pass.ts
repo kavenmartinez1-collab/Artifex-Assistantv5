@@ -525,6 +525,15 @@ export function createForwardPassEngine(
   // Fusion lever F5: beta/decay prologue inside ssm_step. A/B: ?fuseSsm=0.
   const ssmStepFusedPipeline = isHybrid && gemvSearch?.get('fuseSsm') !== '0'
     ? createComputePipeline(device, ssmStepWGSL, 'ssm_step_fused', 'ssm-step-fused') : null;
+  // Occupancy lever: thread-per-(kh,v)-column split — grid (nkh,
+  // ceil(gvd/SSM_WG)) instead of nkh×256, fusing steps 1+2 and 4+5 in
+  // registers (bit-exact; parity in test-fusion-kernels.mts). Same bindings
+  // as ssm_step_fused (raw B/A + dt_bias/a_log). A/B: ?ssmSplit=0; WG size
+  // tunable via ?ssmWG=.
+  const SSM_SPLIT_WG = Number(gemvSearch?.get('ssmWG') ?? 64);
+  const ssmStepSplitPipeline = ssmStepFusedPipeline && gemvSearch?.get('ssmSplit') !== '0'
+    ? createComputePipeline(device, ssmStepWGSL, 'ssm_step_split', 'ssm-step-split',
+        { SSM_WG: SSM_SPLIT_WG }) : null;
 
   // Linear attention dimensions (only for hybrid models)
   const linKD = config.linearKeyHeadDim ?? 0;
@@ -640,6 +649,7 @@ export function createForwardPassEngine(
   registerCat(groupNormPipeline, 'group_norm');
   registerCat(ssmStepPipeline, 'ssm_step');
   registerCat(ssmStepFusedPipeline, 'ssm_step_fused');
+  registerCat(ssmStepSplitPipeline, 'ssm_step_split');
   registerCat(sigmoidPipeline, 'sigmoid');
   registerCat(decayPipeline, 'decay');
   registerCat(l2NormPipeline, 'l2norm');
@@ -2219,7 +2229,11 @@ export function createForwardPassEngine(
             new Uint32Array([linNKH, linNVH, linKD, linGroupedVD, ssmLayoutTiled, 0, 0, 0]), `L${l}-ssm-p`);
           // F5: fused entry takes RAW B (binding 3) / RAW A (binding 4) plus
           // dt_bias/A_log and computes beta/decay in its prologue.
-          const ssmPipe = fuseSsm ? ssmStepFusedPipeline! : ssmStepPipeline;
+          // Occupancy lever: split entry uses the same bindings but a
+          // (nkh, ceil(gvd/SSM_WG)) grid with one thread per (kh, v) column.
+          const ssmSplit = fuseSsm && !!ssmStepSplitPipeline;
+          const ssmPipe = ssmSplit ? ssmStepSplitPipeline!
+            : fuseSsm ? ssmStepFusedPipeline! : ssmStepPipeline;
           const ssmBG0 = cachedBindGroup(ssmPipe, 0, [
             { binding: 0, resource: { buffer: linQBuf! } },
             { binding: 1, resource: { buffer: linKBuf! } }, // K after conv1d + silu + L2 norm
@@ -2245,7 +2259,8 @@ export function createForwardPassEngine(
             { binding: 0, resource: { buffer: ssmParams } },
           ], `L${l}-ssm-g2`);
           bd(ssmPipe, [ssmBG0, ssmBG1, ssmBG2],
-            [linNKH], `L${l}-ssm-step`);
+            ssmSplit ? [linNKH, Math.ceil(linGroupedVD / SSM_SPLIT_WG)] : [linNKH],
+            `L${l}-ssm-step`);
         }
 
         // ── SSM state-drift probe ────────────────────────────────────

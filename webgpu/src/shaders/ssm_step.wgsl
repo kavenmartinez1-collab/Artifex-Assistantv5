@@ -134,6 +134,76 @@ fn ssm_step(@builtin(local_invocation_id) lid: vec3u,
   }
 }
 
+// ── Occupancy split (lever, 2026-06-12) ─────────────────────────────────
+// ssm_step_fused dispatches nkh (=16) workgroups of 256 — occupancy-starved
+// on a 40-CU RDNA2 part. But every (kh, v) column of h is fully independent:
+// each step only touches h[h_base + k*gvd + v] for its own v, and the
+// per-column k-loop order is identical across steps. So: one thread per
+// column, grid (nkh, ceil(gvd/SSM_WG)), no barriers, no LDS.
+//
+// Two additional bit-exact fusions cut h traffic 6 → 4 accesses/element:
+//   pass A (steps 1+2): hk = d*h[k]; h[k] = hk; kv_mem += hk*K[k]
+//   pass B (steps 4+5): hk = h[k] + K[k]*delta; h[k] = hk; dot += hk*Q[k]
+// The fused kernel reads h back from memory between steps — an f32
+// store/load roundtrip, which is exact — so chaining the register value is
+// bit-identical. beta/decay move from the LDS prologue to per-thread
+// registers (same expressions, same inputs → same f32 results).
+// Parity: scripts/test-fusion-kernels.mts (ssmSplitTest, exact equality).
+
+override SSM_WG: u32 = 64u;
+
+@compute @workgroup_size(SSM_WG)
+fn ssm_step_split(@builtin(local_invocation_id) lid: vec3u,
+                  @builtin(workgroup_id) wid: vec3u) {
+  let kh = wid.x;
+  let kd = params.key_head_dim;
+  let gvd = params.grouped_value_dim;
+  let nkh = params.num_key_heads;
+  let nvh = params.num_value_heads;
+  let vh_per_kh = nvh / nkh;
+  let vhd = gvd / vh_per_kh; // value_head_dim (e.g., 128)
+  let v = wid.y * SSM_WG + lid.x;
+  if (v >= gvd) { return; }
+
+  let tiled = params.layout_tiled == 1u;
+  let h_base = kh * kd * gvd;
+  let k_base = kh * kd;
+  let vh = select(kh * vh_per_kh + v / vhd, (v / vhd) * nkh + kh, tiled);
+
+  // beta/decay in registers (expressions verbatim from the fused prologue;
+  // bindings 3/4 carry RAW in_proj B/A as in ssm_step_fused).
+  let beta_val = 1.0 / (1.0 + exp(-beta[vh]));
+  let x = decay[vh] + dt_bias[vh];
+  let dt = select(log(1.0 + exp(x)), x, x > 20.0);
+  let A = -exp(a_log[vh]);
+  let d = exp(A * dt);
+
+  let v_val = V[select(kh * gvd + v, vh * vhd + (v % vhd), tiled)];
+
+  // Pass A: steps 1+2 fused — decay h, accumulate kv_mem from decayed values
+  var kv_mem: f32 = 0.0;
+  for (var k = 0u; k < kd; k = k + 1u) {
+    let h_idx = h_base + k * gvd + v;
+    let hk = d * h[h_idx];
+    h[h_idx] = hk;
+    kv_mem += hk * K[k_base + k];
+  }
+
+  // Step 3: delta = (V - kv_mem) * beta
+  let delta = (v_val - kv_mem) * beta_val;
+
+  // Pass B: steps 4+5 fused — update h, accumulate readout from updated values
+  let scale = 1.0 / sqrt(f32(kd));
+  var dot: f32 = 0.0;
+  for (var k = 0u; k < kd; k = k + 1u) {
+    let h_idx = h_base + k * gvd + v;
+    let hk = h[h_idx] + K[k_base + k] * delta;
+    h[h_idx] = hk;
+    dot += hk * Q[k_base + k];
+  }
+  output[select(kh * gvd + v, vh * vhd + (v % vhd), tiled)] = dot * scale;
+}
+
 // F5: identical recurrence to ssm_step, but binding 3 = RAW in_proj B and
 // binding 4 = RAW in_proj A; beta/decay are computed in the prologue (see
 // comment above wg_beta) and read from workgroup memory.
