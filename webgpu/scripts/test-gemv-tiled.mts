@@ -129,6 +129,69 @@ function decodeUnitQ6K(W: Uint32Array, n: number, nSB: number, u: number): Float
   return out;
 }
 
+// Q2_K/Q3_K sub-blocks are 16 elems; a 32-elem tile unit covers the pair
+// sub0=2p (even), sub1=2p+1 — same group/shift, contiguous qs words.
+
+function decodeUnitQ2K(W: Uint32Array, n: number, nSB: number, u: number): Float64Array {
+  const sb = (u / 8) | 0, pair = u % 8, sub0 = pair * 2;
+  const wordBase = (n * nSB + sb) * 21;
+  const byteBase = wordBase * 4;
+  const [d, dmin] = unpack2x16(W, wordBase + 20);      // d @80, dmin @82
+  const sc0 = wbyte(W, byteBase + sub0);
+  const sc1 = wbyte(W, byteBase + sub0 + 1);
+  const dl0 = d * (sc0 & 0x0F), ml0 = dmin * (sc0 >>> 4);
+  const dl1 = d * (sc1 & 0x0F), ml1 = dmin * (sc1 >>> 4);
+  const group = sub0 >= 8 ? 1 : 0;
+  const shift = ((sub0 & 7) >>> 1) * 2;
+  const qWord = wordBase + 4 + group * 8;              // qs @16 + group*32 B
+  const out = new Float64Array(32);
+  for (let w = 0; w < 8; w++) {
+    const q = (W[qWord + w] >>> shift) & 0x03030303;
+    const dl = w < 4 ? dl0 : dl1, ml = w < 4 ? ml0 : ml1;
+    out[w * 4 + 0] = dl * (q & 0xFF) - ml;
+    out[w * 4 + 1] = dl * ((q >>> 8) & 0xFF) - ml;
+    out[w * 4 + 2] = dl * ((q >>> 16) & 0xFF) - ml;
+    out[w * 4 + 3] = dl * (q >>> 24) - ml;
+  }
+  return out;
+}
+
+function decodeUnitQ3K(W: Uint32Array, n: number, nSB: number, u: number): Float64Array {
+  const KM1 = 0x03030303, KM2 = 0x0f0f0f0f;
+  const sb = (u / 8) | 0, pair = u % 8, sub0 = pair * 2;
+  const wordBase = (n * nSB + sb) * 28;
+  const dAll = unpack2x16(W, wordBase + 27)[0];        // d @108
+  const s0 = W[wordBase + 24], s1 = W[wordBase + 25], tmp = W[wordBase + 26];
+  const widx = sub0 >>> 2;
+  let auxWord: number;
+  if (widx === 0) auxWord = ((s0 & KM2) | ((((tmp >>> 0) & KM1) << 4) >>> 0)) >>> 0;
+  else if (widx === 1) auxWord = ((s1 & KM2) | ((((tmp >>> 2) & KM1) << 4) >>> 0)) >>> 0;
+  else if (widx === 2) auxWord = (((s0 >>> 4) & KM2) | ((((tmp >>> 4) & KM1) << 4) >>> 0)) >>> 0;
+  else auxWord = (((s1 >>> 4) & KM2) | ((((tmp >>> 6) & KM1) << 4) >>> 0)) >>> 0;
+  const scB0 = (auxWord >>> ((sub0 & 3) * 8)) & 0xFF;
+  const scB1 = (auxWord >>> (((sub0 & 3) + 1) * 8)) & 0xFF;
+  const dl0 = dAll * (scB0 - 32);
+  const dl1 = dAll * (scB1 - 32);
+  const group = sub0 >= 8 ? 1 : 0;
+  const j = (sub0 & 7) >>> 1;
+  const shift = j * 2;
+  const hbitpos = group * 4 + j;
+  const qWord = wordBase + 8 + group * 8;              // qs @32 + group*32 B
+  const hWord = wordBase;                              // hmask @0
+  const out = new Float64Array(32);
+  for (let w = 0; w < 8; w++) {
+    const q3 = (W[qWord + w] >>> shift) & 0x03030303;
+    const hb = (W[hWord + w] >>> hbitpos) & 0x01010101;
+    const q = (q3 + ((hb << 2) >>> 0)) >>> 0;          // 0..7/byte, no carry
+    const dl = w < 4 ? dl0 : dl1;
+    out[w * 4 + 0] = dl * ((q & 0xFF) - 4);
+    out[w * 4 + 1] = dl * (((q >>> 8) & 0xFF) - 4);
+    out[w * 4 + 2] = dl * (((q >>> 16) & 0xFF) - 4);
+    out[w * 4 + 3] = dl * (((q >>> 24) & 0xFF) - 4);
+  }
+  return out;
+}
+
 // Full tiled GEMV simulation for one output row n: chunk loop, a_tile staging
 // map, lane = unit ownership — exactly the kernel's index structure, f64 accum.
 function tiledGemvRow(
@@ -250,6 +313,21 @@ runFormat('Q6_K', GGML_TYPES.Q6_K, 210, (raw, base, rng) => {
   const dv = new DataView(raw.buffer, raw.byteOffset);
   dv.setUint16(base + 208, randF16Bits(rng), true);
 }, decodeUnitQ6K);
+
+console.log('Q2_K tiled:');
+runFormat('Q2_K', GGML_TYPES.Q2_K, 84, (raw, base, rng) => {
+  // d @80, dmin @82 — controlled finite f16
+  const dv = new DataView(raw.buffer, raw.byteOffset);
+  dv.setUint16(base + 80, randF16Bits(rng), true);
+  dv.setUint16(base + 82, randF16Bits(rng), true);
+}, decodeUnitQ2K);
+
+console.log('Q3_K tiled:');
+runFormat('Q3_K', GGML_TYPES.Q3_K, 110, (raw, base, rng) => {
+  // d @108 — controlled finite f16 (hmask/qs/scales stay random)
+  const dv = new DataView(raw.buffer, raw.byteOffset);
+  dv.setUint16(base + 108, randF16Bits(rng), true);
+}, decodeUnitQ3K);
 
 if (failures > 0) {
   console.log(`\n${failures} FAILURE(S)`);

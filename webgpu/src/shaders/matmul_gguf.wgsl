@@ -765,3 +765,155 @@ fn matmul_gguf_q6_k_tiled(@builtin(local_invocation_id) lid: vec3u,
   }
   tile_reduce_store(tid, lane, n, m, acc);
 }
+
+// ── Q2_K tiled: TN rows/workgroup, shared activation staging ───────────
+// Same superblock decode as matmul_gguf_q2_k. Q2_K/Q3_K sub-blocks are 16
+// elements, so one 32-elem tile unit covers the consecutive PAIR
+// (sub0=2p, sub1=2p+1). sub0 is even, so both subs share group/shift and
+// their qs bytes are contiguous (8 words: w<4 → sub0, w≥4 → sub1).
+// The whole-word 2-bit shift trick is safe: shift ≤ 6, bits shift..shift+1
+// of each byte never cross a byte boundary under the 0x03030303 mask.
+
+@compute @workgroup_size(TWG, 1, 1)
+fn matmul_gguf_q2_k_tiled(@builtin(local_invocation_id) lid: vec3u,
+                          @builtin(workgroup_id) wid: vec3u) {
+  let tid = lid.x;
+  let TPR = TWG / TN;
+  let lane = tid % TPR;
+  let row = tid / TPR;
+  let n = (wid.x + wid.z * 65535u) * TN + row;
+  let m = wid.y;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 8u;
+  let nChunks = (nUnits + TPR - 1u) / TPR;
+  let aRow = m * K;
+  let valid = n < params.N;
+
+  var acc: f32 = 0.0;
+  for (var c = 0u; c < nChunks; c = c + 1u) {
+    workgroupBarrier();
+    tile_stage(tid, aRow, c * TPR * 32u, K);
+    workgroupBarrier();
+
+    let u = c * TPR + lane;
+    if (u < nUnits && valid) {
+      let sb = u / 8u;
+      let pair = u % 8u;
+      let sub0 = pair * 2u;                   // even; sub1 = sub0 + 1
+      let wordBase = (n * nSB + sb) * 21u;
+      let byteBase = wordBase * 4u;
+      let dm = unpack2x16float(W[wordBase + 20u]);   // d @80, dmin @82
+      let sc0 = wbyte(byteBase + sub0);
+      let sc1 = wbyte(byteBase + sub0 + 1u);
+      let dl0 = dm.x * f32(sc0 & 0x0Fu);
+      let ml0 = dm.y * f32(sc0 >> 4u);
+      let dl1 = dm.x * f32(sc1 & 0x0Fu);
+      let ml1 = dm.y * f32(sc1 >> 4u);
+      let group = select(0u, 1u, sub0 >= 8u);
+      let shift = ((sub0 & 7u) >> 1u) * 2u;
+      let qWord = wordBase + 4u + group * 8u;  // qs @16 + group*32 bytes
+      var dq0: f32 = 0.0;
+      var as0: f32 = 0.0;
+      var dq1: f32 = 0.0;
+      var as1: f32 = 0.0;
+      for (var w = 0u; w < 8u; w = w + 1u) {
+        let q = (W[qWord + w] >> shift) & 0x03030303u;
+        let q2 = vec4<f32>(
+          f32(q & 0xFFu), f32((q >> 8u) & 0xFFu),
+          f32((q >> 16u) & 0xFFu), f32(q >> 24u),
+        );
+        let a4 = a_tile[lane * 8u + w];
+        let asum = a4.x + a4.y + a4.z + a4.w;
+        if (w < 4u) { dq0 = dq0 + dot(a4, q2); as0 = as0 + asum; }
+        else        { dq1 = dq1 + dot(a4, q2); as1 = as1 + asum; }
+      }
+      acc = acc + (dl0 * dq0 - ml0 * as0) + (dl1 * dq1 - ml1 * as1);
+    }
+  }
+  tile_reduce_store(tid, lane, n, m, acc);
+}
+
+// ── Q3_K tiled: TN rows/workgroup, shared activation staging ───────────
+// Same superblock decode as matmul_gguf_q3_k (6-bit scale aux-shuffle, high
+// bit from hmask). Pair layout as Q2_K tiled: sub0=2p/sub1=2p+1 share
+// group/shift/mbit and widx (sub0>>2 == sub1>>2), qs and hmask reads are
+// both 8 contiguous words. Per element: value = dl·(q3 + 4·hbit − 4) —
+// q3 ≤ 3 and 4·hbit ≤ 4, so the byte-wise add never carries.
+
+@compute @workgroup_size(TWG, 1, 1)
+fn matmul_gguf_q3_k_tiled(@builtin(local_invocation_id) lid: vec3u,
+                          @builtin(workgroup_id) wid: vec3u) {
+  let tid = lid.x;
+  let TPR = TWG / TN;
+  let lane = tid % TPR;
+  let row = tid / TPR;
+  let n = (wid.x + wid.z * 65535u) * TN + row;
+  let m = wid.y;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 8u;
+  let nChunks = (nUnits + TPR - 1u) / TPR;
+  let aRow = m * K;
+  let valid = n < params.N;
+  let KM1 = 0x03030303u;
+  let KM2 = 0x0f0f0f0fu;
+
+  var acc: f32 = 0.0;
+  for (var c = 0u; c < nChunks; c = c + 1u) {
+    workgroupBarrier();
+    tile_stage(tid, aRow, c * TPR * 32u, K);
+    workgroupBarrier();
+
+    let u = c * TPR + lane;
+    if (u < nUnits && valid) {
+      let sb = u / 8u;
+      let pair = u % 8u;
+      let sub0 = pair * 2u;                   // even; sub1 = sub0 + 1
+      let wordBase = (n * nSB + sb) * 28u;
+      let dAll = unpack2x16float(W[wordBase + 27u]).x;   // d @108
+
+      // 6-bit signed scales for sub0/sub1 — same auxWord (shared widx).
+      let s0 = W[wordBase + 24u];
+      let s1 = W[wordBase + 25u];
+      let tmp = W[wordBase + 26u];
+      var auxWord: u32;
+      let widx = sub0 >> 2u;
+      if (widx == 0u) {
+        auxWord = (s0 & KM2) | (((tmp >> 0u) & KM1) << 4u);
+      } else if (widx == 1u) {
+        auxWord = (s1 & KM2) | (((tmp >> 2u) & KM1) << 4u);
+      } else if (widx == 2u) {
+        auxWord = ((s0 >> 4u) & KM2) | (((tmp >> 4u) & KM1) << 4u);
+      } else {
+        auxWord = ((s1 >> 4u) & KM2) | (((tmp >> 6u) & KM1) << 4u);
+      }
+      let scB0 = (auxWord >> ((sub0 & 3u) * 8u)) & 0xFFu;
+      let scB1 = (auxWord >> (((sub0 & 3u) + 1u) * 8u)) & 0xFFu;
+      let dl0 = dAll * f32(i32(scB0) - 32);
+      let dl1 = dAll * f32(i32(scB1) - 32);
+
+      let group = select(0u, 1u, sub0 >= 8u);
+      let j = (sub0 & 7u) >> 1u;
+      let shift = j * 2u;
+      let hbitpos = group * 4u + j;           // ≤ 7: stays inside each byte
+      let qWord = wordBase + 8u + group * 8u; // qs @32 + group*32 bytes
+      let hWord = wordBase;                   // hmask @0
+      var dq0: f32 = 0.0;
+      var dq1: f32 = 0.0;
+      for (var w = 0u; w < 8u; w = w + 1u) {
+        let q3 = (W[qWord + w] >> shift) & 0x03030303u;
+        let hb = (W[hWord + w] >> hbitpos) & 0x01010101u;
+        let q = q3 + (hb << 2u);              // 0..7 per byte, no carry
+        let qv = vec4<f32>(
+          f32(q & 0xFFu), f32((q >> 8u) & 0xFFu),
+          f32((q >> 16u) & 0xFFu), f32(q >> 24u),
+        ) - vec4<f32>(4.0);
+        let a4 = a_tile[lane * 8u + w];
+        if (w < 4u) { dq0 = dq0 + dot(a4, qv); } else { dq1 = dq1 + dot(a4, qv); }
+      }
+      acc = acc + dl0 * dq0 + dl1 * dq1;
+    }
+  }
+  tile_reduce_store(tid, lane, n, m, acc);
+}

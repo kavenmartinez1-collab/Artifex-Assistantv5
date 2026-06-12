@@ -403,8 +403,8 @@ export function createForwardPassEngine(
     } : null;
   // Lever 2: multi-output tiled GEMV — TN output rows per workgroup share a
   // staged activation tile (legacy kernels re-read the full activation vector
-  // per output row). Q4_K/Q5_K/Q6_K for now; other formats fall through to
-  // the legacy one-row kernels in dispatchMatmulGGUF.
+  // per output row). Covers all k-quants (Q2_K..Q6_K); other formats fall
+  // through to the legacy one-row kernels in dispatchMatmulGGUF.
   // A/B: ?gemvTile=0 disables. Tile shape tunable via ?gemvTN= / ?gemvTWG=
   // (pipeline-override constants; TWG/TN must be a power of two).
   const gemvSearch = typeof window === 'undefined'
@@ -415,6 +415,8 @@ export function createForwardPassEngine(
   const gemvTileConsts = { TN: GEMV_TILE_N, TWG: GEMV_TILE_WG };
   const matmulGgufTiledPipelines: Record<number, GPUComputePipeline> | null =
     config.sourceFormat === 'gguf' && gemvTileEnabled ? {
+      [GGML_TYPES.Q2_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q2_k_tiled', 'matmul-gguf-q2_k-tiled', gemvTileConsts),
+      [GGML_TYPES.Q3_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q3_k_tiled', 'matmul-gguf-q3_k-tiled', gemvTileConsts),
       [GGML_TYPES.Q4_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q4_k_tiled', 'matmul-gguf-q4_k-tiled', gemvTileConsts),
       [GGML_TYPES.Q5_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_k_tiled', 'matmul-gguf-q5_k-tiled', gemvTileConsts),
       [GGML_TYPES.Q6_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q6_k_tiled', 'matmul-gguf-q6_k-tiled', gemvTileConsts),
