@@ -16,7 +16,8 @@ import { chromium, type Page } from '@playwright/test';
 
 const BASE = 'http://127.0.0.1:5173';
 const REPO = 'local/qwen3.5-9b-abliterated-gguf';
-const ADAPTER_RE = /radeon|6700|amd/i;
+// Headless Chrome strips the marketing name — adapter shows as "rdna-2".
+const ADAPTER_RE = /radeon|6700|amd|rdna/i;
 const PROMPT =
   'Explain, in two detailed paragraphs, how a refrigerator keeps food cold.';
 
@@ -66,12 +67,12 @@ async function selectAmdAdapter(page: Page): Promise<string> {
 
 async function runConfig(tn: number, twg: number): Promise<SweepResult> {
   const browser = await chromium.launch({
+    channel: 'chrome', // user's installed Chrome — no Playwright browser download
     headless: true,
-    args: [
-      '--enable-unsafe-webgpu',
-      '--enable-features=Vulkan',
-      '--use-angle=vulkan',
-    ],
+    // NOTE: do NOT force Vulkan (--enable-features=Vulkan / --use-angle=vulkan)
+    // — on this Windows box those flags make Chrome report zero WebGPU
+    // adapters. Bare unsafe-webgpu exposes the AMD RDNA2 adapter fine.
+    args: ['--enable-unsafe-webgpu'],
   });
   try {
     const page = await browser.newPage();
