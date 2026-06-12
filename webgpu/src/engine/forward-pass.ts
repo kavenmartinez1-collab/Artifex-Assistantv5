@@ -62,7 +62,7 @@ import hadamardWGSL from '../shaders/hadamard.wgsl?raw';
 import dequantQ4BF16WGSL from '../shaders/dequant_q4_bf16.wgsl?raw';
 import matmulGgufWGSL from '../shaders/matmul_gguf.wgsl?raw';
 import { GGML_TYPES, ggmlTypeTraits } from '../model/gguf';
-import { dequantGGML } from '../model/gguf-dequant';
+import { dequantGGML, GGUF_GPU_LAYOUT } from '../model/gguf-dequant';
 import { topKSoftmax, MOE_MAX_TOKENS, type MoEBackend } from './moe-cpu';
 
 // ── Limits ───────────────────────────────────────────────────────────────
@@ -85,6 +85,8 @@ const _cpuEmbedF32 = new Float32Array(_cpuEmbedBuf);
 export interface GGUFWeight {
   data: GPUBuffer;
   ggmlType: number;
+  /** View start into `data` (gate+up concat — must be 256-aligned). */
+  byteOffset?: number;
 }
 
 /** GPU buffers for one transformer layer's weights. */
@@ -149,6 +151,10 @@ export interface LayerWeights {
   oProj_gg?: GGUFWeight;
   gateProj_gg?: GGUFWeight;
   upProj_gg?: GGUFWeight;
+  /** Same-A fusion: gate+up concatenated row-wise into one buffer — one
+   *  decode GEMV with N=2*ffnDim writes [gate | up] contiguously. When set,
+   *  gateProj_gg/upProj_gg are byteOffset views into the same buffer. */
+  gateUpProj_gg?: GGUFWeight;
   downProj_gg?: GGUFWeight;
   linearInProjQKV_gg?: GGUFWeight;
   linearInProjA_gg?: GGUFWeight;
@@ -451,6 +457,55 @@ export function createForwardPassEngine(
       [GGML_TYPES.Q4_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q4_k_tiled_v4', 'matmul-gguf-q4_k-tiled-v4', gemvTileConsts),
       [GGML_TYPES.Q5_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_k_tiled_v4', 'matmul-gguf-q5_k-tiled-v4', gemvTileConsts),
     } : null;
+  // Same-A GEMV fusion: gate and up projections read the SAME activation
+  // vector, have the same shape [ffnDim, H] and (on every GGUF seen so far)
+  // the same quant type. Concatenating their block data row-wise lets decode
+  // run ONE GEMV with N=2*ffnDim — half the FFN gate/up dispatches and twice
+  // the workgroups per dispatch. Row n >= ffnDim of the combined tensor
+  // lands exactly at the up tensor's row n-ffnDim words (the kernel computes
+  // wordBase = (n*nSB + sb)*stride), so per-row math is untouched →
+  // byte-identical. Originals are destroyed and repointed as byteOffset
+  // views into the combined buffer (zero net VRAM; prefill + MoE shared
+  // expert paths keep working through the views). A/B: ?fuseGU=0.
+  const fuseGUEnabled = config.sourceFormat === 'gguf' && gemvSearch?.get('fuseGU') !== '0';
+  if (fuseGUEnabled) {
+    const enc = device.createCommandEncoder({ label: 'gateup-concat' });
+    const deferredWeightDestroys: GPUBuffer[] = [];
+    let fusedLayers = 0;
+    for (const lw of weights.layers) {
+      const g = lw.gateProj_gg, u = lw.upProj_gg;
+      const layout = g ? GGUF_GPU_LAYOUT[g.ggmlType] : undefined;
+      if (!g || !u || g.ggmlType !== u.ggmlType || !layout) continue;
+      const rowBytes = (H / layout.blockElems) * layout.strideU32 * 4;
+      const gateBytes = ffnDim * rowBytes;
+      // Storage-binding offsets must be 256-aligned (gate_silu's up view at
+      // ffnDim*4 too); skip the layer if the shapes don't line up.
+      if (!Number.isInteger(rowBytes) || gateBytes % 256 !== 0 || (ffnDim * 4) % 256 !== 0) continue;
+      if (gateBytes > g.data.size || gateBytes > u.data.size) continue;
+      const combined = device.createBuffer({
+        size: gateBytes * 2,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+        label: 'gateup-gg',
+      });
+      enc.copyBufferToBuffer(g.data, 0, combined, 0, gateBytes);
+      enc.copyBufferToBuffer(u.data, 0, combined, gateBytes, gateBytes);
+      // Submitted copies keep the source allocations alive until the GPU is
+      // done; destroy() just drops them afterwards.
+      const oldG = g.data, oldU = u.data;
+      deferredWeightDestroys.push(oldG, oldU);
+      lw.gateUpProj_gg = { data: combined, ggmlType: g.ggmlType };
+      lw.gateProj_gg = { data: combined, ggmlType: g.ggmlType };
+      lw.upProj_gg = { data: combined, ggmlType: u.ggmlType, byteOffset: gateBytes };
+      fusedLayers++;
+    }
+    device.queue.submit([enc.finish()]);
+    if (fusedLayers > 0) {
+      for (const b of deferredWeightDestroys) b.destroy();
+      deferredWeightDestroys.length = 0;
+      console.log(`[forward-pass] gate+up same-A fusion: concatenated ${fusedLayers} layers`);
+    }
+  }
+
   // Hadamard transform for QuIP#/QuaRot incoherence processing
   const hadamardPipeline = config.isQuantized
     ? createComputePipeline(device, hadamardWGSL, 'hadamard', 'hadamard')
@@ -1115,7 +1170,7 @@ export function createForwardPassEngine(
     const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);
     const bg = cachedBindGroup(pipeline, 0, [
       { binding: 0, resource: ioRes(aBuf, io?.aOffset) },
-      { binding: 1, resource: { buffer: gg.data } },
+      { binding: 1, resource: ioRes(gg.data, gg.byteOffset) },
       { binding: 2, resource: ioRes(cBuf, io?.cOffset) },
       { binding: 3, resource: { buffer: params } },
     ], label);
@@ -2758,18 +2813,36 @@ export function createForwardPassEngine(
       // so its GPU time + readback overlap the CPU expert GEMVs.
       const isMoELayer = !!(lw.moeRouter && weights.moe && routerLogitsBuf);
       if (!isMoELayer) {
-        dispatchProjection(normedBuf, lw, 'gateProj', gateBuf, seqLen, ffnDim, H, `L${l}-gate`);
-        await maybeAudit(l, gateBuf, `L${l}-gate-out`, seqLen, ffnDim);
-        dispatchProjection(normedBuf, lw, 'upProj', upBuf, seqLen, ffnDim, H, `L${l}-up`);
-        await maybeAudit(l, upBuf, `L${l}-up-out`, seqLen, ffnDim);
+        if (lw.gateUpProj_gg && seqLen === 1 && !dumpResults) {
+          // Same-A fusion (decode only): one GEMV computes [gate | up] into
+          // gateBuf, then gate_silu reads the halves via 256-B-aligned
+          // binding offsets. Byte-identical to the two-dispatch path — the
+          // concat preserves every row's words (see gateup-concat above).
+          dispatchMatmulGGUF(normedBuf, lw.gateUpProj_gg, gateBuf, 1, 2 * ffnDim, H, `L${l}-gateup`);
+          const guParamData = new ArrayBuffer(32);
+          new Uint32Array(guParamData, 0, 2).set([ffnDim, 0]);
+          const guP = getCachedUniform(new Uint8Array(guParamData), `L${l}-silumul-p`);
+          const guBG = cachedBindGroup(gateActPipeline, 0, [
+            { binding: 0, resource: { buffer: gateBuf, offset: ffnDim * 4 } }, // input_a = up half
+            { binding: 1, resource: { buffer: ffnTempBuf } },
+            { binding: 2, resource: { buffer: guP } },
+            { binding: 3, resource: { buffer: gateBuf, size: ffnDim * 4 } },   // input_b = gate half
+          ], `L${l}-silumul-gu`);
+          bd(gateActPipeline, [guBG], [workgroupCount(ffnDim, 256)], `L${l}-silumul`);
+        } else {
+          dispatchProjection(normedBuf, lw, 'gateProj', gateBuf, seqLen, ffnDim, H, `L${l}-gate`);
+          await maybeAudit(l, gateBuf, `L${l}-gate-out`, seqLen, ffnDim);
+          dispatchProjection(normedBuf, lw, 'upProj', upBuf, seqLen, ffnDim, H, `L${l}-up`);
+          await maybeAudit(l, upBuf, `L${l}-up-out`, seqLen, ffnDim);
 
-        // Fused gated activation: ffnTemp = up * act(gate) in a single dispatch
-        // (act = silu for most models, gelu_tanh for Gemma — config.activation).
-        // Saves one dispatch + one full ffnDim read/write of VRAM traffic per layer.
-        // Old two-dispatch path (kept for reference):
-        // dispatchElementwise(siluPipeline, gateBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silu`);
-        // dispatchElementwise(mulPipeline, ffnTempBuf, gateBuf, seqLen * ffnDim, `L${l}-mul`, upBuf);
-        dispatchElementwise(gateActPipeline, upBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silumul`, gateBuf);
+          // Fused gated activation: ffnTemp = up * act(gate) in a single dispatch
+          // (act = silu for most models, gelu_tanh for Gemma — config.activation).
+          // Saves one dispatch + one full ffnDim read/write of VRAM traffic per layer.
+          // Old two-dispatch path (kept for reference):
+          // dispatchElementwise(siluPipeline, gateBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silu`);
+          // dispatchElementwise(mulPipeline, ffnTempBuf, gateBuf, seqLen * ffnDim, `L${l}-mul`, upBuf);
+          dispatchElementwise(gateActPipeline, upBuf, ffnTempBuf, seqLen * ffnDim, `L${l}-silumul`, gateBuf);
+        }
 
         dispatchProjection(ffnTempBuf, lw, 'downProj', downBuf, seqLen, H, ffnDim, `L${l}-down`);
         await maybeAudit(l, downBuf, `L${l}-down-out`, seqLen, H);
