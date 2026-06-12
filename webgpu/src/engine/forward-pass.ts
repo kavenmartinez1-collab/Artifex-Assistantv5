@@ -61,6 +61,7 @@ import deinterleaveWGSL from '../shaders/deinterleave.wgsl?raw';
 import hadamardWGSL from '../shaders/hadamard.wgsl?raw';
 import dequantQ4BF16WGSL from '../shaders/dequant_q4_bf16.wgsl?raw';
 import matmulGgufWGSL from '../shaders/matmul_gguf.wgsl?raw';
+import repackQ2kWGSL from '../shaders/repack_q2k.wgsl?raw';
 import { GGML_TYPES, ggmlTypeTraits } from '../model/gguf';
 import { dequantGGML, GGUF_GPU_LAYOUT } from '../model/gguf-dequant';
 import { topKSoftmax, MOE_MAX_TOKENS, type MoEBackend } from './moe-cpu';
@@ -87,6 +88,9 @@ export interface GGUFWeight {
   ggmlType: number;
   /** View start into `data` (gate+up concat — must be 256-aligned). */
   byteOffset?: number;
+  /** Q2_K unit-contiguous repack (lever C): data is in the repack_q2k.wgsl
+   *  layout and MUST be decoded by matmul_gguf_q2_k_tiled_r (any M). */
+  repacked?: boolean;
 }
 
 /** GPU buffers for one transformer layer's weights. */
@@ -457,6 +461,81 @@ export function createForwardPassEngine(
       [GGML_TYPES.Q4_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q4_k_tiled_v4', 'matmul-gguf-q4_k-tiled-v4', gemvTileConsts),
       [GGML_TYPES.Q5_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_k_tiled_v4', 'matmul-gguf-q5_k-tiled-v4', gemvTileConsts),
     } : null;
+  // Lever C: Q2_K unit-contiguous repack — Q2_K GEMVs are ALU/issue-bound
+  // (~27% BW efficiency while Q6_K hits ~82%): each lane extracts one 2-bit
+  // shift plane per qs word, so every word is loaded by 4 lanes and costs
+  // ~5 ops per 4 elements to unpack. A one-shot GPU repack at init
+  // (repack_q2k.wgsl, stride stays 21 → zero VRAM growth) gives each
+  // 32-elem unit 2 contiguous qs words; the _r kernel loads 2 words/unit
+  // instead of 8 and decodes with one extractBits per element. f32 decode
+  // math is IDENTICAL to *_tiled (gate 5, test-gemv-tiled.mts) →
+  // byte-identical output. Repacked buffers REQUIRE the _r kernel for all
+  // M (standard-layout kernels would read garbage), so each weight carries
+  // a `repacked` flag and only the dense per-layer matmul slots are
+  // repacked (embed/lm_head/expert paths keep the standard layout).
+  // A/B: ?gemvR=0.
+  const gemvREnabled = config.sourceFormat === 'gguf' && gemvTileEnabled
+    && gemvSearch?.get('gemvR') !== '0';
+  const matmulGgufRPipeline = gemvREnabled
+    ? createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q2_k_tiled_r', 'matmul-gguf-q2_k-tiled-r', gemvTileConsts)
+    : null;
+  if (gemvREnabled) {
+    const repackPipeline = createComputePipeline(device, repackQ2kWGSL, 'repack_q2k', 'repack-q2k');
+    const Q2K_REPACK_SLOTS = [
+      'qProj_gg', 'kProj_gg', 'vProj_gg', 'oProj_gg',
+      'gateProj_gg', 'upProj_gg', 'downProj_gg',
+      'linearInProjQKV_gg', 'linearInProjA_gg', 'linearInProjB_gg',
+      'linearInProjZ_gg', 'linearOutProj_gg',
+    ] as const;
+    const enc = device.createCommandEncoder({ label: 'q2k-repack' });
+    const pass = enc.beginComputePass({ label: 'q2k-repack' });
+    pass.setPipeline(repackPipeline);
+    const oldToNew = new Map<GPUBuffer, GPUBuffer>();
+    const deferredDestroys: GPUBuffer[] = [];
+    let repackedTensors = 0;
+    for (const lw of weights.layers) {
+      for (const slot of Q2K_REPACK_SLOTS) {
+        const w = lw[slot] as GGUFWeight | undefined;
+        if (!w || w.ggmlType !== GGML_TYPES.Q2_K || w.byteOffset || w.repacked) continue;
+        let dst = oldToNew.get(w.data);
+        if (!dst) {
+          const nSB = Math.floor(w.data.size / 84);   // 21 u32/superblock
+          if (nSB < 1 || nSB > 65535 * 64) continue;
+          dst = device.createBuffer({
+            size: w.data.size,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+            label: 'q2k-repacked',
+          });
+          const pBuf = device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            label: 'q2k-repack-p',
+          });
+          device.queue.writeBuffer(pBuf, 0, new Uint32Array([nSB, 0, 0, 0]));
+          const bg = createBindGroup(device, repackPipeline, 0, [
+            { binding: 0, resource: { buffer: w.data } },
+            { binding: 1, resource: { buffer: dst } },
+            { binding: 2, resource: { buffer: pBuf } },
+          ], 'q2k-repack');
+          pass.setBindGroup(0, bg);
+          pass.dispatchWorkgroups(Math.ceil(nSB / 64));
+          oldToNew.set(w.data, dst);
+          deferredDestroys.push(w.data, pBuf);
+          repackedTensors++;
+        }
+        w.data = dst;
+        w.repacked = true;
+      }
+    }
+    pass.end();
+    device.queue.submit([enc.finish()]);
+    // The submitted pass keeps the source allocations alive until the GPU
+    // is done; destroy() just drops them afterwards.
+    for (const b of deferredDestroys) b.destroy();
+    if (repackedTensors > 0) {
+      console.log(`[forward-pass] Q2_K repack (lever C): ${repackedTensors} tensors → unit-contiguous layout`);
+    }
+  }
   // Same-A GEMV fusion: gate and up projections read the SAME activation
   // vector, have the same shape [ffnDim, H] and (on every GGUF seen so far)
   // the same quant type. Concatenating their block data row-wise lets decode
@@ -476,6 +555,10 @@ export function createForwardPassEngine(
       const g = lw.gateProj_gg, u = lw.upProj_gg;
       const layout = g ? GGUF_GPU_LAYOUT[g.ggmlType] : undefined;
       if (!g || !u || g.ggmlType !== u.ggmlType || !layout) continue;
+      // Lever C ran first: both halves carry the same layout (repack covers
+      // gate and up alike), and the row-wise concat preserves the
+      // per-superblock permutation — just propagate the flag.
+      if (!!g.repacked !== !!u.repacked) continue;
       const rowBytes = (H / layout.blockElems) * layout.strideU32 * 4;
       const gateBytes = ffnDim * rowBytes;
       // Storage-binding offsets must be 256-aligned (gate_silu's up view at
@@ -493,9 +576,9 @@ export function createForwardPassEngine(
       // done; destroy() just drops them afterwards.
       const oldG = g.data, oldU = u.data;
       deferredWeightDestroys.push(oldG, oldU);
-      lw.gateUpProj_gg = { data: combined, ggmlType: g.ggmlType };
-      lw.gateProj_gg = { data: combined, ggmlType: g.ggmlType };
-      lw.upProj_gg = { data: combined, ggmlType: u.ggmlType, byteOffset: gateBytes };
+      lw.gateUpProj_gg = { data: combined, ggmlType: g.ggmlType, repacked: g.repacked };
+      lw.gateProj_gg = { data: combined, ggmlType: g.ggmlType, repacked: g.repacked };
+      lw.upProj_gg = { data: combined, ggmlType: u.ggmlType, byteOffset: gateBytes, repacked: g.repacked };
       fusedLayers++;
     }
     device.queue.submit([enc.finish()]);
@@ -726,6 +809,7 @@ export function createForwardPassEngine(
   for (const [t, p] of Object.entries(matmulGgufV4Pipelines ?? {})) {
     registerCat(p, `gguf_${ggmlTypeTraits(+t).name}_v4`);
   }
+  registerCat(matmulGgufRPipeline, 'gguf_Q2_K_r');
 
   // ── Matmul-Q4 GEMV pipeline selection ──────────────────────────────
   // Cached-scales variants are parameterized by (MAX_GROUPS, WG_SIZE). The
@@ -1161,10 +1245,14 @@ export function createForwardPassEngine(
   ) {
     // Decode (M=1): prefer vec4-W, then no-stage (opt-in), then staged
     // tiled; prefill keeps staged tiled. Same grid math for all three.
-    const fast = M === 1
+    // Repacked Q2_K (lever C) is a different data layout — it MUST go
+    // through the _r kernel for every M (decode AND prefill).
+    const fast = M === 1 && !gg.repacked
       ? matmulGgufV4Pipelines?.[gg.ggmlType] ?? matmulGgufNsPipelines?.[gg.ggmlType] ?? null
       : null;
-    const tiled = fast ?? matmulGgufTiledPipelines?.[gg.ggmlType] ?? null;
+    const tiled = gg.repacked
+      ? matmulGgufRPipeline
+      : fast ?? matmulGgufTiledPipelines?.[gg.ggmlType] ?? null;
     const pipeline = tiled ?? matmulGgufPipelines?.[gg.ggmlType];
     if (!pipeline) throw new Error(`matmul_gguf "${label}": no pipeline for ggml type ${gg.ggmlType}`);
     const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);

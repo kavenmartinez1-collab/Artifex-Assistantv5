@@ -192,6 +192,70 @@ function decodeUnitQ3K(W: Uint32Array, n: number, nSB: number, u: number): Float
   return out;
 }
 
+// ── Q2_K unit-contiguous repack ports (lever C, repack_q2k.wgsl +
+// matmul_gguf_q2_k_tiled_r) ─────────────────────────────────────────────
+// Repack permutation: unit p = u%8 of a superblock decodes group g = p>>2
+// at shift plane t = p&3 (see decodeUnitQ2K: group = sub0>=8, shift =
+// ((sub0&7)>>1)*2 with sub0 = 2p). The repack gives each unit 2 contiguous
+// words at offset 4 + 2p: each source word's plane t (4×2-bit spread across
+// 4 bytes) is compacted to 1 byte via b|(b>>6)|(b>>12)... so output byte j
+// = elements of source word j, e0|e1<<2|e2<<4|e3<<6. Scales (words 0-3)
+// and d/dmin (word 20) unchanged; stride stays 21 (zero VRAM growth).
+// Mirrors repack_q2k.wgsl exactly (thread-per-superblock).
+function repackQ2K(W: Uint32Array): Uint32Array {
+  if (W.length % 21 !== 0) throw new Error('Q2_K buffer not a multiple of 21 words');
+  const out = new Uint32Array(W.length);
+  const nBlocks = W.length / 21;
+  for (let b = 0; b < nBlocks; b++) {
+    const base = b * 21;
+    for (let i = 0; i < 4; i++) out[base + i] = W[base + i];
+    out[base + 20] = W[base + 20];
+    for (let p = 0; p < 8; p++) {
+      const g = p >>> 2, t = p & 3;
+      const srcBase = base + 4 + g * 8;
+      for (let m = 0; m < 2; m++) {
+        let word = 0;
+        for (let j = 0; j < 4; j++) {
+          const bb = (W[srcBase + m * 4 + j] >>> (2 * t)) & 0x03030303;
+          const y = (bb | (bb >>> 6)) >>> 0;
+          const z = (y | (y >>> 12)) >>> 0;
+          word |= (z & 0xFF) << (j * 8);
+        }
+        out[base + 4 + p * 2 + m] = word >>> 0;
+      }
+    }
+  }
+  return out;
+}
+
+// Decode port of matmul_gguf_q2_k_tiled_r: reads the repacked layout. Unit
+// element l = w*4+k sits at bit (w&3)*8 + 2k of word (w<4 ? 0 : 1) of the
+// unit's pair. Scale math, dl/ml w<4 split, and expression shapes are
+// byte-identical to decodeUnitQ2K → must match it EXACTLY on repacked data.
+function decodeUnitQ2KR(W: Uint32Array, n: number, nSB: number, u: number): Float64Array {
+  const sb = (u / 8) | 0, pair = u % 8, sub0 = pair * 2;
+  const wordBase = (n * nSB + sb) * 21;
+  const byteBase = wordBase * 4;
+  const [d, dmin] = unpack2x16(W, wordBase + 20);
+  const sc0 = wbyte(W, byteBase + sub0);
+  const sc1 = wbyte(W, byteBase + sub0 + 1);
+  const dl0 = d * (sc0 & 0x0F), ml0 = dmin * (sc0 >>> 4);
+  const dl1 = d * (sc1 & 0x0F), ml1 = dmin * (sc1 >>> 4);
+  const qBase = wordBase + 4 + pair * 2;
+  const w0 = W[qBase], w1 = W[qBase + 1];
+  const out = new Float64Array(32);
+  for (let w = 0; w < 8; w++) {
+    const src = w < 4 ? w0 : w1;
+    const off = (w & 3) * 8;
+    const dl = w < 4 ? dl0 : dl1, ml = w < 4 ? ml0 : ml1;
+    out[w * 4 + 0] = dl * ((src >>> off) & 3) - ml;
+    out[w * 4 + 1] = dl * ((src >>> (off + 2)) & 3) - ml;
+    out[w * 4 + 2] = dl * ((src >>> (off + 4)) & 3) - ml;
+    out[w * 4 + 3] = dl * ((src >>> (off + 6)) & 3) - ml;
+  }
+  return out;
+}
+
 // ── vec4 W-load decode ports (lever 4 phase 2, *_tiled_v4) ──────────────
 // Same byte math as the tiled decoders, but every W access goes through a
 // vec4 view: v4() throws on any non-multiple-of-4 word index (alignment
@@ -497,6 +561,57 @@ runFormat('Q3_K', GGML_TYPES.Q3_K, 110, (raw, base, rng) => {
   const dv = new DataView(raw.buffer, raw.byteOffset);
   dv.setUint16(base + 108, randF16Bits(rng), true);
 }, decodeUnitQ3K, decodeUnitQ3Kv4);
+
+// Gate 5 (lever C): Q2_K repack + _r decode. (a) per-unit decode of the
+// repacked buffer must equal the original tiled decode EXACTLY for every
+// (n, u, l); (b) full tiled GEMV on repacked data must equal the original
+// tiled GEMV EXACTLY (identical f32 values + identical accumulation order).
+console.log('Q2_K repack (_r):');
+for (const K of [256, 1280, 4096]) {
+  for (const TPR of [16, 32]) {
+    const rng = mulberry32(0xC0FFEE ^ K ^ (TPR << 8) ^ GGML_TYPES.Q2_K ^ 0x52);
+    const N = 11;
+    const nSB = K / 256;
+    const raw = new Uint8Array(N * nSB * 84);
+    for (let i = 0; i < raw.length; i++) raw[i] = Math.floor(rng() * 256);
+    const dv = new DataView(raw.buffer, raw.byteOffset);
+    for (let b = 0; b < N * nSB; b++) {
+      dv.setUint16(b * 84 + 80, randF16Bits(rng), true);
+      dv.setUint16(b * 84 + 82, randF16Bits(rng), true);
+    }
+    const W = repackGGUFForGPU(GGML_TYPES.Q2_K, raw, N * K);
+    const Wr = repackQ2K(W);
+    const A = new Float32Array(K);
+    for (let i = 0; i < K; i++) A[i] = rng() * 2 - 1;
+
+    let rOK = true;
+    for (let n = 0; n < N && rOK; n++) {
+      for (let u = 0; u < nSB * 8 && rOK; u++) {
+        const a = decodeUnitQ2K(W, n, nSB, u);
+        const b = decodeUnitQ2KR(Wr, n, nSB, u);
+        for (let l = 0; l < 32; l++) {
+          if (a[l] !== b[l] && !(Number.isNaN(a[l]) && Number.isNaN(b[l]))) {
+            check(`Q2_K_r K=${K} elem`, false, `n=${n} u=${u} l=${l}: ${b[l]} != ${a[l]}`);
+            rOK = false;
+            break;
+          }
+        }
+      }
+    }
+    if (rOK) console.log(`  ok   Q2_K_r K=${K} TPR=${TPR}: repacked decode == tiled decode (exact)`);
+
+    let gOK = true;
+    for (let n = 0; n < N; n++) {
+      const orig = tiledGemvRow(W, A, n, K, decodeUnitQ2K, TPR);
+      const rep = tiledGemvRow(Wr, A, n, K, decodeUnitQ2KR, TPR);
+      if (rep !== orig) {
+        check(`Q2_K_r K=${K} TPR=${TPR} gemv`, false, `n=${n}: ${rep} != ${orig}`);
+        gOK = false;
+      }
+    }
+    if (gOK) console.log(`  ok   Q2_K_r K=${K} TPR=${TPR}: repacked gemv == tiled gemv (exact)`);
+  }
+}
 
 if (failures > 0) {
   console.log(`\n${failures} FAILURE(S)`);

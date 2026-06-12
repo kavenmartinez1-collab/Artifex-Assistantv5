@@ -869,6 +869,79 @@ fn matmul_gguf_q2_k_tiled(@builtin(local_invocation_id) lid: vec3u,
   tile_reduce_store(tid, lane, n, m, acc);
 }
 
+// ── Q2_K tiled on REPACKED data (lever C, repack_q2k.wgsl) ──────────────
+// The load-time repack gives each 32-elem unit p = u%8 two contiguous qs
+// words at wordBase + 4 + 2p: source shift-plane t = p&3 of group g = p>>2
+// is byte-compacted so element l = w*4+k sits at bit (w&3)*8 + 2k of word
+// (w<4 ? 0 : 1). Loads per unit drop 8→2 and the 4× cross-lane re-read of
+// each qs word disappears; extractBits is one bitfield-extract op/element.
+// Scales (words 0-3), d/dmin (word 20), the dl/ml w<4 split, a_tile
+// indexing, and the acc expression are IDENTICAL to matmul_gguf_q2_k_tiled
+// → bit-exact (gate 5 in scripts/test-gemv-tiled.mts).
+
+@compute @workgroup_size(TWG, 1, 1)
+fn matmul_gguf_q2_k_tiled_r(@builtin(local_invocation_id) lid: vec3u,
+                            @builtin(workgroup_id) wid: vec3u) {
+  let tid = lid.x;
+  let TPR = TWG / TN;
+  let lane = tid % TPR;
+  let row = tid / TPR;
+  let n = (wid.x + wid.z * 65535u) * TN + row;
+  let m = wid.y;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 8u;
+  let nChunks = (nUnits + TPR - 1u) / TPR;
+  let aRow = m * K;
+  let valid = n < params.N;
+
+  var acc: f32 = 0.0;
+  for (var c = 0u; c < nChunks; c = c + 1u) {
+    workgroupBarrier();
+    tile_stage(tid, aRow, c * TPR * 32u, K);
+    workgroupBarrier();
+
+    let u = c * TPR + lane;
+    if (u < nUnits && valid) {
+      let sb = u / 8u;
+      let pair = u % 8u;
+      let sub0 = pair * 2u;                   // even; sub1 = sub0 + 1
+      let wordBase = (n * nSB + sb) * 21u;
+      let byteBase = wordBase * 4u;
+      let dm = unpack2x16float(W[wordBase + 20u]);   // d @80, dmin @82
+      let sc0 = wbyte(byteBase + sub0);
+      let sc1 = wbyte(byteBase + sub0 + 1u);
+      let dl0 = dm.x * f32(sc0 & 0x0Fu);
+      let ml0 = dm.y * f32(sc0 >> 4u);
+      let dl1 = dm.x * f32(sc1 & 0x0Fu);
+      let ml1 = dm.y * f32(sc1 >> 4u);
+      let qBase = wordBase + 4u + pair * 2u;   // unit-contiguous pair
+      let w0 = W[qBase];
+      let w1 = W[qBase + 1u];
+      var dq0: f32 = 0.0;
+      var as0: f32 = 0.0;
+      var dq1: f32 = 0.0;
+      var as1: f32 = 0.0;
+      for (var w = 0u; w < 8u; w = w + 1u) {
+        let src = select(w1, w0, w < 4u);
+        let off = (w & 3u) * 8u;
+        let q2 = vec4<f32>(
+          f32(extractBits(src, off, 2u)),
+          f32(extractBits(src, off + 2u, 2u)),
+          f32(extractBits(src, off + 4u, 2u)),
+          f32(extractBits(src, off + 6u, 2u)),
+        );
+        let a4 = a_tile[lane * 8u + w];
+        let asum = a4.x + a4.y + a4.z + a4.w;
+        if (w < 4u) { dq0 = dq0 + dot(a4, q2); as0 = as0 + asum; }
+        else        { dq1 = dq1 + dot(a4, q2); as1 = as1 + asum; }
+      }
+      acc = acc + (dl0 * dq0 - ml0 * as0) + (dl1 * dq1 - ml1 * as1);
+    }
+  }
+  tile_reduce_store(tid, lane, n, m, acc);
+}
+
 // ── Q3_K tiled: TN rows/workgroup, shared activation staging ───────────
 // Same superblock decode as matmul_gguf_q3_k (6-bit scale aux-shuffle, high
 // bit from hmask). Pair layout as Q2_K tiled: sub0=2p/sub1=2p+1 share
