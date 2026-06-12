@@ -28,23 +28,61 @@ store.
 - **TurboQuant KV** — 3–4 bit KV cache compression (~80% memory) on supported models.
 - **Per-card auto-config** — VRAM budget and attention limits derived from the GPU.
 
-## Quickstart
+## Setup — step by step
 
-Requires **Node.js 18+** and a **WebGPU-capable browser**. **Chrome is the
-reference target** (most reliable WebGPU); Edge usually matches but can lag,
-and Firefox/Safari need WebGPU enabled.
+New to this? Follow these in order. You'll copy-paste a few commands; that's it.
+
+### 1. Install the two things you need
+
+- **Node.js** (version 18 or newer) — download the "LTS" installer from
+  [nodejs.org](https://nodejs.org/) and run it (click Next through the prompts).
+- **Git** — from [git-scm.com/downloads](https://git-scm.com/downloads) (also
+  just click through). Git is how you copy the project to your computer.
+- A **WebGPU browser** — **use Google Chrome** (it works most reliably). You
+  almost certainly already have a recent enough version.
+
+### 2. Open a terminal
+
+- **Windows**: press the Start key, type `cmd`, press Enter.
+- **Mac**: press Cmd+Space, type `terminal`, press Enter.
+
+You'll paste commands here and press Enter after each.
+
+### 3. Download the project (clone it)
+
+```bash
+git clone https://github.com/kavenmartinez1-collab/Artifex_Web.git
+cd Artifex_Web
+```
+
+The first line copies the project into a folder; the second moves into it.
+
+### 4. Install and start
 
 ```bash
 npm install
 npm run dev
 ```
 
-This starts the Vite dev server and a small local file server, then opens the
-app. Type a HuggingFace repo (e.g. `Qwen/Qwen2.5-0.5B-Instruct`) into the model
-box and click **Load**, or pick a local model from the browser (see below).
+`npm install` downloads the project's building blocks (takes a minute, one
+time only). `npm run dev` starts it and **opens the app in your browser
+automatically**. Leave this terminal window open while you use the app — it's
+the local server. To stop it later, click the terminal and press `Ctrl+C`.
 
-> All weights are fetched and run client-side. The bundled Node server only
-> serves local model files and reports GPU info — it performs no inference.
+### 5. Load a model and chat
+
+In the app, the easiest first run: click **Browse** to see models already on
+your computer (from Ollama, if you have it), or type a small model name like
+`Qwen/Qwen2.5-0.5B-Instruct` into the model box and click **Load**. Wait for
+"inference engine ready," then type a message. The first load downloads the
+model (small models are a few hundred MB); after that it's cached.
+
+**Next time** you want to use it, you only need steps 2 and 4 — open a terminal,
+`cd Artifex_Web`, and `npm run dev`.
+
+> Everything runs on **your** computer, in your browser — no data is sent
+> anywhere. The small local server only hands model files to the browser and
+> reports your GPU's free memory; it does no AI itself.
 
 ## Using local models
 
@@ -77,6 +115,13 @@ its file size; an ~8 GB card comfortably runs 7–9B models at Q4_K_M.
 K-quants `Q4_K_M`/`Q5_K_M`/`Q6_K` (plus F16/F32/BF16). `IQ*` (imatrix) and
 `Q4_1`/`Q5_1`/`Q2_K`/`Q3_K` aren't supported yet; the engine says so before
 downloading. When in doubt, grab a `*-Q4_K_M.gguf`.
+
+**Model families**: verified — Llama, Qwen3 / Qwen3.5 / Qwen3.6 (incl. the
+35B MoE), Gemma 4. Experimental (recognized, attempted, not yet fully
+verified — the app flags these on load) — Qwen2.5, Mistral. Not yet
+supported: Gemma 2/3, Phi-3 (fused QKV), DeepSeek (MLA), and Mamba2 hybrids
+(Nemotron-H, Granite-hybrid). Loading an unsupported architecture gives a
+clear message naming it, never silent garbage.
 
 ## Vision
 

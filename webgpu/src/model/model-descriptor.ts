@@ -69,6 +69,8 @@ export interface ModelDescriptor extends ModelConfig {
   attnScale?: number;
   /** Where the weights come from. Affects loader routing, not the forward pass. */
   sourceFormat: 'safetensors' | 'gguf';
+  /** Recognized GGUF arch that hasn't been verified end-to-end (UI flags it). */
+  experimentalArch?: boolean;
   /** Model has per-layer embeddings fused into the residual stream (Gemma 4 PLE). */
   perLayerEmbed?: boolean;
   /** Per-layer embedding dim (Gemma 4 `embedding_length_per_layer_input`, 256). */
@@ -140,9 +142,15 @@ interface GGUFArchInfo {
   attnOutputGate?: boolean;
   /** FFN activation when the arch hardcodes it (GGUF has no hidden_act key). */
   hiddenAct?: string;
+  /** Recognized but not yet verified end-to-end — the engine attempts it via
+   *  the standard-transformer path (the UI flags it). These archs are
+   *  structurally identical to a verified one per llama.cpp, so the worst case
+   *  is a clean shape/tensor error, not silent garbage. */
+  experimental?: boolean;
 }
 
 const GGUF_ARCHS: Record<string, GGUFArchInfo> = {
+  // ── Verified ───────────────────────────────────────────────────────
   qwen35:    { modelType: 'qwen3_5', attnOutputGate: true },
   qwen35moe: { modelType: 'qwen3_5_moe', attnOutputGate: true },
   qwen3:     { modelType: 'qwen3' },
@@ -150,6 +158,15 @@ const GGUF_ARCHS: Record<string, GGUFArchInfo> = {
   llama:     { modelType: 'llama' },
   // llama.cpp hardcodes LLM_FFN_GELU for gemma4 (src/models/gemma4.cpp)
   gemma4:    { modelType: 'gemma4_text', hiddenAct: 'gelu_pytorch_tanh' },
+  // ── Experimental: standard transformers, llama.cpp-confirmed structurally
+  //    identical to the verified paths above. Dims read generically from GGUF
+  //    metadata; bias/MoE handled by tensor presence. Attempted, not yet
+  //    end-to-end verified. (Gemma 2/3, Phi3 fused-QKV, DeepSeek MLA, and the
+  //    Mamba2 hybrids are intentionally NOT here — they need real compute work,
+  //    and a bad mapping would produce wrong output rather than a clean error.)
+  qwen2:     { modelType: 'qwen2', experimental: true },     // attn bias, no qk-norm
+  qwen2moe:  { modelType: 'qwen2_moe', experimental: true },
+  mistral3:  { modelType: 'llama', experimental: true },     // llama-architecture
 };
 
 /**
@@ -313,6 +330,7 @@ export function descriptorFromGGUF(file: GGUFFile): ModelDescriptor {
     // gemma4.cpp: hparams.f_attention_scale = 1.0f (no 1/√d pre-attn scaling)
     attnScale: arch === 'gemma4' ? 1.0 : undefined,
     sourceFormat: 'gguf',
+    experimentalArch: info.experimental ? true : undefined,
     perLayerEmbed: perLayerEmbedDim > 0 ? true : undefined,
     perLayerEmbedDim: perLayerEmbedDim > 0 ? perLayerEmbedDim : undefined,
     // Gemma scales embeddings by √hiddenSize (gemma4.cpp:155)

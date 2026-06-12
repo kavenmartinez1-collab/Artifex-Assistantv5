@@ -1488,6 +1488,13 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
   promptEl.disabled = false;
   sendBtn.disabled = false;
 
+  if ((config as any).experimentalArch) {
+    addMessage('system',
+      `⚠️ EXPERIMENTAL architecture (${(model.file.kv.get('general.architecture') as string) ?? '?'}): `
+      + `recognized and attempted via the standard-transformer path, but not yet verified end-to-end. `
+      + `It may work perfectly, error out, or produce off output — judge the results.`,
+      'experimental arch');
+  }
   addMessage('system',
     `Inference engine ready! (GGUF native)\n` +
     `Model: ${config.modelType} — ${config.numLayers} layers, ${config.numAttentionHeads} heads, d=${config.hiddenSize}\n` +
