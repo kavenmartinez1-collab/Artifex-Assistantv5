@@ -411,8 +411,11 @@ export function createForwardPassEngine(
   const gemvSearch = typeof window === 'undefined'
     ? null : new URLSearchParams(window.location.search);
   const gemvTileEnabled = gemvSearch?.get('gemvTile') !== '0';
+  // Defaults from the 27B sweep on RDNA2 (2026-06-12): 8/128 beat 8/256 by
+  // ~1.6% at 27B shapes (8.81 vs 8.67 tok/s @256 tokens); on the 9B the two
+  // were within noise (14.6 vs 14.7), so 128 is the better global default.
   const GEMV_TILE_N = Number(gemvSearch?.get('gemvTN') ?? 8);
-  const GEMV_TILE_WG = Number(gemvSearch?.get('gemvTWG') ?? 256);
+  const GEMV_TILE_WG = Number(gemvSearch?.get('gemvTWG') ?? 128);
   const gemvTileConsts = { TN: GEMV_TILE_N, TWG: GEMV_TILE_WG };
   const matmulGgufTiledPipelines: Record<number, GPUComputePipeline> | null =
     config.sourceFormat === 'gguf' && gemvTileEnabled ? {
@@ -421,6 +424,21 @@ export function createForwardPassEngine(
       [GGML_TYPES.Q4_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q4_k_tiled', 'matmul-gguf-q4_k-tiled', gemvTileConsts),
       [GGML_TYPES.Q5_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_k_tiled', 'matmul-gguf-q5_k-tiled', gemvTileConsts),
       [GGML_TYPES.Q6_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q6_k_tiled', 'matmul-gguf-q6_k-tiled', gemvTileConsts),
+    } : null;
+  // Lever 4: no-stage decode GEMV — same tiled lane→unit mapping but direct
+  // vec4 A reads (no a_tile staging, no per-chunk barriers). Bit-identical
+  // accumulation to *_tiled; M=1 only. DEFAULT OFF (?gemvNS=1 to enable):
+  // on RDNA2 at 27B shapes it REGRESSED 7.51→7.31 tok/s (Q2_K +3%, Q3_K
+  // +7.5%, Q6_K +10% per-dispatch) — the LDS a_tile broadcast beats TN×
+  // per-lane global A re-reads; the two barriers/chunk were never the cost.
+  const gemvNsEnabled = gemvTileEnabled && gemvSearch?.get('gemvNS') === '1';
+  const matmulGgufNsPipelines: Record<number, GPUComputePipeline> | null =
+    config.sourceFormat === 'gguf' && gemvNsEnabled ? {
+      [GGML_TYPES.Q2_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q2_k_tiled_ns', 'matmul-gguf-q2_k-tiled-ns', gemvTileConsts),
+      [GGML_TYPES.Q3_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q3_k_tiled_ns', 'matmul-gguf-q3_k-tiled-ns', gemvTileConsts),
+      [GGML_TYPES.Q4_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q4_k_tiled_ns', 'matmul-gguf-q4_k-tiled-ns', gemvTileConsts),
+      [GGML_TYPES.Q5_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_k_tiled_ns', 'matmul-gguf-q5_k-tiled-ns', gemvTileConsts),
+      [GGML_TYPES.Q6_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q6_k_tiled_ns', 'matmul-gguf-q6_k-tiled-ns', gemvTileConsts),
     } : null;
   // Hadamard transform for QuIP#/QuaRot incoherence processing
   const hadamardPipeline = config.isQuantized
@@ -625,6 +643,9 @@ export function createForwardPassEngine(
   }
   for (const [t, p] of Object.entries(matmulGgufTiledPipelines ?? {})) {
     registerCat(p, `gguf_${ggmlTypeTraits(+t).name}_tiled`);
+  }
+  for (const [t, p] of Object.entries(matmulGgufNsPipelines ?? {})) {
+    registerCat(p, `gguf_${ggmlTypeTraits(+t).name}_ns`);
   }
 
   // ── Matmul-Q4 GEMV pipeline selection ──────────────────────────────
@@ -1059,7 +1080,10 @@ export function createForwardPassEngine(
     M: number, N: number, K: number, label: string,
     io?: MatmulIO,
   ) {
-    const tiled = matmulGgufTiledPipelines?.[gg.ggmlType] ?? null;
+    // Decode (M=1): prefer no-stage; prefill keeps the staged tiled kernel
+    // (no-stage at M>1 would multiply A traffic ×TN). Same grid math.
+    const ns = M === 1 ? matmulGgufNsPipelines?.[gg.ggmlType] ?? null : null;
+    const tiled = ns ?? matmulGgufTiledPipelines?.[gg.ggmlType] ?? null;
     const pipeline = tiled ?? matmulGgufPipelines?.[gg.ggmlType];
     if (!pipeline) throw new Error(`matmul_gguf "${label}": no pipeline for ggml type ${gg.ggmlType}`);
     const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);

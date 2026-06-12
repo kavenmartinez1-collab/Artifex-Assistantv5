@@ -62,6 +62,14 @@ var<workgroup> wg_partial: array<f32, WG_SIZE>;
 var<workgroup> a_tile: array<vec4<f32>, (TWG / TN) * 8u>;
 var<workgroup> row_acc: array<f32, TWG>;
 
+// ── No-stage decode GEMV (lever 4) ──────────────────────────────────────
+// A4 aliases binding 0 with a vec4 view. WGSL allows duplicate
+// (group,binding) declarations as long as no single entry point statically
+// references both — the *_tiled_ns entries use A4 only (A is only reached
+// via tile_stage, which they don't call), and a_tile is not allocated for
+// them (workgroup vars are materialized per entry point by static use).
+@group(0) @binding(0) var<storage, read> A4: array<vec4<f32>>;
+
 /** Byte `off` of the W buffer (off in bytes; W is u32-backed, little-endian). */
 fn wbyte(off: u32) -> u32 {
   return (W[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
@@ -910,6 +918,297 @@ fn matmul_gguf_q3_k_tiled(@builtin(local_invocation_id) lid: vec3u,
           f32((q >> 16u) & 0xFFu), f32(q >> 24u),
         ) - vec4<f32>(4.0);
         let a4 = a_tile[lane * 8u + w];
+        if (w < 4u) { dq0 = dq0 + dot(a4, qv); } else { dq1 = dq1 + dot(a4, qv); }
+      }
+      acc = acc + dl0 * dq0 + dl1 * dq1;
+    }
+  }
+  tile_reduce_store(tid, lane, n, m, acc);
+}
+
+// ── No-stage tiled GEMV variants (lever 4, decode/M=1 only) ─────────────
+// Same lane→unit ownership and identical per-unit math as the *_tiled
+// kernels, but each lane reads its activations directly from A via the A4
+// vec4 alias instead of staging chunks through a_tile — removing the two
+// workgroupBarriers per K-chunk (5-19 chunks/dispatch at 27B shapes). At
+// M=1 the A row is 14-75 KB and cache-resident, so the TN× re-read that
+// staging avoided is nearly free; at M>1 (prefill) keep the staged tiled
+// kernels. The unit stride u = lane, lane+TPR, ... visits exactly the
+// chunk sequence c*TPR+lane, so accumulation order is bit-identical to
+// *_tiled: a_tile[lane*8+w] == A4[(aRow + u*32)/4 + w] (units never cross
+// K; parity gate 3 in scripts/test-gemv-tiled.mts). Also folds in
+// bit-exact scale-load micro-fixes: Q2_K sc0/sc1 and Q6_K sc0/sc1 each
+// come from one word load instead of two wbyte() word re-reads.
+
+@compute @workgroup_size(TWG, 1, 1)
+fn matmul_gguf_q4_k_tiled_ns(@builtin(local_invocation_id) lid: vec3u,
+                             @builtin(workgroup_id) wid: vec3u) {
+  let tid = lid.x;
+  let TPR = TWG / TN;
+  let lane = tid % TPR;
+  let row = tid / TPR;
+  let n = (wid.x + wid.z * 65535u) * TN + row;
+  let m = wid.y;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 8u;
+  let aRow = m * K;
+
+  var acc: f32 = 0.0;
+  if (n < params.N) {
+    for (var u = lane; u < nUnits; u = u + TPR) {
+      let sb = u / 8u;
+      let sub = u % 8u;                       // scale/min index j
+      let sbBase = (n * nSB + sb) * 36u;      // words
+      let dm = unpack2x16float(W[sbBase]);    // (d, dmin)
+      let sm = scale_min_k4(sub, sbBase * 4u + 4u);
+      let d1 = dm.x * sm.x;
+      let min1 = dm.y * sm.y;
+      let qsWord = sbBase + 4u + (sub >> 1u) * 8u;
+      let hi = (sub & 1u) == 1u;
+      let a4Base = (aRow + u * 32u) / 4u;
+      var dq: f32 = 0.0;
+      var asum: f32 = 0.0;
+      for (var w = 0u; w < 8u; w = w + 1u) {
+        let word = W[qsWord + w];
+        let nib = select(word & 0x0F0F0F0Fu, (word >> 4u) & 0x0F0F0F0Fu, hi);
+        let q4 = vec4<f32>(
+          f32(nib & 0xFFu), f32((nib >> 8u) & 0xFFu),
+          f32((nib >> 16u) & 0xFFu), f32(nib >> 24u),
+        );
+        let a4 = A4[a4Base + w];
+        dq = dq + dot(a4, q4);
+        asum = asum + a4.x + a4.y + a4.z + a4.w;
+      }
+      acc = acc + (d1 * dq - min1 * asum);
+    }
+  }
+  tile_reduce_store(tid, lane, n, m, acc);
+}
+
+@compute @workgroup_size(TWG, 1, 1)
+fn matmul_gguf_q5_k_tiled_ns(@builtin(local_invocation_id) lid: vec3u,
+                             @builtin(workgroup_id) wid: vec3u) {
+  let tid = lid.x;
+  let TPR = TWG / TN;
+  let lane = tid % TPR;
+  let row = tid / TPR;
+  let n = (wid.x + wid.z * 65535u) * TN + row;
+  let m = wid.y;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 8u;
+  let aRow = m * K;
+
+  var acc: f32 = 0.0;
+  if (n < params.N) {
+    for (var u = lane; u < nUnits; u = u + TPR) {
+      let sb = u / 8u;
+      let sub = u % 8u;
+      let sbBase = (n * nSB + sb) * 44u;      // words
+      let dm = unpack2x16float(W[sbBase]);    // (d, dmin)
+      let sm = scale_min_k4(sub, sbBase * 4u + 4u);
+      let d1 = dm.x * sm.x;
+      let min1 = dm.y * sm.y;
+      let qsWord = sbBase + 12u + (sub >> 1u) * 8u;  // qs after 16B header + 32B qh
+      let qhWord = sbBase + 4u;                      // qh[32]
+      let hi = (sub & 1u) == 1u;
+      let a4Base = (aRow + u * 32u) / 4u;
+      var dq: f32 = 0.0;
+      var asum: f32 = 0.0;
+      for (var w = 0u; w < 8u; w = w + 1u) {
+        let word = W[qsWord + w];
+        let hw = W[qhWord + w];
+        let nib = select(word & 0x0F0F0F0Fu, (word >> 4u) & 0x0F0F0F0Fu, hi);
+        let q = nib | (((hw >> sub) & 0x01010101u) << 4u);   // 5-bit value 0..31
+        let q5 = vec4<f32>(
+          f32(q & 0xFFu), f32((q >> 8u) & 0xFFu),
+          f32((q >> 16u) & 0xFFu), f32(q >> 24u),
+        );
+        let a4 = A4[a4Base + w];
+        dq = dq + dot(a4, q5);
+        asum = asum + a4.x + a4.y + a4.z + a4.w;
+      }
+      acc = acc + (d1 * dq - min1 * asum);
+    }
+  }
+  tile_reduce_store(tid, lane, n, m, acc);
+}
+
+@compute @workgroup_size(TWG, 1, 1)
+fn matmul_gguf_q6_k_tiled_ns(@builtin(local_invocation_id) lid: vec3u,
+                             @builtin(workgroup_id) wid: vec3u) {
+  let tid = lid.x;
+  let TPR = TWG / TN;
+  let lane = tid % TPR;
+  let row = tid / TPR;
+  let n = (wid.x + wid.z * 65535u) * TN + row;
+  let m = wid.y;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 8u;
+  let aRow = m * K;
+
+  var acc: f32 = 0.0;
+  if (n < params.N) {
+    for (var u = lane; u < nUnits; u = u + TPR) {
+      let sb = u / 8u;
+      let sub = u % 8u;
+      let half = sub >> 2u;                   // 0 or 1 (which 128-elem half)
+      let s = sub & 3u;                       // q1..q4 group within the half
+      let sbBase = (n * nSB + sb) * 53u;      // words
+      let d = unpack2x16float(W[sbBase + 52u]).x;
+      // ql[l] for s∈{0,2}, ql[l+32] for s∈{1,3}; low nibble for s<2
+      let qlWord = sbBase + half * 16u + select(0u, 8u, (s & 1u) == 1u);
+      let qhWord = sbBase + 32u + half * 8u;
+      let hShift = 2u * s;
+      let lowNib = s < 2u;
+      let a4Base = (aRow + u * 32u) / 4u;
+      // Scale changes at l=16 (word 4): two separate sub-dots.
+      var dq0: f32 = 0.0;
+      var dq1: f32 = 0.0;
+      for (var w = 0u; w < 8u; w = w + 1u) {
+        let lw = W[qlWord + w];
+        let hw = W[qhWord + w];
+        let l4 = select((lw >> 4u) & 0x0F0F0F0Fu, lw & 0x0F0F0F0Fu, lowNib);
+        let q = l4 | (((hw >> hShift) & 0x03030303u) << 4u);
+        let qv = vec4<f32>(
+          f32(q & 0xFFu), f32((q >> 8u) & 0xFFu),
+          f32((q >> 16u) & 0xFFu), f32(q >> 24u),
+        ) - vec4<f32>(32.0);
+        let a4 = A4[a4Base + w];
+        if (w < 4u) { dq0 = dq0 + dot(a4, qv); } else { dq1 = dq1 + dot(a4, qv); }
+      }
+      // i8 scales sc0/sc1 sit in one word: bytes 2(s&1) and 2(s&1)+1 of
+      // word 48 + half*2 + s/2 (byte offset 192 + half*8 + 2s) — same
+      // bytes the tiled kernel fetches via two wbyte() word re-reads.
+      let scw = W[sbBase + 48u + half * 2u + (s >> 1u)];
+      let sc0 = i8_byte(scw, (s & 1u) * 2u);
+      let sc1 = i8_byte(scw, (s & 1u) * 2u + 1u);
+      acc = acc + d * (sc0 * dq0 + sc1 * dq1);
+    }
+  }
+  tile_reduce_store(tid, lane, n, m, acc);
+}
+
+@compute @workgroup_size(TWG, 1, 1)
+fn matmul_gguf_q2_k_tiled_ns(@builtin(local_invocation_id) lid: vec3u,
+                             @builtin(workgroup_id) wid: vec3u) {
+  let tid = lid.x;
+  let TPR = TWG / TN;
+  let lane = tid % TPR;
+  let row = tid / TPR;
+  let n = (wid.x + wid.z * 65535u) * TN + row;
+  let m = wid.y;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 8u;
+  let aRow = m * K;
+
+  var acc: f32 = 0.0;
+  if (n < params.N) {
+    for (var u = lane; u < nUnits; u = u + TPR) {
+      let sb = u / 8u;
+      let pair = u % 8u;
+      let sub0 = pair * 2u;                   // even; sub1 = sub0 + 1
+      let wordBase = (n * nSB + sb) * 21u;
+      let dm = unpack2x16float(W[wordBase + 20u]);   // d @80, dmin @82
+      // scales[sub0] and scales[sub0+1] share one word (sub0 is even).
+      let scw = W[wordBase + (sub0 >> 2u)];
+      let sc0 = (scw >> ((sub0 & 3u) * 8u)) & 0xFFu;
+      let sc1 = (scw >> ((sub0 & 3u) * 8u + 8u)) & 0xFFu;
+      let dl0 = dm.x * f32(sc0 & 0x0Fu);
+      let ml0 = dm.y * f32(sc0 >> 4u);
+      let dl1 = dm.x * f32(sc1 & 0x0Fu);
+      let ml1 = dm.y * f32(sc1 >> 4u);
+      let group = select(0u, 1u, sub0 >= 8u);
+      let shift = ((sub0 & 7u) >> 1u) * 2u;
+      let qWord = wordBase + 4u + group * 8u;  // qs @16 + group*32 bytes
+      let a4Base = (aRow + u * 32u) / 4u;
+      var dq0: f32 = 0.0;
+      var as0: f32 = 0.0;
+      var dq1: f32 = 0.0;
+      var as1: f32 = 0.0;
+      for (var w = 0u; w < 8u; w = w + 1u) {
+        let q = (W[qWord + w] >> shift) & 0x03030303u;
+        let q2 = vec4<f32>(
+          f32(q & 0xFFu), f32((q >> 8u) & 0xFFu),
+          f32((q >> 16u) & 0xFFu), f32(q >> 24u),
+        );
+        let a4 = A4[a4Base + w];
+        let asum = a4.x + a4.y + a4.z + a4.w;
+        if (w < 4u) { dq0 = dq0 + dot(a4, q2); as0 = as0 + asum; }
+        else        { dq1 = dq1 + dot(a4, q2); as1 = as1 + asum; }
+      }
+      acc = acc + (dl0 * dq0 - ml0 * as0) + (dl1 * dq1 - ml1 * as1);
+    }
+  }
+  tile_reduce_store(tid, lane, n, m, acc);
+}
+
+@compute @workgroup_size(TWG, 1, 1)
+fn matmul_gguf_q3_k_tiled_ns(@builtin(local_invocation_id) lid: vec3u,
+                             @builtin(workgroup_id) wid: vec3u) {
+  let tid = lid.x;
+  let TPR = TWG / TN;
+  let lane = tid % TPR;
+  let row = tid / TPR;
+  let n = (wid.x + wid.z * 65535u) * TN + row;
+  let m = wid.y;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 8u;
+  let aRow = m * K;
+  let KM1 = 0x03030303u;
+  let KM2 = 0x0f0f0f0fu;
+
+  var acc: f32 = 0.0;
+  if (n < params.N) {
+    for (var u = lane; u < nUnits; u = u + TPR) {
+      let sb = u / 8u;
+      let pair = u % 8u;
+      let sub0 = pair * 2u;                   // even; sub1 = sub0 + 1
+      let wordBase = (n * nSB + sb) * 28u;
+      let dAll = unpack2x16float(W[wordBase + 27u]).x;   // d @108
+
+      // 6-bit signed scales for sub0/sub1 — same auxWord (shared widx).
+      let s0 = W[wordBase + 24u];
+      let s1 = W[wordBase + 25u];
+      let tmp = W[wordBase + 26u];
+      var auxWord: u32;
+      let widx = sub0 >> 2u;
+      if (widx == 0u) {
+        auxWord = (s0 & KM2) | (((tmp >> 0u) & KM1) << 4u);
+      } else if (widx == 1u) {
+        auxWord = (s1 & KM2) | (((tmp >> 2u) & KM1) << 4u);
+      } else if (widx == 2u) {
+        auxWord = ((s0 >> 4u) & KM2) | (((tmp >> 4u) & KM1) << 4u);
+      } else {
+        auxWord = ((s1 >> 4u) & KM2) | (((tmp >> 6u) & KM1) << 4u);
+      }
+      let scB0 = (auxWord >> ((sub0 & 3u) * 8u)) & 0xFFu;
+      let scB1 = (auxWord >> (((sub0 & 3u) + 1u) * 8u)) & 0xFFu;
+      let dl0 = dAll * f32(i32(scB0) - 32);
+      let dl1 = dAll * f32(i32(scB1) - 32);
+
+      let group = select(0u, 1u, sub0 >= 8u);
+      let j = (sub0 & 7u) >> 1u;
+      let shift = j * 2u;
+      let hbitpos = group * 4u + j;           // ≤ 7: stays inside each byte
+      let qWord = wordBase + 8u + group * 8u; // qs @32 + group*32 bytes
+      let hWord = wordBase;                   // hmask @0
+      let a4Base = (aRow + u * 32u) / 4u;
+      var dq0: f32 = 0.0;
+      var dq1: f32 = 0.0;
+      for (var w = 0u; w < 8u; w = w + 1u) {
+        let q3 = (W[qWord + w] >> shift) & 0x03030303u;
+        let hb = (W[hWord + w] >> hbitpos) & 0x01010101u;
+        let q = q3 + (hb << 2u);              // 0..7 per byte, no carry
+        let qv = vec4<f32>(
+          f32(q & 0xFFu), f32((q >> 8u) & 0xFFu),
+          f32((q >> 16u) & 0xFFu), f32(q >> 24u),
+        ) - vec4<f32>(4.0);
+        let a4 = A4[a4Base + w];
         if (w < 4u) { dq0 = dq0 + dot(a4, qv); } else { dq1 = dq1 + dot(a4, qv); }
       }
       acc = acc + dl0 * dq0 + dl1 * dq1;
