@@ -802,6 +802,55 @@ export function createForwardPassEngine(
     return buf;
   }
 
+  // ── Bind group cache ───────────────────────────────────────────────
+  // Bind groups are immutable, and at M=1 decode the same (pipeline, buffers)
+  // tuples recur every token — re-creating ~950 bind groups per token via
+  // device.createBindGroup is pure encoding overhead. Cache by pipeline +
+  // group index + buffer identities (+ offset/size). Uniform params buffers
+  // are content-cached above, so their identity is stable per dispatch site.
+  // Buffer contents may change (writeBuffer/copies); that never invalidates a
+  // bind group — only buffer *identity* matters. A/B toggle: ?bgCache=0.
+  const bgCacheEnabled = typeof window === 'undefined'
+    || new URLSearchParams(window.location.search).get('bgCache') !== '0';
+  const bindGroupCache = new Map<string, GPUBindGroup>();
+  const bgKeyIds = new WeakMap<object, number>();
+  let bgNextKeyId = 1;
+  function bgKeyId(o: object): number {
+    let id = bgKeyIds.get(o);
+    if (id === undefined) {
+      id = bgNextKeyId++;
+      bgKeyIds.set(o, id);
+    }
+    return id;
+  }
+  function cachedBindGroup(
+    pipeline: GPUComputePipeline,
+    groupIndex: number,
+    entries: Array<{ binding: number; resource: GPUBindingResource }>,
+    label = '',
+  ): GPUBindGroup {
+    if (bgCacheEnabled) {
+      let key = `${bgKeyId(pipeline)}|${groupIndex}`;
+      let cacheable = true;
+      for (const e of entries) {
+        const r = e.resource as Partial<GPUBufferBinding>;
+        if (!r.buffer) { cacheable = false; break; } // non-buffer resource
+        key += `|${e.binding}:${bgKeyId(r.buffer)}:${r.offset ?? 0}:${r.size ?? 'w'}`;
+      }
+      if (cacheable) {
+        let bg = bindGroupCache.get(key);
+        if (!bg) {
+          __perfBindGroupCount++;
+          bg = createBindGroup(device, pipeline, groupIndex, entries, label);
+          bindGroupCache.set(key, bg);
+        }
+        return bg;
+      }
+    }
+    __perfBindGroupCount++;
+    return createBindGroup(device, pipeline, groupIndex, entries, label);
+  }
+
   /** C[M,N] = A[M,K] @ dequant(q4_packed, scales, zeros)^T — GPTQ INT4 */
   function dispatchMatmulQ4(
     aBuf: GPUBuffer,
@@ -847,7 +896,7 @@ export function createForwardPassEngine(
       }
     }
     const pipeline = useGemv && gemvPipeline ? gemvPipeline : matmulQ4Pipeline;
-    const bg = createBindGroup(device, pipeline, 0, [
+    const bg = cachedBindGroup(pipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
       { binding: 1, resource: { buffer: q4.qweight } },
       { binding: 2, resource: { buffer: cBuf } },
@@ -880,7 +929,7 @@ export function createForwardPassEngine(
     }
     const params = getCachedUniform(
       new Uint32Array([M, N, K, config.quantGroupSize]), `${label}-p`);
-    const bg = createBindGroup(device, matmulE8Pipeline, 0, [
+    const bg = cachedBindGroup(matmulE8Pipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
       { binding: 1, resource: { buffer: e8.indices } },
       { binding: 2, resource: { buffer: cBuf } },
@@ -914,7 +963,7 @@ export function createForwardPassEngine(
     }
     const params = getCachedUniform(
       new Uint32Array([M, N, K, config.quantGroupSize]), `${label}-p`);
-    const bg = createBindGroup(device, matmulQ8Pipeline, 0, [
+    const bg = cachedBindGroup(matmulQ8Pipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
       { binding: 1, resource: { buffer: q8.qweight } },
       { binding: 2, resource: { buffer: cBuf } },
@@ -935,7 +984,7 @@ export function createForwardPassEngine(
     const pipeline = matmulGgufPipelines?.[gg.ggmlType];
     if (!pipeline) throw new Error(`matmul_gguf "${label}": no pipeline for ggml type ${gg.ggmlType}`);
     const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);
-    const bg = createBindGroup(device, pipeline, 0, [
+    const bg = cachedBindGroup(pipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
       { binding: 1, resource: { buffer: gg.data } },
       { binding: 2, resource: { buffer: cBuf } },
@@ -957,7 +1006,7 @@ export function createForwardPassEngine(
   ) {
     const Khalf = Math.ceil(K / 2);
     const dqParams = getCachedUniform(new Uint32Array([N, K, config.quantGroupSize, 0]), `${label}-dq-p`);
-    const dqBG = createBindGroup(device, dequantQ4Pipeline!, 0, [
+    const dqBG = cachedBindGroup(dequantQ4Pipeline!, 0, [
       { binding: 0, resource: { buffer: q4.qweight } },
       { binding: 1, resource: { buffer: q4.scales } },
       { binding: 2, resource: { buffer: q4.qzeros } },
@@ -1164,7 +1213,7 @@ export function createForwardPassEngine(
     M: number, N: number, K: number, label: string,
   ) {
     const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);
-    const bg = createBindGroup(device, matmulPipeline, 0, [
+    const bg = cachedBindGroup(matmulPipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
       { binding: 1, resource: { buffer: bBuf } },
       { binding: 2, resource: { buffer: cBuf } },
@@ -1179,7 +1228,7 @@ export function createForwardPassEngine(
     M: number, N: number, K: number, label: string,
   ) {
     const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);
-    const bg = createBindGroup(device, matmulBTPipeline, 0, [
+    const bg = cachedBindGroup(matmulBTPipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
       { binding: 1, resource: { buffer: bBuf } },
       { binding: 2, resource: { buffer: cBuf } },
@@ -1194,7 +1243,7 @@ export function createForwardPassEngine(
     M: number, N: number, K: number, label: string,
   ) {
     const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);
-    const bg = createBindGroup(device, matmulBTBF16Pipeline, 0, [
+    const bg = cachedBindGroup(matmulBTBF16Pipeline, 0, [
       { binding: 0, resource: { buffer: aBuf } },
       { binding: 2, resource: { buffer: cBuf } },
       { binding: 3, resource: { buffer: params } },
@@ -1218,7 +1267,7 @@ export function createForwardPassEngine(
     if (!hadamardPipeline) return;
     const params = getCachedUniform(
       new Uint32Array([cols, rows, signSeed]), `${label}-p`);
-    const bg = createBindGroup(device, hadamardPipeline, 0, [
+    const bg = cachedBindGroup(hadamardPipeline, 0, [
       { binding: 0, resource: { buffer: inputBuf } },
       { binding: 1, resource: { buffer: outputBuf } },
       { binding: 2, resource: { buffer: params } },
@@ -1237,7 +1286,7 @@ export function createForwardPassEngine(
     new Uint32Array(paramData, 8, 1)[0] = useResidualWeight;
     new Uint32Array(paramData, 12, 1)[0] = skipWeight ? 1 : 0;
     const paramBuf = getCachedUniform(new Uint8Array(paramData), `${label}-p`);
-    const bg = createBindGroup(device, rmsnormPipeline, 0, [
+    const bg = cachedBindGroup(rmsnormPipeline, 0, [
       { binding: 0, resource: { buffer: inputBuf } },
       { binding: 1, resource: { buffer: outputBuf } },
       { binding: 2, resource: { buffer: weightBuf } },
@@ -1264,7 +1313,7 @@ export function createForwardPassEngine(
       { binding: 2, resource: { buffer: params } },
     ];
     if (secondBuf) entries.push({ binding: 3, resource: { buffer: secondBuf } });
-    const bg = createBindGroup(device, pipeline, 0, entries, label);
+    const bg = cachedBindGroup(pipeline, 0, entries, label);
     bd(pipeline, [bg], [workgroupCount(size, 256)], label);
   }
 
@@ -1290,7 +1339,7 @@ export function createForwardPassEngine(
     u32View[6] = rp;
     const paramBuf = getCachedUniform(new Uint8Array(paramData), `${label}-p`);
 
-    const bg = createBindGroup(device, ropePipeline, 0, [
+    const bg = cachedBindGroup(ropePipeline, 0, [
       { binding: 0, resource: { buffer: qkBuf } },
       { binding: 1, resource: { buffer: paramBuf } },
     ], label);
@@ -1334,7 +1383,7 @@ export function createForwardPassEngine(
 
     const useSoftpick = (globalThis as any).__USE_SOFTPICK__ === true;
     const pipe = useSoftpick ? attentionPipelineSoftpick : attentionPipeline;
-    const bg = createBindGroup(device, pipe, 0, [
+    const bg = cachedBindGroup(pipe, 0, [
       { binding: 0, resource: { buffer: qBuf } },
       { binding: 1, resource: { buffer: kCacheBuf } },
       { binding: 2, resource: { buffer: vCacheBuf } },
@@ -1378,7 +1427,7 @@ export function createForwardPassEngine(
 
     const useSoftpick = (globalThis as any).__USE_SOFTPICK__ === true;
     const pipe = useSoftpick ? attentionTqPipelineSoftpick : attentionTqPipeline;
-    const bg0 = createBindGroup(device, pipe, 0, [
+    const bg0 = cachedBindGroup(pipe, 0, [
       { binding: 0, resource: { buffer: qBuf } },
       { binding: 1, resource: { buffer: kCacheBuf } },
       { binding: 2, resource: { buffer: vCacheBuf } },
@@ -1386,7 +1435,7 @@ export function createForwardPassEngine(
       { binding: 4, resource: { buffer: paramBuf } },
     ], `${label}-g0`);
 
-    const bg1 = createBindGroup(device, pipe, 1, [
+    const bg1 = cachedBindGroup(pipe, 1, [
       { binding: 0, resource: { buffer: signBitsK } },
       { binding: 1, resource: { buffer: normsK } },
       { binding: 2, resource: { buffer: residualNormsK } },
@@ -1417,14 +1466,14 @@ export function createForwardPassEngine(
       new Uint32Array([dHead, TQ_BITS, tqCodebook.centroids.length,
         tqCodebook.thresholds.length, outVecOffset]),
       `${label}-p`);
-    const bg0 = createBindGroup(device, tqEncodePipeline, 0, [
+    const bg0 = cachedBindGroup(tqEncodePipeline, 0, [
       { binding: 0, resource: { buffer: inputBuf } },
       { binding: 1, resource: { buffer: outQuantBuf } },
       { binding: 2, resource: { buffer: outSignBuf } },
       { binding: 3, resource: { buffer: outNormsBuf } },
       { binding: 4, resource: { buffer: outResidualNormsBuf } },
     ], `${label}-g0`);
-    const bg2 = createBindGroup(device, tqEncodePipeline, 2, [
+    const bg2 = cachedBindGroup(tqEncodePipeline, 2, [
       { binding: 0, resource: { buffer: params } },
     ], `${label}-g2`);
     bd(tqEncodePipeline, [bg0, tqEncodeMatBG, bg2], [numVecs], label);
@@ -1438,13 +1487,13 @@ export function createForwardPassEngine(
       new Uint32Array([dHead, TQ_BITS, tqCodebook.centroids.length,
         tqCodebook.thresholds.length]),
       `${label}-p`);
-    const bg0 = createBindGroup(device, tqDecodePipeline, 0, [
+    const bg0 = cachedBindGroup(tqDecodePipeline, 0, [
       { binding: 0, resource: { buffer: inQuantBuf } },
       { binding: 1, resource: { buffer: inSignBuf } },
       { binding: 2, resource: { buffer: outputBuf } },
       { binding: 3, resource: { buffer: inNormsBuf } },
     ], `${label}-g0`);
-    const bg2 = createBindGroup(device, tqDecodePipeline, 2, [
+    const bg2 = cachedBindGroup(tqDecodePipeline, 2, [
       { binding: 0, resource: { buffer: params } },
     ], `${label}-g2`);
     bd(tqDecodePipeline, [bg0, tqDecodeMatBG, bg2], [numVecs], label);
@@ -1511,6 +1560,7 @@ export function createForwardPassEngine(
     const __perfT0 = performance.now();
     const __perfDispStart = __perfDispatchCount;
     const __perfCopyStart = __perfCopyCount;
+    const __perfBGStart = __perfBindGroupCount;
     __perfMoESyncMs = 0;
     __perfMoEExpertMs = 0;
 
@@ -1596,7 +1646,7 @@ export function createForwardPassEngine(
       const split = weights.global.embedSplit;
       const embedParams = getCachedUniform(
         new Uint32Array([H, seqLen, split.splitPoints[0], 0]), 'embed-split-p');
-      const embedBG = createBindGroup(device, embedF16SplitPipeline, 0, [
+      const embedBG = cachedBindGroup(embedF16SplitPipeline, 0, [
         { binding: 0, resource: { buffer: tokenIdBuf } },
         { binding: 1, resource: { buffer: hiddenBuf } },
         { binding: 2, resource: { buffer: split.buffers[0] } },
@@ -1610,7 +1660,7 @@ export function createForwardPassEngine(
       const eq4 = weights.global.embedQ4;
       const embedParams = getCachedUniform(
         new Uint32Array([H, seqLen, config.quantGroupSize || 128, V]), 'embed-q4-p');
-      const embedBG = createBindGroup(device, embedQ4Pipeline, 0, [
+      const embedBG = cachedBindGroup(embedQ4Pipeline, 0, [
         { binding: 0, resource: { buffer: tokenIdBuf } },
         { binding: 1, resource: { buffer: hiddenBuf } },
         { binding: 2, resource: { buffer: eq4.qweight } },
@@ -1624,7 +1674,7 @@ export function createForwardPassEngine(
       const useF16Embed = weights.global.embedIsF16 === true;
       const embedPipe = useF16Embed ? embedF16Pipeline : embedPipeline;
       const embedParams = getCachedUniform(new Uint32Array([H, seqLen]), 'embed-p');
-      const embedBG = createBindGroup(device, embedPipe, 0, [
+      const embedBG = cachedBindGroup(embedPipe, 0, [
         { binding: 0, resource: { buffer: tokenIdBuf } },
         { binding: 1, resource: { buffer: hiddenBuf } },
         { binding: 2, resource: { buffer: weights.global.embedTokens } },
@@ -1799,7 +1849,7 @@ export function createForwardPassEngine(
         if (conv1dPipeline && conv1dUpdatePipeline) {
           const convParams = getCachedUniform(
             new Uint32Array([linQKVDim, linConvK]), `L${l}-conv-p`);
-          const convBG = createBindGroup(device, conv1dPipeline, 0, [
+          const convBG = cachedBindGroup(conv1dPipeline, 0, [
             { binding: 0, resource: { buffer: linQKVBuf! } },
             { binding: 1, resource: { buffer: csBuf } },
             { binding: 2, resource: { buffer: lw.linearConv1dWeight! } },
@@ -1810,7 +1860,7 @@ export function createForwardPassEngine(
             [workgroupCount(linQKVDim, 256)], `L${l}-conv1d`);
 
           // Update conv state (shift + append raw QKV)
-          const updateBG = createBindGroup(device, conv1dUpdatePipeline, 0, [
+          const updateBG = cachedBindGroup(conv1dUpdatePipeline, 0, [
             { binding: 0, resource: { buffer: linQKVBuf! } },
             { binding: 1, resource: { buffer: csBuf } },
             { binding: 4, resource: { buffer: convParams } },
@@ -1885,7 +1935,7 @@ export function createForwardPassEngine(
           const kDim = linNKH * linKD;
 
           const l2pQ = getCachedUniform(new Uint32Array([qDim, linKD]), `L${l}-l2q-p`);
-          const l2bgQ = createBindGroup(device, l2NormPipeline, 0, [
+          const l2bgQ = cachedBindGroup(l2NormPipeline, 0, [
             { binding: 0, resource: { buffer: linQBuf! } },
             { binding: 1, resource: { buffer: linConvOutBuf! } },
             { binding: 2, resource: { buffer: l2pQ } },
@@ -1894,7 +1944,7 @@ export function createForwardPassEngine(
           batchCopy(linConvOutBuf!, 0, linQBuf!, 0, qDim * 4);
 
           const l2pK = getCachedUniform(new Uint32Array([kDim, linKD]), `L${l}-l2k-p`);
-          const l2bgK = createBindGroup(device, l2NormPipeline, 0, [
+          const l2bgK = cachedBindGroup(l2NormPipeline, 0, [
             { binding: 0, resource: { buffer: linKBuf! } },
             { binding: 1, resource: { buffer: linConvOutBuf! } },
             { binding: 2, resource: { buffer: l2pK } },
@@ -1957,18 +2007,18 @@ export function createForwardPassEngine(
           const ssmLayoutTiled = config.sourceFormat === 'gguf' ? 1 : 0;
           const ssmParams = getCachedUniform(
             new Uint32Array([linNKH, linNVH, linKD, linGroupedVD, ssmLayoutTiled, 0, 0, 0]), `L${l}-ssm-p`);
-          const ssmBG0 = createBindGroup(device, ssmStepPipeline, 0, [
+          const ssmBG0 = cachedBindGroup(ssmStepPipeline, 0, [
             { binding: 0, resource: { buffer: linQBuf! } },
             { binding: 1, resource: { buffer: linKBuf! } }, // K after conv1d + silu + L2 norm
             { binding: 2, resource: { buffer: linVBuf! } },
             { binding: 3, resource: { buffer: linBBuf! } },       // beta (after sigmoid)
             { binding: 4, resource: { buffer: linDecayBuf! } },   // decay = exp(-exp(A_log)*dt)
           ], `L${l}-ssm-g0`);
-          const ssmBG1 = createBindGroup(device, ssmStepPipeline, 1, [
+          const ssmBG1 = cachedBindGroup(ssmStepPipeline, 1, [
             { binding: 0, resource: { buffer: hBuf } },
             { binding: 1, resource: { buffer: linOutBuf! } },
           ], `L${l}-ssm-g1`);
-          const ssmBG2 = createBindGroup(device, ssmStepPipeline, 2, [
+          const ssmBG2 = cachedBindGroup(ssmStepPipeline, 2, [
             { binding: 0, resource: { buffer: ssmParams } },
           ], `L${l}-ssm-g2`);
           bd(ssmStepPipeline, [ssmBG0, ssmBG1, ssmBG2],
@@ -2083,7 +2133,7 @@ export function createForwardPassEngine(
           // would clobber tokens already written at offsets 0..(ssmT-1)*H by prior
           // iterations of the per-token loop. The final value of ssmOutBuf is
           // copied into attnProjBuf at the correct per-token offset below.
-          const gnBG = createBindGroup(device, rmsnormPipeline, 0, [
+          const gnBG = cachedBindGroup(rmsnormPipeline, 0, [
             { binding: 0, resource: { buffer: linOutBuf! } },
             { binding: 1, resource: { buffer: ssmOutBuf! } },
             { binding: 2, resource: { buffer: lw.linearNormWeight } },
@@ -2712,7 +2762,7 @@ export function createForwardPassEngine(
       const align = device.limits.minStorageBufferOffsetAlignment || 256;
 
       const params0 = getCachedUniform(new Uint32Array([1, V_lo, H, 0]), 'lm-head-s0-p');
-      const bg0 = createBindGroup(device, matmulBTBF16Pipeline, 0, [
+      const bg0 = cachedBindGroup(matmulBTBF16Pipeline, 0, [
         { binding: 0, resource: { buffer: lmInputBuf } },
         { binding: 2, resource: { buffer: logitsBuf, offset: 0, size: V_lo * 4 } },
         { binding: 3, resource: { buffer: params0 } },
@@ -2725,7 +2775,7 @@ export function createForwardPassEngine(
         console.error(`[LM-HEAD] Split offset ${offsetBytes} not aligned to ${align} — output will be corrupted!`);
       }
       const params1 = getCachedUniform(new Uint32Array([1, V_hi, H, 0]), 'lm-head-s1-p');
-      const bg1 = createBindGroup(device, matmulBTBF16Pipeline, 0, [
+      const bg1 = cachedBindGroup(matmulBTBF16Pipeline, 0, [
         { binding: 0, resource: { buffer: lmInputBuf } },
         { binding: 2, resource: { buffer: logitsBuf, offset: offsetBytes, size: V_hi * 4 } },
         { binding: 3, resource: { buffer: params1 } },
@@ -2740,7 +2790,7 @@ export function createForwardPassEngine(
       dispatchMatmulQ4(lmInputBuf, weights.global.lmHeadQ4!, logitsBuf, 1, V, H, 'lm-head');
     } else if (weights.global.lmHeadIsBF16) {
       const params = getCachedUniform(new Uint32Array([1, V, H, 0]), 'lm-head-p');
-      const bg = createBindGroup(device, matmulBTBF16Pipeline, 0, [
+      const bg = cachedBindGroup(matmulBTBF16Pipeline, 0, [
         { binding: 0, resource: { buffer: lmInputBuf } },
         { binding: 2, resource: { buffer: logitsBuf } },
         { binding: 3, resource: { buffer: params } },
@@ -2881,9 +2931,11 @@ export function createForwardPassEngine(
     const __perfT1 = performance.now();
     const __perfDisp = __perfDispatchCount - __perfDispStart;
     const __perfCopy = __perfCopyCount - __perfCopyStart;
+    const __perfBG = __perfBindGroupCount - __perfBGStart;
     const __perfMs = __perfT1 - __perfT0;
     (globalThis as any).__perfLastForward = {
       seqLen, cpuMs: __perfMs, dispatches: __perfDisp, copies: __perfCopy,
+      bgCreates: __perfBG,
       moeSyncMs: __perfMoESyncMs, moeExpertMs: __perfMoEExpertMs,
     };
     // Auto-log for the first 5 forward calls so the user sees the breakdown
@@ -2893,7 +2945,7 @@ export function createForwardPassEngine(
       console.log(
         `[perf forward #${debugCallCount} seqLen=${seqLen} pos=${pos}] `
         + `cpu=${__perfMs.toFixed(1)}ms `
-        + `dispatches=${__perfDisp} copies=${__perfCopy} `
+        + `dispatches=${__perfDisp} copies=${__perfCopy} bg_creates=${__perfBG} `
         + `(per-token: ${(__perfMs / seqLen).toFixed(1)}ms, `
         + `${(__perfDisp / seqLen).toFixed(0)} dispatches)`
         + (__perfMoESyncMs + __perfMoEExpertMs > 0

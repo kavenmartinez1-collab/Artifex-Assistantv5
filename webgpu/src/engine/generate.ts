@@ -841,8 +841,10 @@ export function generate(
       const __readbackMs = __tReadback - __tGpuDone;
       const __sampleMs = __tSample - __tReadback;
       const __lastFwd = (globalThis as any).__perfLastForward as
-        | { dispatches: number; copies: number; cpuMs: number; moeSyncMs?: number; moeExpertMs?: number } | undefined;
+        | { dispatches: number; copies: number; cpuMs: number; bgCreates?: number;
+            moeSyncMs?: number; moeExpertMs?: number } | undefined;
       const __dispatchCount = __lastFwd ? __lastFwd.dispatches : -1;
+      const __bgCreates = __lastFwd?.bgCreates ?? -1;
       const __moeSyncMs = __lastFwd?.moeSyncMs ?? 0;
       const __moeExpertMs = __lastFwd?.moeExpertMs ?? 0;
       __perfFwdCpuSum += __fwdCpuMs;
@@ -861,7 +863,7 @@ export function generate(
           + `readback=${__readbackMs.toFixed(1)}ms `
           + `sample=${__sampleMs.toFixed(1)}ms `
           + `total=${__total.toFixed(1)}ms `
-          + `dispatches=${__dispatchCount}`
+          + `dispatches=${__dispatchCount} bg_creates=${__bgCreates}`
           + (__moeSyncMs + __moeExpertMs > 0
             ? ` | moe_sync=${__moeSyncMs.toFixed(1)}ms moe_experts=${__moeExpertMs.toFixed(1)}ms (inside fwd_cpu)`
             : '')

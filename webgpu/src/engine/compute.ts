@@ -126,21 +126,42 @@ export async function dispatchAndWait(
   return elapsed;
 }
 
+// Pass fusion: keep ONE compute pass open across consecutive dispatches
+// instead of begin/end per dispatch (~950 open/close pairs per decode token).
+// WebGPU inserts implicit barriers between dispatches within a single pass
+// (each dispatch is its own usage scope), so ordering and memory visibility
+// are identical to per-dispatch passes — this only removes encoding overhead.
+// A/B toggle: ?fusePass=0 restores the old per-dispatch passes.
+const passFusionEnabled = typeof window === 'undefined'
+  || new URLSearchParams(window.location.search).get('fusePass') !== '0';
+
 /**
  * Batched dispatcher — collects multiple compute dispatches into a single
  * command encoder and submits them all at once via flush().
  *
  * For a 32-layer model this reduces ~480 separate queue.submit() calls
- * down to 1, eliminating per-submit driver overhead.
+ * down to 1, eliminating per-submit driver overhead. With pass fusion the
+ * dispatches also share one compute pass (setPipeline only on change).
  */
 export class BatchedDispatcher {
   private encoder: GPUCommandEncoder;
   private device: GPUDevice;
   private count = 0;
+  private pass: GPUComputePassEncoder | null = null;
+  private lastPipeline: GPUComputePipeline | null = null;
 
   constructor(device: GPUDevice, label?: string) {
     this.device = device;
     this.encoder = device.createCommandEncoder({ label: label ?? 'batched-encoder' });
+  }
+
+  /** End the open fused pass (before copies, query resolves, or finish). */
+  private endPass(): void {
+    if (this.pass) {
+      this.pass.end();
+      this.pass = null;
+      this.lastPipeline = null;
+    }
   }
 
   /** Add a compute dispatch to the batch (no GPU submission yet). */
@@ -151,21 +172,44 @@ export class BatchedDispatcher {
     label?: string,
     timestampWrites?: GPUComputePassTimestampWrites,
   ): void {
-    const passLabel = label ? `${label}-pass` : `batch-pass-${this.count}`;
-    const passDesc: GPUComputePassDescriptor = { label: passLabel };
-    if (timestampWrites) passDesc.timestampWrites = timestampWrites;
-    const pass = this.encoder.beginComputePass(passDesc);
-
-    pass.setPipeline(pipeline);
-    for (let i = 0; i < bindGroups.length; i++) {
-      pass.setBindGroup(i, bindGroups[i]);
+    // Timestamped dispatches need their own pass (timestampWrites are a
+    // pass-level property); same for the ?fusePass=0 A/B fallback.
+    if (timestampWrites || !passFusionEnabled) {
+      this.endPass();
+      const passLabel = label ? `${label}-pass` : `batch-pass-${this.count}`;
+      const passDesc: GPUComputePassDescriptor = { label: passLabel };
+      if (timestampWrites) passDesc.timestampWrites = timestampWrites;
+      const pass = this.encoder.beginComputePass(passDesc);
+      pass.setPipeline(pipeline);
+      for (let i = 0; i < bindGroups.length; i++) {
+        pass.setBindGroup(i, bindGroups[i]);
+      }
+      pass.dispatchWorkgroups(
+        workgroupCounts[0],
+        workgroupCounts[1] ?? 1,
+        workgroupCounts[2] ?? 1,
+      );
+      pass.end();
+      this.count++;
+      return;
     }
-    pass.dispatchWorkgroups(
+
+    if (!this.pass) {
+      this.pass = this.encoder.beginComputePass({ label: 'batch-fused-pass' });
+      this.lastPipeline = null;
+    }
+    if (this.lastPipeline !== pipeline) {
+      this.pass.setPipeline(pipeline);
+      this.lastPipeline = pipeline;
+    }
+    for (let i = 0; i < bindGroups.length; i++) {
+      this.pass.setBindGroup(i, bindGroups[i]);
+    }
+    this.pass.dispatchWorkgroups(
       workgroupCounts[0],
       workgroupCounts[1] ?? 1,
       workgroupCounts[2] ?? 1,
     );
-    pass.end();
     this.count++;
   }
 
@@ -177,6 +221,7 @@ export class BatchedDispatcher {
     destination: GPUBuffer,
     destinationOffset: number,
   ): void {
+    this.endPass();
     this.encoder.resolveQuerySet(querySet, firstQuery, queryCount, destination, destinationOffset);
   }
 
@@ -186,18 +231,22 @@ export class BatchedDispatcher {
     dst: GPUBuffer, dstOffset: number,
     size: number,
   ): void {
+    this.endPass();
     this.encoder.copyBufferToBuffer(src, srcOffset, dst, dstOffset, size);
     this.count++;
   }
 
   /** Submit all batched dispatches to the GPU in a single queue.submit(). */
   flush(): void {
+    this.endPass();
     if (this.count === 0) return;
     this.device.queue.submit([this.encoder.finish()]);
   }
 
   /** Reset the encoder for reuse after a flush (e.g. after debug reads). */
   reset(label?: string): void {
+    this.pass = null;
+    this.lastPipeline = null;
     this.encoder = this.device.createCommandEncoder({ label: label ?? 'batched-encoder' });
     this.count = 0;
   }
