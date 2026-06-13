@@ -506,6 +506,20 @@ export function createForwardPassEngine(
   const matmulGgufR2Pipeline = gemvR2Enabled
     ? createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q2_k_tiled_r2', 'matmul-gguf-q2_k-tiled-r2', gemvTileConsts)
     : null;
+  // Phase C4: M-reuse GEMM for repacked Q2_K. The verify forward runs M rows
+  // (spec-decode draft+pending) through the same weights; the GEMV path put M
+  // in grid.y so each row re-decoded every weight (V≈K — a K-row verify cost
+  // ~K single forwards). This kernel stages M activation rows in LDS and
+  // decodes each 2-bit unit ONCE, reusing it across all M outputs. Bit-exact
+  // with _r at M=1 (same accumulation order). DEFAULT OFF — A/B: ?gemmM=1.
+  // The kernel's MAXM (per-thread acc/partial array size) is a WGSL const = 8
+  // (override-sized arrays are illegal in function-local space); it matches
+  // the spec-decode cap. Must stay in sync with `const MAXM` in matmul_gguf.wgsl.
+  const GEMM_MAX_M = 8;
+  const gemmMEnabled = gemvREnabled && gemvSearch?.get('gemmM') === '1';
+  const matmulGgufRGemmPipeline = gemmMEnabled
+    ? createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q2_k_tiled_r_gemm', 'matmul-gguf-q2_k-tiled-r-gemm', gemvTileConsts)
+    : null;
   if (gemvREnabled) {
     const repackPipeline = createComputePipeline(device, repackQ2kWGSL, 'repack_q2k', 'repack-q2k');
     const Q2K_REPACK_SLOTS = [
@@ -838,6 +852,7 @@ export function createForwardPassEngine(
   }
   registerCat(matmulGgufRPipeline, 'gguf_Q2_K_r');
   registerCat(matmulGgufR2Pipeline, 'gguf_Q2_K_r2');
+  registerCat(matmulGgufRGemmPipeline, 'gguf_Q2_K_r_gemm');
 
   // ── Matmul-Q4 GEMV pipeline selection ──────────────────────────────
   // Cached-scales variants are parameterized by (MAX_GROUPS, WG_SIZE). The
@@ -1281,9 +1296,15 @@ export function createForwardPassEngine(
     const fast = M === 1 && !gg.repacked
       ? matmulGgufV4Pipelines?.[gg.ggmlType] ?? matmulGgufNsPipelines?.[gg.ggmlType] ?? null
       : null;
-    const tiled = gg.repacked
+    // Phase C4: repacked Q2_K with M>1 (verify forward) uses the M-reuse GEMM
+    // kernel — decodes weights once and reuses across all M rows (grid.y=1).
+    // Capped at the kernel's MAXM (8, a WGSL const): the spec-decode verify is
+    // M≤specK+1≤8, but prefill chunks are larger (seqLen up to 16), so prefill
+    // falls back to the _r GEMV path (grid.y=M) to avoid OOB acc indexing.
+    const gemm = gg.repacked && M > 1 && M <= GEMM_MAX_M && matmulGgufRGemmPipeline ? matmulGgufRGemmPipeline : null;
+    const tiled = gemm ?? (gg.repacked
       ? (matmulGgufR2Pipeline ?? matmulGgufRPipeline)
-      : fast ?? matmulGgufTiledPipelines?.[gg.ggmlType] ?? null;
+      : fast ?? matmulGgufTiledPipelines?.[gg.ggmlType] ?? null);
     const pipeline = tiled ?? matmulGgufPipelines?.[gg.ggmlType];
     if (!pipeline) throw new Error(`matmul_gguf "${label}": no pipeline for ggml type ${gg.ggmlType}`);
     const params = getCachedUniform(new Uint32Array([M, N, K, 0]), `${label}-p`);
@@ -1293,7 +1314,11 @@ export function createForwardPassEngine(
       { binding: 2, resource: ioRes(cBuf, io?.cOffset) },
       { binding: 3, resource: { buffer: params } },
     ], label);
-    if (tiled) {
+    if (gemm) {
+      // GEMM handles all M rows internally → grid.y = 1.
+      const nWG = Math.ceil(N / GEMV_TILE_N);
+      bd(pipeline, [bg], [Math.min(nWG, 65535), 1, Math.ceil(nWG / 65535)], label);
+    } else if (tiled) {
       // One workgroup per TN output elements; z chunks past the 65535 cap.
       const nWG = Math.ceil(N / GEMV_TILE_N);
       bd(pipeline, [bg], [Math.min(nWG, 65535), M, Math.ceil(nWG / 65535)], label);

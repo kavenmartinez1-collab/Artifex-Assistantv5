@@ -40,6 +40,11 @@ const WG_SIZE: u32 = 64u;
 
 override TN: u32 = 8u;     // output rows per workgroup
 override TWG: u32 = 256u;  // threads per workgroup
+// Max M (activation rows) the GEMM kernel batches. A plain const, NOT an
+// override: WGSL only permits override-sized arrays in <workgroup> space, and
+// the GEMM kernel needs function-local acc/partial arrays of this size. 8
+// matches the spec-decode cap (MAX_SPEC_ROWS / MAX_ARGMAX_ROWS).
+const MAXM: u32 = 8u;
 
 struct Params {
   M: u32,
@@ -61,6 +66,12 @@ var<workgroup> wg_partial: array<f32, WG_SIZE>;
 // partial sums for the per-row tree reduce.
 var<workgroup> a_tile: array<vec4<f32>, (TWG / TN) * 8u>;
 var<workgroup> row_acc: array<f32, TWG>;
+
+// GEMM (Phase C4) workgroup storage: one chunk of activations for ALL M rows,
+// laid out [m][vec], so a decoded weight unit is reused across M outputs.
+// MAXM * (TWG/TN) * 8 vec4s (16 KB at MAXM=8, TWG=128, TN=8). Only materialized
+// for the *_gemm entry point (which never references a_tile).
+var<workgroup> a_tile_m: array<vec4<f32>, MAXM * (TWG / TN) * 8u>;
 
 // ── No-stage decode GEMV (lever 4) ──────────────────────────────────────
 // A4 aliases binding 0 with a vec4 view. WGSL allows duplicate
@@ -159,6 +170,24 @@ fn tile_stage(tid: u32, aRow: u32, elemBase: u32, K: u32) {
       v = vec4<f32>(A[aRow + e], A[aRow + e + 1u], A[aRow + e + 2u], A[aRow + e + 3u]);
     }
     a_tile[i] = v;
+  }
+}
+
+/** GEMM variant of tile_stage: stage the same TPR*32-element chunk for ALL M
+ *  activation rows into a_tile_m, laid out [m * nVec + i]. Caller wraps with
+ *  workgroupBarrier() on both sides. */
+fn tile_stage_m(tid: u32, M: u32, elemBase: u32, K: u32) {
+  let nVec = (TWG / TN) * 8u;
+  for (var i = tid; i < nVec; i = i + TWG) {
+    let e = elemBase + i * 4u;
+    for (var mi = 0u; mi < M; mi = mi + 1u) {
+      var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+      if (e < K) {
+        let aRow = mi * K;
+        v = vec4<f32>(A[aRow + e], A[aRow + e + 1u], A[aRow + e + 2u], A[aRow + e + 3u]);
+      }
+      a_tile_m[mi * nVec + i] = v;
+    }
   }
 }
 
@@ -940,6 +969,93 @@ fn matmul_gguf_q2_k_tiled_r(@builtin(local_invocation_id) lid: vec3u,
     }
   }
   tile_reduce_store(tid, lane, n, m, acc);
+}
+
+// ── Q2_K tiled GEMM on REPACKED data (Phase C4 — M-reuse) ───────────────
+// Same decode bit-math as matmul_gguf_q2_k_tiled_r, but M (the verify-row
+// count) is handled INSIDE the workgroup instead of in grid.y. Each lane
+// decodes its 32-elem unit's 8 quants ONCE, then loops over the M staged
+// activation rows accumulating per-m partials. This amortizes the 2-bit
+// decode ALU and the weight loads across all M outputs — the no-reuse GEMV
+// path re-decoded every weight once per row (V≈K). Grid.y = 1.
+//
+// Bit-exact requirement: the per-m accumulation order (dq0/as0/dq1/as1 split,
+// then acc += (dl0*dq0 - ml0*as0) + (dl1*dq1 - ml1*as1)) is IDENTICAL to _r,
+// so the M=1 column is byte-for-byte equal to matmul_gguf_q2_k_tiled_r.
+
+@compute @workgroup_size(TWG, 1, 1)
+fn matmul_gguf_q2_k_tiled_r_gemm(@builtin(local_invocation_id) lid: vec3u,
+                                 @builtin(workgroup_id) wid: vec3u) {
+  let tid = lid.x;
+  let TPR = TWG / TN;
+  let lane = tid % TPR;
+  let row = tid / TPR;
+  let n = (wid.x + wid.z * 65535u) * TN + row;
+  let M = params.M;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 8u;
+  let nChunks = (nUnits + TPR - 1u) / TPR;
+  let nVec = (TWG / TN) * 8u;
+  let valid = n < params.N;
+
+  var acc: array<f32, MAXM>;
+  for (var mi = 0u; mi < M; mi = mi + 1u) { acc[mi] = 0.0; }
+
+  for (var c = 0u; c < nChunks; c = c + 1u) {
+    workgroupBarrier();
+    tile_stage_m(tid, M, c * TPR * 32u, K);
+    workgroupBarrier();
+
+    let u = c * TPR + lane;
+    if (u < nUnits && valid) {
+      let sb = u / 8u;
+      let pair = u % 8u;
+      let sub0 = pair * 2u;                   // even; sub1 = sub0 + 1
+      let wordBase = (n * nSB + sb) * 21u;
+      let byteBase = wordBase * 4u;
+      let dm = unpack2x16float(W[wordBase + 20u]);   // d @80, dmin @82
+      let sc0 = wbyte(byteBase + sub0);
+      let sc1 = wbyte(byteBase + sub0 + 1u);
+      let dl0 = dm.x * f32(sc0 & 0x0Fu);
+      let ml0 = dm.y * f32(sc0 >> 4u);
+      let dl1 = dm.x * f32(sc1 & 0x0Fu);
+      let ml1 = dm.y * f32(sc1 >> 4u);
+      let qBase = wordBase + 4u + pair * 2u;   // unit-contiguous pair
+      let w0 = W[qBase];
+      let w1 = W[qBase + 1u];
+
+      var dq0: array<f32, MAXM>;
+      var as0: array<f32, MAXM>;
+      var dq1: array<f32, MAXM>;
+      var as1: array<f32, MAXM>;
+      for (var mi = 0u; mi < M; mi = mi + 1u) {
+        dq0[mi] = 0.0; as0[mi] = 0.0; dq1[mi] = 0.0; as1[mi] = 0.0;
+      }
+      for (var w = 0u; w < 8u; w = w + 1u) {
+        let src = select(w1, w0, w < 4u);
+        let off = (w & 3u) * 8u;
+        let q2 = vec4<f32>(
+          f32(extractBits(src, off, 2u)),
+          f32(extractBits(src, off + 2u, 2u)),
+          f32(extractBits(src, off + 4u, 2u)),
+          f32(extractBits(src, off + 6u, 2u)),
+        );
+        for (var mi = 0u; mi < M; mi = mi + 1u) {
+          let a4 = a_tile_m[mi * nVec + lane * 8u + w];
+          let asum = a4.x + a4.y + a4.z + a4.w;
+          if (w < 4u) { dq0[mi] = dq0[mi] + dot(a4, q2); as0[mi] = as0[mi] + asum; }
+          else        { dq1[mi] = dq1[mi] + dot(a4, q2); as1[mi] = as1[mi] + asum; }
+        }
+      }
+      for (var mi = 0u; mi < M; mi = mi + 1u) {
+        acc[mi] = acc[mi] + (dl0 * dq0[mi] - ml0 * as0[mi]) + (dl1 * dq1[mi] - ml1 * as1[mi]);
+      }
+    }
+  }
+  for (var mi = 0u; mi < M; mi = mi + 1u) {
+    tile_reduce_store(tid, lane, n, mi, acc[mi]);
+  }
 }
 
 // ── Q2_K repacked, 2 units/lane (ILP probe — loads-in-flight) ────────────

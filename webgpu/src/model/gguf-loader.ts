@@ -72,6 +72,13 @@ export interface LoadedGGUFModel {
    */
   expertTensors: Map<string, GGUFTensorInfo>;
   expertBytes: number;
+  /**
+   * Multi-token-prediction (MTP) head tensors (blk.L, L ≥ block_count) —
+   * uploaded to GPU but kept OUT of the trunk `tensors` map so the decode
+   * forward (layers 0..block_count-1) never touches them. The speculative
+   * MTP drafter pulls its weights from here.
+   */
+  mtpTensors: Map<string, GGUFTensorGPU>;
   totalGPUBytes: number;
   tensorCount: number;
   loadTimeMs: number;
@@ -179,7 +186,9 @@ export async function loadGGUFModel(
   const alsoGPU = tied ? new Set(['token_embd.weight']) : new Set<string>();
 
   // MTP guard: some GGUFs carry next-token-prediction blocks at blk.L,
-  // L ≥ block_count — the forward pass never runs them, skip entirely.
+  // L ≥ block_count. The trunk forward (layers 0..block_count-1) never runs
+  // them, so they're routed to a dedicated `mtpTensors` map — uploaded to GPU
+  // for the speculative MTP drafter, but kept out of the trunk `tensors` map.
   const numLayers = archKV<number>(file, 'block_count');
   const isMTP = (name: string): boolean => {
     const m = BLK_RE.exec(name);
@@ -217,7 +226,7 @@ export async function loadGGUFModel(
   ]);
   const unsupportedTypes = new Map<string, number>();
   for (const t of file.tensors.values()) {
-    if (isVision(t.name) || isMTP(t.name) || isDeadKV(t.name) || EXPERT_RE.test(t.name)) continue;
+    if (isVision(t.name) || isDeadKV(t.name) || EXPERT_RE.test(t.name)) continue;
     if (!SUPPORTED_GPU.has(t.ggmlType)) {
       unsupportedTypes.set(t.typeName, (unsupportedTypes.get(t.typeName) ?? 0) + 1);
     }
@@ -242,11 +251,13 @@ export async function loadGGUFModel(
       throw new Error(`[GGUF] "${t.name}": fused gate+up expert tensors unsupported — expected split ffn_gate_exps/ffn_up_exps`);
     }
     if (isVision(t.name)) { visionBytesSkipped += t.byteLength; continue; }
-    if (isMTP(t.name) || isDeadKV(t.name)) continue;
+    if (isDeadKV(t.name)) continue;
     if (EXPERT_RE.test(t.name)) {
       expertBytes += t.byteLength;
       continue; // CPU worker fleet, never downloaded here
     }
+    // MTP head goes on GPU (mtpTensors) — count it against the VRAM budget so
+    // a tight card refuses cleanly instead of OOMing on the drafter upload.
     totalFileBytes += t.byteLength;
     if (isCPUOnly(t.name)) {
       cpuBytesPlanned += t.byteLength; // raw blocks kept in RAM
@@ -303,6 +314,7 @@ export async function loadGGUFModel(
   }
 
   const tensors = new Map<string, GGUFTensorGPU>();
+  const mtpTensors = new Map<string, GGUFTensorGPU>();
   const cpuTensors = new Map<string, GGUFTensorCPU>();
   const expertTensors = new Map<string, GGUFTensorInfo>();
   let totalGPUBytes = 0;
@@ -315,7 +327,7 @@ export async function loadGGUFModel(
 
   for (const t of file.tensors.values()) {
     idx++;
-    if (isVision(t.name) || isMTP(t.name) || isDeadKV(t.name)) continue;
+    if (isVision(t.name) || isDeadKV(t.name)) continue;
     if (EXPERT_RE.test(t.name)) {
       expertTensors.set(t.name, t); // worker fleet fetches these itself
       continue;
@@ -392,7 +404,7 @@ export async function loadGGUFModel(
       } else {
         throw new Error(`[GGUF] Tensor "${t.name}": unsupported ggml type ${t.typeName} (${t.ggmlType})`);
       }
-      tensors.set(t.name, {
+      (isMTP(t.name) ? mtpTensors : tensors).set(t.name, {
         name: t.name,
         buffer: buf,
         shape: t.shape,
@@ -412,7 +424,9 @@ export async function loadGGUFModel(
   const loadTimeMs = performance.now() - t0;
   console.log(
     `[GGUF-Loader] ${repo}/${filename}: ${tensors.size} GPU tensors `
-    + `(${(totalGPUBytes / 1e9).toFixed(2)} GB), ${cpuTensors.size} CPU tensors, `
+    + `(${(totalGPUBytes / 1e9).toFixed(2)} GB)`
+    + (mtpTensors.size > 0 ? ` + ${mtpTensors.size} MTP-head tensors` : '')
+    + `, ${cpuTensors.size} CPU tensors, `
     + `${expertTensors.size} expert tensors deferred (${(expertBytes / 1e9).toFixed(2)} GB for worker fleet), `
     + `${(loadTimeMs / 1000).toFixed(1)}s${tied ? ' (tied embeddings)' : ''}`,
   );
@@ -455,6 +469,7 @@ export async function loadGGUFModel(
     file,
     url,
     tensors,
+    mtpTensors,
     cpuTensors,
     expertTensors,
     expertBytes,

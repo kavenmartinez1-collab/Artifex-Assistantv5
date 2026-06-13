@@ -715,6 +715,171 @@ for (const K of [256, 1280, 4096, 5120]) {
   }
 }
 
+// Gate 7 (Phase C4): Q2_K M-reuse GEMM (matmul_gguf_q2_k_tiled_r_gemm). The
+// kernel decodes each unit's raw 2-bit quants ONCE and reuses them across M
+// activation rows, accumulating per-row with the SAME deferred-scale split as
+// matmul_gguf_q2_k_tiled_r (dq0/as0/dq1/as1 then dl0*dq0 - ml0*as0 + ...).
+// Ports both the _r single-row kernel and the GEMM kernel (deferred scale,
+// matching the WGSL exactly — NOT the folded-scale decodeUnitQ2KR used by
+// gates 1/5). Asserts: (a) _r single-row matches the f64 reference dot within
+// 1e-9 (anchors the port to ground truth); (b) GEMM column row mi equals the
+// _r single-row on that row EXACTLY for every mi (M-batching is per-row
+// independent — the only thing C4 changes is decode REUSE, not arithmetic).
+
+/** Per-unit decode of the repacked layout returning the deferred scales and
+ *  the 8 raw 2-bit quad groups — mirrors the _r/GEMM kernel decode (no fold). */
+function unitRawQ2KR(W: Uint32Array, n: number, nSB: number, u: number) {
+  const sb = (u / 8) | 0, pair = u % 8, sub0 = pair * 2;
+  const wordBase = (n * nSB + sb) * 21;
+  const byteBase = wordBase * 4;
+  const [d, dmin] = unpack2x16(W, wordBase + 20);
+  const sc0 = wbyte(W, byteBase + sub0);
+  const sc1 = wbyte(W, byteBase + sub0 + 1);
+  const dl0 = d * (sc0 & 0x0F), ml0 = dmin * (sc0 >>> 4);
+  const dl1 = d * (sc1 & 0x0F), ml1 = dmin * (sc1 >>> 4);
+  const qBase = wordBase + 4 + pair * 2;
+  const w0 = W[qBase], w1 = W[qBase + 1];
+  const q: number[][] = [];
+  for (let w = 0; w < 8; w++) {
+    const src = w < 4 ? w0 : w1;
+    const off = (w & 3) * 8;
+    q.push([(src >>> off) & 3, (src >>> (off + 2)) & 3, (src >>> (off + 4)) & 3, (src >>> (off + 6)) & 3]);
+  }
+  return { dl0, ml0, dl1, ml1, q };
+}
+
+/** Port of matmul_gguf_q2_k_tiled_r (deferred-scale dq0/as0/dq1/as1 split). */
+function rKernelRow(W: Uint32Array, A: Float32Array, n: number, K: number, TPR: number): number {
+  const nSB = K / 256, nUnits = nSB * 8, nChunks = Math.ceil(nUnits / TPR);
+  const laneAcc = new Float64Array(TPR);
+  for (let c = 0; c < nChunks; c++) {
+    for (let lane = 0; lane < TPR; lane++) {
+      const u = c * TPR + lane;
+      if (u >= nUnits) continue;
+      const { dl0, ml0, dl1, ml1, q } = unitRawQ2KR(W, n, nSB, u);
+      let dq0 = 0, as0 = 0, dq1 = 0, as1 = 0;
+      for (let w = 0; w < 8; w++) {
+        const b = u * 32 + w * 4;
+        const a0 = A[b], a1 = A[b + 1], a2 = A[b + 2], a3 = A[b + 3];
+        const dot = a0 * q[w][0] + a1 * q[w][1] + a2 * q[w][2] + a3 * q[w][3];
+        const asum = a0 + a1 + a2 + a3;
+        if (w < 4) { dq0 += dot; as0 += asum; } else { dq1 += dot; as1 += asum; }
+      }
+      laneAcc[lane] += (dl0 * dq0 - ml0 * as0) + (dl1 * dq1 - ml1 * as1);
+    }
+  }
+  let sum = 0;
+  for (let lane = 0; lane < TPR; lane++) sum += laneAcc[lane];
+  return sum;
+}
+
+/** Port of matmul_gguf_q2_k_tiled_r_gemm: decode each unit once, accumulate
+ *  per-m into acc[mi]. Arows is M activation rows of length K (flat). Returns
+ *  the M column outputs for output row n. */
+function gemmCol(W: Uint32Array, Arows: Float32Array[], n: number, K: number, TPR: number): Float64Array {
+  const M = Arows.length;
+  const nSB = K / 256, nUnits = nSB * 8, nChunks = Math.ceil(nUnits / TPR);
+  const laneAcc = new Float64Array(TPR * M);
+  for (let c = 0; c < nChunks; c++) {
+    for (let lane = 0; lane < TPR; lane++) {
+      const u = c * TPR + lane;
+      if (u >= nUnits) continue;
+      const { dl0, ml0, dl1, ml1, q } = unitRawQ2KR(W, n, nSB, u);
+      for (let mi = 0; mi < M; mi++) {
+        const A = Arows[mi];
+        let dq0 = 0, as0 = 0, dq1 = 0, as1 = 0;
+        for (let w = 0; w < 8; w++) {
+          const b = u * 32 + w * 4;
+          const a0 = A[b], a1 = A[b + 1], a2 = A[b + 2], a3 = A[b + 3];
+          const dot = a0 * q[w][0] + a1 * q[w][1] + a2 * q[w][2] + a3 * q[w][3];
+          const asum = a0 + a1 + a2 + a3;
+          if (w < 4) { dq0 += dot; as0 += asum; } else { dq1 += dot; as1 += asum; }
+        }
+        laneAcc[mi * TPR + lane] += (dl0 * dq0 - ml0 * as0) + (dl1 * dq1 - ml1 * as1);
+      }
+    }
+  }
+  const out = new Float64Array(M);
+  for (let mi = 0; mi < M; mi++) {
+    let sum = 0;
+    for (let lane = 0; lane < TPR; lane++) sum += laneAcc[mi * TPR + lane];
+    out[mi] = sum;
+  }
+  return out;
+}
+
+console.log('Q2_K M-reuse GEMM (_r_gemm, Phase C4):');
+for (const K of [256, 1280, 4096, 5120]) {
+  for (const TPR of [16, 32]) {
+    for (const M of [1, 2, 5, 8]) {
+      const rng = mulberry32(0xC4 ^ K ^ (TPR << 8) ^ (M << 16));
+      const N = 11;
+      const nSB = K / 256;
+      const raw = new Uint8Array(N * nSB * 84);
+      for (let i = 0; i < raw.length; i++) raw[i] = Math.floor(rng() * 256);
+      const dv = new DataView(raw.buffer, raw.byteOffset);
+      for (let b = 0; b < N * nSB; b++) {
+        dv.setUint16(b * 84 + 80, randF16Bits(rng), true);
+        dv.setUint16(b * 84 + 82, randF16Bits(rng), true);
+      }
+      const W = repackGGUFForGPU(GGML_TYPES.Q2_K, raw, N * K);
+      const Wr = repackQ2K(W);
+      const ref = dequantGGML(GGML_TYPES.Q2_K, raw, N * K);
+      const Arows: Float32Array[] = [];
+      for (let mi = 0; mi < M; mi++) {
+        const A = new Float32Array(K);
+        for (let i = 0; i < K; i++) A[i] = rng() * 2 - 1;
+        Arows.push(A);
+      }
+
+      // (a) _r single-row port anchored to the f64 reference dot.
+      let anchorOK = true, maxRel = 0;
+      for (let mi = 0; mi < M && anchorOK; mi++) {
+        for (let n = 0; n < N; n++) {
+          let refDot = 0, refMag = 0;
+          for (let i = 0; i < K; i++) {
+            const t = Arows[mi][i] * ref[n * K + i];
+            refDot += t;
+            refMag += Math.abs(t);
+          }
+          const got = rKernelRow(Wr, Arows[mi], n, K, TPR);
+          // Scale the error by the accumulation magnitude (Σ|terms|), not by
+          // |refDot| — rows where refDot ≈ 0 (catastrophic cancellation) make
+          // a |refDot| denominator meaningless. The _r/GEMM path uses the
+          // deferred-scale split dl0*Σdot - ml0*Σasum, algebraically equal to
+          // but numerically distinct from the folded per-element reference
+          // (drift ~1e-6 of the accumulation scale even in f64). Anchors the
+          // port to ground truth; gate (b) is the exact GEMM==_r parity check.
+          const rel = Math.abs(got - refDot) / Math.max(1e-30, refMag);
+          maxRel = Math.max(maxRel, rel);
+          if (rel >= 1e-5) {
+            check(`_r_gemm K=${K} M=${M} anchor`, false, `n=${n} mi=${mi} rel=${rel}`);
+            anchorOK = false;
+            break;
+          }
+        }
+      }
+
+      // (b) GEMM column row mi == _r single-row on row mi EXACTLY.
+      let gemmOK = true;
+      for (let n = 0; n < N && gemmOK; n++) {
+        const cols = gemmCol(Wr, Arows, n, K, TPR);
+        for (let mi = 0; mi < M; mi++) {
+          const single = rKernelRow(Wr, Arows[mi], n, K, TPR);
+          if (cols[mi] !== single) {
+            check(`_r_gemm K=${K} M=${M} gemm`, false, `n=${n} mi=${mi}: ${cols[mi]} != ${single}`);
+            gemmOK = false;
+            break;
+          }
+        }
+      }
+      if (anchorOK && gemmOK) {
+        console.log(`  ok   _r_gemm K=${K} TPR=${TPR} M=${M}: gemm[mi] == _r row mi (exact), anchor maxRel=${maxRel.toExponential(2)}`);
+      }
+    }
+  }
+}
+
 if (failures > 0) {
   console.log(`\n${failures} FAILURE(S)`);
   process.exit(1);
