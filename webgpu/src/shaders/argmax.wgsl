@@ -8,12 +8,17 @@
 // parallel reduction order cannot change the result.
 //
 // Two passes:
-//   argmax_partial — NWG=256 workgroups × WG=256 threads; each thread
-//     strides the array (i = wid*WG + lid, step WG*NWG), keeps its best
-//     (value, index) with index 0xFFFFFFFF as the "no element" marker,
-//     then an LDS tree reduce writes one partial per workgroup.
-//   argmax_final   — one workgroup reduces the 256 partials and writes
-//     the winning index to out_idx[0].
+//   argmax_partial — grid (NWG=256, rows) × WG=256 threads; wid.y is the
+//     row, each thread strides that row (i = wid.x*WG + lid, step WG*NWG)
+//     reading logits[row*n + i], keeps its best (value, LOCAL index) with
+//     index 0xFFFFFFFF as the "no element" marker, then an LDS tree
+//     reduce writes one partial per workgroup at partials[row*NWG + wid.x].
+//   argmax_final   — grid (1, rows); one workgroup per row reduces its
+//     256 partials and writes the winning LOCAL index to out_idx[row].
+//
+// rows=1 is bit-for-bit the original single-row reduction (M=1 decode
+// path unchanged). Multi-row serves spec-decode verify (one argmax per
+// logits row of the chunk).
 //
 // Partials are vec2<u32>: .x = bitcast<u32>(value), .y = index.
 // JS parity port: scripts/test-argmax.mts (must mirror this file).
@@ -23,8 +28,8 @@ const NWG: u32 = 256u;
 const EMPTY: u32 = 0xFFFFFFFFu;
 
 struct Params {
-  n: u32,      // number of logits (vocabSize)
-  _p0: u32,
+  n: u32,      // number of logits per row (vocabSize)
+  rows: u32,   // number of rows (1 for the M=1 decode path)
   _p1: u32,
   _p2: u32,
 }
@@ -53,11 +58,13 @@ fn pick(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
 fn argmax_partial(@builtin(workgroup_id) wid: vec3u,
                   @builtin(local_invocation_id) lid: vec3u) {
   let n = params.n;
+  let row = wid.y;
+  let base = row * n;
   let stride = WG * NWG;
   var bv: f32 = 0.0;
   var bi: u32 = EMPTY;
   for (var i = wid.x * WG + lid.x; i < n; i = i + stride) {
-    let v = logits[i];
+    let v = logits[base + i];
     if (bi == EMPTY || better(v, i, bv, bi)) { bv = v; bi = i; }
   }
   sh[lid.x] = vec2<u32>(bitcast<u32>(bv), bi);
@@ -66,16 +73,18 @@ fn argmax_partial(@builtin(workgroup_id) wid: vec3u,
     if (lid.x < s) { sh[lid.x] = pick(sh[lid.x], sh[lid.x + s]); }
     workgroupBarrier();
   }
-  if (lid.x == 0u) { partials[wid.x] = sh[0]; }
+  if (lid.x == 0u) { partials[row * NWG + wid.x] = sh[0]; }
 }
 
 @compute @workgroup_size(WG, 1, 1)
-fn argmax_final(@builtin(local_invocation_id) lid: vec3u) {
-  sh[lid.x] = partials[lid.x];
+fn argmax_final(@builtin(workgroup_id) wid: vec3u,
+                @builtin(local_invocation_id) lid: vec3u) {
+  let row = wid.y;
+  sh[lid.x] = partials[row * NWG + lid.x];
   workgroupBarrier();
   for (var s = WG / 2u; s > 0u; s = s >> 1u) {
     if (lid.x < s) { sh[lid.x] = pick(sh[lid.x], sh[lid.x + s]); }
     workgroupBarrier();
   }
-  if (lid.x == 0u) { out_idx[0] = sh[0].y; }
+  if (lid.x == 0u) { out_idx[row] = sh[0].y; }
 }

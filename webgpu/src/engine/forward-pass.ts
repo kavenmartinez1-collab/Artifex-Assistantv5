@@ -297,6 +297,9 @@ export interface KVCache {
 export interface ForwardOutput {
   /** Logits for the last token: [vocab_size] */
   logitsBuffer: GPUBuffer;
+  /** When forward() ran with specRows: number of row-major logits rows
+   *  ([rows × vocab_size]) in logitsBuffer. Absent on the normal path. */
+  logitsRows?: number;
 }
 
 // ── Forward Pass Engine ──────────────────────────────────────────────────
@@ -316,7 +319,15 @@ export interface ForwardOptions {
   deepstackFeatures?: Float32Array[];
   /** Image-span chunks attend bidirectionally within the chunk (Gemma). */
   bidirectional?: boolean;
+  /** Spec-decode verify: compute lm_head logits for ALL rows of this chunk.
+   *  Must equal the chunk length (1..MAX_SPEC_ROWS). GGUF lm_head only —
+   *  other lm_head formats throw. logitsBuffer then holds specRows × V
+   *  row-major logits and ForwardOutput.logitsRows is set. */
+  specRows?: number;
 }
+
+/** Max rows per spec-decode verify chunk — mirrors MAX_ARGMAX_ROWS. */
+export const MAX_SPEC_ROWS = 8;
 
 export interface ForwardPassEngine {
   /** Run one forward pass step (prefill or single-token decode). */
@@ -328,6 +339,13 @@ export interface ForwardPassEngine {
 
   /** Destroy all buffers in a KV cache. */
   destroyKVCache(kvCache: KVCache): void;
+
+  /** Spec decode: snapshot SSM recurrent state into a shadow set (lazy
+   *  ~150 MB on the 27B). No-op for non-hybrid models. */
+  snapshotSSMState(kvCache: KVCache): void;
+  /** Spec decode: restore SSM state from the last snapshot. KV rollback is
+   *  caller-side via kvCache.position. */
+  restoreSSMState(kvCache: KVCache): void;
 
   /** Get the model descriptor. */
   readonly config: ModelDescriptor;
@@ -950,6 +968,9 @@ export function createForwardPassEngine(
   const scratchDim = Math.max(ffnDim, nHeads * dHead, H, kvDim);
   const ffnTempBuf = createStorageBuffer(device, null, MAX_PREFILL * scratchDim * 4, 'ffn-temp', true);
   const logitsBuf = createStorageBuffer(device, null, V * 4, 'logits', true);
+  // Spec-decode verify logits (specRows × V) — lazily allocated on first use
+  // (5.8 MB at V=151936; only spec decode pays for it).
+  let specLogitsBuf: GPUBuffer | null = null;
   // Softcap needs a read-side copy (WebGPU can't bind one buffer read + read_write)
   const logitsTempBuf = config.finalLogitSoftcap
     ? createStorageBuffer(device, null, V * 4, 'logits-precap') : null;
@@ -3145,16 +3166,36 @@ export function createForwardPassEngine(
       ? weights.global.embedTokens
       : weights.global.lmHead;
 
+    // Spec-decode verify: lm_head over ALL chunk rows (GGUF lm_head only).
+    const specRows = opts?.specRows ?? 0;
+    if (specRows > 0) {
+      if (specRows !== seqLen || specRows > MAX_SPEC_ROWS) {
+        throw new Error(`[forward] specRows=${specRows} must equal seqLen=${seqLen} and be <= ${MAX_SPEC_ROWS}`);
+      }
+      if (!weights.global.lmHeadGG) {
+        throw new Error('[forward] specRows requires a GGUF lm_head (lmHeadGG)');
+      }
+      if (config.finalLogitSoftcap) {
+        throw new Error('[forward] specRows does not support finalLogitSoftcap');
+      }
+      if (!specLogitsBuf) {
+        specLogitsBuf = createStorageBuffer(device, null, MAX_SPEC_ROWS * V * 4, 'spec-logits', true);
+      }
+      dispatchMatmulGGUF(normedBuf, weights.global.lmHeadGG, specLogitsBuf, specRows, V, H, 'lm-head');
+    }
+
     // For batch prefill (seqLen > 1), extract last row of normedBuf for LM head
     let lmInputBuf = normedBuf;
-    if (seqLen > 1) {
+    if (seqLen > 1 && specRows === 0) {
       const lastRowOffset = (seqLen - 1) * H * 4;
       batchCopy(normedBuf, lastRowOffset, lastHiddenBuf, 0, H * 4);
       lmInputBuf = lastHiddenBuf;
     }
     // LM head — select kernel based on weight format (CPU BF16, split BF16, BF16, INT4 GPTQ, or f32)
     const lmIsQ4 = !!(weights.global.lmHeadQ4 && matmulQ4Pipeline);
-    if (weights.global.lmHeadCPU) {
+    if (specRows > 0) {
+      // already dispatched above — skip the single-row lm_head chain
+    } else if (weights.global.lmHeadCPU) {
       // CPU BF16 lm_head: flush GPU, read hidden state, matmul on CPU, write logits back.
       // This saves ~2.4 GB VRAM at the cost of slower lm_head computation.
       if (__timingCtx && currentBatch && __timingCtx.used > 0) {
@@ -3411,7 +3452,9 @@ export function createForwardPassEngine(
       );
     }
 
-    return { logitsBuffer: logitsBuf };
+    return specRows > 0
+      ? { logitsBuffer: specLogitsBuf!, logitsRows: specRows }
+      : { logitsBuffer: logitsBuf };
   }
 
   // ── KV Cache ───────────────────────────────────────────────────────
@@ -3472,7 +3515,8 @@ export function createForwardPassEngine(
           hiddenStates.push(createStorageBuffer(device, null, hSize, `ssm-h-${l}`, true));
           // conv_state: [kernel_size - 1, proj_dim]
           const csSize = (linConvK - 1) * convDim * 4;
-          convStates.push(createStorageBuffer(device, null, csSize, `ssm-conv-${l}`, false));
+          // readable: spec-decode snapshot copies FROM conv state (COPY_SRC)
+          convStates.push(createStorageBuffer(device, null, csSize, `ssm-conv-${l}`, true));
           layerToSSMIndex[l] = ssmIdx++;
         }
       }
@@ -3590,7 +3634,47 @@ export function createForwardPassEngine(
       for (const b of kvCache.ssmState.hiddenStates) b.destroy();
       for (const b of kvCache.ssmState.convStates) b.destroy();
     }
+    if (ssmShadow) {
+      for (const b of [...ssmShadow.hidden, ...ssmShadow.conv]) b.destroy();
+      ssmShadow = null;
+    }
   }
 
-  return { forward, createKVCache, destroyKVCache, config };
+  // ── Spec decode: SSM state snapshot/restore ────────────────────────────
+  // One lazily-allocated shadow set mirroring ssmState (~150 MB on the 27B).
+  // Both directions are a single encoder of buffer-to-buffer copies (~0.5 ms
+  // GPU). KV/position rollback is caller-side (kvCache.position = saved).
+  let ssmShadow: { hidden: GPUBuffer[]; conv: GPUBuffer[] } | null = null;
+
+  function copySSM(srcH: GPUBuffer[], srcC: GPUBuffer[], dstH: GPUBuffer[], dstC: GPUBuffer[]): void {
+    const enc = device.createCommandEncoder({ label: 'ssm-snapshot' });
+    for (let i = 0; i < srcH.length; i++) enc.copyBufferToBuffer(srcH[i], 0, dstH[i], 0, srcH[i].size);
+    for (let i = 0; i < srcC.length; i++) enc.copyBufferToBuffer(srcC[i], 0, dstC[i], 0, srcC[i].size);
+    device.queue.submit([enc.finish()]);
+  }
+
+  function snapshotSSMState(kvCache: KVCache): void {
+    const ssm = kvCache.ssmState;
+    if (!ssm) return; // non-hybrid model: KV position rollback is sufficient
+    if (!ssmShadow) {
+      ssmShadow = {
+        hidden: ssm.hiddenStates.map((b, i) => device.createBuffer({
+          size: b.size, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, label: `ssm-shadow-h-${i}`,
+        })),
+        conv: ssm.convStates.map((b, i) => device.createBuffer({
+          size: b.size, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, label: `ssm-shadow-c-${i}`,
+        })),
+      };
+    }
+    copySSM(ssm.hiddenStates, ssm.convStates, ssmShadow.hidden, ssmShadow.conv);
+  }
+
+  function restoreSSMState(kvCache: KVCache): void {
+    const ssm = kvCache.ssmState;
+    if (!ssm) return;
+    if (!ssmShadow) throw new Error('[ssm] restoreSSMState called before snapshotSSMState');
+    copySSM(ssmShadow.hidden, ssmShadow.conv, ssm.hiddenStates, ssm.convStates);
+  }
+
+  return { forward, createKVCache, destroyKVCache, snapshotSSMState, restoreSSMState, config };
 }

@@ -13,9 +13,15 @@ import argmaxWGSL from '../shaders/argmax.wgsl?raw';
 
 const NWG = 256; // pass-1 workgroups — must mirror argmax.wgsl
 
+/** Max logits rows per dispatch — the spec-decode verify chunk cap. */
+export const MAX_ARGMAX_ROWS = 8;
+
 export interface GpuArgmax {
   /** Argmax over the first n f32 values of logitsBuf (a storage buffer). */
   run(logitsBuf: GPUBuffer, n: number): Promise<number>;
+  /** Per-row argmax over rows consecutive n-length rows of logitsBuf.
+   *  Returns rows LOCAL indices (each 0..n-1). One submit, one readback. */
+  runRows(logitsBuf: GPUBuffer, n: number, rows: number): Promise<Uint32Array>;
   destroy(): void;
 }
 
@@ -29,16 +35,16 @@ export function createGpuArgmax(device: GPUDevice): GpuArgmax {
   });
 
   const partialsBuf = device.createBuffer({
-    size: NWG * 8, usage: GPUBufferUsage.STORAGE, label: 'argmax-partials',
+    size: MAX_ARGMAX_ROWS * NWG * 8, usage: GPUBufferUsage.STORAGE, label: 'argmax-partials',
   });
   const outBuf = device.createBuffer({
-    size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC, label: 'argmax-out',
+    size: MAX_ARGMAX_ROWS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC, label: 'argmax-out',
   });
   const paramsBuf = device.createBuffer({
     size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'argmax-params',
   });
   const staging = device.createBuffer({
-    size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST, label: 'argmax-staging',
+    size: MAX_ARGMAX_ROWS * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST, label: 'argmax-staging',
   });
 
   // Auto layouts only include statically-referenced bindings:
@@ -55,6 +61,7 @@ export function createGpuArgmax(device: GPUDevice): GpuArgmax {
   });
   const partialBGCache = new Map<GPUBuffer, GPUBindGroup>();
   let lastN = -1;
+  let lastRows = -1;
 
   // mapAsync pump (same trick as forward-pass.ts): Chrome's mapAsync has a
   // ~3 ms resolution floor when the event loop idles; pumping a 4-byte
@@ -78,10 +85,14 @@ export function createGpuArgmax(device: GPUDevice): GpuArgmax {
     await p;
   }
 
-  async function run(logitsBuf: GPUBuffer, n: number): Promise<number> {
-    if (n !== lastN) {
-      device.queue.writeBuffer(paramsBuf, 0, new Uint32Array([n, 0, 0, 0]));
+  async function runRows(logitsBuf: GPUBuffer, n: number, rows: number): Promise<Uint32Array> {
+    if (rows < 1 || rows > MAX_ARGMAX_ROWS) {
+      throw new Error(`[argmax] rows=${rows} out of range 1..${MAX_ARGMAX_ROWS}`);
+    }
+    if (n !== lastN || rows !== lastRows) {
+      device.queue.writeBuffer(paramsBuf, 0, new Uint32Array([n, rows, 0, 0]));
       lastN = n;
+      lastRows = rows;
     }
     let partialBG = partialBGCache.get(logitsBuf);
     if (!partialBG) {
@@ -100,17 +111,21 @@ export function createGpuArgmax(device: GPUDevice): GpuArgmax {
     const pass = enc.beginComputePass();
     pass.setPipeline(partialPipe);
     pass.setBindGroup(0, partialBG);
-    pass.dispatchWorkgroups(NWG);
+    pass.dispatchWorkgroups(NWG, rows);
     pass.setPipeline(finalPipe);
     pass.setBindGroup(0, finalBG);
-    pass.dispatchWorkgroups(1);
+    pass.dispatchWorkgroups(1, rows);
     pass.end();
-    enc.copyBufferToBuffer(outBuf, 0, staging, 0, 4);
+    enc.copyBufferToBuffer(outBuf, 0, staging, 0, rows * 4);
     device.queue.submit([enc.finish()]);
-    await mapWithPump(staging, 4);
-    const idx = new Uint32Array(staging.getMappedRange(0, 4))[0];
+    await mapWithPump(staging, rows * 4);
+    const out = new Uint32Array(staging.getMappedRange(0, rows * 4)).slice();
     staging.unmap();
-    return idx;
+    return out;
+  }
+
+  async function run(logitsBuf: GPUBuffer, n: number): Promise<number> {
+    return (await runRows(logitsBuf, n, 1))[0];
   }
 
   function destroy() {
@@ -122,5 +137,5 @@ export function createGpuArgmax(device: GPUDevice): GpuArgmax {
     partialBGCache.clear();
   }
 
-  return { run, destroy };
+  return { run, runRows, destroy };
 }

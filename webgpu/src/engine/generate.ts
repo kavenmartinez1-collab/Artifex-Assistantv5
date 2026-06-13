@@ -13,7 +13,7 @@
  */
 
 import { readBuffer } from './buffers';
-import { createGpuArgmax, type GpuArgmax } from './argmax';
+import { createGpuArgmax, MAX_ARGMAX_ROWS, type GpuArgmax } from './argmax';
 import { MAX_ATTN_SEQ_LEN, type ForwardPassEngine, type KVCache } from './forward-pass';
 import type { Tokenizer } from '../model/tokenizer';
 
@@ -179,6 +179,37 @@ function detectRepetition(ids: number[], ngramSize = 3, minRepeats = 3): boolean
     }
   }
   return false;
+}
+
+/**
+ * n-gram drafter for speculative decoding (pure CPU, model-free).
+ *
+ * Looks for the longest suffix of `ctx` (n = 4 → 2) that occurred EARLIER
+ * in ctx, and proposes the up-to-`maxDrafts` tokens that followed the most
+ * recent earlier occurrence — the bet being that locally repeated patterns
+ * (code, lists, quoted text) continue the same way. Returns [] (abstain)
+ * when no n ≥ 2 suffix recurs; abstaining costs nothing — the decode loop
+ * falls through to the normal single-token path.
+ */
+function ngramDraft(ctx: number[], maxDrafts: number): number[] {
+  const len = ctx.length;
+  for (let n = 4; n >= 2; n--) {
+    if (len < n + 1) continue;
+    const tail = ctx.slice(len - n);
+    // Most recent earlier occurrence wins (recency ≈ relevance).
+    for (let i = len - n - 1; i >= 0; i--) {
+      let match = true;
+      for (let j = 0; j < n; j++) {
+        if (ctx[i + j] !== tail[j]) { match = false; break; }
+      }
+      if (match) {
+        const drafts = ctx.slice(i + n, Math.min(i + n + maxDrafts, len));
+        if (drafts.length > 0) return drafts;
+        break; // suffix only recurs as itself — try a shorter n
+      }
+    }
+  }
+  return [];
 }
 
 /**
@@ -584,6 +615,20 @@ export function generate(
       }
       console.log('[Generate] GPU argmax active (greedy, 4-byte readback)');
     }
+
+    // ── Speculative decode (?spec=1): drafter-agnostic chunk verify ──────
+    // Same greedy-neutral eligibility as gpuArgmax (verify IS a greedy argmax
+    // per row). Drafts come from ngramDraft today; an MTP head can replace
+    // the drafter without touching the verify loop. Default OFF.
+    const specEnabled = __argmaxSearch?.get('spec') === '1' && gpuArgmax !== null;
+    if (__argmaxSearch?.get('spec') === '1' && !specEnabled) {
+      console.warn('[Spec] ?spec=1 ignored — requires greedy-neutral sampling (gpuArgmax eligibility)');
+    }
+    const specK = Math.max(1, Math.min(
+      MAX_ARGMAX_ROWS - 1,
+      parseInt(__argmaxSearch?.get('specK') ?? '4', 10) || 4,
+    ));
+    if (specEnabled) console.log(`[Spec] speculative decode active (n-gram drafter, specK=${specK})`);
     console.log(`[Generate] Prompt: ${promptTokens} tokens, first 5: [${promptIds.slice(0, 5).join(', ')}]`);
     // Debug: decode the full prompt to see what the model actually sees
     console.log(`[Generate] Decoded prompt: "${tokenizer.decode(promptIds)}"`);
@@ -808,10 +853,86 @@ export function generate(
       let __perfMoESyncSum = 0, __perfMoEExpertSum = 0;
       // Reset MoE backend perf so the SUMMARY covers decode only (not prefill).
       ((globalThis as any).__MOE_PERF__ as { reset(): void } | undefined)?.reset?.();
+      // ── Spec decode state ─────────────────────────────────────────
+      // specPending = tokens already COMMITTED to output (pushed/emitted)
+      // whose forward passes have NOT advanced KV/SSM state yet. Invariant:
+      // when length is 1 it is exactly lastTokenId. Grows past 1 only after
+      // a partial-accept round (state was rolled back).
+      let specPending: number[] = specEnabled ? [lastTokenId] : [];
+      let specRounds = 0, specDrafted = 0, specAccepted = 0;
       for (let step = 1; step < config.maxNewTokens; step++) {
         if (aborted) {
           stopReason = 'aborted';
           break;
+        }
+        // Token-budget guard (count TOKENS, not rounds): a spec round commits
+        // multiple tokens per iteration, so `step` alone can't bound output.
+        // For the non-spec path this is equivalent to the old step<maxNew test.
+        if (generatedIds.length >= config.maxNewTokens) {
+          stopReason = 'max_length';
+          break;
+        }
+
+        // ── Speculative round (?spec=1) ─────────────────────────────
+        // chunk = pending ++ drafts (≤ MAX_ARGMAX_ROWS). One forward with
+        // specRows, one multi-row argmax. Row P-1+i is the TRUE token after
+        // chunk[P-1+i]; accept drafts while they match; the first mismatch
+        // row contributes its truth as a free corrected token. If the
+        // drafter abstains with nothing pending, fall through to the
+        // untouched single-token path below (zero overhead vs today).
+        if (specEnabled) {
+          if (specPending.length === 1) specPending[0] = lastTokenId;
+          const maxDrafts = Math.min(specK, MAX_ARGMAX_ROWS - specPending.length);
+          const drafts = maxDrafts > 0
+            ? ngramDraft([...promptIds, ...generatedIds], maxDrafts) : [];
+          if (drafts.length > 0 || specPending.length > 1) {
+            const P = specPending.length;
+            const chunk = [...specPending, ...drafts];
+            const savedPos = kvCache.position;
+            engine.snapshotSSMState(kvCache);
+            const out = await engine.forward(new Uint32Array(chunk), kvCache, { specRows: chunk.length });
+            if ((out.logitsRows ?? 1) !== chunk.length) {
+              throw new Error(`[Spec] expected ${chunk.length} logits rows, got ${out.logitsRows ?? 1}`);
+            }
+            const truths = await gpuArgmax!.runRows(
+              out.logitsBuffer, engine.config.vocabSize, chunk.length);
+            let a = 0; // accepted drafts
+            while (a < drafts.length && truths[P - 1 + a] === drafts[a]) a++;
+            // Tokens newly committed this round: accepted drafts + one free
+            // token (the bonus continuation on full accept, else the truth
+            // at the first mismatch row).
+            const commit = drafts.slice(0, a);
+            commit.push(truths[P - 1 + a]);
+            if (a === drafts.length) {
+              // Full accept: state advanced through chunk correctly — keep it.
+              if (sess) sess.cachedTokenIds.push(...chunk);
+              specPending = [commit[commit.length - 1]];
+            } else {
+              // Partial: state advanced through wrong drafts — roll back.
+              engine.restoreSSMState(kvCache);
+              kvCache.position = savedPos;
+              specPending = [...specPending, ...commit];
+            }
+            specRounds++; specDrafted += drafts.length; specAccepted += a;
+            // Commit strictly in order with the same per-token rules as the
+            // standard path: EOS → push → budget → emit → repetition.
+            let stopAll = false;
+            for (const tok of commit) {
+              if (tokenizer.isEos(tok)) { stopReason = 'eos'; stopAll = true; break; }
+              generatedIds.push(tok);
+              lastTokenId = tok;
+              emitDelta(tok, generatedIds.length - 1);
+              if (generatedIds.length >= config.maxNewTokens) { stopAll = true; break; }
+              if (detectRepetition(generatedIds, 3, 4) || detectRepetition(generatedIds, 2, 6)) {
+                stopReason = 'eos';
+                console.log(`[Generate] Stopping: repetition detected (spec round ${specRounds})`);
+                stopAll = true; break;
+              }
+            }
+            if (stopAll) break;
+            continue;
+          }
+          // drafter abstained with nothing pending → standard path below
         }
 
         // Divergence probe: re-arm dump flag with a step-specific tag when
@@ -976,6 +1097,14 @@ export function generate(
           );
         }
         console.log(`[perf decode SUMMARY] DIAGNOSIS: ${diag}`);
+      }
+      if (specEnabled) {
+        const accPct = specDrafted > 0 ? (100 * specAccepted / specDrafted).toFixed(0) : 'n/a';
+        console.log(
+          `[spec SUMMARY] rounds=${specRounds} drafted=${specDrafted} `
+          + `accepted=${specAccepted} (${accPct}%) tokens=${generatedIds.length} `
+          + `tokens/round=${specRounds > 0 ? (generatedIds.length / specRounds).toFixed(2) : 'n/a'}`
+        );
       }
     } // end if !eos from first token
 
