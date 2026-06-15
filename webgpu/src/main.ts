@@ -815,14 +815,42 @@ async function resolveVRAMBudget(): Promise<number | undefined> {
         intel: /intel|arc/i,
       };
       const re = vendorRe[vendor];
-      const pick = re ? gpus.find(g => re.test(g.name)) : (gpus.find(g => g.displayActive) ?? gpus[0]);
+      if (re && !gpus.some(g => re.test(g.name))) {
+        console.warn(`[VRAM] no /api/gpu-info entry matches active adapter vendor "${vendor}" — using loader default budget`);
+        return undefined;
+      }
+      // Cards matching the active adapter's vendor. On a multi-GPU box with two
+      // same-vendor cards (e.g. a display GPU + a discrete inference GPU) the
+      // vendor regex matches BOTH, and a plain `.find()` grabs whichever
+      // nvidia-smi lists first — often the display card at index 0, budgeting
+      // the load against the wrong, smaller GPU. WebGPU never reports VRAM, but
+      // it DOES report the adapter architecture — use it to pin the budget to
+      // the card WebGPU actually chose, falling back to the same-vendor card
+      // with the most free VRAM (the idle discrete inference target).
+      const candidates = re ? gpus.filter(g => re.test(g.name)) : gpus.slice();
+      const arch = (gpu?.adapterInfo?.architecture ?? '').toLowerCase();
+      const archToName: Array<[RegExp, RegExp]> = [
+        [/lovelace|ada/, /rtx\s*40\d\d|\bada\b/i],         // 40-series / Ada
+        [/blackwell/,    /rtx\s*50\d\d/i],                 // 50-series
+        [/ampere/,       /rtx\s*30\d\d|\ba\d{3,4}\b/i],    // 30-series / A-series
+        [/turing/,       /rtx\s*20\d\d|gtx\s*16\d\d/i],
+        [/pascal/,       /gtx\s*10\d\d|titan\s*x|\bp\d{3,4}\b/i], // 10-series
+      ];
+      const nameRe = archToName.find(([a]) => a.test(arch))?.[1];
+      const pick =
+        // 1) exact card by architecture (authoritative on multi-GPU boxes)
+        (candidates.length > 1 && nameRe ? candidates.find(g => nameRe.test(g.name)) : undefined)
+        // 2) else the same-vendor card with the most free VRAM
+        ?? candidates.slice().sort((a, b) => b.freeMB - a.freeMB)[0]
+        // 3) last resort: display-active, then first entry
+        ?? gpus.find(g => g.displayActive) ?? gpus[0];
       if (!pick) {
         console.warn(`[VRAM] no /api/gpu-info entry matches active adapter vendor "${vendor}" — using loader default budget`);
         return undefined;
       }
       if (pick.freeMB > 0) {
         const budget = Math.max(2e9, (pick.freeMB - 1024) * 1e6);
-        console.log(`[VRAM] auto budget: ${(budget / 1e9).toFixed(1)} GB (driver-reported free minus 1 GB reserve)`);
+        console.log(`[VRAM] auto budget: ${(budget / 1e9).toFixed(1)} GB on "${pick.name}" (arch="${arch}", driver-reported free minus 1 GB reserve)`);
         return budget;
       }
       console.warn('[VRAM] /api/gpu-info returned no usable GPUs — using loader default budget');
