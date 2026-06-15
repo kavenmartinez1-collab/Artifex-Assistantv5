@@ -1,0 +1,92 @@
+[page] [vite] connecting...
+[page] [vite] connected.
+[page] [Init] crossOriginIsolated — SharedArrayBuffer available
+[page] [DOM] Password field is not contained in a form: (More info: https://goo.gl/9p2vKq) %o
+[page] Failed to load resource: the server responded with a status of 404 (Not Found)
+[page] [GPU Discovery] Found 1 unique adapter(s):
+[page] [GPU Discovery] Note: WebGPU can only discover discrete vs integrated GPUs.
+[page] [Init] Discovered 1 GPU adapter(s)
+[page] [WebGPU] Device initialized: {vendor: amd, architecture: rdna-2, device: , description: , maxBufferSize_MB: 2048}
+adapter: rdna-2
+loading local/qwen3.6-27b-iq2xxs-gguf ...
+[page] [HF Hub] Using local cache: /api/hf-cache
+[page] [Orchestrator] Connected to hub
+[page] [GGUF-Loader] local/qwen3.6-27b-iq2xxs-gguf/Qwen3.6-27B-IQ2_XXS-mtp.gguf: 850 GPU tensors (8.17 GB), 1 CPU tensors, 0 expert tensors deferred (0.00 GB for worker fleet), 35.5s
+[page] [GGUF-Loader] GPU tensors by type: IQ2_XXS x424 (5588 MB), Q4_K x64 (1463 MB), Q5_K x1 (874 MB), Q2_K x8 (234 MB), F32 x353 (11 MB)
+[page] [GGUF-Loader] mixed types for ffn_down.weight: Q2_K@[0,1,2,3,4,5,6,7] | IQ2_XXS@[56 layers L8..L63]
+[page] [GGUF] embed: CPU row-gather (1680 B/row); lm_head: Q5_K
+[page] [GGUF] Hybrid model: 48 linear + 16 full attention layers
+[page] [forward-pass] Q2_K repack (lever C): 8 tensors → unit-contiguous layout
+[page] [forward-pass] gate+up same-A fusion: concatenated 64 layers
+[page] Failed to load resource: the server responded with a status of 404 (Not Found)
+[page] Failed to load resource: the server responded with a status of 404 (Not Found)
+[page] Failed to load resource: the server responded with a status of 404 (Not Found)
+[page] [Tokenizer] Local model fallback, using tokenizer from: Qwen/Qwen3.6-35B-A3B
+[page] [Tokenizer] EOS token IDs: [248046, 248044]
+[page] [HF Hub] Using remote CDN
+loaded in 37s
+[page] [Tokenizer] ChatML template applied (thinking=true)
+[page] [Generate] GPU argmax active (greedy, 4-byte readback)
+[page] [Generate] Prompt: 40 tokens, first 5: [248045, 8678, 198, 2523, 513]
+[page] [Generate] Decoded prompt: "<|im_start|>system
+You are Artifex, a helpful AI assistant.<|im_end|>
+<|im_start|>user
+Explain, in two detailed paragraphs, how a refrigerator keeps food cold.<|im_end|>
+<|im_start|>assistant
+<think>
+"
+[page] [KVCache] SSM state: 149.6 MB for 48 linear layers (fixed, sequence-independent)
+[page] [perf forward #1 seqLen=16 pos=0] cpu=47.4ms dispatches=9138 copies=177 bg_creates=4477 (per-token: 3.0ms, 571 dispatches)
+[page] [perf forward #2 seqLen=16 pos=16] cpu=35.2ms dispatches=9138 copies=177 bg_creates=18 (per-token: 2.2ms, 571 dispatches)
+[page] [perf forward #3 seqLen=8 pos=32] cpu=12.7ms dispatches=4914 copies=177 bg_creates=279 (per-token: 1.6ms, 614 dispatches)
+[page] [Generate] Prefill: 40 tokens in 3 chunk(s), 4726ms (8 tok/s)
+[page] [timing forward #4 seqLen=1 pos=40] GPU-sum=131.01ms across 1154 dispatches
+[page] [Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object]
+[page] [perf forward #4 seqLen=1 pos=40] cpu=153.1ms dispatches=1154 copies=176 bg_creates=216 (per-token: 153.1ms, 1154 dispatches)
+[page] [perf decode #1] fwd_cpu=153.4ms gpu_wait=0.4ms readback=1.1ms sample=0.0ms total=154.9ms dispatches=1154 bg_creates=216
+[page] [timing forward #5 seqLen=1 pos=41] GPU-sum=124.35ms across 1154 dispatches
+[page] [Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object]
+[page] [perf forward #5 seqLen=1 pos=41] cpu=138.1ms dispatches=1154 copies=176 bg_creates=18 (per-token: 138.1ms, 1154 dispatches)
+[page] [perf decode #2] fwd_cpu=138.7ms gpu_wait=0.6ms readback=1.7ms sample=0.0ms total=140.9ms dispatches=1154 bg_creates=18
+[page] [perf decode #3] fwd_cpu=5.4ms gpu_wait=130.7ms readback=0.6ms sample=0.0ms total=136.6ms dispatches=1154 bg_creates=18
+[page] [perf decode #4] fwd_cpu=3.8ms gpu_wait=122.2ms readback=7.0ms sample=0.0ms total=133.0ms dispatches=1154 bg_creates=18
+[page] [perf decode #5] fwd_cpu=3.9ms gpu_wait=133.5ms readback=2.1ms sample=0.0ms total=139.4ms dispatches=1154 bg_creates=18
+[page] [perf decode] DIAGNOSIS: GPU-bound — kernel fusion (norm+proj, FFN) is the win (fwd_cpu=7%, gpu_wait=93%, readback=0%, sample=0%)
+[page] [perf decode SUMMARY over 79 steps] avg_total=136.2ms (=7.34 tok/s) | fwd_cpu=9.5ms (7%) gpu_wait=125.3ms (92%) readback=1.4ms (1%) sample=0.0ms (0%) | avg_dispatches/token=1154
+[page] [perf decode SUMMARY] DIAGNOSIS: GPU-bound — kernel fusion (norm+proj, FFN swiglu) is the win
+
+──── meta ────
+80 tokens | 7.4 tok/s | 15.6s | max_length
+
+──── perfLastForward ────
+{"seqLen":1,"cpuMs":5.110000014305115,"dispatches":1154,"copies":176,"bgCreates":18,"moeSyncMs":0,"moeExpertMs":0}
+
+──── GPU per-category (last profiled forward) ────
+gguf_IQ2_XXS                 n= 360  102.101 ms   82.1%  avg 283.6 us
+gguf_Q4_K_v4                 n=  64    8.055 ms    6.5%  avg 125.9 us
+gguf_Q2_K_r                  n=   8    3.532 ms    2.8%  avg 441.5 us
+ssm_step_split               n=  48    3.374 ms    2.7%  avg 70.3 us
+gguf_Q5_K_v4                 n=   1    3.205 ms    2.6%  avg 3204.6 us
+rmsnorm                      n= 209    1.668 ms    1.3%  avg 8.0 us
+l2norm                       n=  96    1.035 ms    0.8%  avg 10.8 us
+attention                    n=  16    0.834 ms    0.7%  avg 52.1 us
+conv1d_fused                 n=  48    0.163 ms    0.1%  avg 3.4 us
+add                          n= 128    0.141 ms    0.1%  avg 1.1 us
+gate_silu                    n= 112    0.135 ms    0.1%  avg 1.2 us
+deinterleave                 n=  16    0.066 ms    0.1%  avg 4.1 us
+rope                         n=  32    0.022 ms    0.0%  avg 0.7 us
+gate_sigmoid                 n=  16    0.019 ms    0.0%  avg 1.2 us
+
+──── response (greedy) ────
+💭 Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - **Topic:** How a refrigerator keeps food cold
+   - **Format:** Two detailed paragraphs
+   - **Goal:** Explain the mechanism clearly and thoroughly within the constraint
+
+2.  **Identify Key Concepts:**
+   - Refrigeration cycle (vapor compression cycle)
+   - Refrigerant (
+
+[wrote 334 chars to scripts/iq2xxs_webgpu_headed.txt]

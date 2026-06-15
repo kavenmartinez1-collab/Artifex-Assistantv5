@@ -1,0 +1,10 @@
+💭 Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - **Topic:** How a refrigerator keeps food cold
+   - **Format:** Two detailed paragraphs
+   - **Goal:** Explain the mechanism clearly and thoroughly within the constraint
+
+2.  **Identify Key Concepts:**
+   - Refrigeration cycle (vapor compression cycle)
+   - Refrigerant (

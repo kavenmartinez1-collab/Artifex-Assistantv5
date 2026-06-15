@@ -1,0 +1,129 @@
+[page] [vite] connecting...
+[page] [vite] connected.
+[page] [Init] crossOriginIsolated — SharedArrayBuffer available
+[page] [DOM] Password field is not contained in a form: (More info: https://goo.gl/9p2vKq) %o
+[page] Failed to load resource: the server responded with a status of 404 (Not Found)
+[page] [GPU Discovery] Found 1 unique adapter(s):
+[page] [GPU Discovery] Note: WebGPU can only discover discrete vs integrated GPUs.
+[page] [Init] Discovered 1 GPU adapter(s)
+[page] [WebGPU] Device initialized: {vendor: amd, architecture: rdna-2, device: , description: , maxBufferSize_MB: 2048}
+adapter: rdna-2
+loading local/qwen3.6-27b-iq2xxs-gguf ...
+[page] [HF Hub] Using local cache: /api/hf-cache
+[page] [Orchestrator] Connected to hub
+[page] [GGUF-Loader] local/qwen3.6-27b-iq2xxs-gguf/Qwen3.6-27B-IQ2_XXS-mtp.gguf: 850 GPU tensors (8.17 GB), 1 CPU tensors, 0 expert tensors deferred (0.00 GB for worker fleet), 48.3s
+[page] [GGUF-Loader] GPU tensors by type: IQ2_XXS x424 (5588 MB), Q4_K x64 (1463 MB), Q5_K x1 (874 MB), Q2_K x8 (234 MB), F32 x353 (11 MB)
+[page] [GGUF-Loader] mixed types for ffn_down.weight: Q2_K@[0,1,2,3,4,5,6,7] | IQ2_XXS@[56 layers L8..L63]
+[page] [GGUF] embed: CPU row-gather (1680 B/row); lm_head: Q5_K
+[page] [GGUF] Hybrid model: 48 linear + 16 full attention layers
+[page] [forward-pass] Q2_K repack (lever C): 8 tensors → unit-contiguous layout
+[page] [forward-pass] gate+up same-A fusion: concatenated 64 layers
+[page] Failed to load resource: the server responded with a status of 404 (Not Found)
+[page] Failed to load resource: the server responded with a status of 404 (Not Found)
+[page] Failed to load resource: the server responded with a status of 404 (Not Found)
+[page] [Tokenizer] Local model fallback, using tokenizer from: Qwen/Qwen3.6-35B-A3B
+[page] [Tokenizer] EOS token IDs: [248046, 248044]
+[page] [HF Hub] Using remote CDN
+loaded in 50s
+[page] [Tokenizer] ChatML template applied (thinking=true)
+[page] [Generate] GPU argmax active (greedy, 4-byte readback)
+[page] [Generate] Prompt: 40 tokens, first 5: [248045, 8678, 198, 2523, 513]
+[page] [Generate] Decoded prompt: "<|im_start|>system
+You are Artifex, a helpful AI assistant.<|im_end|>
+<|im_start|>user
+Explain, in two detailed paragraphs, how a refrigerator keeps food cold.<|im_end|>
+<|im_start|>assistant
+<think>
+"
+[page] [Generate] maxNewTokens clamped 2048 -> 2008 (attention kernel limit 2048)
+[page] [KVCache] SSM state: 149.6 MB for 48 linear layers (fixed, sequence-independent)
+[page] [perf forward #1 seqLen=16 pos=0] cpu=71.9ms dispatches=9138 copies=177 bg_creates=4477 (per-token: 4.5ms, 571 dispatches)
+[page] [perf forward #2 seqLen=16 pos=16] cpu=37.3ms dispatches=9138 copies=177 bg_creates=18 (per-token: 2.3ms, 571 dispatches)
+[page] [perf forward #3 seqLen=8 pos=32] cpu=17.6ms dispatches=4914 copies=177 bg_creates=279 (per-token: 2.2ms, 614 dispatches)
+[page] [Generate] Prefill: 40 tokens in 3 chunk(s), 5335ms (7 tok/s)
+[page] [timing forward #4 seqLen=1 pos=40] GPU-sum=123.34ms across 1154 dispatches
+[page] [Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object]
+[page] [perf forward #4 seqLen=1 pos=40] cpu=152.7ms dispatches=1154 copies=176 bg_creates=216 (per-token: 152.7ms, 1154 dispatches)
+[page] [perf decode #1] fwd_cpu=152.9ms gpu_wait=0.2ms readback=0.9ms sample=0.0ms total=153.9ms dispatches=1154 bg_creates=216
+[page] [timing forward #5 seqLen=1 pos=41] GPU-sum=124.25ms across 1154 dispatches
+[page] [Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object]
+[page] [perf forward #5 seqLen=1 pos=41] cpu=135.1ms dispatches=1154 copies=176 bg_creates=18 (per-token: 135.1ms, 1154 dispatches)
+[page] [perf decode #2] fwd_cpu=135.2ms gpu_wait=0.1ms readback=0.6ms sample=0.0ms total=135.9ms dispatches=1154 bg_creates=18
+[page] [perf decode #3] fwd_cpu=3.2ms gpu_wait=125.7ms readback=0.5ms sample=0.0ms total=129.4ms dispatches=1154 bg_creates=18
+[page] [perf decode #4] fwd_cpu=3.5ms gpu_wait=123.0ms readback=11.3ms sample=0.0ms total=137.8ms dispatches=1154 bg_creates=18
+[page] [perf decode #5] fwd_cpu=4.1ms gpu_wait=133.1ms readback=2.2ms sample=0.0ms total=139.3ms dispatches=1154 bg_creates=18
+[page] [perf decode] DIAGNOSIS: GPU-bound — kernel fusion (norm+proj, FFN) is the win (fwd_cpu=6%, gpu_wait=93%, readback=1%, sample=0%)
+[page] [perf decode SUMMARY over 1095 steps] avg_total=147.4ms (=6.78 tok/s) | fwd_cpu=5.2ms (4%) gpu_wait=140.4ms (95%) readback=1.7ms (1%) sample=0.0ms (0%) | avg_dispatches/token=1154
+[page] [perf decode SUMMARY] DIAGNOSIS: GPU-bound — kernel fusion (norm+proj, FFN swiglu) is the win
+
+──── meta ────
+1095 tokens | 6.6 tok/s | 170.9s | eos
+
+──── perfLastForward ────
+{"seqLen":1,"cpuMs":3.509999990463257,"dispatches":1154,"copies":176,"bgCreates":18,"moeSyncMs":0,"moeExpertMs":0}
+
+──── GPU per-category (last profiled forward) ────
+gguf_IQ2_XXS                 n= 360  101.010 ms   81.3%  avg 280.6 us
+gguf_Q4_K_v4                 n=  64    8.118 ms    6.5%  avg 126.9 us
+ssm_step_split               n=  48    3.373 ms    2.7%  avg 70.3 us
+gguf_Q2_K_r                  n=   8    3.368 ms    2.7%  avg 420.9 us
+gguf_Q5_K_v4                 n=   1    3.203 ms    2.6%  avg 3203.1 us
+rmsnorm                      n= 209    2.782 ms    2.2%  avg 13.3 us
+l2norm                       n=  96    1.026 ms    0.8%  avg 10.7 us
+attention                    n=  16    0.828 ms    0.7%  avg 51.7 us
+conv1d_fused                 n=  48    0.162 ms    0.1%  avg 3.4 us
+add                          n= 128    0.142 ms    0.1%  avg 1.1 us
+gate_silu                    n= 112    0.134 ms    0.1%  avg 1.2 us
+deinterleave                 n=  16    0.065 ms    0.1%  avg 4.1 us
+rope                         n=  32    0.022 ms    0.0%  avg 0.7 us
+gate_sigmoid                 n=  16    0.019 ms    0.0%  avg 1.2 us
+
+──── response (greedy) ────
+Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - **Topic:** How a refrigerator keeps food cold
+   - **Format:** Two detailed paragraphs
+   - **Goal:** Explain the mechanism clearly and thoroughly within the constraint
+
+2.  **Identify Key Concepts:**
+   - Refrigeration cycle (vapor compression cycle)
+   - Refrigerant (coolant)
+   - Compressor
+   - Condenser
+   - Expansion valve/expansion device
+   - Evaporator
+   - Heat transfer principles
+   - Thermostat/control system
+
+3.  **Draft - Paragraph 1: The Cooling Cycle & Heat Transfer**
+   - *Focus:* How the refrigerant moves heat, the role of the evaporator, and the thermodynamic cycle.
+   - *Content:* A refrigerator operates on the principle of heat transfer rather than creating cold directly. Inside the unit, a refrigerant circulates through a closed loop of coils known as the evaporator. When the compressor pumps the refrigerant into a low-pressure state, it rapidly expands and boils, absorbing heat from the interior air and the food placed inside. This phase change from liquid to gas requires significant thermal energy, which is drawn from the surrounding environment, effectively lowering the temperature inside the compartment. As the refrigerant warms up during this process, it moves toward the condenser coils located at the back or bottom of the appliance, carrying the absorbed heat with it.
+   - *Check:* Detailed? Yes. Covers evaporator, refrigerant, heat absorption, phase change. Fits paragraph structure.
+
+4.  **Draft - Paragraph 2: The Compressor, Condenser & Regulation**
+   - *Focus:* How heat is expelled, the role of the compressor, condenser, and thermostat control.
+   - *Content:* To complete the cycle, the compressor pressurizes the refrigerant gas, forcing it into the condenser coils where it releases its heat into the surrounding room air. As the refrigerant cools and condenses back into a liquid, it passes through an expansion valve that drastically reduces its pressure, preparing it to absorb more heat in the evaporator. A built-in thermostat continuously monitors the internal temperature; once the desired cold threshold is reached, it signals the compressor to pause, conserving energy while maintaining equilibrium. This continuous loop of compression, heat rejection, expansion, and heat absorption ensures that the refrigerator maintains a consistent, safe temperature that slows bacterial growth and preserves food freshness.
+   - *Check:* Detailed? Yes. Covers compressor, condenser, expansion valve, thermostat, and food preservation link. Fits paragraph structure.
+
+5.  **Review & Refine (Self-Correction/Verification):**
+   - *Constraint Check:* Exactly two paragraphs? Yes.
+   - *Detail Level:* Detailed? Yes, covers thermodynamics, components, cycle, and control system.
+   - *Accuracy:* Scientifically accurate (vapor compression cycle, heat transfer, phase change, thermostat feedback).
+   - *Flow/Readability:* Logical progression from internal cooling process to external heat rejection and system regulation.
+   - *Adjustments:* Ensure technical terms are explained contextually. Make sure the connection between the cycle and food preservation is clear. The draft looks solid. I'll polish the language slightly for precision and flow.
+
+   *Paragraph 1:* Focuses on evaporator, refrigerant, heat absorption, phase change.
+   *Paragraph 2:* Focuses on compressor, condenser, heat rejection, expansion valve, thermostat, and food preservation outcome.
+
+   All good. Proceed to output. 
+   *Self-Correction/Verification during thought:* 
+   - Check if "refrigerant" explanation is clear. Yes.
+   - Check if the cycle is complete. Yes.
+   - Check paragraph count. Exactly two.
+   - Tone: Informative, technical but accessible.
+   - Ready.✅A refrigerator maintains low temperatures through a continuous thermodynamic cycle that actively removes heat from the interior rather than generating cold directly. Inside the unit, a refrigerant circulates through a network of coils called the evaporator. When the compressor forces the refrigerant into a low-pressure state, it rapidly expands and boils, transitioning from a liquid to a gas. This phase change requires significant thermal energy, which is drawn directly from the surrounding air and the food stored inside, effectively lowering the internal temperature. As the refrigerant absorbs this heat, it travels toward the condenser coils located at the back or bottom of the appliance, carrying the thermal energy away from the food compartment while maintaining a chilled environment.
+
+To complete the cycle, the compressor pressurizes the refrigerant gas, forcing it into the condenser coils where it releases its absorbed heat into the surrounding room air. As the refrigerant cools and condenses back into a liquid, it passes through an expansion valve that drastically reduces its pressure, priming it to absorb more heat in the evaporator. A built-in thermostat continuously monitors the internal temperature; once the desired threshold is reached, it signals the compressor to pause, conserving energy while maintaining thermal equilibrium. This automated loop of compression, heat rejection, expansion, and heat absorption ensures consistent cooling that slows bacterial growth, preserves cellular integrity, and extends the shelf life of perishable items.
+
+[wrote 5341 chars to scripts/iq2xxs_webgpu_headless.txt]
