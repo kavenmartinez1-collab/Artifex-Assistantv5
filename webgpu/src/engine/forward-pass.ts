@@ -433,6 +433,9 @@ export function createForwardPassEngine(
       [GGML_TYPES.IQ4_NL]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq4_nl', 'matmul-gguf-iq4_nl'),
       [GGML_TYPES.IQ4_XS]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq4_xs', 'matmul-gguf-iq4_xs'),
       [GGML_TYPES.IQ2_XXS]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq2_xxs', 'matmul-gguf-iq2_xxs'),
+      [GGML_TYPES.IQ3_XXS]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq3_xxs', 'matmul-gguf-iq3_xxs'),
+      [GGML_TYPES.IQ3_S]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq3_s', 'matmul-gguf-iq3_s'),
+      [GGML_TYPES.IQ2_S]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq2_s', 'matmul-gguf-iq2_s'),
     } : null;
   // Lever 2: multi-output tiled GEMV — TN output rows per workgroup share a
   // staged activation tile (legacy kernels re-read the full activation vector
@@ -443,6 +446,17 @@ export function createForwardPassEngine(
   const gemvSearch = typeof window === 'undefined'
     ? null : new URLSearchParams(window.location.search);
   const gemvTileEnabled = gemvSearch?.get('gemvTile') !== '0';
+  // ── TDR guard: cap GPU work per submit ───────────────────────────
+  // Diagnosis (2026-06-15): UD-IQ2_XXS 27B tripped DXGI_ERROR_DEVICE_HUNG when
+  // its slow legacy IQ3_XXS/IQ3_S/IQ2_S GEMV kernels were packed back-to-back
+  // into one large batched submit — a single command buffer ran the GPU past
+  // the ~2s Windows TDR window. Proven batch-emergent: un-batched (1 dispatch /
+  // submit) the identical work completes with no hang. Fix: auto-flush the batch
+  // every N dispatches (submit + fresh encoder, NO cpu await) so each submit is
+  // short enough for the TDR watchdog to reset between command buffers, while
+  // keeping CPU throughput (no onSubmittedWorkDone stalls). ?batchFlush=0 keeps
+  // the old single-submit behavior (fast models like pure-IQ2_XXS don't need it).
+  const batchFlushEvery = Number(gemvSearch?.get('batchFlush') ?? 256);
   // Defaults from the 27B sweep on RDNA2 (2026-06-12): 8/128 beat 8/256 by
   // ~1.6% at 27B shapes (8.81 vs 8.67 tok/s @256 tokens); on the 9B the two
   // were within noise (14.6 vs 14.7), so 128 is the better global default.
@@ -1490,6 +1504,7 @@ export function createForwardPassEngine(
   let currentBatch: BatchedDispatcher | null = null;
   let deferredDestroys: GPUBuffer[] = [];
 
+
   /** Dispatch a compute pass — batched if currentBatch is set, else immediate. */
   // ── Performance instrumentation (Step 1: measurement layer) ────────
   // Module-scope counters so we can attribute per-forward dispatch/copy load
@@ -1521,6 +1536,13 @@ export function createForwardPassEngine(
         __timingCtx.used += 2;
       }
       currentBatch.dispatch(pipeline, bindGroups, workgroupCounts, label, tsWrites);
+      // TDR guard: split into multiple short submits. Skip while timestamp
+      // profiling (the query-set resolve must stay in one encoder) — that path
+      // only runs for the first few decode calls, never the hang-prone prefill.
+      if (batchFlushEvery > 0 && !__timingCtx && currentBatch.size >= batchFlushEvery) {
+        currentBatch.flush();
+        currentBatch.reset('forward-cont');
+      }
     } else {
       dispatch(device, pipeline, bindGroups, workgroupCounts, label ?? '');
     }
@@ -1924,7 +1946,9 @@ export function createForwardPassEngine(
     // Upload token IDs
     device.queue.writeBuffer(tokenIdBuf, 0, tokenIds.buffer, tokenIds.byteOffset, tokenIds.byteLength);
 
-    // Batch all GPU work into a single submit for speed
+    // Batch GPU work to cut ~900 queue.submit() calls per forward to a handful.
+    // bd() auto-flushes every batchFlushEvery dispatches (TDR guard) so no single
+    // submit runs the GPU past the driver watchdog window.
     currentBatch = new BatchedDispatcher(device, 'forward');
     deferredDestroys = [];
 
