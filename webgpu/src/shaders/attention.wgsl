@@ -49,9 +49,9 @@ override USE_SOFTPICK: u32 = 0u;
 @group(0) @binding(4) var<uniform> params: Params;
 
 // Shared memory for attention scores (one row of the attention matrix)
-// Max cache_len supported in shared memory = 3840
-// Total workgroup storage: 3840*4 + 256*4 = 16384 bytes (exactly at default limit)
-var<workgroup> scores: array<f32, 3840>;
+// Max cache_len supported in shared memory = 2048 (matches MAX_ATTN_SEQ_LEN)
+// Total workgroup storage: 2048*4 + 256*4 = 9216 bytes (well under 16384 default limit)
+var<workgroup> scores: array<f32, 2048>;
 var<workgroup> shmem: array<f32, 256>;
 
 @compute @workgroup_size(256)
