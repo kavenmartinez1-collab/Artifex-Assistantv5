@@ -92,7 +92,7 @@ export interface GGUFLoadProgress {
 const QUANT_GPU_TYPES = new Set<number>([
   GGML_TYPES.Q4_0, GGML_TYPES.Q5_0, GGML_TYPES.Q2_K, GGML_TYPES.Q3_K,
   GGML_TYPES.Q8_0, GGML_TYPES.Q4_K, GGML_TYPES.Q5_K, GGML_TYPES.Q6_K,
-  GGML_TYPES.IQ4_NL, GGML_TYPES.IQ4_XS,
+  GGML_TYPES.IQ2_XXS, GGML_TYPES.IQ4_NL, GGML_TYPES.IQ4_XS,
 ]);
 
 const MAX_CHUNK = 128 * 1024 * 1024;
@@ -185,15 +185,23 @@ export async function loadGGUFModel(
   ]);
   const alsoGPU = tied ? new Set(['token_embd.weight']) : new Set<string>();
 
-  // MTP guard: some GGUFs carry next-token-prediction blocks at blk.L,
-  // L ≥ block_count. The trunk forward (layers 0..block_count-1) never runs
-  // them, so they're routed to a dedicated `mtpTensors` map — uploaded to GPU
-  // for the speculative MTP drafter, but kept out of the trunk `tensors` map.
-  const numLayers = archKV<number>(file, 'block_count');
+  // MTP guard: Qwen3.6 GGUFs carry `nextn_predict_layers` next-token-prediction
+  // blocks at the END of the block range (indices >= block_count - nextn). The
+  // trunk forward only runs layers 0..numLayers-1 (matching model-descriptor.ts),
+  // so those blocks are dead weight unless an MTP drafter consumes them. Use the
+  // SAME trunk count the engine uses so isMTP actually catches them — checking
+  // against block_count alone never matched (the MTP index is < block_count).
+  const numLayers = archKV<number>(file, 'block_count') - archKV<number>(file, 'nextn_predict_layers', 0);
   const isMTP = (name: string): boolean => {
     const m = BLK_RE.exec(name);
     return m !== null && Number(m[1]) >= numLayers;
   };
+  // The MTP / next-token-prediction head (blk.L, L >= block_count) is loaded
+  // for a future speculative MTP drafter, but NO forward / decode / draft path
+  // reads it today — drafts come from the n-gram drafter (generate.ts). On a
+  // VRAM-tight card it is pure dead weight (~0.5 GB for the 27B), so skip it.
+  // Flip to true if/when an MTP drafter actually consumes mtpTensors.
+  const LOAD_MTP_HEAD = false;
   const isCPUOnly = (name: string): boolean => cpuNames.has(name) || SHEXP_GATE_RE.test(name);
 
   // Vision tower guard: multimodal GGUFs (Ollama-packed Gemma 4, Qwen-VL)
@@ -214,15 +222,15 @@ export async function loadGGUFModel(
 
   // ── Pre-flight quant check — fail fast with guidance, before any download ──
   // The GPU path dequantizes the k-quants (Q2_K…Q6_K), legacy Q4_0/Q5_0/Q8_0,
-  // and the IQ4 codebook pair (IQ4_NL/IQ4_XS) natively. The grid-codebook IQ
-  // quants (IQ1/IQ2/IQ3) and Q4_1/Q5_1 aren't wired, so a model in those would
-  // fail tensor-by-tensor mid-load. Catch it up front and tell the user what
-  // to download instead.
+  // the IQ4 codebook pair (IQ4_NL/IQ4_XS) and the IQ2_XXS grid-codebook quant
+  // natively. The remaining grid-codebook IQ quants (IQ1/IQ2_XS/IQ2_S/IQ3) and
+  // Q4_1/Q5_1 aren't wired, so a model in those would fail tensor-by-tensor
+  // mid-load. Catch it up front and tell the user what to download instead.
   const SUPPORTED_GPU = new Set<number>([
     GGML_TYPES.F32, GGML_TYPES.F16, GGML_TYPES.BF16,
     GGML_TYPES.Q4_0, GGML_TYPES.Q5_0, GGML_TYPES.Q2_K, GGML_TYPES.Q3_K,
     GGML_TYPES.Q8_0, GGML_TYPES.Q4_K, GGML_TYPES.Q5_K, GGML_TYPES.Q6_K,
-    GGML_TYPES.IQ4_NL, GGML_TYPES.IQ4_XS,
+    GGML_TYPES.IQ2_XXS, GGML_TYPES.IQ4_NL, GGML_TYPES.IQ4_XS,
   ]);
   const unsupportedTypes = new Map<string, number>();
   for (const t of file.tensors.values()) {
@@ -235,9 +243,9 @@ export async function loadGGUFModel(
     const list = [...unsupportedTypes.entries()].map(([n, c]) => `${n} (${c} tensors)`).join(', ');
     throw new Error(
       `This GGUF uses quantization the WebGPU engine can't run yet: ${list}. `
-      + `Supported: Q2_K, Q3_K, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS (and F16/F32/BF16). `
-      + `Download a K-quant or IQ4 build instead — e.g. a *-Q4_K_M.gguf or *-IQ4_XS.gguf. `
-      + `(IQ1/IQ2/IQ3 grid-codebook quants and Q4_1/Q5_1 aren't supported.)`);
+      + `Supported: Q2_K, Q3_K, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ4_NL, IQ4_XS (and F16/F32/BF16). `
+      + `Download a K-quant or IQ build instead — e.g. a *-Q4_K_M.gguf or *-IQ4_XS.gguf. `
+      + `(IQ1/IQ2_XS/IQ2_S/IQ3 grid-codebook quants and Q4_1/Q5_1 aren't supported.)`);
   }
 
   // ── VRAM + RAM gates: refuse before downloading anything ──
@@ -256,8 +264,7 @@ export async function loadGGUFModel(
       expertBytes += t.byteLength;
       continue; // CPU worker fleet, never downloaded here
     }
-    // MTP head goes on GPU (mtpTensors) — count it against the VRAM budget so
-    // a tight card refuses cleanly instead of OOMing on the drafter upload.
+    if (!LOAD_MTP_HEAD && isMTP(t.name)) continue; // dead weight: no path reads it
     totalFileBytes += t.byteLength;
     if (isCPUOnly(t.name)) {
       cpuBytesPlanned += t.byteLength; // raw blocks kept in RAM
@@ -270,11 +277,13 @@ export async function loadGGUFModel(
   // "ready", then OOM on the FIRST forward when the KV cache and activation
   // buffers allocate. Estimate that headroom and include it, so the gate
   // either refuses clearly at load or the model actually runs.
-  const MAX_SEQ = 3840;        // KV clamp (MAX_ATTN_SEQ_LEN)
-  const MAX_PREFILL = 512;     // engine's batch-prefill width
+  const MAX_SEQ = 2048;        // KV clamp (MAX_ATTN_SEQ_LEN)
   const headCount = archKV<number>(file, 'attention.head_count', 8);
   const hiddenSize = archKV<number>(file, 'embedding_length', headCount * 128);
   const isHybrid = archKV<number>(file, 'ssm.conv_kernel', 0) > 0;
+  // Mirror forward-pass.ts: hybrid models size activation buffers to 64 (their
+  // prefill chunk is 16), dense to 512. Keep this estimate in lockstep.
+  const MAX_PREFILL = isHybrid ? 64 : 512;
   const fullAttnInterval = archKV<number>(file, 'full_attention_interval', 1);
   let nKV = archKV<number | number[]>(file, 'attention.head_count_kv', headCount);
   if (Array.isArray(nKV)) { const nz = nKV.filter(v => v > 0); nKV = nz.length ? Math.max(...nz) : headCount; }
@@ -332,6 +341,7 @@ export async function loadGGUFModel(
       expertTensors.set(t.name, t); // worker fleet fetches these itself
       continue;
     }
+    if (!LOAD_MTP_HEAD && isMTP(t.name)) continue; // dead weight: skip GPU upload
     onProgress?.({
       message: `[${idx}/${file.tensorCount}] ${t.name} (${t.typeName}, ${(t.byteLength / 1e6).toFixed(1)} MB)`,
       overallProgress: doneBytes / totalFileBytes,

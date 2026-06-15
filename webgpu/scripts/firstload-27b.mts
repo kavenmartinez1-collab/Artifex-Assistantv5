@@ -16,7 +16,7 @@ import { writeFileSync } from 'node:fs';
 const BASE = 'http://127.0.0.1:5173';
 const URLQ = process.env.URLQ ? `?${process.env.URLQ}` : '';
 const OUT = process.env.OUT ?? '';
-const REPO = 'local/qwen3.5-27b-gguf';
+const REPO = process.env.REPO ?? 'local/qwen3.6-27b-mtp-gguf';
 const ADAPTER_RE = /radeon|6700|amd|rdna/i;
 const PROMPT =
   'Explain, in two detailed paragraphs, how a refrigerator keeps food cold.';
@@ -26,7 +26,10 @@ const GEN_TIMEOUT = 900_000;
 (async () => {
   const browser = await chromium.launch({
     channel: 'chrome',
-    headless: true,
+    // HEADED=1 launches a visible Chrome window so the load runs through the
+    // desktop compositor on the display-driving GPU — the real headed scenario
+    // (compositor VRAM tax) the headless bench can't reproduce.
+    headless: !process.env.HEADED,
     // Vulkan-forcing flags break adapter discovery on this box — bare flag only.
     args: ['--enable-unsafe-webgpu'],
   });
@@ -41,7 +44,8 @@ const GEN_TIMEOUT = 900_000;
     // /api/gpu-info is nvidia-smi-only, so the AMD card gets the loader's
     // 6.5 GB default — too small for the 27B (~10.4 GB). Manual override:
     // 11 GB on the 12 GB card leaves ~1 GB for the compositor.
-    await page.addInitScript(() => localStorage.setItem('vramBudgetGB', '11'));
+    const VRAMGB = process.env.VRAMGB ?? '11.8';
+    await page.addInitScript((gb) => localStorage.setItem('vramBudgetGB', gb), VRAMGB);
     await page.goto(`${BASE}/${URLQ}`);
 
     // Select the AMD adapter (headless label is "rdna-2").

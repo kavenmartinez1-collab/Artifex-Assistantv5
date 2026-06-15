@@ -71,9 +71,12 @@ import { topKSoftmax, MOE_MAX_TOKENS, type MoEBackend } from './moe-cpu';
 /** Longest KV sequence the attention kernels can read: attention.wgsl (and
  *  attention_tq.wgsl) hold per-position scores in `var<workgroup> scores:
  *  array<f32, 3840>` — 3840*4 + 256*4 = 16384 bytes, exactly the default
- *  WebGPU workgroup-storage limit. KV caches must not exceed this; callers
- *  sizing persistent chat sessions must clamp to it. */
-export const MAX_ATTN_SEQ_LEN = 3840;
+ *  WebGPU workgroup-storage limit. That shader array is the HARD ceiling
+ *  (3840); this constant clamps the KV cache / session length BELOW it to
+ *  trade max context for VRAM, so the 27B fits headed on a 12 GB card. Must
+ *  stay <= 3840. KV caches must not exceed this; callers sizing persistent
+ *  chat sessions must clamp to it. */
+export const MAX_ATTN_SEQ_LEN = 2048;
 
 // ── CPU embed helpers (BF16 → F32 decode) ──────────────────────────────
 const _cpuEmbedBuf = new ArrayBuffer(4);
@@ -429,6 +432,7 @@ export function createForwardPassEngine(
       [GGML_TYPES.Q6_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q6_k', 'matmul-gguf-q6_k'),
       [GGML_TYPES.IQ4_NL]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq4_nl', 'matmul-gguf-iq4_nl'),
       [GGML_TYPES.IQ4_XS]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq4_xs', 'matmul-gguf-iq4_xs'),
+      [GGML_TYPES.IQ2_XXS]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq2_xxs', 'matmul-gguf-iq2_xxs'),
     } : null;
   // Lever 2: multi-output tiled GEMV — TN output rows per workgroup share a
   // staged activation tile (legacy kernels re-read the full activation vector
@@ -958,7 +962,15 @@ export function createForwardPassEngine(
   // ── Reusable intermediate buffers ──────────────────────────────────
   // Sized for batch prefill (up to MAX_PREFILL tokens per forward pass).
   // Single-token decode uses the same buffers (seqLen=1).
-  const MAX_PREFILL = 512;
+  //
+  // COUPLING: this must be >= the largest M ever passed to forward(). That is
+  // generate.ts's PREFILL_CHUNK (isHybrid ? 16 : 512) and spec-verify rows
+  // (MAX_SPEC_ROWS = 8). Hybrid models therefore only ever see M<=16, so 64
+  // gives a 4x margin while shrinking every activation buffer 8x — the largest
+  // reducible transient on a VRAM-tight headed load. Dense models still chunk
+  // prefill at 512 and need the full width. Decode is M=1 either way, so this
+  // changes prefill peak memory only, never decode throughput.
+  const MAX_PREFILL = config.isHybrid ? 64 : 512;
 
   const hiddenBuf = createStorageBuffer(device, null, MAX_PREFILL * H * 4, 'hidden', true);
   const residualBuf = createStorageBuffer(device, null, MAX_PREFILL * H * 4, 'residual', true);
