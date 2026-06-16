@@ -546,6 +546,12 @@ export function createForwardPassEngine(
       [GGML_TYPES.Q4_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q4_k_tiled', 'matmul-gguf-q4_k-tiled', gemvTileConsts),
       [GGML_TYPES.Q5_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q5_k_tiled', 'matmul-gguf-q5_k-tiled', gemvTileConsts),
       [GGML_TYPES.Q6_K]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q6_k_tiled', 'matmul-gguf-q6_k-tiled', gemvTileConsts),
+      // IQ2_XXS tiled (Path 2, 2026-06-16). Same TN-rows-per-WG, shared
+      // a_tile pattern as the k-quant tiled kernels. Targets the dominant
+      // GEMV on IQ2_XXS 27B (~82% of decode @ ~15% peak BW); the lm_head's
+      // tiled Q6_K kernel hits ~64% peak on the same hardware, so this
+      // pattern is the existence proof.
+      [GGML_TYPES.IQ2_XXS]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq2_xxs_tiled', 'matmul-gguf-iq2_xxs-tiled', gemvTileConsts),
     } : null;
   // Lever 4: no-stage decode GEMV — same tiled lane→unit mapping but direct
   // vec4 A reads (no a_tile staging, no per-chunk barriers). Bit-identical

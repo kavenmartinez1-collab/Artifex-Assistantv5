@@ -534,6 +534,86 @@ fn matmul_gguf_iq2_xxs(@builtin(local_invocation_id) lid: vec3u,
   reduce_and_store(tid, n, m, sum);
 }
 
+// ── IQ2_XXS tiled: TN rows/workgroup, shared activation staging ────────
+// Same superblock decode as matmul_gguf_iq2_xxs above (17 u32/SB, 8 ib32
+// groups of 8 bytes = aux0[4] grid indices | aux1 with 4× 7-bit signs +
+// 4-bit ls scale at the top). One 32-elem tile unit = one ib32 group.
+// Per-lane bit-math (d/db, grid lookup, sign byte) is IDENTICAL to the
+// legacy kernel; only the activation source (a_tile vec4 lane stride) and
+// accumulation order change (plain f32 + dot(), no inner Kahan — same
+// tradeoff Q2_K_tiled etc. make; runtime A/B via ?gemvTile=0 covers it).
+
+@compute @workgroup_size(TWG, 1, 1)
+fn matmul_gguf_iq2_xxs_tiled(@builtin(local_invocation_id) lid: vec3u,
+                             @builtin(workgroup_id) wid: vec3u) {
+  let tid = lid.x;
+  let TPR = TWG / TN;
+  let lane = tid % TPR;
+  let row = tid / TPR;
+  let n = (wid.x + wid.z * 65535u) * TN + row;
+  let m = wid.y;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 8u;
+  let nChunks = (nUnits + TPR - 1u) / TPR;
+  let aRow = m * K;
+  let valid = n < params.N;
+
+  var acc: f32 = 0.0;
+  for (var c = 0u; c < nChunks; c = c + 1u) {
+    workgroupBarrier();
+    tile_stage(tid, aRow, c * TPR * 32u, K);
+    workgroupBarrier();
+
+    let u = c * TPR + lane;
+    if (u < nUnits && valid) {
+      let sb = u / 8u;
+      let ib = u % 8u;
+      let wordBase = (n * nSB + sb) * 17u;
+      let d = unpack2x16float(W[wordBase]).x;  // f16 d @ bytes 0-1
+      let g = wordBase * 4u + 2u + ib * 8u;    // aux0[4] @ g..g+3 | aux1 @ g+4..g+7
+      let aux1 = wbyte(g + 4u) | (wbyte(g + 5u) << 8u)
+               | (wbyte(g + 6u) << 16u) | (wbyte(g + 7u) << 24u);
+      let ls = aux1 >> 28u;
+      let db = d * (0.5 + f32(ls)) * 0.25;
+      var dot_acc: f32 = 0.0;
+      for (var l = 0u; l < 4u; l = l + 1u) {
+        let gridIdx = wbyte(g + l);
+        let signs = iq2xxs_sign_byte((aux1 >> (7u * l)) & 127u);
+        let mlo = vec4<f32>(
+          iq2xxs_grid_byte(gridIdx, 0u),
+          iq2xxs_grid_byte(gridIdx, 1u),
+          iq2xxs_grid_byte(gridIdx, 2u),
+          iq2xxs_grid_byte(gridIdx, 3u),
+        );
+        let mhi = vec4<f32>(
+          iq2xxs_grid_byte(gridIdx, 4u),
+          iq2xxs_grid_byte(gridIdx, 5u),
+          iq2xxs_grid_byte(gridIdx, 6u),
+          iq2xxs_grid_byte(gridIdx, 7u),
+        );
+        let slo = vec4<f32>(
+          select(1.0, -1.0, (signs & 1u) == 1u),
+          select(1.0, -1.0, ((signs >> 1u) & 1u) == 1u),
+          select(1.0, -1.0, ((signs >> 2u) & 1u) == 1u),
+          select(1.0, -1.0, ((signs >> 3u) & 1u) == 1u),
+        );
+        let shi = vec4<f32>(
+          select(1.0, -1.0, ((signs >> 4u) & 1u) == 1u),
+          select(1.0, -1.0, ((signs >> 5u) & 1u) == 1u),
+          select(1.0, -1.0, ((signs >> 6u) & 1u) == 1u),
+          select(1.0, -1.0, ((signs >> 7u) & 1u) == 1u),
+        );
+        let alo = a_tile[lane * 8u + l * 2u];
+        let ahi = a_tile[lane * 8u + l * 2u + 1u];
+        dot_acc = dot_acc + dot(alo, mlo * slo) + dot(ahi, mhi * shi);
+      }
+      acc = acc + db * dot_acc;
+    }
+  }
+  tile_reduce_store(tid, lane, n, m, acc);
+}
+
 // ── IQ3_XXS / IQ3_S / IQ2_S grids ───────────────────────────────────────
 // iq3xxs_grid[256] / iq3s_grid[512] (u32, 4 magnitude bytes each) and
 // iq2s_grid[1024] (u64 → 2 u32 lo/hi, 8 magnitude bytes each). Generated

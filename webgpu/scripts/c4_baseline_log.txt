@@ -1,0 +1,97 @@
+[page] [vite] connecting...
+[page] [vite] connected.
+[page] [Init] crossOriginIsolated — SharedArrayBuffer available
+[page] [DOM] Password field is not contained in a form: (More info: https://goo.gl/9p2vKq) %o
+[page] Failed to load resource: the server responded with a status of 404 (Not Found)
+[page] [GPU Discovery] Found 1 unique adapter(s):
+[page] [GPU Discovery] Note: WebGPU can only discover discrete vs integrated GPUs.
+[page] [Init] Discovered 1 GPU adapter(s)
+[page] [WebGPU] Device initialized: {vendor: amd, architecture: rdna-2, device: , description: , maxBufferSize_MB: 2048}
+adapter: rdna-2
+loading local/qwen3.5-27b-gguf ...
+[page] [HF Hub] Using local cache: /api/hf-cache
+[page] [Orchestrator] Connected to hub
+[page] [GGUF-Loader] local/qwen3.5-27b-gguf/Qwen3.5-27B.Q2_K.gguf: 850 GPU tensors (9.75 GB), 1 CPU tensors, 0 expert tensors deferred (0.00 GB for worker fleet), 36.2s
+[page] [GGUF-Loader] GPU tensors by type: Q2_K x400 (5926 MB), Q3_K x80 (2716 MB), Q6_K x1 (1053 MB), Q4_K x16 (47 MB), F32 x353 (11 MB)
+[page] [GGUF] embed: CPU row-gather (1680 B/row); lm_head: Q6_K
+[page] [GGUF] Hybrid model: 48 linear + 16 full attention layers
+[page] [forward-pass] Q2_K repack (lever C): 400 tensors → unit-contiguous layout
+[page] [forward-pass] gate+up same-A fusion: concatenated 64 layers
+[page] Failed to load resource: the server responded with a status of 404 (Not Found)
+[page] Failed to load resource: the server responded with a status of 404 (Not Found)
+[page] Failed to load resource: the server responded with a status of 404 (Not Found)
+[page] [Tokenizer] Local model fallback, using tokenizer from: Qwen/Qwen3.5-9B
+[page] [Tokenizer] EOS token IDs: [248046, 248044]
+[page] [HF Hub] Using remote CDN
+loaded in 38s
+[page] [Tokenizer] ChatML template applied (thinking=true)
+[page] [Generate] GPU argmax active (greedy, 4-byte readback)
+[page] [Spec] speculative decode active (n-gram drafter, specK=4)
+[page] [Generate] Prompt: 40 tokens, first 5: [248045, 8678, 198, 2523, 513]
+[page] [Generate] Decoded prompt: "<|im_start|>system
+You are Artifex, a helpful AI assistant.<|im_end|>
+<|im_start|>user
+Explain, in two detailed paragraphs, how a refrigerator keeps food cold.<|im_end|>
+<|im_start|>assistant
+<think>
+"
+[page] [KVCache] SSM state: 149.6 MB for 48 linear layers (fixed, sequence-independent)
+[page] [perf forward #1 seqLen=16 pos=0] cpu=42.6ms dispatches=9138 copies=177 bg_creates=4477 (per-token: 2.7ms, 571 dispatches)
+[page] [perf forward #2 seqLen=16 pos=16] cpu=23.2ms dispatches=9138 copies=177 bg_creates=18 (per-token: 1.4ms, 571 dispatches)
+[page] [perf forward #3 seqLen=8 pos=32] cpu=10.8ms dispatches=4914 copies=177 bg_creates=279 (per-token: 1.3ms, 614 dispatches)
+[page] [Generate] Prefill: 40 tokens in 3 chunk(s), 6354ms (6 tok/s)
+[page] [timing forward #4 seqLen=1 pos=40] GPU-sum=101.93ms across 1154 dispatches
+[page] [Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object]
+[page] [perf forward #4 seqLen=1 pos=40] cpu=127.4ms dispatches=1154 copies=176 bg_creates=216 (per-token: 127.4ms, 1154 dispatches)
+[page] [perf decode #1] fwd_cpu=127.7ms gpu_wait=0.3ms readback=2.0ms sample=0.0ms total=130.0ms dispatches=1154 bg_creates=216
+[page] [timing forward #5 seqLen=1 pos=41] GPU-sum=91.16ms across 1154 dispatches
+[page] [Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object]
+[page] [perf forward #5 seqLen=1 pos=41] cpu=105.9ms dispatches=1154 copies=176 bg_creates=18 (per-token: 105.9ms, 1154 dispatches)
+[page] [perf decode #2] fwd_cpu=106.2ms gpu_wait=0.3ms readback=0.6ms sample=0.0ms total=107.1ms dispatches=1154 bg_creates=18
+[page] [perf decode #3] fwd_cpu=3.5ms gpu_wait=94.5ms readback=2.7ms sample=0.0ms total=100.7ms dispatches=1154 bg_creates=18
+[page] [perf decode #4] fwd_cpu=9.9ms gpu_wait=101.9ms readback=2.4ms sample=0.0ms total=114.3ms dispatches=1154 bg_creates=18
+[page] [perf decode #5] fwd_cpu=9.6ms gpu_wait=99.9ms readback=2.6ms sample=0.0ms total=112.1ms dispatches=1154 bg_creates=18
+[page] [perf decode] DIAGNOSIS: GPU-bound — kernel fusion (norm+proj, FFN) is the win (fwd_cpu=6%, gpu_wait=92%, readback=2%, sample=0%)
+[page] [perf decode SUMMARY over 130 steps] avg_total=102.2ms (=9.79 tok/s) | fwd_cpu=7.7ms (8%) gpu_wait=92.3ms (90%) readback=2.2ms (2%) sample=0.0ms (0%) | avg_dispatches/token=1154
+[page] [perf decode SUMMARY] DIAGNOSIS: GPU-bound — kernel fusion (norm+proj, FFN swiglu) is the win
+[page] [spec SUMMARY] rounds=30 drafted=64 accepted=31 (48%) tokens=192 tokens/round=6.40
+
+──── meta ────
+192 tokens | 8.1 tok/s | 30.2s | max_length
+
+──── perfLastForward ────
+{"seqLen":1,"cpuMs":3.5,"dispatches":1154,"copies":176,"bgCreates":18,"moeSyncMs":0,"moeExpertMs":0}
+
+──── GPU per-category (last profiled forward) ────
+gguf_Q2_K_r                  n= 336   59.864 ms   65.7%  avg 178.2 us
+gguf_Q3_K_v4                 n=  80   19.032 ms   20.9%  avg 237.9 us
+ssm_step_split               n=  48    3.795 ms    4.2%  avg 79.1 us
+gguf_Q6_K_tiled              n=   1    3.188 ms    3.5%  avg 3187.8 us
+rmsnorm                      n= 209    2.096 ms    2.3%  avg 10.0 us
+l2norm                       n=  96    1.226 ms    1.3%  avg 12.8 us
+attention                    n=  16    0.874 ms    1.0%  avg 54.6 us
+add                          n= 128    0.506 ms    0.6%  avg 4.0 us
+gate_silu                    n= 112    0.273 ms    0.3%  avg 2.4 us
+conv1d_fused                 n=  48    0.172 ms    0.2%  avg 3.6 us
+gguf_Q4_K_v4                 n=  16    0.054 ms    0.1%  avg 3.4 us
+deinterleave                 n=  16    0.034 ms    0.0%  avg 2.1 us
+rope                         n=  32    0.025 ms    0.0%  avg 0.8 us
+gate_sigmoid                 n=  16    0.021 ms    0.0%  avg 1.3 us
+
+──── response (greedy) ────
+💭 Thinking Process:
+
+1.  **Analyze the Request:**
+    *   **Persona:** Artifex (a helpful AI assistant).
+    *   **Task:** Explain how a refrigerator keeps food cold.
+    *   **Constraint:** Exactly two detailed paragraphs.
+    *   **Topic:** Refrigeration mechanism (thermodynamics, heat transfer, refrigerant cycle).
+
+2.  **Drafting - Paragraph 1: The Core Mechanism (Heat Transfer & Phase Change):**
+    *   Focus on the basic principle: removing heat from the interior.
+    *   Explain the role of the refrigerant (coolant).
+    *   Describe the cycle: compressor, condenser, expansion valve, evaporator.
+    *   Key concept: Heat flows from hot to cold, so the fridge must be colder than the food to absorb heat.
+    *   *Drafting thought:* Start with the fundamental law of
+
+[wrote 780 chars to scripts/c4_baseline.txt]

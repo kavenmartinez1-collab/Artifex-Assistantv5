@@ -1,0 +1,87 @@
+[page] [vite] connecting...
+[page] [vite] connected.
+[page] [Init] crossOriginIsolated — SharedArrayBuffer available
+[page] [DOM] Password field is not contained in a form: (More info: https://goo.gl/9p2vKq) %o
+[page] Failed to load resource: the server responded with a status of 404 (Not Found)
+[page] [GPU Discovery] Found 1 unique adapter(s):
+[page] [GPU Discovery] Note: WebGPU can only discover discrete vs integrated GPUs.
+[page] [Init] Discovered 1 GPU adapter(s)
+[page] [WebGPU] Device initialized: {vendor: amd, architecture: rdna-2, device: , description: , maxBufferSize_MB: 2048}
+adapter: rdna-2
+loading local/qwen3.6-27b-iq2xxs-gguf ...
+[page] [HF Hub] Using local cache: /api/hf-cache
+[page] [Orchestrator] Connected to hub
+[page] [GGUF-Loader] local/qwen3.6-27b-iq2xxs-gguf/Qwen3.6-27B-IQ2_XXS-mtp.gguf: 850 GPU tensors (8.17 GB), 1 CPU tensors, 0 expert tensors deferred (0.00 GB for worker fleet), 32.4s
+[page] [GGUF-Loader] GPU tensors by type: IQ2_XXS x424 (5588 MB), Q4_K x64 (1463 MB), Q5_K x1 (874 MB), Q2_K x8 (234 MB), F32 x353 (11 MB)
+[page] [GGUF-Loader] mixed types for ffn_down.weight: Q2_K@[0,1,2,3,4,5,6,7] | IQ2_XXS@[56 layers L8..L63]
+[page] [GGUF] embed: CPU row-gather (1680 B/row); lm_head: Q5_K
+[page] [GGUF] Hybrid model: 48 linear + 16 full attention layers
+[page] [forward-pass] Q2_K repack (lever C): 8 tensors → unit-contiguous layout
+[page] [forward-pass] gate+up same-A fusion: concatenated 64 layers
+[page] [Tokenizer] Loaded from local model dir: local/qwen3.6-27b-iq2xxs-gguf
+[page] [Tokenizer] EOS token IDs: [248046, 248044]
+[page] [HF Hub] Using remote CDN
+loaded in 34s
+[page] [Tokenizer] ChatML template applied (thinking=true)
+[page] [Generate] GPU argmax active (greedy, 4-byte readback)
+[page] [Generate] Prompt: 40 tokens, first 5: [248045, 8678, 198, 2523, 513]
+[page] [Generate] Decoded prompt: "<|im_start|>system
+You are Artifex, a helpful AI assistant.<|im_end|>
+<|im_start|>user
+Explain, in two detailed paragraphs, how a refrigerator keeps food cold.<|im_end|>
+<|im_start|>assistant
+<think>
+"
+[page] [KVCache] SSM state: 149.6 MB for 48 linear layers (fixed, sequence-independent)
+[page] [perf forward #1 seqLen=16 pos=0] cpu=46.9ms dispatches=9138 copies=177 bg_creates=4477 (per-token: 2.9ms, 571 dispatches)
+[page] [perf forward #2 seqLen=16 pos=16] cpu=24.8ms dispatches=9138 copies=177 bg_creates=18 (per-token: 1.6ms, 571 dispatches)
+[page] [perf forward #3 seqLen=8 pos=32] cpu=11.7ms dispatches=4914 copies=177 bg_creates=279 (per-token: 1.5ms, 614 dispatches)
+[page] [Generate] Prefill: 40 tokens in 3 chunk(s), 4455ms (9 tok/s)
+[page] [timing forward #4 seqLen=1 pos=40] GPU-sum=90.32ms across 1154 dispatches
+[page] [Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object]
+[page] [perf forward #4 seqLen=1 pos=40] cpu=111.9ms dispatches=1154 copies=176 bg_creates=216 (per-token: 111.9ms, 1154 dispatches)
+[page] [perf decode #1] fwd_cpu=112.1ms gpu_wait=0.2ms readback=1.0ms sample=0.0ms total=113.3ms dispatches=1154 bg_creates=216
+[page] [timing forward #5 seqLen=1 pos=41] GPU-sum=90.44ms across 1154 dispatches
+[page] [Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object, Object]
+[page] [perf forward #5 seqLen=1 pos=41] cpu=101.2ms dispatches=1154 copies=176 bg_creates=18 (per-token: 101.2ms, 1154 dispatches)
+[page] [perf decode #2] fwd_cpu=101.6ms gpu_wait=0.3ms readback=0.9ms sample=0.0ms total=102.8ms dispatches=1154 bg_creates=18
+[page] [perf decode #3] fwd_cpu=4.7ms gpu_wait=75.4ms readback=0.9ms sample=0.0ms total=81.0ms dispatches=1154 bg_creates=18
+[page] [perf decode #4] fwd_cpu=3.9ms gpu_wait=77.8ms readback=4.9ms sample=0.0ms total=86.5ms dispatches=1154 bg_creates=18
+[page] [perf decode #5] fwd_cpu=3.9ms gpu_wait=79.3ms readback=0.7ms sample=0.0ms total=83.9ms dispatches=1154 bg_creates=18
+[page] [perf decode] DIAGNOSIS: GPU-bound — kernel fusion (norm+proj, FFN) is the win (fwd_cpu=6%, gpu_wait=93%, readback=1%, sample=0%)
+[page] [perf decode SUMMARY over 63 steps] avg_total=86.7ms (=11.53 tok/s) | fwd_cpu=8.9ms (10%) gpu_wait=76.7ms (88%) readback=1.1ms (1%) sample=0.0ms (0%) | avg_dispatches/token=1154
+[page] [perf decode SUMMARY] DIAGNOSIS: GPU-bound — kernel fusion (norm+proj, FFN swiglu) is the win
+
+──── meta ────
+64 tokens | 11.6 tok/s | 10.0s | max_length
+
+──── perfLastForward ────
+{"seqLen":1,"cpuMs":4.110000003129244,"dispatches":1154,"copies":176,"bgCreates":18,"moeSyncMs":0,"moeExpertMs":0}
+
+──── GPU per-category (last profiled forward) ────
+gguf_IQ2_XXS_tiled           n= 360   66.891 ms   74.0%  avg 185.8 us
+gguf_Q4_K_v4                 n=  64    8.119 ms    9.0%  avg 126.9 us
+gguf_Q2_K_r                  n=   8    4.057 ms    4.5%  avg 507.2 us
+ssm_step_split               n=  48    3.441 ms    3.8%  avg 71.7 us
+gguf_Q5_K_v4                 n=   1    3.198 ms    3.5%  avg 3198.3 us
+rmsnorm                      n= 209    1.692 ms    1.9%  avg 8.1 us
+l2norm                       n=  96    1.063 ms    1.2%  avg 11.1 us
+attention                    n=  16    0.872 ms    1.0%  avg 54.5 us
+add                          n= 128    0.697 ms    0.8%  avg 5.4 us
+conv1d_fused                 n=  48    0.166 ms    0.2%  avg 3.5 us
+gate_silu                    n= 112    0.162 ms    0.2%  avg 1.4 us
+deinterleave                 n=  16    0.037 ms    0.0%  avg 2.3 us
+rope                         n=  32    0.023 ms    0.0%  avg 0.7 us
+gate_sigmoid                 n=  16    0.019 ms    0.0%  avg 1.2 us
+
+──── response (greedy) ────
+💭 Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - **Topic:** How a refrigerator keeps food cold
+   - **Format:** Two detailed paragraphs
+   - **Goal:** Explain the mechanism clearly and thoroughly within the constraint
+
+2.  **Identify Key Concepts:**
+
+[wrote 264 chars to scripts/c4_iq2xxs_tiled.txt]
