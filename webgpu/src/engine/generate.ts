@@ -14,7 +14,7 @@
 
 import { readBuffer } from './buffers';
 import { createGpuArgmax, MAX_ARGMAX_ROWS, type GpuArgmax } from './argmax';
-import { MAX_ATTN_SEQ_LEN, type ForwardPassEngine, type KVCache } from './forward-pass';
+import { MAX_ATTN_SEQ_LEN, MAX_SPEC_ROWS, type ForwardPassEngine, type ForwardOptions, type KVCache } from './forward-pass';
 import type { Tokenizer } from '../model/tokenizer';
 
 // One GPU-argmax instance per device, reused across generations (pipelines
@@ -628,7 +628,15 @@ export function generate(
       MAX_ARGMAX_ROWS - 1,
       parseInt(__argmaxSearch?.get('specK') ?? '4', 10) || 4,
     ));
-    if (specEnabled) console.log(`[Spec] speculative decode active (n-gram drafter, specK=${specK})`);
+    // Pick the drafter: an MTP head (blk.{block_count}.*, loaded via ?spec=1)
+    // drafts from the model itself; otherwise fall back to the model-free
+    // n-gram drafter. The verify loop below is drafter-agnostic.
+    const mtpSpec = specEnabled && engine.hasMtpHead;
+    if (specEnabled) {
+      console.log(mtpSpec
+        ? '[Spec] speculative decode active (MTP head drafter, 1 token/round)'
+        : `[Spec] speculative decode active (n-gram drafter, specK=${specK})`);
+    }
     console.log(`[Generate] Prompt: ${promptTokens} tokens, first 5: [${promptIds.slice(0, 5).join(', ')}]`);
     // Debug: decode the full prompt to see what the model actually sees
     console.log(`[Generate] Decoded prompt: "${tokenizer.decode(promptIds)}"`);
@@ -785,13 +793,16 @@ export function generate(
             `[Generate] bidirectional image span (${seg.ids.length} tokens) exceeds the `
             + `prefill chunk (${PREFILL_CHUNK}) — bidirectionality cannot span chunks`);
         }
-        const fwdOpts = seg.embeds
+        const fwdOpts: ForwardOptions = seg.embeds
           ? {
               embeddings: seg.embeds.subarray(i * Hdim, chunkEnd * Hdim),
               deepstackFeatures: seg.deepstack?.map(f => f.subarray(i * Hdim, chunkEnd * Hdim)),
               bidirectional: seg.bidirectional,
             }
-          : undefined;
+          : {};
+        // MTP seed: the head needs the trunk hidden of the row that produced the
+        // first sampled token, i.e. the LAST prefill row's pre-final-norm hidden.
+        if (mtpSpec && isLastChunk) fwdOpts.returnMtpHidden = true;
         prefillOutput = await engine.forward(chunk, kvCache, fwdOpts);
       }
     }
@@ -860,6 +871,17 @@ export function generate(
       // a partial-accept round (state was rolled back).
       let specPending: number[] = specEnabled ? [lastTokenId] : [];
       let specRounds = 0, specDrafted = 0, specAccepted = 0;
+      // MTP drafter: nextDraft is the head's guess for the token after the last
+      // committed token. Seed it from the prefill's last row — the pre-final-norm
+      // hidden that produced lastTokenId — paired with lastTokenId at its position
+      // (kvCache.position; it isn't in the trunk KV yet). Also primes MTP-KV[pos].
+      let mtpNextDraft = -1;
+      if (mtpSpec) {
+        const seedH = prefillOutput!.mtpHidden;
+        if (!seedH) throw new Error('[Spec] MTP seed: prefill did not return mtpHidden');
+        const seed = await engine.mtpDraft(kvCache, seedH, lastTokenId, kvCache.position);
+        mtpNextDraft = await gpuArgmax!.run(seed.logits, engine.config.vocabSize);
+      }
       for (let step = 1; step < config.maxNewTokens; step++) {
         if (aborted) {
           stopReason = 'aborted';
@@ -882,15 +904,20 @@ export function generate(
         // untouched single-token path below (zero overhead vs today).
         if (specEnabled) {
           if (specPending.length === 1) specPending[0] = lastTokenId;
-          const maxDrafts = Math.min(specK, MAX_ARGMAX_ROWS - specPending.length);
+          // MTP drafts exactly 1 token/round (Opt 1); n-gram drafts up to specK.
+          const maxDrafts = mtpSpec
+            ? Math.min(1, MAX_SPEC_ROWS - specPending.length)
+            : Math.min(specK, MAX_ARGMAX_ROWS - specPending.length);
           const drafts = maxDrafts > 0
-            ? ngramDraft([...promptIds, ...generatedIds], maxDrafts) : [];
+            ? (mtpSpec ? [mtpNextDraft] : ngramDraft([...promptIds, ...generatedIds], maxDrafts))
+            : [];
           if (drafts.length > 0 || specPending.length > 1) {
             const P = specPending.length;
             const chunk = [...specPending, ...drafts];
             const savedPos = kvCache.position;
             engine.snapshotSSMState(kvCache);
-            const out = await engine.forward(new Uint32Array(chunk), kvCache, { specRows: chunk.length });
+            const out = await engine.forward(new Uint32Array(chunk), kvCache,
+              { specRows: chunk.length, returnMtpHidden: mtpSpec });
             if ((out.logitsRows ?? 1) !== chunk.length) {
               throw new Error(`[Spec] expected ${chunk.length} logits rows, got ${out.logitsRows ?? 1}`);
             }
@@ -927,6 +954,23 @@ export function generate(
                 stopReason = 'eos';
                 console.log(`[Generate] Stopping: repetition detected (spec round ${specRounds})`);
                 stopAll = true; break;
+              }
+            }
+            // Dense MTP-KV refresh + next-round draft. For every COMMITTED token,
+            // run the head at its true position, paired with the trunk hidden of
+            // the row that produced it (out.mtpHidden row P-1+j). This keeps the
+            // 1-layer MTP-KV gap-free; the last call's argmax is next round's
+            // draft. Rejected drafts are never written to the MTP-KV, so a
+            // partial-accept rollback needs no MTP-KV unwind — committed tokens
+            // keep their positions when they re-enter specPending.
+            if (mtpSpec && !stopAll) {
+              const Hb = engine.config.hiddenSize * 4;
+              for (let j = 0; j < commit.length; j++) {
+                const r = await engine.mtpDraft(
+                  kvCache, out.mtpHidden!, commit[j], savedPos + P + j, (P - 1 + j) * Hb);
+                if (j === commit.length - 1) {
+                  mtpNextDraft = await gpuArgmax!.run(r.logits, engine.config.vocabSize);
+                }
               }
             }
             if (stopAll) break;

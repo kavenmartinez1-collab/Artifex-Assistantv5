@@ -197,14 +197,16 @@ export async function loadGGUFModel(
     const m = BLK_RE.exec(name);
     return m !== null && Number(m[1]) >= numLayers;
   };
-  // The MTP / next-token-prediction head (blk.L, L >= block_count) is loaded
-  // for a future speculative MTP drafter, but NO forward / decode / draft path
-  // reads it today — drafts come from the n-gram drafter (generate.ts). On a
-  // VRAM-tight card it is pure dead weight (~0.5 GB for the 27B), so skip it by
-  // default. Opt in with ?mtpHead=1 to load it into mtpTensors (e.g. to verify
-  // VRAM fit / wire up an MTP drafter); loading it alone does NOT speed decode.
-  const LOAD_MTP_HEAD = typeof window !== 'undefined'
-    && new URLSearchParams(window.location.search).get('mtpHead') === '1';
+  // The MTP / next-token-prediction head (blk.L, L >= block_count) feeds the
+  // speculative MTP drafter (mtpDraft in forward-pass.ts). On a VRAM-tight card
+  // it is dead weight (~0.5 GB for the 27B) for plain autoregressive decode, so
+  // skip it by default. It is loaded when EITHER ?mtpHead=1 (explicit, e.g. to
+  // verify VRAM fit) OR ?spec=1 (the spec-decode drafter consumes it; loading it
+  // alone still does NOT speed decode — generate.ts must drive mtpDraft).
+  const _mtpParams = typeof window !== 'undefined'
+    ? new URLSearchParams(window.location.search) : null;
+  const LOAD_MTP_HEAD = _mtpParams !== null
+    && (_mtpParams.get('mtpHead') === '1' || _mtpParams.get('spec') === '1');
   const isCPUOnly = (name: string): boolean => cpuNames.has(name) || SHEXP_GATE_RE.test(name);
 
   // Vision tower guard: multimodal GGUFs (Ollama-packed Gemma 4, Qwen-VL)

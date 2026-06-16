@@ -254,6 +254,33 @@ export interface ModelWeights {
     /** sharedGateVecs[l] = ffn_gate_inp_shexp.weight (F32 [hidden]) — scalar sigmoid gate. */
     sharedGateVecs: Float32Array[];
   };
+  /** Qwen3.5/3.6 MTP / next-token-prediction head (blk.{block_count}.*),
+   *  loaded only when the speculative drafter wants it. Drives mtpDraft(). */
+  mtp?: MTPHeadWeights;
+}
+
+/**
+ * MTP / next-token-prediction head weights (Qwen3.5/3.6 blk.{block_count}.*).
+ *
+ * Structurally the head is a `full_attention` trunk layer (gated attention +
+ * SwiGLU FFN), so `layer` carries the same role buffers a trunk layer would
+ * (inputNorm←attn_norm, postAttnNorm←ffn_norm, qProj/kProj/vProj/oProj,
+ * qNorm/kNorm, gateProj/upProj/downProj — `_gg` variants when k-quantized).
+ * The four `nextn.*` tensors are head-specific. embed + lm_head are SHARED
+ * with the trunk (embedGG / lmHeadGG); this file carries no nextn.embed_tokens
+ * / nextn.shared_head_head. Verified against qwen35.cpp:490-644.
+ */
+export interface MTPHeadWeights {
+  /** Trunk-style gated-attn + SwiGLU layer for the head. */
+  layer: LayerWeights;
+  /** blk.L.nextn.eh_proj: [hidden, 2*hidden] — projects [enorm(e); hnorm(h)] → hidden. */
+  ehProj: GGUFWeight | GPUBuffer;
+  /** blk.L.nextn.enorm: RMSNorm weight [hidden] for the next-token embedding. */
+  enorm: GPUBuffer;
+  /** blk.L.nextn.hnorm: RMSNorm weight [hidden] for the trunk pre-final-norm hidden. */
+  hnorm: GPUBuffer;
+  /** blk.L.nextn.shared_head_norm: RMSNorm weight [hidden] before the shared lm_head. */
+  sharedHeadNorm: GPUBuffer;
 }
 
 /** Compressed KV cache data (TurboQuant). */
@@ -294,6 +321,13 @@ export interface KVCache {
   compressed?: CompressedKVData;
   /** SSM state for hybrid models with linear attention layers */
   ssmState?: SSMState;
+  /** MTP head's own 1-layer KV cache (Qwen3.5/3.6 kv_only_nextn). Allocated
+   *  only when the engine has an MTP head. Advanced/rolled-back by the spec
+   *  drafter in lockstep with `position` (mtpDraft writes at mtpPosition). */
+  mtpKeys?: GPUBuffer;
+  mtpValues?: GPUBuffer;
+  /** Cached-token count in the MTP-KV (the head's analogue of `position`). */
+  mtpPosition?: number;
 }
 
 /** Output of a forward pass step. */
@@ -303,6 +337,12 @@ export interface ForwardOutput {
   /** When forward() ran with specRows: number of row-major logits rows
    *  ([rows × vocab_size]) in logitsBuffer. Absent on the normal path. */
   logitsRows?: number;
+  /** When opts.returnMtpHidden: the PRE-final-norm hidden (residual stream
+   *  before global finalNorm — `res->t_h_pre_norm` in qwen35.cpp). Holds
+   *  specRows rows ([specRows × H]) on the verify path, or the single last
+   *  row ([H]) otherwise. This is the `h` the MTP head consumes (mtpDraft).
+   *  Overwritten by the next forward() — consume before the next call. */
+  mtpHidden?: GPUBuffer;
 }
 
 // ── Forward Pass Engine ──────────────────────────────────────────────────
@@ -327,6 +367,11 @@ export interface ForwardOptions {
    *  other lm_head formats throw. logitsBuffer then holds specRows × V
    *  row-major logits and ForwardOutput.logitsRows is set. */
   specRows?: number;
+  /** Spec-decode MTP drafter: also expose the PRE-final-norm hidden via
+   *  ForwardOutput.mtpHidden (the `h` seed the MTP head consumes). Costs one
+   *  batchCopy; the normal path leaves it unset and pays nothing. No-op when
+   *  the model has no MTP head. */
+  returnMtpHidden?: boolean;
 }
 
 /** Max rows per spec-decode verify chunk — mirrors MAX_ARGMAX_ROWS. */
@@ -349,6 +394,26 @@ export interface ForwardPassEngine {
   /** Spec decode: restore SSM state from the last snapshot. KV rollback is
    *  caller-side via kvCache.position. */
   restoreSSMState(kvCache: KVCache): void;
+
+  /** True when the model carries an MTP / next-token-prediction head and it
+   *  was loaded (?spec=1 / ?mtpHead=1). The speculative drafter in generate.ts
+   *  picks the MTP drafter over the n-gram fallback based on this. */
+  readonly hasMtpHead: boolean;
+
+  /**
+   * MTP speculative drafter: predict the token AFTER `tokenId` by running the
+   * next-token-prediction head (blk.{block_count}.*) on the trunk's PRE-final-
+   * norm hidden `hiddenRow` (one row [H], e.g. ForwardOutput.mtpHidden). When
+   * `hiddenRow` packs several rows (the specRows tap), `hiddenRowOffsetBytes`
+   * selects which row to read. Writes the head's K/V into the 1-layer MTP-KV at
+   * `position` and attends [0..position]. Returns the head's logits ([V]); the
+   * caller argmaxes them (greedy spec). Throws if hasMtpHead is false or the
+   * model isn't a GGUF shared-embed/lm_head model.
+   */
+  mtpDraft(
+    kvCache: KVCache, hiddenRow: GPUBuffer, tokenId: number, position: number,
+    hiddenRowOffsetBytes?: number,
+  ): Promise<{ logits: GPUBuffer }>;
 
   /** Get the model descriptor. */
   readonly config: ModelDescriptor;
@@ -375,6 +440,17 @@ export function createForwardPassEngine(
   } = config;
 
   const kvDim = nKVHeads * dHead;
+
+  // MTP / next-token-prediction head (Qwen3.5/3.6). Present only when the
+  // loader uploaded blk.{block_count}.* (?spec=1 / ?mtpHead=1). mtpDraft()
+  // and the 1-layer MTP-KV are gated on this.
+  const mtpHead = weights.mtp;
+  const hasMtpHead = mtpHead !== undefined;
+  // The head is a full_attention-style block, so it shares the trunk full
+  // attention layers' RoPE config (per-layer theta / proportional rotation).
+  const mtpRope = hasMtpHead
+    ? config.layers.find(d => d.kind === 'full_attention')?.rope
+    : undefined;
 
   // ── Compile all pipelines ──────────────────────────────────────────
 
@@ -1012,6 +1088,16 @@ export function createForwardPassEngine(
   // Spec-decode verify logits (specRows × V) — lazily allocated on first use
   // (5.8 MB at V=151936; only spec decode pays for it).
   let specLogitsBuf: GPUBuffer | null = null;
+  // MTP drafter: holds the pre-final-norm hidden rows the head consumes
+  // (opts.returnMtpHidden). Lazy — only spec decode with an MTP head pays.
+  let mtpHiddenBuf: GPUBuffer | null = null;
+  // MTP drafter scratch (lazy): embedded next-token [H] and the [enorm(e);
+  // hnorm(h)] concat [2H] fed to eh_proj. Only mtpDraft allocates these.
+  let mtpEmbedBuf: GPUBuffer | null = null;
+  let mtpConcatBuf: GPUBuffer | null = null;
+  // Holds the selected hidden row [H] at offset 0 when the caller passes a
+  // packed multi-row buffer (specRows tap) with a non-zero row offset.
+  let mtpHRowBuf: GPUBuffer | null = null;
   // Softcap needs a read-side copy (WebGPU can't bind one buffer read + read_write)
   const logitsTempBuf = config.finalLogitSoftcap
     ? createStorageBuffer(device, null, V * 4, 'logits-precap') : null;
@@ -3213,6 +3299,22 @@ export function createForwardPassEngine(
       }
     }
 
+    // MTP drafter seed: tap the PRE-final-norm hidden (qwen35.cpp t_h_pre_norm)
+    // BEFORE the global final norm overwrites nothing but is conceptually the
+    // input to the head. specRows path keeps all rows; single-row keeps last.
+    const returnMtpHidden = opts?.returnMtpHidden === true && hasMtpHead;
+    if (returnMtpHidden) {
+      if (!mtpHiddenBuf) {
+        mtpHiddenBuf = createStorageBuffer(device, null, MAX_SPEC_ROWS * H * 4, 'mtp-hidden', true);
+      }
+      const specRowsTap = opts?.specRows ?? 0;
+      if (specRowsTap > 0) {
+        batchCopy(hiddenBuf, 0, mtpHiddenBuf, 0, specRowsTap * H * 4);
+      } else {
+        batchCopy(hiddenBuf, (seqLen - 1) * H * 4, mtpHiddenBuf, 0, H * 4);
+      }
+    }
+
     // ── Final norm + LM head ─────────────────────────────────────────
     dispatchRMSNorm(hiddenBuf, normedBuf, weights.global.finalNorm, seqLen, 'final-norm');
 
@@ -3513,9 +3615,10 @@ export function createForwardPassEngine(
       );
     }
 
+    const mtpHidden = returnMtpHidden ? mtpHiddenBuf! : undefined;
     return specRows > 0
-      ? { logitsBuffer: specLogitsBuf!, logitsRows: specRows }
-      : { logitsBuffer: logitsBuf };
+      ? { logitsBuffer: specLogitsBuf!, logitsRows: specRows, mtpHidden }
+      : { logitsBuffer: logitsBuf, mtpHidden };
   }
 
   // ── KV Cache ───────────────────────────────────────────────────────
@@ -3553,6 +3656,15 @@ export function createForwardPassEngine(
           + `(${config.modelType}) or extend the compressed branch.`);
       }
     }
+    // MTP head's own 1-layer KV (Qwen3.5/3.6 kv_only_nextn). Plain dense
+    // attention KV sized like one trunk full-attention layer (~1/L of trunk KV).
+    let mtpKeys: GPUBuffer | undefined;
+    let mtpValues: GPUBuffer | undefined;
+    if (hasMtpHead) {
+      mtpKeys = createStorageBuffer(device, null, maxSeqLen * kvDim * 4, 'mtp-kv-k', true);
+      mtpValues = createStorageBuffer(device, null, maxSeqLen * kvDim * 4, 'mtp-kv-v', true);
+    }
+
     // For hybrid models, allocate SSM state for linear attention layers
     let ssmState: SSMState | undefined;
     if (config.isHybrid) {
@@ -3608,7 +3720,7 @@ export function createForwardPassEngine(
           values.push(createStorageBuffer(device, null, maxSeqLen * kvDimL * 4, `kv-v-${l}`, true));
         }
       }
-      return { keys, values, position: 0, maxSeqLen, ssmState };
+      return { keys, values, position: 0, maxSeqLen, ssmState, mtpKeys, mtpValues, mtpPosition: 0 };
     }
 
     // TurboQuant compressed KV cache
@@ -3668,6 +3780,7 @@ export function createForwardPassEngine(
         residualNormsK, residualNormsV,
       },
       ssmState,
+      mtpKeys, mtpValues, mtpPosition: 0,
     };
   }
 
@@ -3695,6 +3808,8 @@ export function createForwardPassEngine(
       for (const b of kvCache.ssmState.hiddenStates) b.destroy();
       for (const b of kvCache.ssmState.convStates) b.destroy();
     }
+    if (kvCache.mtpKeys) kvCache.mtpKeys.destroy();
+    if (kvCache.mtpValues) kvCache.mtpValues.destroy();
     if (ssmShadow) {
       for (const b of [...ssmShadow.hidden, ...ssmShadow.conv]) b.destroy();
       ssmShadow = null;
@@ -3737,5 +3852,143 @@ export function createForwardPassEngine(
     copySSM(ssmShadow.hidden, ssmShadow.conv, ssm.hiddenStates, ssm.convStates);
   }
 
-  return { forward, createKVCache, destroyKVCache, snapshotSSMState, restoreSSMState, config };
+  /**
+   * MTP speculative drafter (Opt 1 — one token per call). Runs the
+   * next-token-prediction head (blk.{block_count}.*) on the trunk's
+   * PRE-final-norm hidden `hiddenRow` to predict the token after `tokenId`.
+   * Structurally identical to a full_attention trunk layer (gated attention +
+   * SwiGLU FFN) plus the four nextn.* tensors. Verified against
+   * vendor/llama.cpp/src/models/qwen35.cpp:490-644 (graph_mtp).
+   *
+   * Writes K/V into the 1-layer MTP-KV at `position`, attends [0..position],
+   * and returns the head's logits ([V], in the shared logitsBuf). The caller
+   * argmaxes them (greedy spec) and manages kvCache.mtpPosition.
+   */
+  async function mtpDraft(
+    kvCache: KVCache, hiddenRow: GPUBuffer, tokenId: number, position: number,
+    hiddenRowOffsetBytes = 0,
+  ): Promise<{ logits: GPUBuffer }> {
+    if (!mtpHead) throw new Error('[mtpDraft] model has no MTP head');
+    if (!weights.global.embedGG) throw new Error('[mtpDraft] requires a GGUF shared embed (embedGG)');
+    if (!weights.global.lmHeadGG) throw new Error('[mtpDraft] requires a GGUF shared lm_head (lmHeadGG)');
+    const mtpK = kvCache.mtpKeys, mtpV = kvCache.mtpValues;
+    if (!mtpK || !mtpV) throw new Error('[mtpDraft] kvCache has no MTP-KV (was it created by this engine?)');
+    if (!deinterleavePipeline || !attnGateBuf || !gateSigmoidPipeline) {
+      throw new Error('[mtpDraft] requires the attnOutputGate fast path (deinterleave + gate_sigmoid)');
+    }
+    const mlw = mtpHead.layer;
+
+    if (!mtpEmbedBuf) mtpEmbedBuf = createStorageBuffer(device, null, H * 4, 'mtp-embed', true);
+    if (!mtpConcatBuf) mtpConcatBuf = createStorageBuffer(device, null, 2 * H * 4, 'mtp-concat', true);
+
+    // Batch this draft's dispatches like a forward() (TDR-guarded short submits).
+    currentBatch = new BatchedDispatcher(device, 'mtp-draft');
+
+    // 1. e = embed(tokenId): shared CPU row-gather + k-quant dequant → mtpEmbedBuf.
+    {
+      const { data, ggmlType, rowBytes } = weights.global.embedGG;
+      const row = data.subarray(tokenId * rowBytes, (tokenId + 1) * rowBytes);
+      if (row.byteLength !== rowBytes) {
+        throw new Error(`[mtpDraft] embed token ${tokenId}: row slice ${row.byteLength} != ${rowBytes} bytes`);
+      }
+      const eF32 = dequantGGML(ggmlType, row, H);
+      device.queue.writeBuffer(mtpEmbedBuf, 0, eF32.buffer as ArrayBuffer, eF32.byteOffset, H * 4);
+    }
+
+    // 2. concat = [ RMSNorm(e, enorm) ; RMSNorm(h, hnorm) ]  (e first; dim0 → 2H)
+    dispatchRMSNorm(mtpEmbedBuf, attnOutBuf, mtpHead.enorm, 1, 'mtp-enorm');
+    batchCopy(attnOutBuf, 0, mtpConcatBuf, 0, H * 4);
+    // dispatchRMSNorm reads its input at offset 0; if the caller selected a row
+    // inside a packed multi-row buffer, stage that row to mtpHRowBuf first.
+    let hSrc = hiddenRow;
+    if (hiddenRowOffsetBytes !== 0) {
+      if (!mtpHRowBuf) mtpHRowBuf = createStorageBuffer(device, null, H * 4, 'mtp-hrow', true);
+      batchCopy(hiddenRow, hiddenRowOffsetBytes, mtpHRowBuf, 0, H * 4);
+      hSrc = mtpHRowBuf;
+    }
+    dispatchRMSNorm(hSrc, normedBuf, mtpHead.hnorm, 1, 'mtp-hnorm');
+    batchCopy(normedBuf, 0, mtpConcatBuf, H * 4, H * 4);
+
+    // 3. x = eh_proj @ concat  (2H → H) → hiddenBuf
+    if (typeof (mtpHead.ehProj as GGUFWeight).ggmlType === 'number') {
+      dispatchMatmulGGUF(mtpConcatBuf, mtpHead.ehProj as GGUFWeight, hiddenBuf, 1, H, 2 * H, 'mtp-ehproj');
+    } else {
+      dispatchMatmulBT(mtpConcatBuf, mtpHead.ehProj as GPUBuffer, hiddenBuf, 1, H, 2 * H, 'mtp-ehproj');
+    }
+
+    // 4. inpSA = x
+    batchCopy(hiddenBuf, 0, residualBuf, 0, H * 4);
+
+    // 5. x = RMSNorm(x, attn_norm) → normedBuf
+    dispatchRMSNorm(hiddenBuf, normedBuf, mlw.inputNorm, 1, 'mtp-attn-norm');
+
+    // 6. gated attention (mirror the trunk full-attention path; seqLen=1).
+    // Q proj outputs interleaved [Q|gate] → deinterleave to attnOutBuf(Q)/attnGateBuf(gate).
+    dispatchProjection(normedBuf, mlw, 'qProj', qBuf, 1, nHeads * dHead * 2, H, 'mtp-q');
+    {
+      const nElems = nHeads * dHead;
+      const params = getCachedUniform(new Uint32Array([nElems, dHead]), 'mtp-deint-p');
+      const bg = cachedBindGroup(deinterleavePipeline, 0, [
+        { binding: 0, resource: { buffer: qBuf } },
+        { binding: 1, resource: { buffer: attnOutBuf } },
+        { binding: 2, resource: { buffer: attnGateBuf } },
+        { binding: 3, resource: { buffer: params } },
+      ], 'mtp-deint');
+      bd(deinterleavePipeline, [bg], [workgroupCount(nElems, 256)], 'mtp-deint');
+    }
+    dispatchProjection(normedBuf, mlw, 'kProj', kBuf, 1, kvDim, H, 'mtp-k');
+    dispatchProjection(normedBuf, mlw, 'vProj', vBuf, 1, kvDim, H, 'mtp-v');
+    // Per-head Q/K RMSNorm (Qwen3.5). Q lives in attnOutBuf (qInAttnOut) → norm home to qBuf.
+    if (mlw.qNorm) {
+      dispatchRMSNorm(attnOutBuf, qBuf, mlw.qNorm, nHeads, 'mtp-qnorm', dHead);
+    } else {
+      batchCopy(attnOutBuf, 0, qBuf, 0, nHeads * dHead * 4);
+    }
+    if (mlw.kNorm) {
+      dispatchRMSNorm(kBuf, ffnTempBuf, mlw.kNorm, nKVHeads, 'mtp-knorm', dHead);
+      batchCopy(ffnTempBuf, 0, kBuf, 0, kvDim * 4);
+    }
+    // RoPE (partial, same theta/rotated-pairs as the trunk full-attention layers).
+    const mtpRotaryDim = config.partialRotaryFactor ? Math.floor(config.partialRotaryFactor * dHead) : 0;
+    dispatchRoPE(qBuf, 1, nHeads, position, 'mtp-rope-q', dHead, mtpRotaryDim, mtpRope?.theta, mtpRope?.rotatedPairs);
+    dispatchRoPE(kBuf, 1, nKVHeads, position, 'mtp-rope-k', dHead, mtpRotaryDim, mtpRope?.theta, mtpRope?.rotatedPairs);
+    // Write K/V into the MTP-KV at `position`, attend [0..position].
+    copyToKVCache(kBuf, mtpK, 1, kvDim, position);
+    copyToKVCache(vBuf, mtpV, 1, kvDim, position);
+    dispatchAttention(qBuf, mtpK, mtpV, attnOutBuf, 1, position + 1, false, position, 'mtp-attn', dHead);
+    // Output gate: attn * sigmoid(gate) → ffnTempBuf
+    dispatchElementwise(gateSigmoidPipeline, attnOutBuf, ffnTempBuf, nHeads * dHead, 'mtp-attn-gate', attnGateBuf);
+    // o proj → attnProjBuf
+    dispatchProjection(ffnTempBuf, mlw, 'oProj', attnProjBuf, 1, H, nHeads * dHead, 'mtp-o');
+
+    // 7. x = inpSA + attn → hiddenBuf
+    dispatchElementwise(addPipeline, residualBuf, hiddenBuf, H, 'mtp-res1', attnProjBuf);
+
+    // 8. ffn_residual = x
+    batchCopy(hiddenBuf, 0, residualBuf, 0, H * 4);
+
+    // 9. x = RMSNorm(x, attn_post_norm) → normedBuf
+    dispatchRMSNorm(hiddenBuf, normedBuf, mlw.postAttnNorm, 1, 'mtp-norm2');
+
+    // 10. FFN (SwiGLU)
+    dispatchProjection(normedBuf, mlw, 'gateProj', gateBuf, 1, ffnDim, H, 'mtp-gate');
+    dispatchProjection(normedBuf, mlw, 'upProj', upBuf, 1, ffnDim, H, 'mtp-up');
+    dispatchElementwise(gateActPipeline, upBuf, ffnTempBuf, ffnDim, 'mtp-silumul', gateBuf);
+    dispatchProjection(ffnTempBuf, mlw, 'downProj', downBuf, 1, H, ffnDim, 'mtp-down');
+
+    // 11. x = ffn_residual + ffn_out → hiddenBuf  (= t_h_pre_norm; pre-shared-norm)
+    dispatchElementwise(addPipeline, residualBuf, hiddenBuf, H, 'mtp-res2', downBuf);
+
+    // 12. shared_head_norm + 13. shared lm_head → logits
+    dispatchRMSNorm(hiddenBuf, normedBuf, mtpHead.sharedHeadNorm, 1, 'mtp-shnorm');
+    dispatchMatmulGGUF(normedBuf, weights.global.lmHeadGG, logitsBuf, 1, V, H, 'mtp-lmhead');
+
+    currentBatch.flush();
+    for (const buf of deferredDestroys) buf.destroy();
+    deferredDestroys = [];
+    currentBatch = null;
+    return { logits: logitsBuf };
+  }
+
+  return { forward, createKVCache, destroyKVCache, snapshotSSMState, restoreSSMState, hasMtpHead, mtpDraft, config };
 }

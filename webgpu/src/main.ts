@@ -1412,7 +1412,62 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
     console.log(`[GGUF] Hybrid model: ${linCount} linear + ${config.numLayers - linCount} full attention layers`);
   }
 
-  const engine = createForwardPassEngine(gpu!.device, config, { global, layers, moe });
+  // MTP / next-token-prediction head. The loader parks blk.{block_count}.*
+  // in model.mtpTensors (not the trunk `tensors` map) only when ?spec=1 /
+  // ?mtpHead=1. The head is structurally a full_attention trunk layer, so
+  // reuse the same role→GGUF-name locator at layer index = numLayers (the
+  // first MTP block) plus the four nextn.* tensors. Shared embed/lm_head.
+  let mtp: any;
+  if (model.mtpTensors.size > 0) {
+    const ML = config.numLayers; // = block_count - nextn_predict_layers
+    const mtpAssign = (lw: any, slot: string, role: TensorRole) => {
+      const n = loc.locate(role, ML);
+      const t = n ? model.mtpTensors.get(n) : undefined;
+      if (!t) throw new Error(`MTP head: missing tensor for role "${role}" (blk.${ML}, name: ${n ?? 'unmapped'})`);
+      if (t.isQuantized) lw[`${slot}_gg`] = { data: t.buffer, ggmlType: t.ggmlType };
+      else lw[slot] = t.buffer;
+    };
+    const mtpNorm = (role: TensorRole): GPUBuffer => {
+      const n = loc.locate(role, ML);
+      const t = n ? model.mtpTensors.get(n) : undefined;
+      if (!t) throw new Error(`MTP head: missing norm "${role}" (blk.${ML})`);
+      return t.buffer;
+    };
+    const mtpRoleBuf = (role: TensorRole): GPUBuffer | undefined => {
+      const n = loc.locate(role, ML);
+      return n ? model.mtpTensors.get(n)?.buffer : undefined;
+    };
+    const nextnTensor = (suffix: string) => {
+      const t = model.mtpTensors.get(`blk.${ML}.nextn.${suffix}`);
+      if (!t) throw new Error(`MTP head: missing blk.${ML}.nextn.${suffix}`);
+      return t;
+    };
+    const mlw: any = {
+      inputNorm: mtpNorm('inputNorm'),       // blk.L.attn_norm
+      postAttnNorm: mtpNorm('postAttnNorm'), // blk.L.ffn_norm (pre-FFN norm)
+    };
+    mtpAssign(mlw, 'qProj', 'qProj');
+    mtpAssign(mlw, 'kProj', 'kProj');
+    mtpAssign(mlw, 'vProj', 'vProj');
+    mtpAssign(mlw, 'oProj', 'oProj');
+    mlw.qNorm = mtpRoleBuf('qNorm');
+    mlw.kNorm = mtpRoleBuf('kNorm');
+    mtpAssign(mlw, 'gateProj', 'gateProj');
+    mtpAssign(mlw, 'upProj', 'upProj');
+    mtpAssign(mlw, 'downProj', 'downProj');
+
+    const ehT = nextnTensor('eh_proj.weight');
+    mtp = {
+      layer: mlw,
+      ehProj: ehT.isQuantized ? { data: ehT.buffer, ggmlType: ehT.ggmlType } : ehT.buffer,
+      enorm: nextnTensor('enorm.weight').buffer,
+      hnorm: nextnTensor('hnorm.weight').buffer,
+      sharedHeadNorm: nextnTensor('shared_head_norm.weight').buffer,
+    };
+    console.log(`[GGUF] MTP head loaded (blk.${ML}.*): drafter available for spec decode`);
+  }
+
+  const engine = createForwardPassEngine(gpu!.device, config, { global, layers, moe, mtp });
   const tokenizer = await createTokenizer({ modelId: repo });
   // Guard: a tokenizer from the wrong model family silently produces garbage
   // (e.g. Qwen3-8B fallback vocab 151936 vs Qwen3.6 vocab 248320).
