@@ -1296,7 +1296,7 @@ class TransformersEngine(BaseEngine):
         if on_telemetry is not None:
             try:
                 from core.forward_telemetry import TelemetryCapture
-                _tele = TelemetryCapture(model)
+                _tele = TelemetryCapture(model, tokenizer=tokenizer)
             except Exception:
                 _tele = None
 

@@ -120,9 +120,11 @@ class TelemetryCapture:
     model object and fire on the next generation.
     """
 
-    def __init__(self, model, max_queue=512):
+    def __init__(self, model, tokenizer=None, max_queue=512, logit_k=5):
         self.q = queue.Queue(maxsize=max_queue)
         self._handles = []
+        self._tokenizer = tokenizer
+        self._logit_k = logit_k
         self._layers = _find_decoder_layers(model)
         self._n = len(self._layers)
         self._is_moe = _is_moe(model)
@@ -130,9 +132,22 @@ class TelemetryCapture:
             self._topk = int(getattr(model.config, "num_experts_per_tok", 0)) or 8
         except Exception:
             self._topk = 8
+        # Optional LM head: drives the next-token distribution AND the per-token
+        # flush. It runs after every decoder layer, so by the time it fires the
+        # whole forward (norms, experts, logits) is ready for this token.
+        self._head = None
+        self._flush_on_lmhead = False
+        if tokenizer is not None:
+            try:
+                h = model.get_output_embeddings()
+                if h is not None:
+                    self._head = h
+            except Exception:
+                self._head = None
         # Per-token scratch: GPU tensors, converted to Python in _flush().
         self._norms = [None] * self._n          # 0-d float tensors
         self._experts = [None] * self._n         # (idx_tensor, weight_tensor)
+        self._logits = None                       # (idx_tensor, prob_tensor)
         self._step = 0
         if self._n:
             self._register()
@@ -151,6 +166,13 @@ class TelemetryCapture:
                     self._handles.append(
                         gate.register_forward_hook(self._gate_hook(i))
                     )
+        if self._head is not None:
+            try:
+                self._handles.append(
+                    self._head.register_forward_hook(self._lmhead_hook()))
+                self._flush_on_lmhead = True
+            except Exception:
+                self._flush_on_lmhead = False
 
     def _norm_hook(self, i):
         is_last = i == self._n - 1
@@ -163,8 +185,9 @@ class TelemetryCapture:
                 self._norms[i] = vec.detach().float().norm()
             except Exception:
                 self._norms[i] = None
-            # The final layer firing means the token's forward is complete.
-            if is_last:
+            # The final decoder layer marks the token's forward complete — but if
+            # an LM-head hook is present it owns the flush (it runs even later).
+            if is_last and not self._flush_on_lmhead:
                 self._flush()
 
         return hook
@@ -181,6 +204,26 @@ class TelemetryCapture:
                 self._experts[i] = (idx, torch.softmax(vals, dim=-1))
             except Exception:
                 self._experts[i] = None
+
+        return hook
+
+    def _lmhead_hook(self):
+        import torch
+
+        def hook(_module, _inputs, output):
+            try:
+                logits = output[0] if isinstance(output, (tuple, list)) else output
+                row = logits.reshape(-1, logits.shape[-1])[-1].detach().float()
+                probs = torch.softmax(row, dim=-1)
+                k = min(self._logit_k, probs.shape[-1])
+                vals, idx = torch.topk(probs, k)
+                self._logits = (idx, vals)
+            except Exception:
+                self._logits = None
+            finally:
+                # LM head runs last in the forward — flush the token here.
+                if self._flush_on_lmhead:
+                    self._flush()
 
         return hook
 
@@ -219,15 +262,32 @@ class TelemetryCapture:
                     except Exception:
                         experts[j] = None
 
+        top_logits = None
+        if self._logits is not None and self._tokenizer is not None:
+            try:
+                ids = self._logits[0].tolist()
+                ps = self._logits[1].tolist()
+                top_logits = []
+                for tid, p in zip(ids, ps):
+                    try:
+                        s = self._tokenizer.decode([int(tid)])
+                    except Exception:
+                        s = "<%d>" % int(tid)
+                    top_logits.append([s, float(p)])
+            except Exception:
+                top_logits = None
+
         frame = {
             "step": self._step,
             "n_layers": n,
             "moe": any(e is not None for e in experts),
             "layers": [{"norm": norms[j], "experts": experts[j]} for j in range(n)],
+            "top_logits": top_logits,
         }
         self._step += 1
         self._norms = [None] * n
         self._experts = [None] * n
+        self._logits = None
         try:
             self.q.put_nowait(frame)
         except queue.Full:
@@ -285,7 +345,11 @@ def iter_mock_frames(steps=10_000, n_layers=48, n_experts=128, k=8, seed=1):
                 "norm": norm,
                 "experts": [[e, w / tot] for e, w in zip(picks, raw)],
             })
+        toks = [" the", " a", " model", " is", " ."]
+        lp = sorted((rnd() for _ in toks), reverse=True)
+        tot = sum(lp) or 1.0
+        top = [[toks[i], lp[i] / tot] for i in range(len(toks))]
         yield {
             "step": s, "n_layers": n_layers, "moe": True,
-            "layers": layers, "token": " ·",
+            "layers": layers, "token": " ·", "top_logits": top,
         }
