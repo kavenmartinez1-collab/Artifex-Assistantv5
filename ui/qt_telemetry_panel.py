@@ -22,7 +22,8 @@ import math
 import time
 from collections import deque
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                             QSlider, QPushButton)
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
 
@@ -43,7 +44,8 @@ SPAN = 50.0                                  # x-extent of the layer stack
 
 MIN_PULSE_DT = 0.06      # never cross the stack faster than this (visibility)
 MAX_PULSE_DT = 2.0       # never slower than this (don't stall on a slow model)
-PENDING_CAP = 24         # bound the queue if the model outruns the animation
+PENDING_CAP = 24         # real-time: bound the queue if the model outruns the view
+PENDING_CAP_SLOW = 4000  # slow-mo: buffer tokens so none are lost (we just lag)
 AHEAD = 0.06             # brightness of layers the front hasn't reached
 TRAIL = 0.50             # brightness of already-computed layers
 LEAD_BAND = 1.5          # how many layers around the front read as "computing"
@@ -78,6 +80,8 @@ class TelemetryPanel(QWidget):
         self._last_t = None
         self._tps = 0.0
         self._pulse_dt = 0.2
+        self._speed_mult = 1.0         # 1 = real-time; >1 = slow-mo playback
+        self._paused = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -135,6 +139,39 @@ class TelemetryPanel(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._animate)
         self._timer.start(16)                            # ~60 FPS for smooth pulses
+
+        # ── compact playback chip, floats over the view (bottom-right) ──
+        self._ctrl = QWidget(self._view)
+        self._ctrl.setStyleSheet(
+            "QWidget{background:rgba(10,14,22,170); border-radius:5px;}"
+            "QLabel{color:#bfe6ff; background:transparent; font:9pt 'Consolas';}"
+            "QPushButton{color:#bfe6ff; background:rgba(40,50,70,210); border:0;"
+            " border-radius:3px; padding:1px 5px; font:9pt 'Consolas';}"
+            "QPushButton:checked{color:#ffd27f;}")
+        cl = QHBoxLayout(self._ctrl)
+        cl.setContentsMargins(6, 3, 6, 3)
+        cl.setSpacing(6)
+        self._pause_btn = QPushButton("⏸")
+        self._pause_btn.setCheckable(True)
+        self._pause_btn.setFixedWidth(26)
+        self._pause_btn.setToolTip("Pause / resume the wave")
+        self._pause_btn.toggled.connect(self._on_pause)
+        cl.addWidget(self._pause_btn)
+        self._speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self._speed_slider.setRange(1, 16)
+        self._speed_slider.setValue(1)
+        self._speed_slider.setFixedWidth(92)
+        self._speed_slider.setToolTip(
+            "Slow-mo. 1× = real-time (faithful). Higher = slower playback; "
+            "tokens buffer and the view lags behind generation.")
+        self._speed_slider.valueChanged.connect(self._on_speed)
+        cl.addWidget(self._speed_slider)
+        self._speed_label = QLabel("1×")
+        self._speed_label.setFixedWidth(30)
+        self._speed_label.setToolTip("Slow-mo factor")
+        cl.addWidget(self._speed_label)
+        self._ctrl.adjustSize()
+        self._position_ctrl()
 
     @property
     def n_layers(self):
@@ -250,8 +287,10 @@ class TelemetryPanel(QWidget):
             self._build_geometry(n)
 
         self._pending.append(frame)
-        while len(self._pending) > PENDING_CAP:
-            self._pending.popleft()              # bound memory if we fall behind
+        # real-time drops oldest to stay current; slow-mo buffers (plays them all)
+        cap = PENDING_CAP if self._speed_mult <= 1.0 else PENDING_CAP_SLOW
+        while len(self._pending) > cap:
+            self._pending.popleft()
 
         # smoothed tok/s from real arrival cadence -> paces the pulse
         t = time.perf_counter()
@@ -276,11 +315,17 @@ class TelemetryPanel(QWidget):
 
     def _advance(self, dt):
         """Move the front for the active pulse; finalize + chain at the head."""
-        if self._cur is None or self._pulse_done:
+        if self._cur is None or self._pulse_done or self._paused:
             return
-        if self._tps > 0:
-            self._pulse_dt = min(MAX_PULSE_DT, max(MIN_PULSE_DT, 1.0 / self._tps))
-        eff = max(MIN_PULSE_DT, self._pulse_dt) / (1.0 + 0.5 * len(self._pending))
+        base = (min(MAX_PULSE_DT, max(MIN_PULSE_DT, 1.0 / self._tps))
+                if self._tps > 0 else 0.2)
+        self._pulse_dt = base * self._speed_mult
+        if self._speed_mult <= 1.0:
+            # real-time: speed up to drain any backlog and stay current
+            eff = max(MIN_PULSE_DT, self._pulse_dt) / (1.0 + 0.5 * len(self._pending))
+        else:
+            # slow-mo: fixed slow pace, let the queue buffer (we lag, lose nothing)
+            eff = max(MIN_PULSE_DT, self._pulse_dt)
         self._front += (self._n_layers / eff) * dt
         if self._front >= self._n_layers:
             # reached the head — the prediction reads out now
@@ -314,6 +359,29 @@ class TelemetryPanel(QWidget):
                 except Exception:
                     pass
             self._logits_hud.setText("")
+
+    # ── playback controls ─────────────────────────────────────────────
+    def _on_pause(self, checked):
+        self._paused = bool(checked)
+        self._pause_btn.setText("▶" if checked else "⏸")
+
+    def _on_speed(self, val):
+        self._speed_mult = float(val)
+        self._speed_label.setText("%d×" % val)
+
+    def _position_ctrl(self):
+        """Pin the playback chip to the bottom-right of the view."""
+        if self._view is None or getattr(self, "_ctrl", None) is None:
+            return
+        self._ctrl.adjustSize()
+        m = 8
+        x = max(m, self._view.width() - self._ctrl.width() - m)
+        y = max(m, self._view.height() - self._ctrl.height() - m)
+        self._ctrl.move(x, y)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_ctrl()
 
     # ── render loop ───────────────────────────────────────────────────
     def _animate(self):
