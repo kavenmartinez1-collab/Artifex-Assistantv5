@@ -62,6 +62,8 @@ class GenerationWorker(QThread):
         finished(str): Final complete response text
         error(str): Error message if generation fails
         status_changed(str): Status updates during loading
+        telemetry_received(dict): Per-token forward-pass telemetry frame
+            (per-layer norms + MoE routing); see core/forward_telemetry.py
     """
 
     token_received = pyqtSignal(str)
@@ -70,6 +72,7 @@ class GenerationWorker(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
     status_changed = pyqtSignal(str)
+    telemetry_received = pyqtSignal(dict)
 
     def __init__(self, engine, messages: list, max_tokens: int,
                  temperature: float, enable_thinking: bool = True,
@@ -117,6 +120,11 @@ class GenerationWorker(QThread):
                 self.token_received.emit(text)
                 tf.feed(text)
 
+            def on_telemetry(frame):
+                # Small JSON-safe dict; Qt marshals the emit to the GUI thread.
+                # Best-effort — visualization only, never gates generation.
+                self.telemetry_received.emit(frame)
+
             # Load engine if needed
             if not self.engine.is_loaded():
                 self.status_changed.emit("Loading model...")
@@ -131,6 +139,7 @@ class GenerationWorker(QThread):
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
                 on_token=on_token,
+                on_telemetry=on_telemetry,
                 enable_thinking=self.enable_thinking,
             )
 

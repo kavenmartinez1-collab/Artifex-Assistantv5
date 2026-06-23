@@ -648,7 +648,8 @@ class LlamaCppEngine(BaseEngine):
                            enable_thinking=True,
                            grammar=None, response_format=None,
                            raw_output=False,
-                           web_tools=False) -> str:
+                           web_tools=False,
+                           on_telemetry=None) -> str:
         """Stream from llama-server's OpenAI-compatible /v1/chat/completions.
 
         Thinking is handled via <think> tags in the content stream (same as

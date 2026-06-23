@@ -173,7 +173,8 @@ class ClaudeCliEngine(BaseEngine):
                            enable_thinking=True,
                            grammar=None, response_format=None,
                            raw_output=False,
-                           web_tools=False) -> str:
+                           web_tools=False,
+                           on_telemetry=None) -> str:
         """Run inference via the claude CLI.
 
         The CLI doesn't expose sampling controls (temperature,

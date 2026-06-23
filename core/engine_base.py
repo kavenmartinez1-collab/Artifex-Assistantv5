@@ -52,7 +52,8 @@ class BaseEngine(ABC):
                            on_token=None, on_complete=None,
                            enable_thinking=True,
                            grammar=None, response_format=None,
-                           web_tools=False) -> str:
+                           web_tools=False,
+                           on_telemetry=None) -> str:
         """Run streaming inference.
 
         Args:

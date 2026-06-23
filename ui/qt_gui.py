@@ -36,6 +36,7 @@ from ui.qt_widgets import (
     MicrophoneRecorder, ChatView, ChatBubble,
 )
 from ui.qt_workers import GenerationWorker, PipelineWorker, ActionWorker, TokenBatcher
+from ui.qt_telemetry_panel import TelemetryPanel
 
 from core.config import (
     MODES, get_active_backend, set_active_backend, get_model_names,
@@ -481,6 +482,10 @@ class ArtifexMainWindow(QMainWindow):
         )
         self._tabs.addTab(self._log_view, "Logs")
         self._install_log_handler()
+
+        # Forward Pass tab — live transformers forward-pass telemetry (3D)
+        self._viz_panel = TelemetryPanel()
+        self._tabs.addTab(self._viz_panel, "Forward Pass")
 
         self._tabs.setMinimumHeight(400)
         layout.addWidget(self._tabs, 1)
@@ -951,6 +956,8 @@ class ArtifexMainWindow(QMainWindow):
         worker.status_changed.connect(self._set_status)
         worker.finished.connect(self._on_generation_finished)
         worker.error.connect(self._on_generation_error)
+        worker.telemetry_received.connect(self._viz_panel.push_frame)
+        self._viz_panel.reset()
         self._current_worker = worker
         worker.start()
 

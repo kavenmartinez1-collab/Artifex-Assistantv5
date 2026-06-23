@@ -1139,11 +1139,16 @@ class TransformersEngine(BaseEngine):
                            enable_thinking=True,
                            grammar=None, response_format=None,
                            raw_output=False,
-                           web_tools=False) -> str:
+                           web_tools=False,
+                           on_telemetry=None) -> str:
         """Run streaming inference on the local transformers model.
 
         web_tools is accepted-and-ignored — transformers models use the
         @search/@web_read post-processor in api/server.py for tools.
+
+        on_telemetry, if provided, receives one forward-pass telemetry frame
+        per generated token (per-layer norms + MoE expert routing). See
+        core/forward_telemetry.py. It is best-effort and never affects output.
         """
         self.load()
 
@@ -1284,6 +1289,17 @@ class TransformersEngine(BaseEngine):
 
         gen_error = [None]
 
+        # Live forward-pass telemetry (opt-in). Register hooks BEFORE generation
+        # so prefill is captured too. Any failure disables it without touching
+        # the decode path; close() in the finally below guarantees hook removal.
+        _tele = None
+        if on_telemetry is not None:
+            try:
+                from core.forward_telemetry import TelemetryCapture
+                _tele = TelemetryCapture(model)
+            except Exception:
+                _tele = None
+
         def _safe_generate():
             try:
                 model.generate(**gen_kwargs)
@@ -1301,14 +1317,31 @@ class TransformersEngine(BaseEngine):
         t_first = None
         t_start = _time.perf_counter()
 
-        for new_text in streamer:
-            full_response += new_text
-            if new_text:
-                token_count += 1
-                if t_first is None:
-                    t_first = _time.perf_counter()
-            if on_token and new_text:
-                on_token(new_text)
+        try:
+            for new_text in streamer:
+                full_response += new_text
+                if new_text:
+                    token_count += 1
+                    if t_first is None:
+                        t_first = _time.perf_counter()
+                if on_token and new_text:
+                    on_token(new_text)
+                if _tele is not None and on_telemetry is not None:
+                    for _frame in _tele.drain():
+                        _frame["token"] = new_text
+                        try:
+                            on_telemetry(_frame)
+                        except Exception:
+                            pass
+        finally:
+            if _tele is not None:
+                if on_telemetry is not None:
+                    try:
+                        for _frame in _tele.drain():
+                            on_telemetry(_frame)
+                    except Exception:
+                        pass
+                _tele.close()
 
         t_end = _time.perf_counter()
         thread.join()

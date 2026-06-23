@@ -164,7 +164,8 @@ class OllamaEngine(BaseEngine):
                            enable_thinking=True,
                            grammar=None, response_format=None,
                            raw_output=False,
-                           web_tools=False) -> str:
+                           web_tools=False,
+                           on_telemetry=None) -> str:
         """Stream a response from the Ollama /api/chat endpoint (localhost only).
 
         web_tools is accepted-and-ignored — Ollama models use the
