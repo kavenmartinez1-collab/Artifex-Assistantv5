@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QPushButton, QComboBox, QLineEdit, QTextEdit, QPlainTextEdit,
     QTabWidget, QGroupBox, QCheckBox, QSlider, QProgressBar,
-    QListWidget, QStatusBar, QFrame, QFileDialog, QMessageBox,
+    QListWidget, QListWidgetItem, QStatusBar, QFrame, QFileDialog, QMessageBox,
     QSizePolicy, QApplication,
 )
 
@@ -277,6 +277,12 @@ class ArtifexMainWindow(QMainWindow):
         self.session_map = SessionMap()
         self._system_info = get_assistant_tools_prompt()
 
+        # Harness ingestion (Agent / Harness Mode) — context absorbed from the
+        # workspace's .artifex bundle, injected into the system prompt.
+        self._agent_inject_text = ""
+        self._agent_inject_on = True
+        self._agent_last_report = None
+
         # Build UI
         self._build_ui()
         self._connect_signals()
@@ -486,6 +492,9 @@ class ArtifexMainWindow(QMainWindow):
         # Forward Pass tab — live transformers forward-pass telemetry (3D)
         self._viz_panel = TelemetryPanel()
         self._tabs.addTab(self._viz_panel, "Forward Pass")
+
+        # Agent tab — harness ingestion (absorb a folder's prior-agent context)
+        self._tabs.addTab(self._build_agent_tab(), "Agent")
 
         self._tabs.setMinimumHeight(400)
         layout.addWidget(self._tabs, 1)
@@ -1611,25 +1620,32 @@ class ArtifexMainWindow(QMainWindow):
             if path:
                 self._ws_path.setText(path)
         if path and os.path.isdir(path):
-            if self.km.set_workspace(path):
-                self.km.bind_workspace_store(path)
-                # Change the process CWD so that:
-                #   1. The system prompt's CWD field reflects the workspace
-                #      (build_assistant_prompt reads os.getcwd())
-                #   2. All agent tools resolve relative paths against the
-                #      workspace (14 os.getcwd() calls in agent_tools.py)
-                #   3. Subprocess shells (```bash blocks) execute in the
-                #      workspace directory
-                # The GUI itself uses absolute paths via BASE_DIR for its
-                # own files (logs, output, sessions), so this is safe.
-                os.chdir(path)
-                summary = self.km.get_workspace_summary()
-                self._set_status(f"Workspace: {path}")
-                bubble = self._chat_view.add_bubble("assistant")
-                bubble.add_text(f"Workspace set: {path}\n{summary}")
-                _log.info("Workspace changed: %s (CWD updated)", path)
-            else:
-                self._set_status(f"Invalid workspace: {path}")
+            if self._set_workspace_path(path, announce=True):
+                # Auto-adopt: absorb any prior agent's context from this folder.
+                self._auto_adopt_harness(path)
+
+    def _set_workspace_path(self, path: str, announce: bool = True) -> bool:
+        """Bind a workspace: km store + process CWD, keeping path fields in sync.
+
+        Changing the process CWD makes (1) the prompt's CWD field, (2) the agent
+        tools' relative-path resolution, and (3) ```bash``` subprocess shells all
+        operate inside the workspace. The GUI's own files use absolute BASE_DIR
+        paths, so this is safe.
+        """
+        if not (path and os.path.isdir(path) and self.km.set_workspace(path)):
+            self._set_status(f"Invalid workspace: {path}")
+            return False
+        self.km.bind_workspace_store(path)
+        os.chdir(path)
+        self._ws_path.setText(path)
+        if hasattr(self, "_agent_path"):
+            self._agent_path.setText(path)
+        _log.info("Workspace changed: %s (CWD updated)", path)
+        if announce:
+            self._set_status(f"Workspace: {path}")
+            bubble = self._chat_view.add_bubble("assistant")
+            bubble.add_text(f"Workspace set: {path}\n{self.km.get_workspace_summary()}")
+        return True
 
     def _on_ws_scan(self):
         self.km.rescan_workspace()
@@ -1637,6 +1653,202 @@ class ArtifexMainWindow(QMainWindow):
         self._set_status("Workspace rescanned")
         bubble = self._chat_view.add_bubble("assistant")
         bubble.add_text(f"Workspace rescanned.\n{summary}")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # AGENT / HARNESS MODE  (absorb a folder's prior-agent context)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _build_agent_tab(self) -> QWidget:
+        w = QWidget()
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(6)
+
+        intro = QLabel(
+            "Point Artifex at a folder another AI agent worked in (Claude, Codex, "
+            "Cursor, Gemini, Qwen, Aider, Copilot, Cline, Windsurf, Continue…). "
+            "Artifex copies + normalizes their context into <b>.artifex/</b> and "
+            "injects it, so this model absorbs the folder the way Claude Code does."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#aaa; font-size:9pt;")
+        outer.addWidget(intro)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Folder:"))
+        self._agent_path = QLineEdit(os.getcwd())
+        self._agent_path.setPlaceholderText("Folder to absorb…")
+        row.addWidget(self._agent_path, 1)
+        self._agent_browse_btn = QPushButton("Browse")
+        self._agent_browse_btn.setProperty("class", "secondary")
+        self._agent_detect_btn = QPushButton("Detect")
+        self._agent_detect_btn.setProperty("class", "secondary")
+        self._agent_adopt_btn = QPushButton("Adopt & Inject")
+        for b in (self._agent_browse_btn, self._agent_detect_btn, self._agent_adopt_btn):
+            row.addWidget(b)
+        outer.addLayout(row)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.addWidget(QLabel("Detected harnesses (uncheck to exclude):"))
+        self._agent_list = QListWidget()
+        ll.addWidget(self._agent_list, 1)
+        self._agent_inject_cb = QCheckBox("Inject absorbed context into the model")
+        self._agent_inject_cb.setChecked(True)
+        ll.addWidget(self._agent_inject_cb)
+        self._agent_global_cb = QCheckBox("Include global configs (~/.claude, ~/.codex…)")
+        ll.addWidget(self._agent_global_cb)
+        self._agent_resync_btn = QPushButton("Re-sync .artifex")
+        self._agent_resync_btn.setProperty("class", "secondary")
+        ll.addWidget(self._agent_resync_btn)
+        split.addWidget(left)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(QLabel("ARTIFEX.md preview (what gets injected):"))
+        self._agent_preview = QPlainTextEdit()
+        self._agent_preview.setReadOnly(True)
+        self._agent_preview.setFont(QFont("Consolas", 9))
+        rl.addWidget(self._agent_preview, 1)
+        split.addWidget(right)
+
+        split.setSizes([320, 540])
+        outer.addWidget(split, 1)
+
+        self._agent_status = QLabel("No folder absorbed yet.")
+        self._agent_status.setStyleSheet("color:#888; font-size:9pt;")
+        outer.addWidget(self._agent_status)
+
+        self._agent_browse_btn.clicked.connect(self._on_agent_browse)
+        self._agent_detect_btn.clicked.connect(self._on_agent_detect)
+        self._agent_adopt_btn.clicked.connect(self._on_agent_adopt)
+        self._agent_resync_btn.clicked.connect(self._on_agent_adopt)  # re-sync = re-adopt
+        self._agent_inject_cb.toggled.connect(self._on_agent_inject_toggle)
+        return w
+
+    def _refresh_agent_list(self, report):
+        self._agent_last_report = report
+        self._agent_list.clear()
+        if report.is_empty:
+            item = QListWidgetItem("(no known harness config found)")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._agent_list.addItem(item)
+            return
+        for h in report.hits:
+            n = len(h.files)
+            item = QListWidgetItem(f"{h.spec.name}  ·  {n} file{'s' if n != 1 else ''}")
+            item.setData(Qt.ItemDataRole.UserRole, h.spec.id)
+            item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setToolTip(h.spec.note + "\n" + "\n".join(f.relpath for f in h.files))
+            self._agent_list.addItem(item)
+
+    def _agent_include(self):
+        """Set of checked tool ids, or None when nothing was detected."""
+        if not self._agent_last_report or self._agent_last_report.is_empty:
+            return None
+        ids = []
+        for i in range(self._agent_list.count()):
+            item = self._agent_list.item(i)
+            tid = item.data(Qt.ItemDataRole.UserRole)
+            if tid and item.checkState() == Qt.CheckState.Checked:
+                ids.append(tid)
+        return set(ids)
+
+    def _on_agent_browse(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Select folder to absorb", self._agent_path.text() or os.getcwd())
+        if path:
+            self._agent_path.setText(path)
+            self._on_agent_detect()
+
+    def _on_agent_detect(self):
+        from core import harness
+        path = self._agent_path.text().strip()
+        if not (path and os.path.isdir(path)):
+            self._agent_status.setText("Folder not found.")
+            return
+        report = harness.detect(path)
+        self._refresh_agent_list(report)
+        self._agent_preview.setPlainText(
+            harness.preview(report) if not report.is_empty else "(nothing to inject)")
+        adopted = " · already adopted" if harness.is_adopted(path) else ""
+        self._agent_status.setText(report.summary() + adopted + " — click Adopt & Inject.")
+
+    def _on_agent_adopt(self):
+        from core import harness
+        path = self._agent_path.text().strip()
+        if not (path and os.path.isdir(path)):
+            self._agent_status.setText("Folder not found.")
+            return
+        # Align cwd / km / tools with the folder being absorbed.
+        self._set_workspace_path(path, announce=False)
+        if self._agent_last_report is None:
+            self._refresh_agent_list(harness.detect(path))
+        try:
+            res = harness.adopt(path, include=self._agent_include(),
+                                 include_global=self._agent_global_cb.isChecked())
+        except Exception as e:
+            _log.exception("harness adopt failed")
+            self._agent_status.setText(f"Adopt failed: {e}")
+            return
+        self._agent_inject_on = self._agent_inject_cb.isChecked()
+        self._agent_inject_text = harness.load_injection(path) if self._agent_inject_on else ""
+        self._refresh_agent_list(harness.detect(path))
+        self._agent_preview.setPlainText(harness.load_injection(path) or "(nothing to inject)")
+        self._update_system_prompt()
+        tools = ", ".join(name for _, name, _ in res.tools) or "none"
+        self._agent_status.setText(
+            f"Adopted → .artifex · {tools} · ~{res.injected_token_estimate} tokens "
+            f"{'injected' if self._agent_inject_on else '(injection OFF)'}")
+        self._set_status(f"Harness absorbed: {tools}")
+
+    def _on_agent_inject_toggle(self, on: bool):
+        from core import harness
+        self._agent_inject_on = on
+        path = self._agent_path.text().strip()
+        if on and path and harness.is_adopted(path):
+            self._agent_inject_text = harness.load_injection(path)
+        elif not on:
+            self._agent_inject_text = ""
+        self._update_system_prompt()
+        self._agent_status.setText(
+            "Injection ON — absorbed context is in the system prompt."
+            if on else "Injection OFF — absorbed context withheld.")
+
+    def _auto_adopt_harness(self, path: str):
+        """Auto-detect + adopt prior-agent context when a workspace is set (best-effort)."""
+        from core import harness
+        try:
+            report = harness.detect(path)
+            if hasattr(self, "_agent_list"):
+                self._refresh_agent_list(report)
+            if report.is_empty:
+                if hasattr(self, "_agent_preview"):
+                    self._agent_preview.setPlainText("(no known harness config found)")
+                    self._agent_status.setText("No prior-agent config found in this folder.")
+                return
+            res = harness.adopt(path)
+            self._agent_inject_text = harness.load_injection(path) if self._agent_inject_on else ""
+            if hasattr(self, "_agent_preview"):
+                self._agent_preview.setPlainText(harness.load_injection(path) or "")
+            self._update_system_prompt()
+            tools = ", ".join(name for _, name, _ in res.tools)
+            if hasattr(self, "_agent_status"):
+                self._agent_status.setText(
+                    f"Auto-adopted · {tools} · ~{res.injected_token_estimate} tokens "
+                    f"{'injected' if self._agent_inject_on else '(injection OFF)'}")
+            bubble = self._chat_view.add_bubble("assistant")
+            bubble.add_text(
+                f"Absorbed prior-agent context from this folder → .artifex\n"
+                f"Tools: {tools} · ~{res.injected_token_estimate} tokens "
+                f"{'injected into context.' if self._agent_inject_on else '(injection OFF).'}")
+        except Exception as e:
+            _log.warning("auto-adopt harness failed: %s", e)
 
     def _on_copy(self):
         """Copy last assistant response to clipboard."""
@@ -1661,6 +1873,7 @@ class ArtifexMainWindow(QMainWindow):
                     token_budget=profile.knowledge_token_budget),
                 session_map_text=self.session_map.render(
                     token_budget=profile.session_map_token_budget),
+                agent_context=(self._agent_inject_text if self._agent_inject_on else ""),
             )
             self.messages[0]["content"] = prompt
         except Exception as e:

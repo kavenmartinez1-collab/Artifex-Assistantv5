@@ -22,6 +22,7 @@ from core.inference import (ThinkFilter, compress_history,
                             build_active_messages, auto_compact_if_needed)
 from core.prompts import build_assistant_prompt
 from core.knowledge import KnowledgeManager
+from core import harness
 from tools.agent_tools import (
     extract_agent_actions,
     run_agent_action,
@@ -538,7 +539,7 @@ def run_assistant():
     print(f" Artifex-Assistant-v5{Style.RESET_ALL}")
     print()
     print(f"{Fore.WHITE}  Type your questions. The AI can run shell commands, Python, and web searches.")
-    print(f"  Commands: /workspace <path>, /kb search|add|list|show|remove, /refresh, /clear")
+    print(f"  Commands: /workspace <path>, /harness <detect|adopt|on|off>, /kb search|add|list, /refresh, /clear")
     print(f"  Session:  /save [name], /load [name|#], /sessions, /export [path]")
     print(f"  Pipeline: /mode <mode>, /attach <file>, /output <dir>")
     print(f"  System:   /backend transformers|ollama|llama_cpp, /ctx <num>, /health, /compile, /turboquant")
@@ -561,6 +562,32 @@ def run_assistant():
         workspace = os.getcwd()
         km.set_workspace(workspace)
         km.bind_workspace_store(workspace)
+
+    # Harness ingestion — absorb any prior agent's context (.claude, AGENTS.md,
+    # .cursor/rules, GEMINI.md, …) from the workspace into a normalized .artifex
+    # bundle and inject it the way Claude Code absorbs a folder.
+    harness_state = {"text": "", "on": True}
+
+    def _adopt_harness(path, announce=True):
+        try:
+            report = harness.detect(path)
+            if report.is_empty:
+                harness_state["text"] = ""
+                if announce:
+                    print(f"{Fore.CYAN}  Harness: no prior-agent config found.{Style.RESET_ALL}")
+                return
+            res = harness.adopt(path)
+            harness_state["text"] = harness.load_injection(path) if harness_state["on"] else ""
+            tools = ", ".join(n for _, n, _ in res.tools)
+            if announce:
+                print(f"{Fore.CYAN}  Harness absorbed → .artifex: {tools} "
+                      f"(~{res.injected_token_estimate} tokens, "
+                      f"{'injected' if harness_state['on'] else 'OFF'}).{Style.RESET_ALL}")
+        except Exception as e:
+            _log.warning("CLI harness adopt failed: %s", e)
+            harness_state["text"] = ""
+
+    _adopt_harness(workspace, announce=True)
 
     # Load engine (Transformers or Ollama based on config)
     engine = create_engine()
@@ -591,6 +618,7 @@ def run_assistant():
             workspace_text=km.get_workspace_summary(max_tokens=profile.workspace_token_budget),
             knowledge_text=km.render_for_prompt(token_budget=profile.knowledge_token_budget),
             session_map_text=session_map.render(token_budget=profile.session_map_token_budget),
+            agent_context=harness_state["text"] if harness_state["on"] else "",
         )
         # Ollama models need extra emphasis on tool marker format
         if get_active_backend() == "ollama":
@@ -764,13 +792,49 @@ def run_assistant():
                     km.rescan_workspace()
                     print(f"{Fore.CYAN}  [+] Workspace re-scanned.")
                     print(f"  {km.get_workspace_summary()}{Style.RESET_ALL}\n")
+                    _adopt_harness(km.get_workspace() or workspace)
                 else:
                     if km.set_workspace(ws_args):
                         km.bind_workspace_store(ws_args)
                         print(f"{Fore.CYAN}  [+] Workspace: {ws_args}")
                         print(f"  {km.get_workspace_summary()}{Style.RESET_ALL}\n")
+                        _adopt_harness(ws_args)
                     else:
                         print(f"{Fore.YELLOW}  Directory not found: {ws_args}{Style.RESET_ALL}\n")
+                continue
+
+            # /harness command — absorb a folder's prior-agent context into .artifex
+            if user_input.lower().startswith("/harness"):
+                sub = user_input[8:].strip().lower()
+                ws = km.get_workspace() or workspace
+                if sub in ("", "status"):
+                    man = harness.read_manifest(ws)
+                    if man:
+                        tools = ", ".join(t["name"] for t in man.get("tools", []))
+                        print(f"{Fore.CYAN}  Harness: adopted [{tools}] · injection "
+                              f"{'ON' if harness_state['on'] else 'OFF'}{Style.RESET_ALL}")
+                    else:
+                        print(f"{Fore.CYAN}  Harness: nothing adopted in {ws}{Style.RESET_ALL}")
+                    print(f"  Usage: /harness detect|adopt|resync|on|off{Style.RESET_ALL}\n")
+                elif sub == "detect":
+                    rep = harness.detect(ws)
+                    print(f"{Fore.CYAN}  {rep.summary()}{Style.RESET_ALL}")
+                    for h in rep.hits:
+                        print(f"    [{h.spec.id}] {', '.join(f.relpath for f in h.files)}")
+                    print()
+                elif sub in ("adopt", "resync", "sync"):
+                    _adopt_harness(ws, announce=True)
+                    print()
+                elif sub == "on":
+                    harness_state["on"] = True
+                    _adopt_harness(ws, announce=False)
+                    print(f"{Fore.CYAN}  Harness injection ON.{Style.RESET_ALL}\n")
+                elif sub == "off":
+                    harness_state["on"] = False
+                    harness_state["text"] = ""
+                    print(f"{Fore.CYAN}  Harness injection OFF.{Style.RESET_ALL}\n")
+                else:
+                    print(f"{Fore.YELLOW}  Usage: /harness detect|adopt|resync|on|off{Style.RESET_ALL}\n")
                 continue
 
             # /health command

@@ -64,7 +64,7 @@ GUIDELINES:
 - Suggest ONE action at a time. Wait for output before next step.
 - If a command fails, try a different approach.
 
-ENVIRONMENT:
+{agent_context}ENVIRONMENT:
 {system_info}
 
 CWD: {cwd}
@@ -80,14 +80,27 @@ SESSION MAP (files explored — use line numbers to drill in with @read_function
 
 
 def build_assistant_prompt(system_info, cwd, workspace_text="", knowledge_text="",
-                           session_map_text="", rag_context=""):
-    """Build the ASSISTANT agent system prompt with environment context."""
+                           session_map_text="", rag_context="", agent_context=""):
+    """Build the ASSISTANT agent system prompt with environment context.
+
+    `agent_context` is the normalized harness context absorbed from the
+    workspace's .artifex bundle (see core/harness.py). When present it is
+    injected as an authoritative AGENT CONTEXT section ahead of ENVIRONMENT.
+    """
+    agent_block = ""
+    if agent_context and agent_context.strip():
+        agent_block = (
+            "AGENT CONTEXT — absorbed from this folder's .artifex bundle. Treat as "
+            "authoritative project instructions and memory left by a prior agent:\n"
+            f"{agent_context.strip()}\n\n"
+        )
     prompt = ASSISTANT_AGENT_PROMPT_TEMPLATE.format(
         system_info=system_info,
         cwd=cwd,
         workspace=workspace_text or "(same as cwd)",
         knowledge=knowledge_text or "(no entries yet — knowledge accumulates as you use tools)",
         session_map=session_map_text or "(no files explored yet)",
+        agent_context=agent_block,
     )
     if rag_context:
         prompt += f"\n\n{rag_context}"
