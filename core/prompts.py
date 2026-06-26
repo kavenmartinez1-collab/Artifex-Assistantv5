@@ -164,3 +164,24 @@ CWD: {cwd}
 def build_voice_tool_prompt(system_info, cwd):
     """Build the voice assistant system prompt with tool instructions."""
     return VOICE_TOOL_PROMPT_TEMPLATE.format(system_info=system_info, cwd=cwd)
+
+
+# ===== AUTONOMOUS AGENT LOOP =====
+AUTONOMOUS_PREAMBLE = """\
+AUTONOMOUS MODE — you are running in a self-driving loop, not a chat.
+- Work toward the GOAL one concrete step at a time using your tool markers.
+- Tool markers are LIVE: writing @tool("arg") or a ```bash```/```python``` block
+  EXECUTES it. After each result is fed back to you, decide the NEXT action.
+- NEVER ask the user to run a command — YOU run it. NEVER simulate user messages.
+- Take ONE focused step per turn so each result can guide the next.
+- When the GOAL is fully accomplished, STOP issuing tools and either give a short
+  final summary OR emit @done("one-line summary of what you accomplished").
+- If you are genuinely blocked and need the user, say so plainly and stop."""
+
+
+def build_autonomous_prompt(base_prompt: str, goal: str = "") -> str:
+    """Wrap the assistant base prompt with the autonomous loop framing + goal."""
+    out = f"{base_prompt}\n\n{AUTONOMOUS_PREAMBLE}"
+    if goal:
+        out += f"\n\nGOAL:\n{goal.strip()}"
+    return out

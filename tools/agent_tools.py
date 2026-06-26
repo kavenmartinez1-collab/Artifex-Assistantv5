@@ -1805,6 +1805,26 @@ def git_revert_last(file_path: str) -> tuple[bool, str]:
 MAX_AGENT_ROUNDS = int(os.environ.get("ARTIFEX_MAX_AGENT_ROUNDS", "10"))
 AGENT_KEY = os.environ.get("ARTIFEX_AGENT_KEY", "")
 
+# Explicit autonomous-completion marker: a line that is exactly @done(...) or
+# @finish(...) (message optional). Anchored to a line so prose mentioning the
+# marker doesn't trip it.
+_DONE_RE = re.compile(r'(?mi)^\s*@(?:done|finish)\s*(?:\((?P<msg>.*?)\))?\s*$')
+
+
+def detect_done(response):
+    """Return the completion summary if the response declares it is done.
+
+    Returns the message string ("" if the marker carried none) when an @done /
+    @finish line is present, or None when absent — so callers can branch on
+    `detect_done(r) is not None`.
+    """
+    if not response:
+        return None
+    m = _DONE_RE.search(response)
+    if not m:
+        return None
+    return (m.group("msg") or "").strip().strip("'\"")
+
 
 def agent_auto_exec_enabled() -> bool:
     """True if auto-execution mode is unlocked (ARTIFEX_AGENT_KEY is set)."""

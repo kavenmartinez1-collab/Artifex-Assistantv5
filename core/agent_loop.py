@@ -1,0 +1,435 @@
+"""
+Artifex Assistant V5 — Autonomous agent loop.
+
+A UI-agnostic controller that drives the generate → act → observe cycle on its
+own, so a local LLM can pursue a goal across many rounds without a human
+clicking "Run" each time. Both the Qt GUI (via a QThread) and the CLI drive the
+*same* AgentRunner, differing only in their event sink + approval callback.
+
+The loop reuses what already exists:
+  - tools.agent_tools.extract_agent_actions / run_agent_action / detect_done
+  - core.sandbox.check_policy + the self-modification ratchet (every action)
+  - core.sandbox.circuit_breaker.CircuitBreaker (runaway-loop trips)
+  - core.sandbox.human_gate.GateState (periodic human checkpoints)
+  - auto-commit-on-edit / auto-revert-on-failure (git_commit_edit/revert)
+
+Autonomy is a dial, not a kill-switch for safety: MANUAL prompts on every
+action, GUIDED auto-runs only low-risk reads and prompts on writes / MEDIUM+,
+FULL_AUTO runs everything policy *allows* without per-action prompts. Policy,
+ratchet, circuit breaker, and human gate apply at ALL levels.
+"""
+
+import logging
+import threading
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, List, Optional
+
+from core.prompts import build_autonomous_prompt
+from core.sandbox import check_policy, RiskLevel
+from core.sandbox.circuit_breaker import CircuitBreaker
+from core.sandbox.human_gate import GateState
+from tools.agent_tools import (
+    extract_agent_actions, run_agent_action, detect_done,
+    MAX_AGENT_ROUNDS, git_commit_edit, git_revert_last,
+)
+from tools.tool_cache import maybe_cache_output, update_session_map
+
+_log = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ENUMS / VALUE TYPES
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AutonomyLevel(str, Enum):
+    MANUAL = "manual"        # confirm every action (today's behavior)
+    GUIDED = "guided"        # auto low-risk reads; confirm writes / MEDIUM+
+    FULL_AUTO = "full_auto"  # run everything policy allows, no per-action prompt
+
+
+AUTONOMY_LEVELS = (AutonomyLevel.MANUAL, AutonomyLevel.GUIDED, AutonomyLevel.FULL_AUTO)
+
+
+class Decision(str, Enum):
+    APPROVE = "approve"   # run this action / continue past the pause
+    DENY = "deny"         # skip this action, keep going
+    STOP = "stop"         # abort the whole run
+
+
+@dataclass
+class AgentEvent:
+    """One observable thing that happened, handed to the host's event sink."""
+    kind: str
+    round: int = 0
+    text: str = ""
+    action: object = None        # tools.agent_tools.AgentAction
+    decision: object = None      # core.sandbox.PolicyDecision
+    success: Optional[bool] = None
+    output: str = ""
+    reason: str = ""
+    summary: str = ""
+
+
+@dataclass
+class RunConfig:
+    autonomy: AutonomyLevel = AutonomyLevel.GUIDED
+    max_rounds: int = MAX_AGENT_ROUNDS
+    wall_clock_s: float = 0.0            # 0 = no time limit
+    max_consecutive_failures: int = 3
+    context_window: int = 8192
+    max_tokens: int = 2048
+    temperature: float = 0.7
+    enable_thinking: bool = True
+    always_confirm_types: tuple = ("edit_file", "download")  # GUIDED always asks
+    auto_approve_max_risk: str = "LOW"                       # GUIDED auto-runs <= this
+    framing: bool = True   # wrap the prompt with the autonomous preamble + GOAL
+
+    @classmethod
+    def default(cls, autonomy: AutonomyLevel = AutonomyLevel.GUIDED) -> "RunConfig":
+        try:
+            from core.config import MODES
+            m = MODES.get("ASSISTANT")
+        except Exception:
+            m = None
+        return cls(
+            autonomy=autonomy,
+            context_window=getattr(m, "context_window", 8192),
+            max_tokens=getattr(m, "max_tokens", 2048),
+            temperature=getattr(m, "temperature", 0.7),
+            enable_thinking=getattr(m, "enable_thinking", True),
+        )
+
+
+@dataclass
+class RunResult:
+    status: str            # "done" | "stopped:<reason>"
+    rounds: int = 0
+    actions_run: int = 0
+    summary: str = ""
+    history: list = field(default_factory=list)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONTROL (pause / stop, thread-safe — set from the UI thread)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class RunControl:
+    def __init__(self):
+        self._stop = threading.Event()
+        self._pause = threading.Event()
+
+    def request_stop(self):
+        self._stop.set()
+        self._pause.clear()  # don't deadlock a paused loop on stop
+
+    def request_pause(self):
+        self._pause.set()
+
+    def resume(self):
+        self._pause.clear()
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop.is_set()
+
+    @property
+    def paused(self) -> bool:
+        return self._pause.is_set()
+
+    def wait_if_paused(self, poll: float = 0.1):
+        while self._pause.is_set() and not self._stop.is_set():
+            time.sleep(poll)
+
+    def reset(self):
+        self._stop.clear()
+        self._pause.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RUNNER
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AgentRunner:
+    """Drives the autonomous loop. Synchronous — run it in whatever thread the
+    host provides (a QThread for the GUI, the main thread for the CLI).
+
+    build_system_prompt — () -> str: host builds the normal assistant system
+        prompt (with workspace/knowledge/.artifex context); the runner wraps it
+        with the autonomous preamble + goal each round.
+    emit                — (AgentEvent) -> None: display sink.
+    request_approval    — (action, decision, reason) -> Decision: blocking. For
+        per-action prompts action/decision are set; for breaker/gate pauses they
+        are None and `reason` explains. Return APPROVE/DENY/STOP.
+    """
+
+    def __init__(self, engine, *, build_system_prompt: Callable[[], str],
+                 emit: Optional[Callable[[AgentEvent], None]] = None,
+                 request_approval: Optional[Callable] = None,
+                 km=None, session_map=None, config: Optional[RunConfig] = None,
+                 control: Optional[RunControl] = None,
+                 gate: Optional[GateState] = None,
+                 breaker: Optional[CircuitBreaker] = None):
+        self.engine = engine
+        self.build_system_prompt = build_system_prompt
+        self.emit = emit or (lambda e: None)
+        self.request_approval = request_approval or (lambda a, d, r: Decision.APPROVE)
+        self.km = km
+        self.session_map = session_map
+        self.config = config or RunConfig.default()
+        self.control = control or RunControl()
+        self.gate = gate if gate is not None else GateState()
+        self.breaker = breaker if breaker is not None else CircuitBreaker()
+        self._round = 0
+        self._actions_run = 0
+        self._t0 = 0.0
+        self.goal = ""
+
+    # ── public ──────────────────────────────────────────────────────────────
+
+    def run(self, goal: str, history: list) -> RunResult:
+        """Pursue `goal`, mutating `history` in place. Returns a RunResult."""
+        self._t0 = time.monotonic()
+        self._round = 0
+        self._actions_run = 0
+        self.goal = goal or ""
+        if goal:
+            history.append({"role": "user", "content": goal})
+        consecutive_failures = 0
+
+        for rnd in range(1, self.config.max_rounds + 1):
+            self._round = rnd
+            if self.control.stop_requested:
+                return self._finish("stopped:user", history)
+            self.control.wait_if_paused()
+            if self._over_wall_clock():
+                self.emit(AgentEvent("stopped", reason="time limit", round=rnd))
+                return self._finish("stopped:timeout", history)
+
+            self.emit(AgentEvent("round_start", round=rnd))
+            self._set_system_prompt(history)
+            active = self._active_messages(history)
+            resp = self._generate(active)
+            history.append({"role": "assistant", "content": resp})
+            if self.km:
+                self._safe(lambda: self.km.add_from_ai_response(resp))
+            self.emit(AgentEvent("assistant_message", text=resp, round=rnd))
+
+            done = detect_done(resp)
+            actions = extract_agent_actions(resp)
+            if done is not None or not actions:
+                summary = done if done else resp.strip()
+                self.emit(AgentEvent("done", summary=summary, round=rnd))
+                return self._finish("done", history, summary)
+
+            outputs: List[str] = []
+            pending_edits: List[str] = []
+            for action in actions:
+                if self.control.stop_requested:
+                    return self._finish("stopped:user", history)
+                self.control.wait_if_paused()
+
+                decision = check_policy(action.type, action.content)
+                self.emit(AgentEvent("action_proposed", action=action,
+                                     decision=decision, round=rnd))
+
+                if not decision.allowed:
+                    self.emit(AgentEvent("blocked", action=action,
+                                         reason=decision.reason, round=rnd))
+                    outputs.append(f"[BLOCKED by policy] {action.display}: {decision.reason}")
+                    continue
+
+                # Circuit breaker — catch runaway loops before executing.
+                trip = self.breaker.check_and_trip()
+                if trip:
+                    self.emit(AgentEvent("breaker_tripped", reason=trip, round=rnd))
+                    if self.request_approval(None, None, f"circuit breaker: {trip}") == Decision.STOP:
+                        return self._finish("stopped:breaker", history)
+                    self.breaker.acknowledge()
+
+                if self._needs_approval(action, decision):
+                    self.emit(AgentEvent("approval_required", action=action,
+                                         decision=decision, round=rnd))
+                    dec = self.request_approval(action, decision, "")
+                    if dec == Decision.STOP:
+                        return self._finish("stopped:user", history)
+                    if dec == Decision.DENY:
+                        outputs.append(f"[skipped by user] {action.display}")
+                        continue
+
+                self.emit(AgentEvent("action_started", action=action, round=rnd))
+                try:
+                    ok, out = run_agent_action(action)
+                except Exception as e:  # executor blew up — treat as failure
+                    ok, out = False, f"ERROR: {e}"
+                out = out or ""
+                self._actions_run += 1
+
+                if ok:
+                    self.breaker.record_success(action.content)
+                    consecutive_failures = 0
+                else:
+                    self.breaker.record_failure(action.content)
+                    consecutive_failures += 1
+                self.gate.record_action(decision.risk_level)
+
+                if self.km:
+                    self._safe(lambda: self.km.process_tool_result(
+                        action.type, action.display, out))
+                if self.session_map is not None:
+                    self._safe(lambda: update_session_map(
+                        self.session_map, action.type, action.display, out))
+                self._on_action_complete(action, ok, pending_edits)
+
+                cached = out
+                if out:
+                    try:
+                        cached = maybe_cache_output(action.type, action.display, out)
+                    except Exception:
+                        cached = out
+                self.emit(AgentEvent("action_result", action=action,
+                                     success=ok, output=out, round=rnd))
+                outputs.append(f"[{action.type}] `{action.display}`:\n{cached}")
+
+                if consecutive_failures >= self.config.max_consecutive_failures:
+                    self.emit(AgentEvent("stopped", reason="too many consecutive failures",
+                                         round=rnd))
+                    return self._finish("stopped:failures", history)
+
+            # Human gate checkpoint (round interval / action cap / risk budget).
+            greason = self.gate.should_gate(rnd)
+            if greason:
+                self.emit(AgentEvent("gate_pause", reason=greason, round=rnd))
+                if self.request_approval(None, None, f"human gate: {greason}") == Decision.STOP:
+                    return self._finish("stopped:gate", history)
+                self.gate.acknowledge_gate(rnd)
+
+            history.append({"role": "user", "content": self._feedback(outputs)})
+
+        self.emit(AgentEvent("stopped", reason=f"max rounds ({self.config.max_rounds})",
+                             round=self._round))
+        return self._finish("stopped:max_rounds", history)
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _needs_approval(self, action, decision) -> bool:
+        """Whether to pause for human approval before running `action`.
+
+        Autonomy (the dropdown the user picks) is authoritative here — NOT the
+        policy engine's `requires_confirmation`, which under the default STRICT
+        policy would force a prompt on everything and defeat Guided. Hard denies
+        (allowed=False from the ratchet/proc sandbox) never reach this. CRITICAL
+        risk stays gated even in FULL_AUTO as a safety floor.
+        """
+        lvl = self.config.autonomy
+        risk = decision.risk_level
+        if lvl == AutonomyLevel.FULL_AUTO:
+            return risk == RiskLevel.CRITICAL
+        if lvl == AutonomyLevel.MANUAL:
+            return True
+        # GUIDED — auto-run low-risk reads; confirm writes / MEDIUM+.
+        if action.type in self.config.always_confirm_types:
+            return True
+        try:
+            ceiling = RiskLevel[self.config.auto_approve_max_risk]
+        except KeyError:
+            ceiling = RiskLevel.LOW
+        return risk > ceiling   # RiskLevel is an IntEnum
+
+    def _set_system_prompt(self, history):
+        try:
+            base = self.build_system_prompt()
+        except Exception as e:
+            _log.warning("build_system_prompt failed: %s", e)
+            base = ""
+        content = build_autonomous_prompt(base, self.goal) if self.config.framing else base
+        if history and history[0].get("role") == "system":
+            history[0]["content"] = content
+        else:
+            history.insert(0, {"role": "system", "content": content})
+
+    def _active_messages(self, history):
+        from core.inference import (build_active_messages, auto_compact_if_needed,
+                                    trim_messages_to_context)
+        cw = self.config.context_window
+        ctx = 0
+        try:
+            if hasattr(self.engine, "get_context_size"):
+                ctx = self.engine.get_context_size() or 0
+        except Exception:
+            ctx = 0
+        if ctx > 0:
+            new_hist, _ = auto_compact_if_needed(history, ctx, cw)
+            history[:] = new_hist
+        _, active = build_active_messages(history, cw, engine_ctx=ctx)
+        if ctx > 0:
+            active = trim_messages_to_context(active, int(ctx * 0.85))
+        return active
+
+    def _generate(self, active) -> str:
+        from core.inference import ThinkFilter
+        parts: List[str] = []
+
+        def on_resp(t):
+            parts.append(t)
+            self.emit(AgentEvent("assistant_chunk", text=t, round=self._round))
+
+        def on_think(t):
+            self.emit(AgentEvent("thinking_chunk", text=t, round=self._round))
+
+        tf = ThinkFilter(on_response=on_resp, on_thinking=on_think)
+        try:
+            resp = self.engine.generate_streaming(
+                active, max_tokens=self.config.max_tokens,
+                temperature=self.config.temperature, on_token=tf.feed)
+        except Exception as e:
+            _log.exception("agent_loop generation failed")
+            self.emit(AgentEvent("error", reason=str(e), round=self._round))
+            self._safe(tf.flush)
+            return ""
+        self._safe(tf.flush)
+        return resp if isinstance(resp, str) and resp else "".join(parts)
+
+    def _on_action_complete(self, action, ok, pending_edits):
+        """Auto-commit a successful edit; auto-revert this round's edits on a
+        failed python/shell run (so a broken test rolls back automatically)."""
+        if action.type == "edit_file" and ok:
+            path = action.content.split("\x00", 1)[0].strip()
+            if path:
+                cok, msg = git_commit_edit(path, action.display)
+                if cok:
+                    pending_edits.append(path)
+                self.emit(AgentEvent("git", text=msg, round=self._round))
+        elif action.type in ("python", "shell") and not ok and pending_edits:
+            for path in reversed(pending_edits):
+                rok, msg = git_revert_last(path)
+                self.emit(AgentEvent("git", text=msg, round=self._round))
+                if not rok:
+                    break
+            pending_edits.clear()
+
+    def _feedback(self, outputs: List[str]) -> str:
+        body = "\n\n".join(outputs) if outputs else "(no output)"
+        if self.config.framing:
+            tail = ("Continue toward the GOAL. When it is fully done, give a short "
+                    'final summary or emit @done("one-line summary").')
+        else:
+            tail = "Analyze the output above and tell the user what you found, then continue or stop."
+        return f"[TOOL OUTPUT — automated command output, not a human message]\n\n{body}\n\n{tail}"
+
+    def _over_wall_clock(self) -> bool:
+        return (self.config.wall_clock_s > 0
+                and (time.monotonic() - self._t0) >= self.config.wall_clock_s)
+
+    def _finish(self, status: str, history: list, summary: str = "") -> RunResult:
+        return RunResult(status=status, rounds=self._round,
+                         actions_run=self._actions_run, summary=summary,
+                         history=history)
+
+    @staticmethod
+    def _safe(fn):
+        try:
+            fn()
+        except Exception:
+            pass

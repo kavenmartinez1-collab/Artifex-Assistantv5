@@ -17,7 +17,7 @@ import threading
 from core.logging_config import get_logger
 _log = get_logger(__name__)
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QFont
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
@@ -244,6 +244,56 @@ def _format_perf_summary(result) -> str | None:
     return " · ".join(parts)
 
 
+class AutonomousWorker(QThread):
+    """Runs the AgentRunner loop off the UI thread.
+
+    Translates AgentRunner events into Qt signals, and turns the runner's
+    blocking `request_approval` into an `approval_required` signal that the UI
+    thread answers via `resolve(decision)`.
+    """
+    event = pyqtSignal(object)              # core.agent_loop.AgentEvent
+    approval_required = pyqtSignal(object)  # dict: {action, decision, reason}
+    run_finished = pyqtSignal(object)       # core.agent_loop.RunResult
+
+    def __init__(self, engine, goal, history, *, build_system_prompt,
+                 km, session_map, config, control):
+        super().__init__()
+        from core.agent_loop import AgentRunner
+        self._goal = goal
+        self._history = history
+        self.control = control
+        self._decision = None
+        self._decision_event = threading.Event()
+        self._runner = AgentRunner(
+            engine, build_system_prompt=build_system_prompt,
+            emit=self.event.emit, request_approval=self._request_approval,
+            km=km, session_map=session_map, config=config, control=control)
+
+    def _request_approval(self, action, decision, reason):
+        from core.agent_loop import Decision
+        self._decision = None
+        self._decision_event.clear()
+        self.approval_required.emit(
+            {"action": action, "decision": decision, "reason": reason})
+        while not self._decision_event.wait(0.1):
+            if self.control.stop_requested:
+                return Decision.STOP
+        return self._decision
+
+    def resolve(self, decision):
+        self._decision = decision
+        self._decision_event.set()
+
+    def run(self):
+        try:
+            result = self._runner.run(self._goal, self._history)
+        except Exception as e:  # surface, never crash the thread silently
+            from core.agent_loop import RunResult
+            _log.exception("Autonomous run failed")
+            result = RunResult(status=f"error:{e}", summary=str(e))
+        self.run_finished.emit(result)
+
+
 class ArtifexMainWindow(QMainWindow):
     """Main application window for Artifex Assistant V5."""
 
@@ -282,6 +332,12 @@ class ArtifexMainWindow(QMainWindow):
         self._agent_inject_text = ""
         self._agent_inject_on = True
         self._agent_last_report = None
+
+        # Autonomous agent loop state
+        self._auto_worker = None
+        self._auto_control = None
+        self._auto_running = False
+        self._auto_armed_full = False  # one-time Full-auto confirmation per session
 
         # Build UI
         self._build_ui()
@@ -1660,8 +1716,14 @@ class ArtifexMainWindow(QMainWindow):
 
     def _build_agent_tab(self) -> QWidget:
         w = QWidget()
-        outer = QVBoxLayout(w)
-        outer.setContentsMargins(6, 6, 6, 6)
+        root = QVBoxLayout(w)
+        root.setContentsMargins(6, 6, 6, 6)
+        vsplit = QSplitter(Qt.Orientation.Vertical)
+
+        # ── Harness ingestion (top) ──────────────────────────────────────────
+        harness_box = QWidget()
+        outer = QVBoxLayout(harness_box)
+        outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(6)
 
         intro = QLabel(
@@ -1689,7 +1751,6 @@ class ArtifexMainWindow(QMainWindow):
         outer.addLayout(row)
 
         split = QSplitter(Qt.Orientation.Horizontal)
-
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
@@ -1715,19 +1776,92 @@ class ArtifexMainWindow(QMainWindow):
         self._agent_preview.setFont(QFont("Consolas", 9))
         rl.addWidget(self._agent_preview, 1)
         split.addWidget(right)
-
         split.setSizes([320, 540])
         outer.addWidget(split, 1)
 
         self._agent_status = QLabel("No folder absorbed yet.")
         self._agent_status.setStyleSheet("color:#888; font-size:9pt;")
         outer.addWidget(self._agent_status)
+        vsplit.addWidget(harness_box)
 
+        # ── Autonomous run (bottom) ──────────────────────────────────────────
+        run_box = QGroupBox("Autonomous Run — pursue a goal step-by-step in this folder")
+        rb = QVBoxLayout(run_box)
+
+        goal_row = QHBoxLayout()
+        goal_row.addWidget(QLabel("Goal:"))
+        self._auto_goal = QLineEdit()
+        self._auto_goal.setPlaceholderText("Describe the task to run autonomously…")
+        goal_row.addWidget(self._auto_goal, 1)
+        goal_row.addWidget(QLabel("Autonomy:"))
+        self._auto_level = QComboBox()
+        self._auto_level.addItems(["Manual", "Guided", "Full-auto"])
+        self._auto_level.setCurrentText("Guided")
+        self._auto_level.setToolTip(
+            "Manual: confirm every action\n"
+            "Guided: auto-run safe reads, confirm writes / MEDIUM+\n"
+            "Full-auto: run everything policy allows (CRITICAL + ratchet still stop it)")
+        goal_row.addWidget(self._auto_level)
+        rb.addLayout(goal_row)
+
+        btn_row = QHBoxLayout()
+        self._auto_run_btn = QPushButton("Run")
+        self._auto_pause_btn = QPushButton("Pause")
+        self._auto_pause_btn.setProperty("class", "secondary")
+        self._auto_pause_btn.setEnabled(False)
+        self._auto_stop_btn = QPushButton("Stop")
+        self._auto_stop_btn.setProperty("class", "secondary")
+        self._auto_stop_btn.setEnabled(False)
+        btn_row.addWidget(self._auto_run_btn)
+        btn_row.addWidget(self._auto_pause_btn)
+        btn_row.addWidget(self._auto_stop_btn)
+        btn_row.addStretch()
+        self._auto_status = QLabel("Idle.")
+        self._auto_status.setStyleSheet("color:#888; font-size:9pt;")
+        btn_row.addWidget(self._auto_status)
+        rb.addLayout(btn_row)
+
+        # Inline approval bar (shown only when an action/pause needs a human)
+        self._auto_approval = QFrame()
+        self._auto_approval.setVisible(False)
+        ab = QHBoxLayout(self._auto_approval)
+        ab.setContentsMargins(0, 0, 0, 0)
+        self._auto_approval_label = QLabel("")
+        self._auto_approval_label.setWordWrap(True)
+        ab.addWidget(self._auto_approval_label, 1)
+        self._auto_approve_btn = QPushButton("Approve")
+        self._auto_deny_btn = QPushButton("Deny")
+        self._auto_deny_btn.setProperty("class", "secondary")
+        self._auto_abort_btn = QPushButton("Stop")
+        self._auto_abort_btn.setProperty("class", "secondary")
+        for b in (self._auto_approve_btn, self._auto_deny_btn, self._auto_abort_btn):
+            ab.addWidget(b)
+        rb.addWidget(self._auto_approval)
+
+        self._auto_log = QPlainTextEdit()
+        self._auto_log.setReadOnly(True)
+        self._auto_log.setMaximumBlockCount(5000)
+        self._auto_log.setStyleSheet(
+            "font-family: Consolas; font-size: 9pt; background:#0a0a0a; color:#c8c8c8;")
+        rb.addWidget(self._auto_log, 1)
+        vsplit.addWidget(run_box)
+
+        vsplit.setSizes([380, 340])
+        root.addWidget(vsplit)
+
+        # Wire — harness
         self._agent_browse_btn.clicked.connect(self._on_agent_browse)
         self._agent_detect_btn.clicked.connect(self._on_agent_detect)
         self._agent_adopt_btn.clicked.connect(self._on_agent_adopt)
         self._agent_resync_btn.clicked.connect(self._on_agent_adopt)  # re-sync = re-adopt
         self._agent_inject_cb.toggled.connect(self._on_agent_inject_toggle)
+        # Wire — autonomous run
+        self._auto_run_btn.clicked.connect(self._on_auto_run)
+        self._auto_pause_btn.clicked.connect(self._on_auto_pause)
+        self._auto_stop_btn.clicked.connect(self._on_auto_stop)
+        self._auto_approve_btn.clicked.connect(lambda: self._auto_resolve("approve"))
+        self._auto_deny_btn.clicked.connect(lambda: self._auto_resolve("deny"))
+        self._auto_abort_btn.clicked.connect(lambda: self._auto_resolve("stop"))
         return w
 
     def _refresh_agent_list(self, report):
@@ -1850,6 +1984,169 @@ class ArtifexMainWindow(QMainWindow):
         except Exception as e:
             _log.warning("auto-adopt harness failed: %s", e)
 
+    # ── autonomous run ──────────────────────────────────────────────────────
+
+    def _auto_append(self, text: str):
+        self._auto_log.appendPlainText(text.rstrip("\n"))
+
+    def _auto_insert(self, target, text: str):
+        cur = target.textCursor()
+        cur.movePosition(cur.MoveOperation.End)
+        cur.insertText(text)
+        target.setTextCursor(cur)
+        target.ensureCursorVisible()
+
+    def _on_auto_run(self):
+        from core.agent_loop import AutonomyLevel, RunConfig, RunControl
+        if self._busy or self._auto_running:
+            self._auto_status.setText("Busy — finish the current run first.")
+            return
+        goal = self._auto_goal.text().strip()
+        if not goal:
+            self._auto_status.setText("Enter a goal first.")
+            return
+
+        level = {"Manual": AutonomyLevel.MANUAL, "Guided": AutonomyLevel.GUIDED,
+                 "Full-auto": AutonomyLevel.FULL_AUTO}[self._auto_level.currentText()]
+
+        # Full-auto: one-time arm confirmation per session (skipped if the
+        # ARTIFEX_AGENT_KEY power-user unlock is already set).
+        if (level == AutonomyLevel.FULL_AUTO and not self._auto_armed_full
+                and not os.environ.get("ARTIFEX_AGENT_KEY")):
+            resp = QMessageBox.warning(
+                self, "Arm Full-auto?",
+                "Full-auto runs every policy-allowed action with no per-action "
+                "approval. CRITICAL actions (rm -rf, force-push, curl|bash…) and "
+                "the self-modification ratchet still stop it.\n\nProceed?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if resp != QMessageBox.StandardButton.Yes:
+                self._auto_status.setText("Full-auto cancelled.")
+                return
+            self._auto_armed_full = True
+
+        if self.engine is None:
+            self.engine = create_engine()
+
+        self._auto_control = RunControl()
+        cfg = RunConfig.default(level)
+        # Run on a private copy of the conversation so the chat stays clean;
+        # the final summary is folded back into the conversation at the end.
+        history = [dict(m) for m in self.messages]
+
+        self._auto_log.clear()
+        self._auto_append(f"▶ GOAL: {goal}\n  autonomy: {self._auto_level.currentText()}")
+
+        self._auto_worker = AutonomousWorker(
+            self.engine, goal, history,
+            build_system_prompt=self._base_system_prompt,
+            km=self.km, session_map=self.session_map,
+            config=cfg, control=self._auto_control)
+        self._auto_worker.event.connect(self._on_auto_event)
+        self._auto_worker.approval_required.connect(self._on_auto_approval)
+        self._auto_worker.run_finished.connect(self._on_auto_finished)
+        self._auto_worker.finished.connect(self._on_auto_worker_cleanup)
+
+        self._auto_running = True
+        self._auto_run_btn.setEnabled(False)
+        self._auto_pause_btn.setEnabled(True)
+        self._auto_stop_btn.setEnabled(True)
+        self._auto_status.setText("Running…")
+        self._auto_worker.start()
+
+    def _on_auto_pause(self):
+        if not self._auto_control:
+            return
+        if self._auto_control.paused:
+            self._auto_control.resume()
+            self._auto_pause_btn.setText("Pause")
+            self._auto_status.setText("Running…")
+        else:
+            self._auto_control.request_pause()
+            self._auto_pause_btn.setText("Resume")
+            self._auto_status.setText("Paused.")
+
+    def _on_auto_stop(self):
+        if self._auto_control:
+            self._auto_control.request_stop()
+            self._auto_status.setText("Stopping…")
+            self._auto_approval.setVisible(False)
+
+    def _on_auto_event(self, ev):
+        k = ev.kind
+        if k == "round_start":
+            self._auto_append(f"\n── round {ev.round} ──")
+        elif k == "assistant_chunk":
+            self._auto_insert(self._auto_log, ev.text)
+        elif k == "thinking_chunk":
+            self._auto_insert(self._thinking_output, ev.text)
+        elif k == "action_proposed":
+            risk = getattr(ev.decision, "risk_level", None)
+            risk = risk.name if risk is not None else "?"
+            self._auto_append(f"  • {ev.action.type}: {ev.action.display}  [{risk}]")
+        elif k == "action_result":
+            status = "ok" if ev.success else "FAIL"
+            out = (ev.output or "").strip().replace("\n", " ")[:140]
+            self._auto_append(f"    → {status}: {out}")
+        elif k == "blocked":
+            self._auto_append(f"  ⛔ BLOCKED: {ev.action.display} — {ev.reason}")
+        elif k == "breaker_tripped":
+            self._auto_append(f"  ⚡ circuit breaker: {ev.reason}")
+        elif k == "gate_pause":
+            self._auto_append(f"  ⏸ human gate: {ev.reason}")
+        elif k == "git":
+            self._auto_append(f"    [git] {ev.text}")
+        elif k == "error":
+            self._auto_append(f"  ! error: {ev.reason}")
+
+    def _on_auto_approval(self, payload):
+        action = payload.get("action")
+        decision = payload.get("decision")
+        reason = payload.get("reason") or ""
+        if action is not None:
+            risk = getattr(decision, "risk_level", None)
+            risk = risk.name if risk is not None else "?"
+            self._auto_approval_label.setText(
+                f"Approve {action.type} [{risk}]?  {action.display}")
+            self._auto_approve_btn.setText("Approve")
+            self._auto_deny_btn.setVisible(True)
+        else:
+            self._auto_approval_label.setText(f"Paused — {reason}. Continue?")
+            self._auto_approve_btn.setText("Continue")
+            self._auto_deny_btn.setVisible(False)
+        self._auto_approval.setVisible(True)
+
+    def _auto_resolve(self, which: str):
+        from core.agent_loop import Decision
+        self._auto_approval.setVisible(False)
+        if self._auto_worker:
+            self._auto_worker.resolve(
+                {"approve": Decision.APPROVE, "deny": Decision.DENY,
+                 "stop": Decision.STOP}.get(which, Decision.APPROVE))
+
+    def _on_auto_finished(self, result):
+        self._auto_append(
+            f"\n■ {result.status}  ({result.rounds} rounds, {result.actions_run} actions)")
+        if result.summary:
+            self._auto_append(f"  summary: {result.summary}")
+            bubble = self._chat_view.add_bubble("assistant")
+            bubble.add_text(f"[autonomous run · {result.status}]\n{result.summary}")
+            self.messages.append({"role": "assistant", "content": result.summary})
+            self._chat_view.scroll_to_bottom()
+        self._auto_running = False
+        self._auto_run_btn.setEnabled(True)
+        self._auto_pause_btn.setEnabled(False)
+        self._auto_pause_btn.setText("Pause")
+        self._auto_stop_btn.setEnabled(False)
+        self._auto_approval.setVisible(False)
+        self._auto_status.setText(result.status)
+
+    def _on_auto_worker_cleanup(self):
+        w = self._auto_worker
+        if w is not None:
+            w.deleteLater()
+            self._auto_worker = None
+
     def _on_copy(self):
         """Copy last assistant response to clipboard."""
         # Find last assistant message
@@ -1860,22 +2157,27 @@ class ArtifexMainWindow(QMainWindow):
                 return
         self._set_status("Nothing to copy")
 
+    def _base_system_prompt(self) -> str:
+        """The assistant system prompt with full context (workspace, knowledge,
+        session map, absorbed .artifex). The autonomous loop wraps this with its
+        own preamble + goal, so this stays preamble-free."""
+        from core.prompts import build_assistant_prompt
+        profile = get_context_profile()
+        return build_assistant_prompt(
+            self._system_info, os.getcwd(),
+            workspace_text=self.km.get_workspace_summary(
+                max_tokens=profile.workspace_token_budget),
+            knowledge_text=self.km.render_for_prompt(
+                token_budget=profile.knowledge_token_budget),
+            session_map_text=self.session_map.render(
+                token_budget=profile.session_map_token_budget),
+            agent_context=(self._agent_inject_text if self._agent_inject_on else ""),
+        )
+
     def _update_system_prompt(self, mode: str = "ASSISTANT"):
-        """Build system prompt with full context (workspace, knowledge, session map)."""
+        """Refresh self.messages[0] with the current full-context system prompt."""
         try:
-            from core.prompts import build_assistant_prompt
-            profile = get_context_profile()
-            prompt = build_assistant_prompt(
-                self._system_info, os.getcwd(),
-                workspace_text=self.km.get_workspace_summary(
-                    max_tokens=profile.workspace_token_budget),
-                knowledge_text=self.km.render_for_prompt(
-                    token_budget=profile.knowledge_token_budget),
-                session_map_text=self.session_map.render(
-                    token_budget=profile.session_map_token_budget),
-                agent_context=(self._agent_inject_text if self._agent_inject_on else ""),
-            )
-            self.messages[0]["content"] = prompt
+            self.messages[0]["content"] = self._base_system_prompt()
         except Exception as e:
             _log.warning("System prompt update failed: %s", e)
 

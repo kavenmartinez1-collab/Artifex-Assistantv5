@@ -23,6 +23,7 @@ from core.inference import (ThinkFilter, compress_history,
 from core.prompts import build_assistant_prompt
 from core.knowledge import KnowledgeManager
 from core import harness
+from core.agent_loop import AgentRunner, RunConfig, AutonomyLevel, Decision
 from tools.agent_tools import (
     extract_agent_actions,
     run_agent_action,
@@ -118,266 +119,6 @@ def _open_file_externally(path: str):
         subprocess.Popen(["open", path])
     else:
         subprocess.Popen(["xdg-open", path])
-
-
-def _truncate(text, limit=None):
-    if limit is None:
-        limit = get_tool_output_limit()
-    if len(text) > limit:
-        return text[:limit] + "\n[...truncated...]"
-    return text
-
-
-def _execute_action(action, km=None, smap=None):
-    """Execute an agent action with user confirmation.
-
-    Returns (status, output) where status is True on success, False on failure,
-    and None if the user skipped. Output is the (possibly cached/summarized)
-    string fed back to the model, or None on skip.
-    """
-    type_label = action.type.upper()
-    print(f"\n{Fore.YELLOW}  [{type_label}] {Fore.WHITE}{action.display}")
-    confirm = input(f"{Fore.YELLOW}  Execute? [y/N]: {Fore.WHITE}").strip().lower()
-    if confirm not in ("y", "yes"):
-        print(f"{Fore.YELLOW}  Skipped.{Style.RESET_ALL}")
-        return None, None
-
-    print(f"{Fore.CYAN}  Running...{Style.RESET_ALL}\n")
-    success, output = run_agent_action(action)
-
-    if not success:
-        print(f"{Fore.RED}  ERROR: {output}{Style.RESET_ALL}")
-        return False, f"ERROR: {output}"
-
-    # Show FULL output to the user (they see everything on screen)
-    print(f"{Fore.YELLOW}  --- Output ---{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}{output or '(no output)'}{Style.RESET_ALL}")
-    print(f"{Fore.YELLOW}  --- End ---{Style.RESET_ALL}")
-
-    # Process tool output through context engine
-    if km and output:
-        kb_ids = km.process_tool_result(action.type, action.display, output)
-        if kb_ids:
-            print(f"{Fore.CYAN}  [KB] {len(kb_ids)} entries{Style.RESET_ALL}")
-
-    # Update session map BEFORE caching (needs full output for extraction)
-    if smap and output:
-        update_session_map(smap, action.type, action.display, output)
-
-    # Cache large outputs — return summary for model context, full output on disk.
-    # The user already saw the full output above; only the model gets the summary.
-    if output:
-        cached = maybe_cache_output(action.type, action.display, output)
-        if cached != output:
-            print(f"{Fore.CYAN}  [CACHED] Large output saved to disk — summary sent to model{Style.RESET_ALL}")
-        return True, cached
-
-    return True, "(no output — command completed successfully)"
-
-
-def _edit_path_from_content(content: str) -> str | None:
-    """Extract the target path from an edit_file action's content."""
-    parts = content.split("\x00", 1)
-    if not parts:
-        return None
-    path = parts[0].strip()
-    return path or None
-
-
-def _on_action_complete(action, status, pending_edits):
-    """Auto-commit successful edits, auto-revert prior edits on a failed run.
-
-    pending_edits is mutated in-place. The shape of the rollback is:
-      edit_file succeeds → commit it, push file path onto pending_edits
-      python/shell fails → revert each pending edit in reverse order
-
-    Reverting only on python/shell failures (not, say, glob/grep) keeps the
-    behavior aligned with the task acceptance criterion: "agent breaks a
-    passing test → automatic rollback." Reverts stop at the first failure
-    so a partially reverted state is visible to the user.
-    """
-    if status is None:
-        return  # skipped — leave state untouched
-
-    if action.type == "edit_file" and status is True:
-        path = _edit_path_from_content(action.content)
-        if not path:
-            return
-        ok, msg = git_commit_edit(path, action.display)
-        if ok:
-            pending_edits.append(path)
-            print(f"{Fore.CYAN}  [git] {msg}{Style.RESET_ALL}")
-        else:
-            print(f"{Fore.YELLOW}  [git] commit skipped: {msg}{Style.RESET_ALL}")
-        return
-
-    if action.type in ("python", "shell") and status is False and pending_edits:
-        print(
-            f"{Fore.YELLOW}  Run failed — reverting "
-            f"{len(pending_edits)} agent commit(s) from this round.{Style.RESET_ALL}"
-        )
-        for path in reversed(pending_edits):
-            ok, msg = git_revert_last(path)
-            if ok:
-                print(f"{Fore.CYAN}  [git] {msg}{Style.RESET_ALL}")
-            else:
-                print(f"{Fore.YELLOW}  [git] revert stopped: {msg}{Style.RESET_ALL}")
-                break
-        pending_edits.clear()
-
-
-def offer_action_execution(actions, km=None, smap=None):
-    """After AI response, offer to execute detected actions.
-
-    Consults the sandbox policy engine to determine which actions can be
-    auto-executed and which require human confirmation.
-    """
-    if not actions:
-        return None
-
-    _RISK_ICON = {
-        RiskLevel.SAFE: f"{Fore.GREEN}SAFE",
-        RiskLevel.LOW: f"{Fore.GREEN}LOW",
-        RiskLevel.MEDIUM: f"{Fore.YELLOW}MED",
-        RiskLevel.HIGH: f"{Fore.RED}HIGH",
-        RiskLevel.CRITICAL: f"{Fore.RED}CRIT",
-    }
-
-    auto_indices = []
-    confirm_actions = []
-
-    for i, action in enumerate(actions):
-        decision = check_policy(action.type, action.content)
-        if not decision.allowed:
-            risk_str = _RISK_ICON.get(decision.risk_level, "?")
-            print(
-                f"    {Fore.RED}[BLOCKED] [{risk_str}{Fore.RED}] "
-                f"{action.display}: {decision.reason}{Style.RESET_ALL}"
-            )
-            continue
-        if not decision.requires_confirmation:
-            auto_indices.append(i)
-        else:
-            confirm_actions.append(i)
-
-    outputs = []
-    # Track agent commits made this round for auto-revert on test failure (P3-T15).
-    pending_edits: list[str] = []
-
-    if auto_indices:
-        print(f"\n{Fore.GREEN}  Auto-executing ({len(auto_indices)} policy-allowed):{Style.RESET_ALL}")
-        for idx in auto_indices:
-            action = actions[idx]
-            risk = check_policy(action.type, action.content).risk_level
-            risk_str = _RISK_ICON.get(risk, "?")
-            print(f"    {Fore.GREEN}> [{risk_str}{Fore.GREEN}] {action.display}{Style.RESET_ALL}")
-            status, output = _execute_action(action, km, smap)
-            _on_action_complete(action, status, pending_edits)
-            if output is not None:
-                outputs.append(f"[{action.type} output] `{action.display}`:\n{output}")
-
-    if confirm_actions:
-        print(f"\n{Fore.YELLOW}  Actions needing confirmation:{Style.RESET_ALL}")
-        for display_num, idx in enumerate(confirm_actions, 1):
-            action = actions[idx]
-            risk = check_policy(action.type, action.content).risk_level
-            risk_str = _RISK_ICON.get(risk, "?")
-            label = action.type.upper()
-            print(
-                f"    {Fore.GREEN}{display_num}. [{risk_str}{Fore.GREEN}] "
-                f"[{label}] {Fore.WHITE}{action.display}"
-            )
-
-        print(
-            f"\n{Fore.YELLOW}  Run which? {Fore.WHITE}"
-            f"(1-{len(confirm_actions)}, 'a' for all, Enter to skip): ",
-            end="",
-        )
-        choice = input().strip().lower()
-
-        if choice:
-            indices = []
-            if choice == "a":
-                indices = list(range(len(confirm_actions)))
-            else:
-                for part in choice.replace(",", " ").split():
-                    try:
-                        num = int(part) - 1
-                        if 0 <= num < len(confirm_actions):
-                            indices.append(num)
-                    except ValueError:
-                        pass
-
-            for ci in indices:
-                idx = confirm_actions[ci]
-                action = actions[idx]
-                status, output = _execute_action(action, km, smap)
-                _on_action_complete(action, status, pending_edits)
-                if output is not None:
-                    label = action.type
-                    outputs.append(f"[{label} output] `{action.display}`:\n{output}")
-
-    if outputs:
-        return "\n\n".join(outputs)
-    return None
-
-
-def _make_think_indicator():
-    """Create a simple thinking indicator for CLI."""
-    shown = [False]
-
-    def on_thinking(text):
-        if not shown[0]:
-            sys.stdout.write(f"{Fore.MAGENTA}  (thinking...){Style.RESET_ALL}")
-            sys.stdout.flush()
-            shown[0] = True
-
-    return on_thinking
-
-
-def _stream_response(engine, active_messages, mode_cfg):
-    """Stream a response with thinking filtered out. Returns clean response."""
-    print(f"\n{Fore.CYAN}  assistant > ", end="")
-
-    def on_response(text):
-        sys.stdout.write(f"{Fore.WHITE}{text}")
-        sys.stdout.flush()
-
-    think_filter = ThinkFilter(
-        on_response=on_response,
-        on_thinking=_make_think_indicator(),
-    )
-
-    with engine_recovery(engine) as ctx:
-        response = engine.generate_streaming(
-            active_messages,
-            max_tokens=mode_cfg.max_tokens,
-            temperature=mode_cfg.temperature,
-            on_token=think_filter.feed,
-        )
-        ctx.response = response
-
-    if ctx.should_retry:
-        print(f"\n{Fore.YELLOW}  (recovering from error, retrying...){Style.RESET_ALL}")
-        _log.warning("Retrying generation after: %s", ctx.error)
-        print(f"{Fore.CYAN}  assistant > ", end="")
-        think_filter = ThinkFilter(
-            on_response=on_response,
-            on_thinking=_make_think_indicator(),
-        )
-        response = engine.generate_streaming(
-            active_messages,
-            max_tokens=max(mode_cfg.max_tokens // 2, 256),
-            temperature=mode_cfg.temperature,
-            on_token=think_filter.feed,
-        )
-    else:
-        response = ctx.response
-
-    think_filter.flush()
-
-    print(f"{Style.RESET_ALL}\n")
-    return response
 
 
 def _handle_kb_command(args, km):
@@ -520,6 +261,60 @@ def _handle_kb_command(args, km):
         print(f"{Fore.YELLOW}  Unknown /kb subcommand: {subcmd}{Style.RESET_ALL}\n")
 
 
+class _ConsoleHost:
+    """Console event sink + approval callback for the autonomous runner (CLI)."""
+
+    def __init__(self):
+        self._streaming = False
+
+    def _end_stream(self):
+        if self._streaming:
+            sys.stdout.write(Style.RESET_ALL + "\n")
+            sys.stdout.flush()
+            self._streaming = False
+
+    def emit(self, ev):
+        k = ev.kind
+        if k == "assistant_chunk":
+            if not self._streaming:
+                sys.stdout.write(f"\n{Fore.CYAN}  assistant > {Fore.WHITE}")
+                self._streaming = True
+            sys.stdout.write(ev.text)
+            sys.stdout.flush()
+        elif k in ("assistant_message", "done"):
+            self._end_stream()
+        elif k == "action_started":
+            print(f"{Fore.CYAN}  running: {Fore.WHITE}{ev.action.display}{Style.RESET_ALL}")
+        elif k == "action_result":
+            status = "ok" if ev.success else "ERROR"
+            color = Fore.GREEN if ev.success else Fore.RED
+            out = (ev.output or "").strip()
+            print(f"{color}  [{status}]{Style.RESET_ALL} {Fore.WHITE}{out[:1000]}{Style.RESET_ALL}")
+        elif k == "blocked":
+            print(f"{Fore.RED}  BLOCKED: {ev.action.display} — {ev.reason}{Style.RESET_ALL}")
+        elif k == "breaker_tripped":
+            print(f"{Fore.RED}  circuit breaker: {ev.reason}{Style.RESET_ALL}")
+        elif k == "gate_pause":
+            print(f"{Fore.YELLOW}  human gate: {ev.reason}{Style.RESET_ALL}")
+        elif k == "git":
+            print(f"{Fore.CYAN}  [git] {ev.text}{Style.RESET_ALL}")
+        elif k == "error":
+            print(f"{Fore.RED}  error: {ev.reason}{Style.RESET_ALL}")
+
+    def approval(self, action, decision, reason):
+        self._end_stream()
+        if action is None:   # circuit-breaker / human-gate pause
+            ans = input(f"{Fore.YELLOW}  {reason} — continue? [Y/n/stop]: {Fore.WHITE}").strip().lower()
+            return Decision.STOP if ans in ("n", "no", "s", "stop") else Decision.APPROVE
+        risk = getattr(decision, "risk_level", None)
+        risk = risk.name if risk is not None else "?"
+        print(f"{Fore.YELLOW}  [{risk}] {action.type}: {Fore.WHITE}{action.display}{Style.RESET_ALL}")
+        ans = input(f"{Fore.YELLOW}  Execute? [y/N/stop]: {Fore.WHITE}").strip().lower()
+        if ans in ("s", "stop"):
+            return Decision.STOP
+        return Decision.APPROVE if ans in ("y", "yes") else Decision.DENY
+
+
 def run_assistant():
     """Main ASSISTANT agent CLI loop."""
     install_all_hooks()
@@ -540,6 +335,7 @@ def run_assistant():
     print()
     print(f"{Fore.WHITE}  Type your questions. The AI can run shell commands, Python, and web searches.")
     print(f"  Commands: /workspace <path>, /harness <detect|adopt|on|off>, /kb search|add|list, /refresh, /clear")
+    print(f"  Agent:    /run <goal>  (autonomous loop),  /autonomy manual|guided|full")
     print(f"  Session:  /save [name], /load [name|#], /sessions, /export [path]")
     print(f"  Pipeline: /mode <mode>, /attach <file>, /output <dir>")
     print(f"  System:   /backend transformers|ollama|llama_cpp, /ctx <num>, /health, /compile, /turboquant")
@@ -635,6 +431,9 @@ def run_assistant():
     _first_message = True
 
     _voice_listener = None  # Lazy-loaded for voice/artifex mode
+
+    host = _ConsoleHost()
+    cli_autonomy = AutonomyLevel.GUIDED  # level used by /run
 
     while True:
         try:
@@ -835,6 +634,41 @@ def run_assistant():
                     print(f"{Fore.CYAN}  Harness injection OFF.{Style.RESET_ALL}\n")
                 else:
                     print(f"{Fore.YELLOW}  Usage: /harness detect|adopt|resync|on|off{Style.RESET_ALL}\n")
+                continue
+
+            # /autonomy command — set the level used by /run
+            if user_input.lower().startswith("/autonomy"):
+                arg = user_input[9:].strip().lower()
+                amap = {"manual": AutonomyLevel.MANUAL, "guided": AutonomyLevel.GUIDED,
+                        "full": AutonomyLevel.FULL_AUTO, "full-auto": AutonomyLevel.FULL_AUTO,
+                        "auto": AutonomyLevel.FULL_AUTO}
+                if arg in amap:
+                    cli_autonomy = amap[arg]
+                    print(f"{Fore.CYAN}  /run autonomy → {cli_autonomy.value}{Style.RESET_ALL}\n")
+                else:
+                    print(f"{Fore.CYAN}  /run autonomy: {cli_autonomy.value}")
+                    print(f"  Usage: /autonomy manual|guided|full{Style.RESET_ALL}\n")
+                continue
+
+            # /run command — autonomous goal execution via the shared runner
+            if user_input.lower().startswith("/run"):
+                goal = user_input[4:].strip()
+                if not goal:
+                    print(f"{Fore.YELLOW}  Usage: /run <goal>   (set mode via /autonomy manual|guided|full){Style.RESET_ALL}\n")
+                    continue
+                run_cfg = RunConfig.default(cli_autonomy)
+                run_cfg.max_rounds = MAX_AGENT_ROUNDS
+                if cli_autonomy == AutonomyLevel.FULL_AUTO:
+                    print(f"{Fore.YELLOW}  Full-auto — all policy-allowed actions run unattended; "
+                          f"CRITICAL + ratchet still stop it.{Style.RESET_ALL}")
+                result = AgentRunner(
+                    engine, build_system_prompt=_build_system_prompt,
+                    emit=host.emit, request_approval=host.approval,
+                    km=km, session_map=session_map, config=run_cfg,
+                ).run(goal, history)
+                print(f"\n{Fore.CYAN}  ■ {result.status} "
+                      f"({result.rounds} rounds, {result.actions_run} actions){Style.RESET_ALL}\n")
+                history = compress_history(history, mode_cfg.context_window)
                 continue
 
             # /health command
@@ -1114,77 +948,22 @@ def run_assistant():
                 _handle_kb_command(user_input[3:].strip(), km)
                 continue
 
-            # Build system prompt with fresh context
-            system_prompt = _build_system_prompt()
-            history[0] = {"role": "system", "content": system_prompt}
-
-            history.append({"role": "user", "content": user_input})
-
             # Set task from first user message
             if _first_message:
                 session_map.set_task(user_input)
                 _first_message = False
 
-            # Auto-compact if approaching engine context limit
-            ctx = engine.get_context_size() if engine else 0
-            if ctx > 0:
-                history, compacted = auto_compact_if_needed(
-                    history, ctx, mode_cfg.context_window
-                )
-                if compacted:
-                    print(f"{Fore.CYAN}  [Compacted] {len(history)} messages kept{Style.RESET_ALL}")
-
-            # Token-aware sliding window (engine-context-aware)
-            history, active_messages = build_active_messages(
-                history, mode_cfg.context_window, engine_ctx=ctx
-            )
-
-            # Stream response (thinking filtered out)
-            response = _stream_response(engine, active_messages, mode_cfg)
-
-            history.append({"role": "assistant", "content": response})
-
-            # Auto-extract knowledge from AI response
-            ai_kb = km.add_from_ai_response(response)
-            if ai_kb:
-                print(f"{Fore.CYAN}  [KB] {len(ai_kb)} entries from AI response{Style.RESET_ALL}")
-
-            # Extract actions and offer execution
-            actions = extract_agent_actions(response)
-            tool_output = offer_action_execution(actions, km, session_map)
-
-            # If we ran actions, feed output back for analysis (bounded loop)
-            agent_round = 0
-            while tool_output and agent_round < MAX_AGENT_ROUNDS:
-                truncated = _truncate(tool_output)
-                feedback_msg = (
-                    "[TOOL OUTPUT — this is automated command output, not a human message]\n\n"
-                    f"{truncated}\n\n"
-                    "Analyze the output above and tell the user what you found."
-                )
-                history.append({"role": "user", "content": feedback_msg})
-
-                # Rebuild with potentially new cwd + fresh knowledge + updated session map
-                system_prompt = _build_system_prompt()
-                history[0] = {"role": "system", "content": system_prompt}
-                active_messages = [history[0]] + history[1:][-mode_cfg.context_window:]
-
-                response = _stream_response(engine, active_messages, mode_cfg)
-
-                history.append({"role": "assistant", "content": response})
-
-                # Extract knowledge from followup
-                ai_kb = km.add_from_ai_response(response)
-                if ai_kb:
-                    print(f"{Fore.CYAN}  [KB] {len(ai_kb)} entries from AI response{Style.RESET_ALL}")
-
-                # Check for more actions in followup
-                agent_round += 1
-                more_actions = extract_agent_actions(response)
-                tool_output = offer_action_execution(more_actions, km, session_map)
-
-            if agent_round >= MAX_AGENT_ROUNDS:
-                print(f"{Fore.YELLOW}  Agent loop limit reached ({MAX_AGENT_ROUNDS} rounds).{Style.RESET_ALL}")
+            # Conversational turn via the shared autonomous runner (MANUAL + no
+            # autonomous framing → confirm each action, exactly as before, but
+            # one code path for both chat and /run).
+            turn_cfg = RunConfig.default(AutonomyLevel.MANUAL)
+            turn_cfg.framing = False
+            turn_cfg.max_rounds = MAX_AGENT_ROUNDS
+            AgentRunner(
+                engine, build_system_prompt=_build_system_prompt,
+                emit=host.emit, request_approval=host.approval,
+                km=km, session_map=session_map, config=turn_cfg,
+            ).run(user_input, history)
 
             # Compress, cleanup, and auto-save
             history = compress_history(history, mode_cfg.context_window)
