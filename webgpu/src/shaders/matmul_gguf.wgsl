@@ -538,10 +538,19 @@ fn matmul_gguf_iq2_xxs(@builtin(local_invocation_id) lid: vec3u,
 // Same superblock decode as matmul_gguf_iq2_xxs above (17 u32/SB, 8 ib32
 // groups of 8 bytes = aux0[4] grid indices | aux1 with 4× 7-bit signs +
 // 4-bit ls scale at the top). One 32-elem tile unit = one ib32 group.
-// Per-lane bit-math (d/db, grid lookup, sign byte) is IDENTICAL to the
-// legacy kernel; only the activation source (a_tile vec4 lane stride) and
-// accumulation order change (plain f32 + dot(), no inner Kahan — same
-// tradeoff Q2_K_tiled etc. make; runtime A/B via ?gemvTile=0 covers it).
+//
+// Lever C5 (2026-07-01) — same recipe that took Q2_K to _r2-level issue
+// rates, value-preserving so results stay bit-identical to the previous
+// tiled body (which the ?gemvTile=0 legacy A/B already covered):
+//  • The unit's 8 aux bytes sit at byte 2+8·ib of the 68 B block — always
+//    2 mod 4. Instead of 8 wbyte() byte-extract loads, issue 3 aligned u32
+//    loads (w0..w2, hoisted before any decode ALU like q2_k_tiled_r2) and
+//    reassemble with a 16-bit skew: aux0=(w0>>16)|(w1<<16), aux1=(w1>>16)|
+//    (w2<<16). In-bounds: ib=7 reads word 16, the last word of the block.
+//  • Grid magnitudes: 2 table words + unpack4xU8 (exact u8 → f32) instead
+//    of 8 per-byte dynamic IQ2XXS_GRID indexings per l-group.
+//  • Signs: flip the f32 sign bit with a vector XOR (bit-identical to
+//    mag·(±1) for all finite values incl. ±0) instead of 8 selects + muls.
 
 @compute @workgroup_size(TWG, 1, 1)
 fn matmul_gguf_iq2_xxs_tiled(@builtin(local_invocation_id) lid: vec3u,
@@ -559,59 +568,70 @@ fn matmul_gguf_iq2_xxs_tiled(@builtin(local_invocation_id) lid: vec3u,
   let aRow = m * K;
   let valid = n < params.N;
 
+  let UPC = TPR * 2u;                          // units per chunk (r2 pattern)
+  let nChunks2 = (nUnits + UPC - 1u) / UPC;
+
   var acc: f32 = 0.0;
-  for (var c = 0u; c < nChunks; c = c + 1u) {
+  for (var c = 0u; c < nChunks2; c = c + 1u) {
     workgroupBarrier();
-    tile_stage(tid, aRow, c * TPR * 32u, K);
+    tile_stage2(tid, aRow, c * UPC * 32u, K);
     workgroupBarrier();
 
-    let u = c * TPR + lane;
-    if (u < nUnits && valid) {
-      let sb = u / 8u;
-      let ib = u % 8u;
-      let wordBase = (n * nSB + sb) * 17u;
-      let d = unpack2x16float(W[wordBase]).x;  // f16 d @ bytes 0-1
-      let g = wordBase * 4u + 2u + ib * 8u;    // aux0[4] @ g..g+3 | aux1 @ g+4..g+7
-      let aux1 = wbyte(g + 4u) | (wbyte(g + 5u) << 8u)
-               | (wbyte(g + 6u) << 16u) | (wbyte(g + 7u) << 24u);
-      let ls = aux1 >> 28u;
-      let db = d * (0.5 + f32(ls)) * 0.25;
-      var dot_acc: f32 = 0.0;
-      for (var l = 0u; l < 4u; l = l + 1u) {
-        let gridIdx = wbyte(g + l);
-        let signs = iq2xxs_sign_byte((aux1 >> (7u * l)) & 127u);
-        let mlo = vec4<f32>(
-          iq2xxs_grid_byte(gridIdx, 0u),
-          iq2xxs_grid_byte(gridIdx, 1u),
-          iq2xxs_grid_byte(gridIdx, 2u),
-          iq2xxs_grid_byte(gridIdx, 3u),
-        );
-        let mhi = vec4<f32>(
-          iq2xxs_grid_byte(gridIdx, 4u),
-          iq2xxs_grid_byte(gridIdx, 5u),
-          iq2xxs_grid_byte(gridIdx, 6u),
-          iq2xxs_grid_byte(gridIdx, 7u),
-        );
-        let slo = vec4<f32>(
-          select(1.0, -1.0, (signs & 1u) == 1u),
-          select(1.0, -1.0, ((signs >> 1u) & 1u) == 1u),
-          select(1.0, -1.0, ((signs >> 2u) & 1u) == 1u),
-          select(1.0, -1.0, ((signs >> 3u) & 1u) == 1u),
-        );
-        let shi = vec4<f32>(
-          select(1.0, -1.0, ((signs >> 4u) & 1u) == 1u),
-          select(1.0, -1.0, ((signs >> 5u) & 1u) == 1u),
-          select(1.0, -1.0, ((signs >> 6u) & 1u) == 1u),
-          select(1.0, -1.0, ((signs >> 7u) & 1u) == 1u),
-        );
-        let alo = a_tile[lane * 8u + l * 2u];
-        let ahi = a_tile[lane * 8u + l * 2u + 1u];
-        dot_acc = dot_acc + dot(alo, mlo * slo) + dot(ahi, mhi * shi);
-      }
-      acc = acc + db * dot_acc;
-    }
+    // Two units per lane per chunk: ua then ub = ua + TPR. Per-lane visit
+    // order (lane, TPR+lane, 2·TPR+lane, …) is IDENTICAL to the single-unit
+    // body, so accumulation stays bit-identical.
+    let ua = c * UPC + lane;
+    let ub = ua + TPR;
+    let okA = ua < nUnits && valid;
+    let okB = ub < nUnits && valid;
+    // ── all global loads, both units, before any decode ALU ─────────────
+    let bA = select(0u, (n * nSB + ua / 8u) * 17u, okA);   // block word 0
+    let qA = bA + (ua % 8u) * 2u;              // unit's aux bytes @ qA, byte 2
+    let dwA = W[bA];                           // f16 d in low half
+    let wA0 = W[qA];
+    let wA1 = W[qA + 1u];
+    let wA2 = W[qA + 2u];
+    let bB = select(0u, (n * nSB + ub / 8u) * 17u, okB);
+    let qB = bB + (ub % 8u) * 2u;
+    let dwB = W[bB];
+    let wB0 = W[qB];
+    let wB1 = W[qB + 1u];
+    let wB2 = W[qB + 2u];
+    // ── decode + accumulate ──────────────────────────────────────────────
+    let cA = iq2xxs_unit_acc(dwA, wA0, wA1, wA2, lane * 8u);
+    acc = acc + select(0.0, cA, okA);
+    let cB = iq2xxs_unit_acc(dwB, wB0, wB1, wB2, (TPR + lane) * 8u);
+    acc = acc + select(0.0, cB, okB);
   }
   tile_reduce_store(tid, lane, n, m, acc);
+}
+
+/** One IQ2_XXS unit's acc contribution, fed from pre-loaded words.
+ *  dw = block word 0 (f16 d in low half); w0..w2 = the three words holding
+ *  the unit's 8 aux bytes at 16-bit skew; atBase = a_tile2 vec4 index. */
+fn iq2xxs_unit_acc(dw: u32, w0: u32, w1: u32, w2: u32, atBase: u32) -> f32 {
+  let d = unpack2x16float(dw).x;
+  let aux0 = (w0 >> 16u) | (w1 << 16u);        // 4 grid indices
+  let aux1 = (w1 >> 16u) | (w2 << 16u);        // 4× 7-bit sign idx + ls nibble
+  let ls = aux1 >> 28u;
+  let db = d * (0.5 + f32(ls)) * 0.25;
+  // Single accumulation chain, in legacy visit order — bit-identical to the
+  // legacy kernel. A lo/hi split (2 independent chains) benched flat
+  // (183.8 vs 181.6 us, 2026-07-01), so keep the simpler exact-order form.
+  var dot_acc: f32 = 0.0;
+  for (var l = 0u; l < 4u; l = l + 1u) {
+    let gridIdx = (aux0 >> (l * 8u)) & 0xFFu;
+    let signs = iq2xxs_sign_byte((aux1 >> (7u * l)) & 127u);
+    let mlo = vec4<f32>(unpack4xU8(IQ2XXS_GRID[gridIdx * 2u]));
+    let mhi = vec4<f32>(unpack4xU8(IQ2XXS_GRID[gridIdx * 2u + 1u]));
+    let slo = ((vec4<u32>(signs) >> vec4<u32>(0u, 1u, 2u, 3u)) & vec4<u32>(1u)) << vec4<u32>(31u);
+    let shi = ((vec4<u32>(signs) >> vec4<u32>(4u, 5u, 6u, 7u)) & vec4<u32>(1u)) << vec4<u32>(31u);
+    let alo = a_tile2[atBase + l * 2u];
+    let ahi = a_tile2[atBase + l * 2u + 1u];
+    dot_acc = dot_acc + dot(alo, bitcast<vec4<f32>>(bitcast<vec4<u32>>(mlo) ^ slo));
+    dot_acc = dot_acc + dot(ahi, bitcast<vec4<f32>>(bitcast<vec4<u32>>(mhi) ^ shi));
+  }
+  return db * dot_acc;
 }
 
 // ── IQ3_XXS / IQ3_S / IQ2_S grids ───────────────────────────────────────

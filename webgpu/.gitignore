@@ -20,3 +20,6 @@ models/*
 dist/
 metrics.jsonl
 node_modules/
+
+# successor-legible engineering log (local only for now)
+docs/ENGINEERING_LOG.md
