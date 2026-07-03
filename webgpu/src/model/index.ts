@@ -33,6 +33,7 @@ export {
 export {
   // Cache
   hasCache, getCache, putCache, removeCache, clearCache, getCacheStats,
+  removeModelFromCache,
 } from './cache';
 
 export {

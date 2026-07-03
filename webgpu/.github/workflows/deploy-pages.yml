@@ -1,0 +1,42 @@
+# Deploys the production bundle to GitHub Pages.
+#
+# This file lives under webgpu/.github/ in the Artifex monorepo and becomes
+# the repo-root workflow of the standalone Artifex_Web repo via the subtree
+# split — it only runs there. The hosted build is HF-streaming only; the
+# local dev server (Ollama/local-dir models, test APIs) stays a local feature.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - id: deployment
+        uses: actions/deploy-pages@v4

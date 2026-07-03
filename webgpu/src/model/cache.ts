@@ -85,6 +85,26 @@ export async function clearCache(): Promise<boolean> {
 }
 
 /**
+ * Remove every cached shard belonging to one model repo.
+ * Returns the number of entries deleted.
+ */
+export async function removeModelFromCache(repo: string): Promise<number> {
+  let removed = 0;
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    for (const request of await cache.keys()) {
+      const key = urlToKey(request.url);
+      if (key === repo || key.startsWith(`${repo}/`)) {
+        if (await cache.delete(request)) removed++;
+      }
+    }
+  } catch {
+    // Cache API not available
+  }
+  return removed;
+}
+
+/**
  * Get the total size of all cached items and list cached models.
  */
 export async function getCacheStats(): Promise<{
@@ -108,9 +128,13 @@ export async function getCacheStats(): Promise<{
       totalBytes += size;
       itemCount++;
 
-      // Extract model repo from the URL key
+      // Extract model repo from the URL key. Keys are `${repo}/${filename}`
+      // for whole-shard entries and `${repo}/${filename}/chunk-${i}` for
+      // streamed shards — strip the chunk suffix before the filename.
       const key = urlToKey(request.url);
-      const repo = key.split('/').slice(0, -1).join('/'); // "Qwen/Qwen3.5-0.6B"
+      const parts = key.split('/');
+      if (parts.length > 2 && /^chunk-\d+$/.test(parts[parts.length - 1])) parts.pop();
+      const repo = parts.slice(0, -1).join('/'); // "Qwen/Qwen3.5-0.6B"
       const existing = models.get(repo) || { shardCount: 0, totalBytes: 0 };
       existing.shardCount++;
       existing.totalBytes += size;

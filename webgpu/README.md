@@ -53,6 +53,12 @@ store.
 
 ## Setup — step by step
 
+> **Prefer zero setup?** The app also runs as a hosted static page — it's an
+> installable PWA that works offline after the first visit, streaming models
+> straight from HuggingFace (`.github/workflows/deploy-pages.yml` deploys it
+> to GitHub Pages). The local install below additionally unlocks
+> machine-local models: Ollama, your HF cache, and `models/` folders.
+
 New to this? Follow these in order. You'll copy-paste a few commands; that's it.
 
 ### 1. Install the two things you need

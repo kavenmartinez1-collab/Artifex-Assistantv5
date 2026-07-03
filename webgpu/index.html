@@ -4,6 +4,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Artifex WebGPU Engine</title>
+  <meta name="theme-color" content="#0f111a">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <style>
     :root {
       --bg: #0f111a;
@@ -179,6 +182,109 @@
       font-family: var(--mono);
       margin-top: 6px;
     }
+
+    /* ── Rendered markdown (assistant messages) ──────────── */
+    .message .md { white-space: normal; }
+    .md p { margin: 0 0 8px; }
+    .md p:last-child { margin-bottom: 0; }
+    .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
+      margin: 10px 0 6px;
+      color: var(--accent);
+      font-size: 15px;
+    }
+    .md h1 { font-size: 17px; }
+    .md h2 { font-size: 16px; }
+    .md ul, .md ol { margin: 0 0 8px; padding-left: 22px; }
+    .md li { margin: 2px 0; }
+    .md a { color: var(--accent); }
+    .md blockquote {
+      border-left: 3px solid var(--accent2);
+      padding: 2px 10px;
+      margin: 0 0 8px;
+      color: #9aa3d0;
+    }
+    .md hr { border: none; border-top: 1px solid #2a2a4a; margin: 10px 0; }
+    .md code {
+      background: #0a0c14;
+      border: 1px solid #2a2a4a;
+      border-radius: 3px;
+      padding: 1px 5px;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      color: var(--accent);
+    }
+    .md-code {
+      background: #0a0c14;
+      border: 1px solid #2a2a4a;
+      border-radius: 6px;
+      margin: 8px 0;
+      overflow: hidden;
+    }
+    .md-code-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 4px 10px;
+      background: #12152233;
+      border-bottom: 1px solid #2a2a4a;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--dim);
+    }
+    .md-code pre {
+      margin: 0;
+      padding: 10px 12px;
+      overflow-x: auto;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      line-height: 1.5;
+      white-space: pre;
+    }
+    .md-copy {
+      background: none;
+      border: 1px solid #333;
+      border-radius: 3px;
+      color: var(--dim);
+      font-family: var(--mono);
+      font-size: 10px;
+      padding: 1px 8px;
+      cursor: pointer;
+    }
+    .md-copy:hover { color: var(--accent); border-color: var(--accent); }
+    .md-table-wrap { overflow-x: auto; margin: 8px 0; }
+    .md table { border-collapse: collapse; font-size: 13px; }
+    .md th, .md td { border: 1px solid #2a2a4a; padding: 4px 10px; text-align: left; }
+    .md th { background: #12152266; color: var(--accent); }
+
+    /* Dimmed thinking block above the answer */
+    .md-think {
+      opacity: 0.45;
+      font-size: 0.85em;
+      white-space: pre-wrap;
+      margin-bottom: 8px;
+    }
+
+    /* ── Per-message hover actions ───────────────────────── */
+    .message { position: relative; }
+    .msg-actions {
+      position: absolute;
+      top: -10px;
+      right: 8px;
+      display: none;
+      gap: 4px;
+    }
+    .message:hover .msg-actions { display: flex; }
+    .msg-actions button {
+      background: var(--bg2);
+      border: 1px solid #2a2a4a;
+      border-radius: 4px;
+      color: var(--dim);
+      font-size: 11px;
+      padding: 2px 8px;
+      cursor: pointer;
+      font-family: var(--mono);
+    }
+    .msg-actions button:hover { color: var(--accent); border-color: var(--accent); }
     .thinking {
       background: #1a1030;
       border: 1px solid #2a1a4a;
@@ -270,6 +376,10 @@
         <div id="model-browser" style="display:none;margin-bottom:8px">
           <div id="model-list" style="max-height:200px;overflow-y:auto;border:1px solid #333;border-radius:4px;background:var(--bg);font-family:var(--mono);font-size:11px"></div>
         </div>
+        <button class="btn btn-dim" id="suggest-btn" title="Recommend a model that fits this GPU" style="width:100%;margin-bottom:8px">✨ Help me pick a model</button>
+        <div id="model-suggest" style="display:none;margin-bottom:8px">
+          <div id="suggest-list" style="border:1px solid #333;border-radius:4px;background:var(--bg);font-family:var(--mono);font-size:11px"></div>
+        </div>
         <div style="margin:6px 0">
           <label style="font-size:10px;opacity:0.6">HF Token (for gated models)</label>
           <input type="password" id="hf-token" placeholder="hf_..." style="width:100%;padding:4px 6px;background:var(--bg);color:var(--text);border:1px solid #333;border-radius:4px;font-size:11px">
@@ -315,6 +425,26 @@
       </div>
 
       <div class="panel">
+        <div class="panel-title">Tools</div>
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+          <input type="checkbox" id="tools-enabled" style="accent-color:var(--accent2)">
+          <label for="tools-enabled" style="margin:0;cursor:pointer">Enable tool use (experimental)</label>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+          <input type="checkbox" id="web-search-enabled" style="accent-color:var(--accent2)">
+          <label for="web-search-enabled" style="margin:0;cursor:pointer">Allow web_search (queries leave this machine)</label>
+        </div>
+        <div style="font-size:10px;color:var(--dim);margin-top:4px">
+          When enabled, the tool list + calling instructions are appended to your
+          System Prompt automatically on every send — no need to describe tools there.
+          run_javascript is fully local, in a sandboxed worker (no network/page access).
+          web_search is keyless and self-hosted: it goes through your own local server
+          (DuckDuckGo, or set ARTIFEX_SEARXNG_URL for your own engine) — local install only.
+          Models below ~4-bit often fumble tool JSON — prefer Q4+ quants.
+        </div>
+      </div>
+
+      <div class="panel">
         <div class="panel-title">Actions</div>
         <div style="display:flex;gap:6px;flex-wrap:wrap">
           <button class="btn btn-dim" id="clear-btn">Clear Chat</button>
@@ -323,6 +453,15 @@
           <button class="btn btn-dim" id="load-session-btn">Load Session</button>
           <input type="file" id="session-file-input" accept=".json" style="display:none">
           <button class="btn btn-danger" id="unload-btn">Unload</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Storage</div>
+        <div id="cache-list" style="font-size:11px;font-family:var(--mono);color:var(--dim)">Scanning cache...</div>
+        <div style="display:flex;gap:6px;margin-top:8px">
+          <button class="btn btn-dim" id="cache-refresh-btn">Refresh</button>
+          <button class="btn btn-danger" id="cache-clear-btn" title="Delete all cached model downloads">Clear All</button>
         </div>
       </div>
 
@@ -350,12 +489,12 @@
       <div id="image-chips" style="display:none;gap:6px;flex-wrap:wrap;padding:4px 8px"></div>
       <div class="input-bar">
         <button class="btn btn-dim" id="attach-btn"
-                title="Load a vision model to attach images"
-                style="align-self:flex-end;opacity:0.4">📎</button>
-        <input type="file" id="image-input" multiple style="display:none"
-               accept="image/png,image/jpeg,image/webp,image/gif,image/bmp">
+                title="Attach text/code files — images need a vision model"
+                style="align-self:flex-end">📎</button>
+        <input type="file" id="image-input" multiple style="display:none">
         <textarea id="prompt" rows="1" placeholder="Type a message..." disabled></textarea>
         <button class="send-btn" id="send-btn" disabled>Send</button>
+        <button class="send-btn" id="stop-btn" style="display:none;background:var(--error)" title="Stop generating (Esc)">Stop</button>
       </div>
     </div>
   </main>

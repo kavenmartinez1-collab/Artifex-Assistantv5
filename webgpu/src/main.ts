@@ -9,7 +9,7 @@
 import { initWebGPU, discoverAdapters, type GPUContext, type DiscoveredAdapter } from './engine/gpu-device';
 import { reportMetric, reportError, timed } from './utils/metrics';
 import { runKernelTests } from './engine/kernel-tests';
-import { loadModel, unloadModel, previewModel, formatBytes, getCacheStats, clearCache, type LoadedModel } from './model';
+import { loadModel, unloadModel, previewModel, formatBytes, getCacheStats, clearCache, removeModelFromCache, type LoadedModel } from './model';
 import { setAuthToken, useLocalCache, resetToRemote, resolveFileUrl, fetchRange } from './model/hf-hub';
 import { visionDescriptorFromHFConfig, type VisionDescriptor } from './vision/vision-descriptor';
 import { preprocessImage, type PreprocessedImage } from './vision/preprocess';
@@ -24,6 +24,9 @@ import {
   autoSave, saveSession, listSessions, loadSession,
   buildSessionState, exportSessionFile, importSessionFile, type SessionFile,
 } from './chat/sessions';
+import { escapeHtml, markdownToHtml } from './chat/markdown';
+import { parseToolCall, executeToolCall, toolSystemPreamble } from './chat/tools';
+import type { GenerationHandle } from './engine/generate';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -34,6 +37,11 @@ let session: InferenceSession | null = null;
 // Conversation history (user/assistant only — system prompt is read live from
 // the UI each turn). Source of truth for windowing, sessions, and autosave.
 let chatHistory: ChatMessage[] = [];
+
+// The in-flight generation, if any. Stop button / Esc call .abort() on it;
+// the decode loop then exits with stopReason 'aborted' and the result promise
+// resolves normally with the partial text.
+let activeHandle: GenerationHandle | null = null;
 
 // ─── Vision state ────────────────────────────────────────────────────────────
 // Set when the loaded model is a (verified) multimodal checkpoint. The tower
@@ -47,6 +55,51 @@ let visionEncoder: VisionEncoder | null = null;
 let visionEncoderLoading: Promise<VisionEncoder> | null = null;
 interface PendingImage { name: string; pre: PreprocessedImage }
 let pendingImages: PendingImage[] = [];
+
+// ─── Text/code file attachments ─────────────────────────────────────────────
+// Unlike images these need no special model — the file content is inlined
+// into the user message as a fenced [FILE: name] block. The chat window shows
+// a compact 📄 line; history carries the full text (so switching models,
+// sessions, and export all keep the document).
+interface PendingFile { name: string; text: string; truncated: boolean }
+let pendingFiles: PendingFile[] = [];
+/** ~6K tokens/file — enough for real source files without blowing an 8K KV budget. */
+const MAX_FILE_CHARS = 24_000;
+const TEXT_FILE_EXT = /\.(txt|md|markdown|py|js|mjs|ts|tsx|jsx|json|jsonl|csv|tsv|ya?ml|toml|html?|css|c|h|cpp|hpp|cc|rs|go|java|kt|swift|rb|php|sh|bash|ps1|bat|sql|xml|log|ini|cfg|conf|wgsl|glsl|cu)$/i;
+
+function isTextAttachment(f: File): boolean {
+  return f.type.startsWith('text/')
+    || f.type === 'application/json'
+    || f.type === 'application/xml'
+    || TEXT_FILE_EXT.test(f.name);
+}
+
+async function addPendingFile(f: File): Promise<void> {
+  try {
+    let text = await f.text();
+    const truncated = text.length > MAX_FILE_CHARS;
+    if (truncated) text = text.slice(0, MAX_FILE_CHARS);
+    pendingFiles.push({ name: f.name, text, truncated });
+    renderChips();
+  } catch (err) {
+    addMessage('system', `Could not read "${f.name}": ${err}`);
+  }
+}
+
+/** Merge pending files into the outgoing message. Returns the text the model
+ *  sees and the compact text the chat window shows. */
+function consumePendingFiles(typed: string): { sendText: string; displayText: string } {
+  if (pendingFiles.length === 0) return { sendText: typed, displayText: typed };
+  const files = pendingFiles;
+  pendingFiles = [];
+  renderChips();
+  const blocks = files.map(f =>
+    `[FILE: ${f.name}${f.truncated ? ` — truncated to first ${MAX_FILE_CHARS} chars` : ''}]\n\`\`\`\n${f.text}\n\`\`\``);
+  return {
+    sendText: blocks.join('\n\n') + (typed ? `\n\n${typed}` : ''),
+    displayText: files.map(f => `📄 ${f.name}`).join('  ') + (typed ? `\n${typed}` : ''),
+  };
+}
 
 // Thinking markers by model family. Qwen emits <think>...</think> (the opener
 // usually lives in the PROMPT, so generated text may contain only the closer);
@@ -92,6 +145,7 @@ const statusEl = $('status');
 const messagesEl = $('messages');
 const promptEl = $('prompt') as HTMLTextAreaElement;
 const sendBtn = $('send-btn') as HTMLButtonElement;
+const stopBtn = $('stop-btn') as HTMLButtonElement;
 const loadBtn = $('load-btn') as HTMLButtonElement;
 const clearBtn = $('clear-btn') as HTMLButtonElement;
 const exportBtn = $('export-btn') as HTMLButtonElement;
@@ -153,6 +207,20 @@ const modelBrowser = $('model-browser');
 const modelList = $('model-list');
 const clusterStatusEl = $('cluster-status');
 
+// ─── Dev-server detection ────────────────────────────────────────────────────
+// Hosted static builds (GitHub Pages etc.) have no /api routes — a fetch there
+// gets the SPA fallback page or a 404, never JSON. Probe once and gate every
+// dev-only affordance (test pollers, WS hub, local model browsing) on it, so
+// the hosted app doesn't burn cycles polling endpoints that don't exist.
+const devApiAvailable: Promise<boolean> = (async () => {
+  try {
+    const resp = await fetch('/api/gpu-info');
+    return resp.ok && (resp.headers.get('content-type') ?? '').includes('json');
+  } catch {
+    return false;
+  }
+})();
+
 // ─── Orchestration Hub Connection ────────────────────────────────────────────
 
 function connectOrchestrator(): void {
@@ -203,8 +271,12 @@ function connectOrchestrator(): void {
   };
 }
 
-// Connect to hub (non-blocking — doesn't prevent app from working without hub)
-setTimeout(connectOrchestrator, 1000);
+// Connect to hub (non-blocking — doesn't prevent app from working without
+// hub; skipped entirely on hosted builds where no hub can exist)
+devApiAvailable.then(ok => {
+  if (ok) setTimeout(connectOrchestrator, 1000);
+  else clusterStatusEl.textContent = 'Needs the local dev server (npm run dev)';
+});
 
 // ─── Browse Local Models ─────────────────────────────────────────────────────
 
@@ -220,6 +292,13 @@ browseBtn.addEventListener('click', async () => {
   modelList.innerHTML = '<div style="padding:8px;color:var(--dim)">Scanning...</div>';
   modelBrowser.style.display = 'block';
   browseOpen = true;
+
+  if (!(await devApiAvailable)) {
+    modelList.innerHTML = '<div style="padding:8px;color:var(--dim)">'
+      + 'Browsing machine-local models needs the local dev server (npm run dev). '
+      + 'On this hosted build, type a HuggingFace repo above or use ✨ to pick one.</div>';
+    return;
+  }
 
   try {
     const resp = await fetch('/api/hf-cache/models');
@@ -270,10 +349,136 @@ browseBtn.addEventListener('click', async () => {
   }
 });
 
+// ─── Model Recommender ("Help me pick a model") ─────────────────────────────
+// Turns the VRAM budget into 2-4 concrete, one-click choices instead of a
+// raw text box — models already on this machine first, then curated HF
+// downloads that fit. Same principle as the Artifex GUI's pipeline model
+// guidance: the UI should steer model choice, not just accept it.
+
+const suggestBtn = $('suggest-btn') as HTMLButtonElement;
+const modelSuggest = $('model-suggest');
+const suggestList = $('suggest-list');
+let suggestOpen = false;
+
+/** Curated remote picks — safetensors repos on verified families only (the
+ *  remote load path is safetensors; GGUF loads come from local dirs). needGB
+ *  includes weights at the dtype the engine will actually keep (f32 below the
+ *  6 GB threshold, BF16 native above) plus ~1.5 GB KV/overhead headroom. */
+const CURATED_MODELS: Array<{ repo: string; needGB: number; blurb: string; gated?: boolean }> = [
+  { repo: 'Qwen/Qwen3-0.6B',             needGB: 4,    blurb: 'small + snappy — quick chat on any GPU' },
+  { repo: 'Qwen/Qwen3-1.7B',             needGB: 5,    blurb: 'good quality for light tasks' },
+  { repo: 'Qwen/Qwen3.5-2B',             needGB: 5.5,  blurb: 'newer family, strong for its size', gated: true },
+  { repo: 'Qwen/Qwen3-4B-Instruct-2507', needGB: 9.5,  blurb: 'solid daily driver' },
+  { repo: 'Qwen/Qwen3.5-4B',             needGB: 9.5,  blurb: 'newer family daily driver', gated: true },
+  { repo: 'Qwen/Qwen3-VL-4B-Instruct',   needGB: 11,   blurb: 'understands images (📎 attach)' },
+  { repo: 'Qwen/Qwen3-8B',               needGB: 18,   blurb: 'best quality on a big card' },
+  { repo: 'Qwen/Qwen3.5-9B',             needGB: 20,   blurb: 'best quality, newest family', gated: true },
+];
+
+function suggestRow(title: string, sub: string, onPick?: () => void): HTMLElement {
+  const el = document.createElement('div');
+  el.style.cssText = 'padding:6px 8px;border-bottom:1px solid #222'
+    + (onPick ? ';cursor:pointer' : ';color:var(--dim)');
+  const t = document.createElement('div');
+  t.textContent = title;
+  t.style.color = onPick ? 'var(--accent)' : 'var(--dim)';
+  const s = document.createElement('div');
+  s.textContent = sub;
+  s.style.cssText = 'color:var(--dim);font-size:10px';
+  el.append(t, s);
+  if (onPick) {
+    el.addEventListener('mouseenter', () => { el.style.background = '#1a1e33'; });
+    el.addEventListener('mouseleave', () => { el.style.background = 'none'; });
+    el.addEventListener('click', onPick);
+  }
+  return el;
+}
+
+async function renderSuggestions(): Promise<void> {
+  suggestList.innerHTML = '<div style="padding:8px;color:var(--dim)">Checking your GPU...</div>';
+  const budget = await resolveVRAMBudget();
+  const budgetGB = budget !== undefined ? budget / 1e9 : undefined;
+
+  // Models already on this machine (dev server scan). Heuristic family filter
+  // keeps non-LLM repos (whisper etc.) out of the list.
+  let locals: Array<{ repo: string; gb: number }> = [];
+  try {
+    const resp = await fetch('/api/hf-cache/models');
+    if (resp.ok) {
+      const models = await resp.json() as Array<{ repo: string; files: string[]; totalSize: number }>;
+      locals = models
+        .filter(m => /qwen|llama|gemma|mistral/i.test(m.repo) && !/mmproj|whisper/i.test(m.repo))
+        .filter(m => m.files.some(f => f.endsWith('.safetensors') || f.toLowerCase().endsWith('.gguf')))
+        .map(m => ({ repo: m.repo, gb: m.totalSize / 1e9 }));
+    }
+  } catch { /* no dev server — HF-only mode */ }
+
+  suggestList.innerHTML = '';
+  suggestList.appendChild(suggestRow(
+    budgetGB !== undefined
+      ? `Detected ~${budgetGB.toFixed(1)} GB usable VRAM`
+      : 'VRAM unknown — showing options with their needs',
+    'estimates include KV-cache headroom'));
+
+  const pick = (repo: string) => {
+    ($('model-repo') as HTMLInputElement).value = repo;
+    modelSuggest.style.display = 'none';
+    suggestOpen = false;
+    loadBtn.click();
+  };
+
+  let shown = 0;
+  // Local models that fit: file size ≈ resident weights for GGUF/BF16,
+  // +10% and 1 GB KV headroom.
+  for (const m of locals.sort((a, b) => b.gb - a.gb)) {
+    const need = m.gb * 1.1 + 1;
+    if (budgetGB !== undefined && need > budgetGB) continue;
+    if (shown >= 2) break;
+    suggestList.appendChild(suggestRow(
+      `📁 ${m.repo}`,
+      `already on this machine · ~${need.toFixed(1)} GB needed — click to load`,
+      () => pick(m.repo)));
+    shown++;
+  }
+
+  // Curated downloads that fit — largest (best) first, up to 3
+  const fitting = CURATED_MODELS
+    .filter(c => budgetGB === undefined || c.needGB <= budgetGB)
+    .sort((a, b) => b.needGB - a.needGB)
+    .slice(0, 3);
+  const fallback = fitting.length === 0 ? [CURATED_MODELS[0]] : fitting;
+  for (const c of fallback) {
+    suggestList.appendChild(suggestRow(
+      c.repo,
+      `${c.blurb} · ~${c.needGB} GB needed${c.gated ? ' · needs HF token' : ''} — click to download + load`,
+      () => pick(c.repo)));
+    shown++;
+  }
+  if (fitting.length === 0) {
+    suggestList.appendChild(suggestRow(
+      'Tight fit on this GPU',
+      'the smallest curated model is shown — it may still spill; close other GPU apps first'));
+  }
+}
+
+suggestBtn.addEventListener('click', () => {
+  suggestOpen = !suggestOpen;
+  modelSuggest.style.display = suggestOpen ? 'block' : 'none';
+  if (suggestOpen) void renderSuggestions();
+});
+
 // ─── UI Helpers ──────────────────────────────────────────────────────────────
 
 function setStatus(text: string) {
   statusEl.textContent = text;
+}
+
+/** Autoscroll only when the user is already near the bottom — scrolling up to
+ *  reread must not fight the stream. */
+function scrollMessages(force = false) {
+  const nearBottom =
+    messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 60;
+  if (force || nearBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
 function addMessage(role: 'user' | 'assistant' | 'system', content: string, meta?: string) {
@@ -287,9 +492,169 @@ function addMessage(role: 'user' | 'assistant' | 'system', content: string, meta
     div.appendChild(metaEl);
   }
   messagesEl.appendChild(div);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  scrollMessages(true);
   return div;
 }
+
+/** Render assistant output: dimmed thinking block (plain text) above the
+ *  answer (markdown). Replaces the div's content — call attachMeta/attachActions
+ *  AFTER the final render. */
+function renderAssistant(div: HTMLElement, fullText: string, assumeOpen: boolean) {
+  const { thinking, answer } = splitThinking(fullText, assumeOpen);
+  const thinkHtml = thinking
+    ? `<div class="md-think">${answer ? '' : '💭 '}${escapeHtml(thinking)}</div>`
+    : '';
+  div.innerHTML = thinkHtml + (answer ? `<div class="md">${markdownToHtml(answer)}</div>` : '');
+}
+
+function attachMeta(div: HTMLElement, meta: string) {
+  const metaEl = document.createElement('div');
+  metaEl.className = 'meta';
+  metaEl.textContent = meta;
+  div.appendChild(metaEl);
+}
+
+/** Link a chat DOM node to its history entry (by object identity — compression
+ *  keeps kept-message references, so indexOf() finds live messages). */
+function linkMessage(div: HTMLElement, msg: ChatMessage) {
+  (div as any).__msg = msg;
+}
+
+function findMessageIndex(div: HTMLElement): number {
+  const msg = (div as any).__msg as ChatMessage | undefined;
+  return msg ? chatHistory.indexOf(msg) : -1;
+}
+
+/** Hover actions: ✎ edit on user messages; ⧉ copy + ⟳ retry on assistant. */
+function attachActions(div: HTMLElement, role: 'user' | 'assistant') {
+  div.querySelector('.msg-actions')?.remove();
+  const bar = document.createElement('div');
+  bar.className = 'msg-actions';
+  const mkBtn = (label: string, title: string, onClick: () => void) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.title = title;
+    b.addEventListener('click', onClick);
+    bar.appendChild(b);
+  };
+  if (role === 'user') {
+    mkBtn('✎ edit', 'Edit this message and re-send (discards later messages)', () => editMessage(div));
+  } else {
+    mkBtn('⧉ copy', 'Copy response text', () => {
+      const msg = (div as any).__msg as ChatMessage | undefined;
+      const text = msg?.content ?? div.textContent ?? '';
+      navigator.clipboard?.writeText(text).catch(() => {});
+    });
+    mkBtn('⟳ retry', 'Regenerate this response (discards it and later messages)', () => regenerateMessage(div));
+  }
+  div.appendChild(bar);
+}
+
+/** Add a message from history to the DOM with full rendering + actions. */
+function addChatMessage(msg: ChatMessage): HTMLElement {
+  if (msg.role === 'assistant') {
+    const div = document.createElement('div');
+    div.className = 'message assistant';
+    div.innerHTML = `<div class="md">${markdownToHtml(msg.content)}</div>`;
+    messagesEl.appendChild(div);
+    linkMessage(div, msg);
+    attachActions(div, 'assistant');
+    scrollMessages(true);
+    return div;
+  }
+  const div = addMessage(msg.role as 'user' | 'system', msg.content);
+  if (msg.role === 'user') {
+    linkMessage(div, msg);
+    attachActions(div, 'user');
+  }
+  return div;
+}
+
+/** Truncate history at (and including) the given message's index, and remove
+ *  its DOM node plus everything after it. Returns the removed message, or
+ *  null if the message was compressed out of the active history. */
+function truncateAt(div: HTMLElement): ChatMessage | null {
+  const idx = findMessageIndex(div);
+  if (idx === -1) {
+    addMessage('system', 'That message was compressed out of the active history and can no longer be edited.');
+    return null;
+  }
+  const msg = chatHistory[idx];
+  chatHistory = chatHistory.slice(0, idx);
+  const doomed: Element[] = [];
+  let n: Element | null = div;
+  while (n) { doomed.push(n); n = n.nextElementSibling; }
+  doomed.forEach(e => e.remove());
+  session?.resetKV?.();  // history changed — next send re-prefills
+  return msg;
+}
+
+function editMessage(div: HTMLElement) {
+  if (activeHandle) return;  // not while generating
+  const msg = truncateAt(div);
+  if (!msg) return;
+  promptEl.value = msg.content;
+  promptEl.style.height = 'auto';
+  promptEl.style.height = Math.min(promptEl.scrollHeight, 120) + 'px';
+  promptEl.focus();
+}
+
+function regenerateMessage(div: HTMLElement) {
+  if (activeHandle) return;
+  if (!session) {
+    addMessage('system', 'No model loaded. Load a model first.');
+    return;
+  }
+  // Find the user message that produced this response, walking back in history
+  const idx = findMessageIndex(div);
+  if (idx === -1) {
+    addMessage('system', 'That message was compressed out of the active history and can no longer be regenerated.');
+    return;
+  }
+  let u = idx - 1;
+  while (u >= 0 && chatHistory[u].role !== 'user') u--;
+  if (u < 0) return;
+  const userMsg = chatHistory[u];
+  const text = userMsg.content;
+  // Locate the user message's DOM node so it survives the truncation
+  const userDiv = [...messagesEl.children].find(el => (el as any).__msg === userMsg) as HTMLElement | undefined;
+  chatHistory = chatHistory.slice(0, u);
+  if (userDiv) {
+    const doomed: Element[] = [];
+    let n: Element | null = userDiv.nextElementSibling;
+    while (n) { doomed.push(n); n = n.nextElementSibling; }
+    doomed.forEach(e => e.remove());
+  } else {
+    div.remove();
+  }
+  session.resetKV?.();
+  void runGeneration(text, userDiv ?? addMessage('user', text));
+}
+
+/** Toggle Send/Stop while a generation is in flight. */
+function setGenerating(on: boolean) {
+  sendBtn.style.display = on ? 'none' : 'inline-block';
+  stopBtn.style.display = on ? 'inline-block' : 'none';
+  sendBtn.disabled = on;
+}
+
+stopBtn.addEventListener('click', () => activeHandle?.abort());
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && activeHandle) activeHandle.abort();
+});
+
+// Code-block copy buttons (delegated — buttons are re-created on each
+// streaming re-render, the listener survives)
+messagesEl.addEventListener('click', (e) => {
+  const btn = (e.target as HTMLElement).closest?.('.md-copy') as HTMLButtonElement | null;
+  if (!btn) return;
+  const pre = btn.closest('.md-code')?.querySelector('pre');
+  if (!pre) return;
+  navigator.clipboard?.writeText(pre.textContent ?? '').then(() => {
+    btn.textContent = 'copied';
+    setTimeout(() => { btn.textContent = 'copy'; }, 1200);
+  }).catch(() => {});
+});
 
 function updateFooter(data: Record<string, string>) {
   for (const [key, value] of Object.entries(data)) {
@@ -481,6 +846,7 @@ function startKernelTestPoller(): void {
   if (kernelPollerActive) return;
   kernelPollerActive = true;
   (async () => {
+    if (!(await devApiAvailable)) { kernelPollerActive = false; return; }
     while (!session) {
       try {
         const resp = await fetch('/api/test');
@@ -559,15 +925,15 @@ const chipsEl = $('image-chips') as HTMLDivElement;
 const SUPPORTED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/bmp'];
 const SUPPORTED_IMAGE_LABEL = 'PNG, JPEG, WebP, GIF, BMP';
 
-// The 📎 button is never hard-disabled — a dead-feeling button is worse than
-// one that explains itself. visionAvailable gates the file picker; the
-// button's title doubles as the explanation shown on click when unavailable.
+// The 📎 button is always live: text/code files attach on any model, images
+// additionally need a vision model. visionAvailable gates only the image
+// route; the title explains what's possible right now.
 let visionAvailable = false;
 
 function setAttachState(available: boolean, title: string) {
   visionAvailable = available;
-  attachBtn.title = title;
-  attachBtn.style.opacity = available ? '1' : '0.4';
+  attachBtn.title = available ? title : `${title} Text/code files attach on any model.`;
+  attachBtn.style.opacity = '1';
 }
 
 function setVisionDesc(desc: VisionDescriptor | null) {
@@ -601,20 +967,28 @@ function setVisionDescQuiet(desc: VisionDescriptor | null) {
 }
 
 function renderChips() {
-  chipsEl.style.display = pendingImages.length > 0 ? 'flex' : 'none';
+  chipsEl.style.display = (pendingImages.length + pendingFiles.length) > 0 ? 'flex' : 'none';
   chipsEl.innerHTML = '';
-  pendingImages.forEach((img, i) => {
+  const addChip = (label: string, onRemove: () => void) => {
     const chip = document.createElement('span');
     chip.style.cssText =
       'display:inline-flex;align-items:center;gap:4px;background:#1a1e33;border:1px solid #333;'
       + 'border-radius:12px;padding:2px 8px;font-size:11px';
-    chip.textContent = `🖼 ${img.name} (~${img.pre.numTokens} tok)`;
+    chip.textContent = label;
     const x = document.createElement('button');
     x.textContent = '✕';
     x.style.cssText = 'background:none;border:none;color:var(--dim);cursor:pointer;font-size:11px';
-    x.addEventListener('click', () => { pendingImages.splice(i, 1); renderChips(); });
+    x.addEventListener('click', onRemove);
     chip.appendChild(x);
     chipsEl.appendChild(chip);
+  };
+  pendingImages.forEach((img, i) => {
+    addChip(`🖼 ${img.name} (~${img.pre.numTokens} tok)`,
+      () => { pendingImages.splice(i, 1); renderChips(); });
+  });
+  pendingFiles.forEach((f, i) => {
+    addChip(`📄 ${f.name} (~${Math.ceil(f.text.length / 4)} tok${f.truncated ? ', truncated' : ''})`,
+      () => { pendingFiles.splice(i, 1); renderChips(); });
   });
 }
 
@@ -674,15 +1048,15 @@ async function ensureVisionEncoder(): Promise<VisionEncoder> {
 }
 
 attachBtn.addEventListener('click', () => {
-  if (!visionAvailable) {
-    addMessage('system', attachBtn.title);
-    return;
-  }
   imageInput.click();
 });
 imageInput.addEventListener('change', async (e) => {
   const input = e.target as HTMLInputElement;
-  for (const f of Array.from(input.files ?? [])) await addPendingImage(f, f.name);
+  for (const f of Array.from(input.files ?? [])) {
+    if (f.type.startsWith('image/')) await addPendingImage(f, f.name);
+    else if (isTextAttachment(f)) await addPendingFile(f);
+    else addMessage('system', `"${f.name}" isn't a supported attachment — images (${SUPPORTED_IMAGE_LABEL}) or text/code files.`);
+  }
   input.value = '';
 });
 promptEl.addEventListener('paste', async (e) => {
@@ -698,10 +1072,14 @@ document.addEventListener('dragover', (e) => {
   if (e.dataTransfer?.types.includes('Files')) e.preventDefault();
 });
 document.addEventListener('drop', async (e) => {
-  const files = Array.from(e.dataTransfer?.files ?? []).filter(f => f.type.startsWith('image/'));
+  const files = Array.from(e.dataTransfer?.files ?? [])
+    .filter(f => f.type.startsWith('image/') || isTextAttachment(f));
   if (files.length === 0) return;
   e.preventDefault();
-  for (const f of files) await addPendingImage(f, f.name);
+  for (const f of files) {
+    if (f.type.startsWith('image/')) await addPendingImage(f, f.name);
+    else await addPendingFile(f);
+  }
 });
 
 // ─── Vision parity harness (console: __VISION_PARITY__()) ──────────────────
@@ -880,26 +1258,48 @@ async function fetchPreprocessorConfig(repo: string): Promise<Record<string, any
 
 // ─── Chat ─────────────────────────────────────────────────────────────────────
 
-sendBtn.addEventListener('click', async () => {
-  const text = promptEl.value.trim();
-  if (!text) return;
+sendBtn.addEventListener('click', () => {
+  const typed = promptEl.value.trim();
+  if (!typed && pendingFiles.length === 0) return;
 
   promptEl.value = '';
   promptEl.style.height = 'auto';
-  addMessage('user', text);
+  // Attached text files ride inside the message; the window shows a compact
+  // 📄 line while history carries the full content.
+  const { sendText, displayText } = typed.startsWith('/raw ')
+    ? { sendText: typed, displayText: typed }
+    : consumePendingFiles(typed);
+  const userDiv = addMessage('user', displayText);
 
   if (!session) {
     addMessage('system', 'No model loaded. Load a model first.');
     return;
   }
+  void runGeneration(sendText, userDiv);
+});
+
+/** How many tool hops one Send can trigger before the loop is cut. */
+const MAX_TOOL_HOPS = 5;
+
+/** One chat turn: window history, stream the response with markdown rendering,
+ *  write the turn back to history. When tools are enabled and the model ends
+ *  with a ```tool_call block, the tool runs and the model continues — up to
+ *  MAX_TOOL_HOPS times. Shared by Send, ⟳ retry, and ✎ edit. */
+async function runGeneration(text: string, userDiv: HTMLElement): Promise<void> {
+  if (!session || activeHandle) return;
 
   setStatus('Generating...');
-  sendBtn.disabled = true;
+  setGenerating(true);
+
+  // /raw prefix: skip chat template, use raw text completion (for debugging)
+  const isRaw = text.startsWith('/raw ');
+  const userMsg: ChatMessage = { role: 'user', content: text };
+  if (!isRaw) {
+    linkMessage(userDiv, userMsg);
+    attachActions(userDiv, 'user');
+  }
 
   try {
-    const responseDiv = addMessage('assistant', '');
-    let fullText = '';
-
     const temperature = parseFloat(tempSlider.value);
     const topP = parseFloat(toppSlider.value);
     const topK = parseInt(topkInput.value) || 0;
@@ -909,8 +1309,6 @@ sendBtn.addEventListener('click', async () => {
     const maxNewTokens = parseInt(($('max-tokens') as HTMLInputElement).value) || 512;
     const useCompressedKV = ($('turboquant') as HTMLInputElement).checked;
 
-    // /raw prefix: skip chat template, use raw text completion (for debugging)
-    const isRaw = text.startsWith('/raw ');
     const sampling = {
       temperature, topP, topK, minP, repetitionPenalty, dryMultiplier,
       maxNewTokens, useCompressedKV,
@@ -918,26 +1316,57 @@ sendBtn.addEventListener('click', async () => {
     // Gemma emits its thinking opener in the generation; Qwen-style templates
     // put the opener in the prompt, so marker-less text counts as thinking.
     const assumeThinkingOpen = !(session.config.modelType ?? '').toLowerCase().includes('gemma');
-    const onToken = (token: string) => {
-      fullText += token;
 
-      // Show thinking content dimmed, final answer normal
-      const { thinking, answer } = splitThinking(fullText, assumeThinkingOpen);
-      if (answer) {
-        responseDiv.innerHTML = (thinking ? `<span style="opacity:0.4;font-size:0.85em">${thinking}</span><br><br>` : '') + answer;
-      } else {
-        responseDiv.innerHTML = `<span style="opacity:0.4;font-size:0.85em">💭 ${thinking}</span>`;
-      }
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+    /** Stream one model response into a fresh assistant bubble. */
+    const streamTurn = async (buildHandle: (onToken: (t: string) => void) => GenerationHandle) => {
+      const responseDiv = addMessage('assistant', '');
+      let fullText = '';
+      // Markdown-render the stream at most every 80 ms — a full re-parse per
+      // token is wasteful at high tok/s and imperceptible below it.
+      let lastRender = 0;
+      const onToken = (token: string) => {
+        fullText += token;
+        const now = performance.now();
+        if (now - lastRender > 80) {
+          lastRender = now;
+          renderAssistant(responseDiv, fullText, assumeThinkingOpen);
+          scrollMessages();
+        }
+      };
+      const handle = buildHandle(onToken);
+      activeHandle = handle;
+      const result = await handle.result;
+      return { responseDiv, result };
     };
 
-    let handle;
     if (isRaw) {
       const rawText = text.slice(5); // strip "/raw "
       console.log(`[Raw mode] Sending: "${rawText}"`);
-      handle = session.run(rawText, sampling, onToken);
-    } else {
-      const systemPrompt = ($('system-prompt') as HTMLTextAreaElement).value.trim();
+      const { responseDiv, result } = await streamTurn(
+        (onToken) => session!.run(rawText, sampling, onToken));
+      responseDiv.textContent = result.text;
+      attachMeta(responseDiv,
+        `${result.numTokens} tokens | ${result.tokensPerSecond.toFixed(1)} tok/s | `
+        + `${(result.totalMs / 1000).toFixed(1)}s | ${result.stopReason}`);
+      setStatus(`Generated ${result.numTokens} tokens at ${result.tokensPerSecond.toFixed(1)} tok/s`);
+      return;
+    }
+
+    const toolsOn = ($('tools-enabled') as HTMLInputElement).checked;
+    // web_search is offered only when the user opted in AND the local server
+    // is present (the hosted static build has no /api/search).
+    const webSearchOn = toolsOn
+      && ($('web-search-enabled') as HTMLInputElement).checked
+      && await devApiAvailable;
+
+    // The message that enters history on the next hop: the user's text first,
+    // then tool results on later hops (already pushed to chatHistory directly).
+    let pendingUser: ChatMessage | null = userMsg;
+
+    for (let hop = 0; hop <= MAX_TOOL_HOPS; hop++) {
+      let systemPrompt = ($('system-prompt') as HTMLTextAreaElement).value.trim();
+      if (toolsOn) systemPrompt += toolSystemPreamble(webSearchOn);
+
       // Window the conversation: system pinned at [0] (context.ts contract),
       // recent turns kept within the KV budget, older turns compressed to
       // key points. The possibly-compressed history is written back as the
@@ -945,7 +1374,7 @@ sendBtn.addEventListener('click', async () => {
       const fullHistory: ChatMessage[] = [
         { role: 'system', content: systemPrompt },
         ...chatHistory,
-        { role: 'user', content: text },
+        ...(pendingUser ? [pendingUser] : []),
       ];
       const countTokens = (t: string) => session!.tokenizer.encode(t).length;
       const { history: updated, active } = buildActiveMessages(fullHistory, {
@@ -953,9 +1382,11 @@ sendBtn.addEventListener('click', async () => {
         countTokens,
       });
       chatHistory = updated.slice(1);  // write back, minus the system slot
+      pendingUser = null;
       const sendMessages = active[0].content ? active : active.slice(1);  // drop empty system
 
-      if (pendingImages.length > 0 && activeVisionDesc && (session as any).chatMM) {
+      let turn: { responseDiv: HTMLElement; result: any };
+      if (hop === 0 && pendingImages.length > 0 && activeVisionDesc && (session as any).chatMM) {
         // Multimodal turn: encode pending images, prefix the user message
         // with placeholder spans, and send via the MultimodalPrompt path.
         // History keeps the plain text — images are per-turn in v1.
@@ -977,50 +1408,63 @@ sendBtn.addEventListener('click', async () => {
           idx === sendMessages.length - 1 && m.role === 'user'
             ? { ...m, content: padBlock + m.content }
             : m);
-        handle = (session as any).chatMM(mmMessages, encoded, sampling, onToken, { enableThinking: true });
+        turn = await streamTurn((onToken) =>
+          (session as any).chatMM(mmMessages, encoded, sampling, onToken, { enableThinking: true }));
       } else {
-        handle = (session as any).chat(sendMessages, sampling, onToken, { enableThinking: true });
+        turn = await streamTurn((onToken) =>
+          (session as any).chat(sendMessages, sampling, onToken, { enableThinking: true }));
       }
-    }
+      const { responseDiv, result } = turn;
 
-    const result = await handle.result;
-
-    if (!isRaw) {
-      chatHistory.push({ role: 'assistant', content: stripThinking(result.text) });
-      autoSave(chatHistory, { model: currentModel?.repo ?? 'unknown', backend: 'webgpu' });
-
-      // Final render: a non-thinking model never emits think markers, so the
-      // stream rendered everything dimmed under assumeThinkingOpen. If the
-      // model finished cleanly with no markers anywhere, settle to a normal
-      // answer. (On max_length/abort with assumeOpen, it really was thought.)
+      // Final settle: a non-thinking model never emits think markers, so the
+      // stream rendered everything dimmed under assumeThinkingOpen. On a clean
+      // EOS with no markers anywhere, treat it all as the answer. (On
+      // max_length/abort with assumeOpen, it really was mid-thought.)
       const sawMarker = THINK_MARKERS.some(
         m => result.text.includes(m.open) || result.text.includes(m.close));
-      if (!sawMarker && result.stopReason === 'eos' && result.text) {
-        responseDiv.textContent = result.text;
+      const finalAssumeOpen = assumeThinkingOpen && (sawMarker || result.stopReason !== 'eos');
+      renderAssistant(responseDiv, result.text, finalAssumeOpen);
+      scrollMessages();
+
+      const asstMsg: ChatMessage = { role: 'assistant', content: stripThinking(result.text) };
+      chatHistory.push(asstMsg);
+      linkMessage(responseDiv, asstMsg);
+      attachActions(responseDiv, 'assistant');
+      autoSave(chatHistory, { model: currentModel?.repo ?? 'unknown', backend: 'webgpu' });
+
+      attachMeta(responseDiv,
+        `${result.numTokens} tokens | ${result.tokensPerSecond.toFixed(1)} tok/s | `
+        + `${(result.totalMs / 1000).toFixed(1)}s | ${result.stopReason}`);
+      setStatus(result.stopReason === 'aborted'
+        ? `Stopped after ${result.numTokens} tokens`
+        : `Generated ${result.numTokens} tokens at ${result.tokensPerSecond.toFixed(1)} tok/s`);
+
+      // ── Tool hop? ──────────────────────────────────────────────────────
+      if (!toolsOn || result.stopReason !== 'eos') break;
+      const call = parseToolCall(asstMsg.content);
+      if (!call) break;
+      if (hop === MAX_TOOL_HOPS) {
+        addMessage('system', `Tool-call limit (${MAX_TOOL_HOPS}) reached — stopping. Send a message to continue.`);
+        break;
       }
+      setStatus(`Running ${call.tool || 'tool call'}...`);
+      const toolResult = await executeToolCall(call, { webSearchEnabled: webSearchOn });
+      // [TOOL RESULT ...] rides as a user message — the compressor already
+      // knows how to summarize that prefix when the chat grows long.
+      chatHistory.push({ role: 'user', content: toolResult });
+      const preview = toolResult.length > 500 ? toolResult.slice(0, 500) + ' …' : toolResult;
+      addMessage('system', `🔧 ${preview}`);
     }
-
-    // If no streaming happened (e.g., empty response), show the full text
-    if (!fullText && result.text) {
-      responseDiv.textContent = result.text;
-    }
-
-    const meta = `${result.numTokens} tokens | ${result.tokensPerSecond.toFixed(1)} tok/s | ${(result.totalMs / 1000).toFixed(1)}s | ${result.stopReason}`;
-    const metaEl = document.createElement('div');
-    metaEl.className = 'meta';
-    metaEl.textContent = meta;
-    responseDiv.appendChild(metaEl);
-
-    setStatus(`Generated ${result.numTokens} tokens at ${result.tokensPerSecond.toFixed(1)} tok/s`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     addMessage('system', `Generation error: ${msg}`);
     setStatus('Generation failed');
     reportError('generate', err);
   } finally {
-    sendBtn.disabled = false;
+    activeHandle = null;
+    setGenerating(false);
   }
-});
+}
 
 // ─── Auto-test polling ──────────────────────────────────────────────────────
 // Polls /api/test for queued prompts/kernel-test requests while a session
@@ -1031,6 +1475,7 @@ function startAutoTestPoller() {
       let debugLogs: string[] = [];
 
       (async function pollTests() {
+        if (!(await devApiAvailable)) return;
         while (session) {
           try {
             const resp = await fetch('/api/test');
@@ -1598,6 +2043,7 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
     `Type a message to chat!`,
     'engine ready');
   setStatus(`Ready: ${repo}`);
+  markModelReady(repo);
   startAutoTestPoller();
 }
 
@@ -1606,6 +2052,10 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
 loadBtn.addEventListener('click', async () => {
   const repo = ($('model-repo') as HTMLInputElement).value.trim();
   if (!repo) return;
+  if (activeHandle) {
+    addMessage('system', 'Stop the current generation before loading a model.');
+    return;
+  }
 
   // Set HF auth token (for gated models like Qwen3.5)
   const tokenInput = $('hf-token') as HTMLInputElement;
@@ -2249,6 +2699,7 @@ loadBtn.addEventListener('click', async () => {
       );
 
       setStatus(`Ready: ${repo}`);
+      markModelReady(repo);
 
       startAutoTestPoller();
 
@@ -2278,6 +2729,9 @@ clearBtn.addEventListener('click', () => {
   messagesEl.innerHTML = '';
   chatHistory = [];
   session?.resetKV?.();
+  // Remember the clear so the boot-time restore doesn't resurrect autosaves
+  // from before it.
+  try { localStorage.setItem('artifex-ui:cleared-at', String(Date.now() / 1000)); } catch {}
   addMessage('system', 'Chat cleared.');
 });
 
@@ -2288,7 +2742,7 @@ function applyLoadedSession(state: SessionFile) {
     (m): m is ChatMessage => m.role === 'user' || m.role === 'assistant');
   session?.resetKV?.();  // history changed — next send does a full prefill
   messagesEl.innerHTML = '';
-  for (const m of chatHistory) addMessage(m.role, m.content);
+  for (const m of chatHistory) addChatMessage(m);
   const model = state.metadata?.model ? ` (saved with ${state.metadata.model})` : '';
   addMessage('system', `Session "${state.name}" loaded — ${chatHistory.length} messages${model}.`);
 }
@@ -2340,13 +2794,14 @@ function applyLoadedSession(state: SessionFile) {
 });
 
 exportBtn.addEventListener('click', () => {
-  const msgs = messagesEl.querySelectorAll('.message');
+  // Export from history, not the DOM — rendered markdown flattened to
+  // textContent would lose code fences and formatting.
   let md = '# Artifex WebGPU Chat Export\n\n';
-  msgs.forEach(m => {
-    const role = m.classList.contains('user') ? '## User' :
-                 m.classList.contains('assistant') ? '## Assistant' : '## System';
-    md += `${role}\n\n${m.textContent}\n\n`;
-  });
+  const sysPrompt = ($('system-prompt') as HTMLTextAreaElement).value.trim();
+  if (sysPrompt && chatHistory.length > 0) md += `## System\n\n${sysPrompt}\n\n`;
+  for (const m of chatHistory) {
+    md += `## ${m.role === 'user' ? 'User' : 'Assistant'}\n\n${m.content}\n\n`;
+  }
   const blob = new Blob([md], { type: 'text/markdown' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -2372,17 +2827,154 @@ unloadBtn.addEventListener('click', async () => {
   }
 });
 
-// ─── Cache Management ────────────────────────────────────────────────────────
+// ─── Cache Management (Storage panel) ────────────────────────────────────────
+// Model downloads land in the browser's Cache API — multi-GB blobs that are
+// otherwise invisible and only reclaimable through DevTools. The panel lists
+// them with sizes and per-model delete.
 
-// Show cache stats on boot (async, non-blocking)
-getCacheStats().then(stats => {
-  if (stats.itemCount > 0) {
-    console.log(`[Cache] ${stats.itemCount} shards cached (${formatBytes(stats.totalBytes)})`);
-    for (const [repo, info] of stats.models) {
-      console.log(`  ${repo}: ${info.shardCount} shards, ${formatBytes(info.totalBytes)}`);
-    }
+const cacheListEl = $('cache-list');
+
+async function renderCachePanel(): Promise<void> {
+  const stats = await getCacheStats();
+  cacheListEl.innerHTML = '';
+  if (stats.itemCount === 0) {
+    cacheListEl.textContent = 'No cached downloads.';
+    return;
   }
+  for (const [repo, info] of [...stats.models.entries()].sort((a, b) => b[1].totalBytes - a[1].totalBytes)) {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:6px;padding:2px 0';
+    const label = document.createElement('span');
+    label.textContent = `${repo} — ${formatBytes(info.totalBytes)}`;
+    label.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    label.title = `${repo}: ${info.shardCount} file(s), ${formatBytes(info.totalBytes)}`;
+    const del = document.createElement('button');
+    del.textContent = '✕';
+    del.title = `Delete cached download of ${repo} (re-downloads on next load)`;
+    del.style.cssText = 'background:none;border:1px solid #333;border-radius:3px;color:var(--dim);cursor:pointer;font-size:10px;padding:1px 6px';
+    del.addEventListener('click', async () => {
+      del.disabled = true;
+      await removeModelFromCache(repo);
+      await renderCachePanel();
+    });
+    row.append(label, del);
+    cacheListEl.appendChild(row);
+  }
+  const total = document.createElement('div');
+  total.textContent = `total: ${formatBytes(stats.totalBytes)}`;
+  total.style.cssText = 'margin-top:4px;color:var(--accent)';
+  cacheListEl.appendChild(total);
+}
+
+($('cache-refresh-btn') as HTMLButtonElement).addEventListener('click', () => void renderCachePanel());
+($('cache-clear-btn') as HTMLButtonElement).addEventListener('click', async () => {
+  if (!window.confirm('Delete ALL cached model downloads? Models will re-download on next load.')) return;
+  await clearCache();
+  await renderCachePanel();
 });
+
+void renderCachePanel();
+
+// ─── UI Settings Persistence ─────────────────────────────────────────────────
+// Sampler preset (+ custom slider values), system prompt, max tokens,
+// TurboQuant toggle, and the last loaded model survive reloads.
+
+const UI_STORE = 'artifex-ui:';
+
+function persistUISettings(): void {
+  try {
+    localStorage.setItem(UI_STORE + 'settings', JSON.stringify({
+      preset: presetSelect.value,
+      temperature: tempSlider.value,
+      topP: toppSlider.value,
+      topK: topkInput.value,
+      minP: minpSlider.value,
+      repPen: reppenSlider.value,
+      dryMult: drySlider.value,
+      maxTokens: ($('max-tokens') as HTMLInputElement).value,
+      turboquant: ($('turboquant') as HTMLInputElement).checked,
+      systemPrompt: ($('system-prompt') as HTMLTextAreaElement).value,
+      toolsEnabled: ($('tools-enabled') as HTMLInputElement).checked,
+      webSearchEnabled: ($('web-search-enabled') as HTMLInputElement).checked,
+    }));
+  } catch { /* quota — best-effort */ }
+}
+
+function restoreUISettings(): void {
+  try {
+    const raw = localStorage.getItem(UI_STORE + 'settings');
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (s.preset === 'custom') {
+      suppressPresetFlip = true;
+      if (s.temperature !== undefined) tempSlider.value = s.temperature;
+      if (s.topP !== undefined) toppSlider.value = s.topP;
+      if (s.topK !== undefined) topkInput.value = s.topK;
+      if (s.minP !== undefined) minpSlider.value = s.minP;
+      if (s.repPen !== undefined) reppenSlider.value = s.repPen;
+      if (s.dryMult !== undefined) drySlider.value = s.dryMult;
+      [tempSlider, toppSlider, minpSlider, reppenSlider, drySlider].forEach(el =>
+        el.dispatchEvent(new Event('input')));
+      suppressPresetFlip = false;
+      presetSelect.value = 'custom';
+    } else if (s.preset && s.preset in PRESETS) {
+      presetSelect.value = s.preset;
+      applyPreset(s.preset as PresetName);
+    }
+    if (s.maxTokens) ($('max-tokens') as HTMLInputElement).value = s.maxTokens;
+    if (typeof s.turboquant === 'boolean') ($('turboquant') as HTMLInputElement).checked = s.turboquant;
+    if (typeof s.toolsEnabled === 'boolean') ($('tools-enabled') as HTMLInputElement).checked = s.toolsEnabled;
+    if (typeof s.webSearchEnabled === 'boolean') ($('web-search-enabled') as HTMLInputElement).checked = s.webSearchEnabled;
+    if (typeof s.systemPrompt === 'string' && s.systemPrompt.trim()) {
+      ($('system-prompt') as HTMLTextAreaElement).value = s.systemPrompt;
+    }
+  } catch { /* corrupt entry — defaults stand */ }
+}
+
+// Search is keyless now (local /api/search proxy) — clear the key slot any
+// pre-release build may have written.
+try { localStorage.removeItem(UI_STORE + 'tavily-key'); } catch {}
+
+for (const id of ['max-tokens', 'turboquant', 'system-prompt', 'tools-enabled', 'web-search-enabled']) {
+  $(id).addEventListener('change', persistUISettings);
+  $(id).addEventListener('input', persistUISettings);
+}
+for (const el of [tempSlider, toppSlider, topkInput, minpSlider, reppenSlider, drySlider]) {
+  el.addEventListener('change', persistUISettings);
+}
+presetSelect.addEventListener('change', persistUISettings);
+
+/** Called by both load paths once the engine is ready. */
+function markModelReady(repo: string): void {
+  try { localStorage.setItem(UI_STORE + 'last-model', repo); } catch {}
+  // Mid-chat model switch: history is text-level, so it carries over — the
+  // new model just re-prefills it on the next send.
+  if (chatHistory.length > 0) {
+    addMessage('system',
+      `Conversation continues with ${repo} — it re-reads the chat history on your next message.`);
+  }
+  void renderCachePanel();  // a fresh download may have landed in the cache
+}
+
+/** Boot-time restore of the most recent conversation (autosave or named),
+ *  unless the user's last action was Clear Chat. The model is NOT auto-loaded
+ *  — multi-GB downloads/uploads shouldn't happen on page open. */
+function restoreLastConversation(): void {
+  try {
+    const latest = listSessions()[0];
+    if (!latest || latest.message_count === 0) return;
+    const clearedAt = Number(localStorage.getItem(UI_STORE + 'cleared-at') ?? 0);
+    if (latest.saved_at <= clearedAt) return;
+    const state = loadSession(latest.key);
+    if (!state) return;
+    chatHistory = state.messages.filter(
+      (m): m is ChatMessage => m.role === 'user' || m.role === 'assistant');
+    if (chatHistory.length === 0) return;
+    for (const m of chatHistory) addChatMessage(m);
+    addMessage('system',
+      `Restored last conversation (${chatHistory.length} messages) — Clear Chat to start fresh.`);
+  } catch { /* corrupt store — start clean */ }
+}
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
 
@@ -2391,6 +2983,18 @@ const savedToken = localStorage.getItem('hf-token');
 if (savedToken) {
   setAuthToken(savedToken);
   ($('hf-token') as HTMLInputElement).value = savedToken;
+}
+
+restoreUISettings();
+const lastModel = localStorage.getItem(UI_STORE + 'last-model');
+if (lastModel) ($('model-repo') as HTMLInputElement).value = lastModel;
+restoreLastConversation();
+
+// PWA service worker — production builds only. In dev, vite owns module
+// serving and the dev server sets the COOP/COEP headers itself.
+if (import.meta.env.PROD && 'serviceWorker' in navigator) {
+  navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`)
+    .catch(err => console.warn('[PWA] service worker registration failed:', err));
 }
 
 init();

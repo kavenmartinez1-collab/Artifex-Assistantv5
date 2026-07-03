@@ -121,6 +121,101 @@ app.get('/api/gpu-info', (_req, res) => {
   );
 });
 
+// ─── Web search (self-owned, keyless) ────────────────────────────────────────
+// GET /api/search?q=... — the browser's web_search tool routes here so no
+// third-party API key or account ever exists, client-side or otherwise.
+// Engines:
+//   - ARTIFEX_SEARXNG_URL env — a self-hosted SearXNG instance (JSON API),
+//     for fully self-owned search infrastructure
+//   - default — DuckDuckGo's HTML endpoint, parsed server-side (keyless)
+// Privacy/safety shape: only the query string leaves the machine, sent
+// directly to the engine; nothing is stored or logged beyond the console.
+// The endpoint fetches exactly one hard-coded engine URL — client input is
+// never used as a fetch target, so there is no SSRF surface toward LAN
+// services. Localhost-bound like the rest of this server.
+
+const SEARXNG_URL = (process.env.ARTIFEX_SEARXNG_URL ?? '').replace(/\/+$/, '');
+const SEARCH_TIMEOUT_MS = 10_000;
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'").replace(/&nbsp;/g, ' ');
+}
+
+function stripTags(s: string): string {
+  return decodeEntities(s.replace(/<[^>]*>/g, '')).replace(/\s+/g, ' ').trim();
+}
+
+interface SearchResult { title: string; url: string; snippet: string }
+
+async function searchSearxng(q: string, max: number): Promise<SearchResult[]> {
+  const resp = await fetch(
+    `${SEARXNG_URL}/search?q=${encodeURIComponent(q)}&format=json`,
+    { signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS) });
+  if (!resp.ok) throw new Error(`searxng returned ${resp.status}`);
+  const data = await resp.json() as { results?: Array<{ title?: string; url?: string; content?: string }> };
+  return (data.results ?? []).slice(0, max).map(r => ({
+    title: r.title ?? '',
+    url: r.url ?? '',
+    snippet: (r.content ?? '').slice(0, 300),
+  }));
+}
+
+async function searchDuckDuckGo(q: string, max: number): Promise<SearchResult[]> {
+  const resp = await fetch(
+    `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`,
+    {
+      headers: {
+        // The HTML endpoint serves plain markup to browser UAs; the default
+        // undici UA gets challenged.
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+        'Accept': 'text/html',
+      },
+      signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
+    });
+  if (!resp.ok) throw new Error(`engine returned ${resp.status}`);
+  const html = await resp.text();
+
+  // Result anchors: <a class="result__a" href="//duckduckgo.com/l/?uddg=<url>...">Title</a>
+  // paired in document order with <a class="result__snippet" ...>snippet</a>.
+  const links = [...html.matchAll(/class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)];
+  const snippets = [...html.matchAll(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g)];
+  const resolveUrl = (href: string): string => {
+    const m = href.match(/[?&]uddg=([^&]+)/);
+    if (m) { try { return decodeURIComponent(m[1]); } catch { /* keep raw */ } }
+    return href.startsWith('//') ? `https:${href}` : href;
+  };
+  const results: SearchResult[] = [];
+  for (let i = 0; i < links.length && results.length < max; i++) {
+    const url = resolveUrl(decodeEntities(links[i][1]));
+    if (/duckduckgo\.com\/y\.js/.test(url)) continue; // ad click-through
+    results.push({
+      title: stripTags(links[i][2]),
+      url,
+      snippet: stripTags(snippets[i]?.[1] ?? '').slice(0, 300),
+    });
+  }
+  return results;
+}
+
+app.get('/api/search', async (req, res) => {
+  const q = String(req.query.q ?? '').trim();
+  if (!q) return res.status(400).json({ error: 'missing q parameter' });
+  const max = Math.min(Math.max(Number(req.query.max) || 5, 1), 10);
+  const engine = SEARXNG_URL ? 'searxng' : 'duckduckgo';
+  try {
+    const results = SEARXNG_URL
+      ? await searchSearxng(q, max)
+      : await searchDuckDuckGo(q, max);
+    console.log(`\x1b[35m[Search]\x1b[0m ${engine}: "${q}" → ${results.length} results`);
+    res.json({ engine, results });
+  } catch (err) {
+    console.warn(`\x1b[35m[Search]\x1b[0m ${engine} failed for "${q}": ${err}`);
+    res.status(502).json({ error: `search failed: ${err instanceof Error ? err.message : err}` });
+  }
+});
+
 // ─── Local HuggingFace Cache ─────────────────────────────────────────────────
 // Serves SafeTensors files from the local HF cache, eliminating CDN downloads.
 // The browser's hf-hub.ts switches its base URL to use these endpoints instead.

@@ -1,0 +1,15 @@
+{
+  "name": "Artifex WebGPU Engine",
+  "short_name": "Artifex",
+  "description": "Browser-based LLM inference on any GPU — pure WebGPU, no server-side inference.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f111a",
+  "theme_color": "#0f111a",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

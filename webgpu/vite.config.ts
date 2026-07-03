@@ -78,6 +78,9 @@ function debugApiPlugin(): Plugin {
 
 export default defineConfig({
   root: '.',
+  // Relative base so the production bundle works from any mount point —
+  // a domain root, a GitHub Pages /<repo>/ subpath, or file-served dirs.
+  base: './',
   publicDir: 'public',
   build: {
     outDir: 'dist',
@@ -101,6 +104,8 @@ export default defineConfig({
       '/metrics': 'http://127.0.0.1:3001',
       // GPU info (VRAM auto-budget) lives on the dev server
       '/api/gpu-info': 'http://127.0.0.1:3001',
+      // Keyless web search proxy (web_search tool) lives on the dev server
+      '/api/search': 'http://127.0.0.1:3001',
       // Proxy local HF cache to the dev server (streams large weight shards)
       '/api/hf-cache': {
         target: 'http://127.0.0.1:3001',
