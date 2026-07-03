@@ -23,3 +23,14 @@ node_modules/
 
 # successor-legible engineering log (local only for now)
 docs/ENGINEERING_LOG.md
+
+# bench evidence dumps (A/B toggles, smoke/greedy responses, page logs) — local only
+scripts/ab_*.txt
+scripts/c4_*.txt
+scripts/c5_*.txt
+scripts/mtp_*.txt
+scripts/q2ks_*.txt
+scripts/qwen36_*.txt
+scripts/smoke_*.txt
+scripts/*_log.txt
+scripts/iq2xxs_llamacpp_parity.txt

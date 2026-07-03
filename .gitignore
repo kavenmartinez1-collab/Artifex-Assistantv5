@@ -94,6 +94,10 @@ scripts/reference_output.txt
 reference_dump*.json
 weight_sweep*.json
 
+# ── Local bench evidence dumps (WebGPU A/B toggles, run logs) ───────
+/log.txt
+scripts/ab_*.txt
+
 # ── Session-specific diagnostic probes (one-off investigation tools) ─
 scripts/l21_*.py
 scripts/zero_offset_probe*.py
