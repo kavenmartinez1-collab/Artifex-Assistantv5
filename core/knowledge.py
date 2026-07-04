@@ -12,6 +12,7 @@ Architecture:
 import json
 import os
 import re
+import shutil
 import time
 import uuid
 from collections import deque
@@ -768,6 +769,33 @@ class KnowledgeManager:
         ws_kb_dir = os.path.join(KNOWLEDGE_DIR, "workspaces", safe_name)
         self.session_store = KnowledgeStore(ws_kb_dir)
         self._engine = ContextEngine(self.session_store)
+
+    def purge_all(self) -> int:
+        """Wipe the entire knowledge base (reference + all workspace stores).
+
+        Removes everything under KNOWLEDGE_DIR on disk, then re-initializes the
+        live stores empty so the running app keeps working. Returns bytes
+        reclaimed. Note: session KBs bound alongside a session JSON live under
+        the sessions dir and are cleared by session purging, but their in-memory
+        index is reset here too.
+        """
+        reclaimed = 0
+        if os.path.isdir(KNOWLEDGE_DIR):
+            for root, _, files in os.walk(KNOWLEDGE_DIR):
+                for f in files:
+                    try:
+                        reclaimed += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+            shutil.rmtree(KNOWLEDGE_DIR, ignore_errors=True)
+        os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
+
+        # Re-initialize live stores empty (fresh instances reset in-memory index)
+        self.reference_store = KnowledgeStore(KNOWLEDGE_REFERENCE_DIR)
+        if self.session_store is not None:
+            self.session_store = KnowledgeStore(self.session_store.store_dir)
+            self._engine = ContextEngine(self.session_store)
+        return reclaimed
 
     # --- Unified tool output processing ---
 

@@ -159,7 +159,10 @@ class ImageEditPipeline(BasePipeline):
             if self._mode == "inpaint" and params.mask_path and os.path.isfile(params.mask_path):
                 gen_kwargs["mask_image"] = Image.open(params.mask_path).convert("L")
             elif self._mode != "upscale":
-                gen_kwargs["strength"] = params.strength
+                # Reference-based editors (e.g. FLUX.2 klein) take no strength param
+                import inspect
+                if "strength" in inspect.signature(self.pipe.__call__).parameters:
+                    gen_kwargs["strength"] = params.strength
 
             result = self.pipe(**gen_kwargs)
             image = result.images[0]

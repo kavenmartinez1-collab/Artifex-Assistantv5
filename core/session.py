@@ -5,6 +5,7 @@ Save and restore conversation state across sessions.
 
 import json
 import os
+import shutil
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -158,6 +159,34 @@ def list_sessions(session_dir=None):
     sessions.sort(key=lambda s: (s.get("saved_at", 0), s["timestamp"]),
                   reverse=True)
     return sessions
+
+
+def purge_sessions(session_dir=None) -> int:
+    """Delete every saved session (including autosaves and _kb sidecars).
+
+    Returns the number of bytes reclaimed. The session directory itself is
+    preserved so save/load keep working afterwards.
+    """
+    d = _ensure_session_dir(session_dir)
+    reclaimed = 0
+    for name in os.listdir(d):
+        p = os.path.join(d, name)
+        try:
+            if os.path.isfile(p):
+                reclaimed += os.path.getsize(p)
+                os.remove(p)
+            elif os.path.isdir(p):
+                # e.g. <session>_kb sidecar knowledge stores
+                for root, _, files in os.walk(p):
+                    for f in files:
+                        try:
+                            reclaimed += os.path.getsize(os.path.join(root, f))
+                        except OSError:
+                            pass
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError:
+            pass
+    return reclaimed
 
 
 def find_session(name_or_index, session_dir=None):

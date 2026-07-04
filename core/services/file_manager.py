@@ -259,6 +259,34 @@ class FileManager:
             self.delete_file(fid)
         return len(to_delete)
 
+    def purge(self) -> int:
+        """Delete ALL uploaded + generated files and reset the index.
+
+        Returns the number of bytes reclaimed. Configs are untouched (this
+        object only owns output/uploads + output/generated + file_index.json).
+        """
+        reclaimed = 0
+        with self._lock:
+            for d in (self._upload_dir, self._generated_dir):
+                if not os.path.isdir(d):
+                    continue
+                for name in os.listdir(d):
+                    p = os.path.join(d, name)
+                    try:
+                        if os.path.isfile(p):
+                            reclaimed += os.path.getsize(p)
+                            os.remove(p)
+                    except OSError:
+                        pass
+            self._index = {}
+            if os.path.isfile(self._index_path):
+                try:
+                    reclaimed += os.path.getsize(self._index_path)
+                    os.remove(self._index_path)
+                except OSError:
+                    pass
+        return reclaimed
+
     # --- Persistence ---
 
     def _load_index(self):

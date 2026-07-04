@@ -334,7 +334,7 @@ def run_assistant():
     print(f" Artifex-Assistant-v5{Style.RESET_ALL}")
     print()
     print(f"{Fore.WHITE}  Type your questions. The AI can run shell commands, Python, and web searches.")
-    print(f"  Commands: /workspace <path>, /harness <detect|adopt|on|off>, /kb search|add|list, /refresh, /clear")
+    print(f"  Commands: /workspace <path>, /harness <detect|adopt|on|off>, /kb search|add|list, /refresh, /clear, /purge")
     print(f"  Agent:    /run <goal>  (autonomous loop),  /autonomy manual|guided|full")
     print(f"  Session:  /save [name], /load [name|#], /sessions, /export [path]")
     print(f"  Pipeline: /mode <mode>, /attach <file>, /output <dir>")
@@ -517,6 +517,68 @@ def run_assistant():
                 else:
                     print(f"    No stale workspaces found")
                 print(f"  Knowledge preserved ({km.session_store.count if km.session_store else 0} entries).{Style.RESET_ALL}\n")
+                continue
+
+            if user_input.lower() == "/purge":
+                from core.config import BASE_DIR, SESSION_DIR, KNOWLEDGE_DIR
+                from core.session import purge_sessions
+                from core.services import get_service
+                from tools.tool_cache import CACHE_DIR
+
+                def _dir_size(path):
+                    total = 0
+                    if os.path.isdir(path):
+                        for root, _, files in os.walk(path):
+                            for f in files:
+                                try:
+                                    total += os.path.getsize(os.path.join(root, f))
+                                except OSError:
+                                    pass
+                    return total
+
+                def _fmt(n):
+                    size = float(n)
+                    for unit in ("B", "KB", "MB", "GB"):
+                        if size < 1024 or unit == "GB":
+                            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+                        size /= 1024
+
+                stores = [
+                    ("Generated media + uploads", os.path.join(BASE_DIR, "output")),
+                    ("Tool cache", CACHE_DIR),
+                    ("Saved sessions", SESSION_DIR),
+                    ("Knowledge base", KNOWLEDGE_DIR),
+                ]
+                sizes = [(label, _dir_size(path)) for label, path in stores]
+                total = sum(s for _, s in sizes)
+                print(f"{Fore.YELLOW}  Purge will permanently delete (configs untouched):")
+                for label, size in sizes:
+                    print(f"    - {label}: {_fmt(size)}")
+                print(f"  Total to reclaim: {_fmt(total)}")
+                print(f"  Sessions and knowledge cannot be recovered.{Style.RESET_ALL}")
+                confirm = input(f"{Fore.RED}  Type 'yes' to confirm: {Style.RESET_ALL}").strip().lower()
+                if confirm != "yes":
+                    print(f"{Fore.CYAN}  Purge cancelled.{Style.RESET_ALL}\n")
+                    continue
+                reclaimed = 0
+                try:
+                    reclaimed += get_service().file_manager.purge()
+                except Exception as e:
+                    print(f"{Fore.YELLOW}  media purge error: {e}{Style.RESET_ALL}")
+                try:
+                    reclaimed += _dir_size(CACHE_DIR)
+                    clear_cache()
+                except Exception as e:
+                    print(f"{Fore.YELLOW}  tool-cache purge error: {e}{Style.RESET_ALL}")
+                try:
+                    reclaimed += purge_sessions()
+                except Exception as e:
+                    print(f"{Fore.YELLOW}  session purge error: {e}{Style.RESET_ALL}")
+                try:
+                    reclaimed += km.purge_all()
+                except Exception as e:
+                    print(f"{Fore.YELLOW}  knowledge purge error: {e}{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}  Purge complete — reclaimed {_fmt(reclaimed)}.{Style.RESET_ALL}\n")
                 continue
 
             # /backend command

@@ -470,6 +470,11 @@ class ArtifexMainWindow(QMainWindow):
         self._health_btn.setProperty("class", "secondary")
         layout.addWidget(self._health_btn)
 
+        # Purge stored data (media, cache, sessions, knowledge) — configs untouched
+        self._purge_btn = QPushButton("Purge Data")
+        self._purge_btn.setProperty("class", "secondary")
+        layout.addWidget(self._purge_btn)
+
         layout.addStretch()
         self._splitter.addWidget(sidebar)
 
@@ -800,6 +805,9 @@ class ArtifexMainWindow(QMainWindow):
         # Health
         self._health_btn.clicked.connect(self._on_health)
 
+        # Purge stored data
+        self._purge_btn.clicked.connect(self._on_purge)
+
         # Session
         self._save_btn.clicked.connect(self._on_save_session)
         self._load_btn.clicked.connect(self._on_load_session)
@@ -1076,11 +1084,17 @@ class ArtifexMainWindow(QMainWindow):
         if mode == "Image Gen":
             kwargs = {"prompt": prompt, "width": 512, "height": 512,
                       "num_steps": 30}
+            # FLUX.2 klein is step-distilled: 4 steps, no CFG, native 1024px
+            if "klein" in (get_active_model_path() or "").lower():
+                kwargs.update({"width": 1024, "height": 1024,
+                               "num_steps": 4, "guidance_scale": 1.0})
         elif mode == "Image Edit":
             files = self._drop_zone.attached_files
             if files:
                 kwargs = {"image_path": files[0], "prompt": prompt,
                           "strength": 0.75, "num_steps": 30}
+                if "klein" in (get_active_model_path() or "").lower():
+                    kwargs.update({"num_steps": 4, "guidance_scale": 1.0})
         elif mode == "Vision":
             files = self._drop_zone.attached_files
             if files:
@@ -1586,6 +1600,83 @@ class ArtifexMainWindow(QMainWindow):
         self.session_map.clear()
         clear_cache()
         self._set_status("STANDBY")
+
+    def _on_purge(self):
+        """Purge stored data (media, tool cache, sessions, knowledge).
+
+        Configs (llama_cpp_config.json, ollama_config.json, etc.) are never
+        touched. Sessions and knowledge are curated user data and cannot be
+        recovered — hence the confirmation dialog with a size breakdown.
+        """
+        from core.config import SESSION_DIR, KNOWLEDGE_DIR
+        from core.session import purge_sessions
+        from tools.tool_cache import CACHE_DIR
+
+        def _dir_size(path):
+            total = 0
+            if os.path.isdir(path):
+                for root, _, files in os.walk(path):
+                    for f in files:
+                        try:
+                            total += os.path.getsize(os.path.join(root, f))
+                        except OSError:
+                            pass
+            return total
+
+        def _fmt(n):
+            size = float(n)
+            for unit in ("B", "KB", "MB", "GB"):
+                if size < 1024 or unit == "GB":
+                    return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+                size /= 1024
+
+        output_dir = os.path.join(BASE_DIR, "output")
+        stores = [
+            ("Generated media + uploads", output_dir),
+            ("Tool cache", CACHE_DIR),
+            ("Saved sessions", SESSION_DIR),
+            ("Knowledge base", KNOWLEDGE_DIR),
+        ]
+        sizes = [(label, path, _dir_size(path)) for label, path in stores]
+        total = sum(s for _, _, s in sizes)
+
+        breakdown = "\n".join(f"  • {label}: {_fmt(size)}" for label, _, size in sizes)
+        resp = QMessageBox.warning(
+            self,
+            "Purge stored data",
+            "This permanently deletes the following (configs are NOT touched):\n\n"
+            f"{breakdown}\n\n"
+            f"Total to reclaim: {_fmt(total)}\n\n"
+            "Saved sessions and knowledge base are curated data and cannot be "
+            "recovered. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+
+        reclaimed = 0
+        try:
+            reclaimed += get_service().file_manager.purge()
+        except Exception as e:
+            _log.warning("Purge (media) error: %s", e)
+        try:
+            reclaimed += _dir_size(CACHE_DIR)
+            clear_cache()
+        except Exception as e:
+            _log.warning("Purge (tool cache) error: %s", e)
+        try:
+            reclaimed += purge_sessions()
+        except Exception as e:
+            _log.warning("Purge (sessions) error: %s", e)
+        try:
+            reclaimed += self.km.purge_all()
+        except Exception as e:
+            _log.warning("Purge (knowledge) error: %s", e)
+
+        self._set_status(f"Purged stored data — reclaimed {_fmt(reclaimed)}")
+        QMessageBox.information(
+            self, "Purge complete", f"Reclaimed {_fmt(reclaimed)} of disk space.")
 
     def _on_vram_relief(self):
         if self.engine:
