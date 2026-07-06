@@ -12,6 +12,9 @@
 //   swiglu_gate     Out[r,d] = silu(X[r,d]) * X[r,dim+d]   (Flux2SwiGLU)
 //   gate_add        Out[r,d] = X[r,d] + Mod[off_a + d] * Y[r,d]
 //                   (gated residual; off_a = gate)
+//   concat_cols     Out[r, off_a + d] = X[r, d] with Out rows of width off_b
+//                   (column-band copy; builds the single-block [attn|mlp]
+//                   concat without a strided GEMM)
 //
 // layout 'auto' drops bindings an entry doesn't reference: bind only what
 // the entry uses (adaln_modulate/swiglu_gate skip Y; swiglu_gate skips Mod).
@@ -60,4 +63,13 @@ fn gate_add(@builtin(workgroup_id) wid: vec3u,
   let r = wid.y;
   let i = r * params.dim + d;
   Out[i] = X[i] + Mod[params.off_a + d] * Y[i];
+}
+
+@compute @workgroup_size(256)
+fn concat_cols(@builtin(workgroup_id) wid: vec3u,
+               @builtin(local_invocation_id) lid: vec3u) {
+  let d = wid.x * 256u + lid.x;
+  if (d >= params.dim) { return; }
+  let r = wid.y;
+  Out[r * params.off_b + params.off_a + d] = X[r * params.dim + d];
 }

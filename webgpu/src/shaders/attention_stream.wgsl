@@ -134,3 +134,23 @@ fn attention_stream(@builtin(workgroup_id) wid: vec3u,
     Out[q_base + d] = acc_sh[d] * inv_l;
   }
 }
+
+// ── transpose_khds: K [S, H*D] -> KT [H, D, S] ──────────────────────────
+// Produces the transposed K layout attention_stream requires (see header).
+// Reuses this file's bindings: source K in the Q slot (@0), dest in Out (@3).
+// One thread per element over S*H*D. Dispatch: (ceil(S*H*D / 256), 1, 1)
+// — at the max DiT joint seq (4608*3072/256 = 55296) this stays under the
+// 65535 per-dimension workgroup limit.
+@compute @workgroup_size(256)
+fn transpose_khds(@builtin(global_invocation_id) gid: vec3u) {
+  let D = params.head_dim;
+  let H = params.num_heads;
+  let S = params.seq_kv;
+  let idx = gid.x;
+  if (idx >= S * H * D) { return; }
+  let s = idx / (H * D);
+  let hd = idx % (H * D);
+  let h = hd / D;
+  let d = hd % D;
+  Out[(h * D + d) * S + s] = Q[idx];
+}
