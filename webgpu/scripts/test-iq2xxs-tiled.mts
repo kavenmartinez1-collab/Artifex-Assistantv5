@@ -34,8 +34,12 @@ function mulberry32(seed: number) {
 
 const TN = 8, TWG = 128;
 const SHAPES = [
-  { name: 'N16 K512', N: 16, K: 512 },
-  { name: 'N12 K768 (edge: N%TN!=0, partial chunk)', N: 12, K: 768 },
+  { name: 'N16 K512 M1', N: 16, K: 512, M: 1 },
+  { name: 'N12 K768 M1 (edge: N%TN!=0, partial chunk)', N: 12, K: 768, M: 1 },
+  // M>1 exercises the M-reuse GEMM entry (spec-decode verify path).
+  { name: 'N16 K512 M2', N: 16, K: 512, M: 2 },
+  { name: 'N12 K768 M5 (edge: N%TN!=0, partial chunk)', N: 12, K: 768, M: 5 },
+  { name: 'N16 K768 M8 (MAXM cap)', N: 16, K: 768, M: 8 },
 ];
 
 const RAW_SB = 66; // bytes per raw IQ2_XXS superblock
@@ -51,15 +55,17 @@ const problems = SHAPES.map((s, si) => {
 
   const ref = dequantGGML(GGML_TYPES.IQ2_XXS, raw, s.N * s.K);
   const W = repackGGUFForGPU(GGML_TYPES.IQ2_XXS, raw, s.N * s.K) as Uint32Array;
-  const A = new Float32Array(s.K);
-  for (let i = 0; i < s.K; i++) A[i] = rng() * 2 - 1;
-  const expected = new Float32Array(s.N);
-  for (let n = 0; n < s.N; n++) {
-    let acc = 0;
-    for (let i = 0; i < s.K; i++) acc += A[i] * ref[n * s.K + i];
-    expected[n] = acc;
+  const A = new Float32Array(s.M * s.K);
+  for (let i = 0; i < A.length; i++) A[i] = rng() * 2 - 1;
+  const expected = new Float32Array(s.M * s.N);
+  for (let m = 0; m < s.M; m++) {
+    for (let n = 0; n < s.N; n++) {
+      let acc = 0;
+      for (let i = 0; i < s.K; i++) acc += A[m * s.K + i] * ref[n * s.K + i];
+      expected[m * s.N + n] = acc;
+    }
   }
-  return { name: s.name, N: s.N, K: s.K, W: Array.from(W), A: Array.from(A), expected: Array.from(expected) };
+  return { name: s.name, N: s.N, K: s.K, M: s.M, W: Array.from(W), A: Array.from(A), expected: Array.from(expected) };
 });
 
 const browser = await chromium.launch({ channel: 'chrome', headless: true, args: ['--enable-unsafe-webgpu'] });
@@ -77,7 +83,11 @@ try {
     if (!g) return { error: 'no navigator.gpu' };
     const adapter = await g.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) return { error: 'no adapter' };
-    const device = await adapter.requestDevice();
+    // Match the engine (gpu-device.ts): the gemm entry needs a_tile_m (16 KB)
+    // + row_acc, above the 16 KB default workgroup-storage limit.
+    const device = await adapter.requestDevice({
+      requiredLimits: { maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize },
+    });
 
     const module = device.createShaderModule({ code: shaderSrc });
     const info = await module.getCompilationInfo();
@@ -86,12 +96,14 @@ try {
       .map((mm: any) => `${mm.lineNum}:${mm.linePos} ${mm.message}`);
     if (compileMsgs.length) return { error: `shader errors:\n${compileMsgs.join('\n')}` };
 
-    const out: Array<{ name: string; legacy: number[]; tiled: number[]; errs: string[] }> = [];
+    const out: Array<{ name: string; legacy: number[]; tiled: number[]; gemm: number[]; errs: string[] }> = [];
     for (const p of problems) {
       const errs: string[] = [];
       const variants = [
-        { key: 'legacy', entry: 'matmul_gguf_iq2_xxs', constants: undefined as Record<string, number> | undefined, gridX: p.N },
-        { key: 'tiled', entry: 'matmul_gguf_iq2_xxs_tiled', constants: { TN, TWG }, gridX: Math.ceil(p.N / TN) },
+        // legacy + tiled batch M via grid.y; gemm handles all M internally (grid.y=1).
+        { key: 'legacy', entry: 'matmul_gguf_iq2_xxs', constants: undefined as Record<string, number> | undefined, gridX: p.N, gridY: p.M },
+        { key: 'tiled', entry: 'matmul_gguf_iq2_xxs_tiled', constants: { TN, TWG }, gridX: Math.ceil(p.N / TN), gridY: p.M },
+        { key: 'gemm', entry: 'matmul_gguf_iq2_xxs_gemm', constants: { TN, TWG }, gridX: Math.ceil(p.N / TN), gridY: 1 },
       ];
       const got: Record<string, number[]> = {};
       for (const v of variants) {
@@ -102,9 +114,9 @@ try {
         device.queue.writeBuffer(aBuf, 0, Af);
         const wBuf = device.createBuffer({ size: Wu.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
         device.queue.writeBuffer(wBuf, 0, Wu);
-        const cBuf = device.createBuffer({ size: p.N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const cBuf = device.createBuffer({ size: p.M * p.N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
         const pBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        device.queue.writeBuffer(pBuf, 0, new Uint32Array([1, p.N, p.K, 0]));
+        device.queue.writeBuffer(pBuf, 0, new Uint32Array([p.M, p.N, p.K, 0]));
         const pipeline = device.createComputePipeline({
           layout: 'auto',
           compute: { module, entryPoint: v.entry, constants: v.constants },
@@ -122,10 +134,10 @@ try {
         const pass = enc.beginComputePass();
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, bind);
-        pass.dispatchWorkgroups(v.gridX, 1, 1);
+        pass.dispatchWorkgroups(v.gridX, v.gridY, 1);
         pass.end();
-        const readBuf = device.createBuffer({ size: p.N * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-        enc.copyBufferToBuffer(cBuf, 0, readBuf, 0, p.N * 4);
+        const readBuf = device.createBuffer({ size: p.M * p.N * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        enc.copyBufferToBuffer(cBuf, 0, readBuf, 0, p.M * p.N * 4);
         device.queue.submit([enc.finish()]);
         await readBuf.mapAsync(GPUMapMode.READ);
         got[v.key] = Array.from(new Float32Array(readBuf.getMappedRange().slice(0)));
@@ -133,7 +145,7 @@ try {
         const err = await device.popErrorScope();
         if (err) errs.push(`${v.key}: ${err.message}`);
       }
-      out.push({ name: p.name, legacy: got.legacy, tiled: got.tiled, errs });
+      out.push({ name: p.name, legacy: got.legacy, tiled: got.tiled, gemm: got.gemm, errs });
     }
     return { out };
   }, { shaderSrc, problems, TN, TWG });
@@ -151,7 +163,7 @@ try {
     }
     const check = (label: string, got: number[], want: number[], tol: number) => {
       let maxRel = 0, maxAbs = 0;
-      for (let n = 0; n < prob.N; n++) {
+      for (let n = 0; n < prob.M * prob.N; n++) {
         const abs = Math.abs(got[n] - want[n]);
         maxAbs = Math.max(maxAbs, abs);
         maxRel = Math.max(maxRel, abs / Math.max(1e-4, Math.abs(want[n])));
@@ -166,7 +178,9 @@ try {
     };
     check('legacy vs CPU', r.legacy, prob.expected as unknown as number[], 2e-3);
     check('tiled  vs CPU', r.tiled, prob.expected as unknown as number[], 2e-3);
+    check('gemm   vs CPU', r.gemm, prob.expected as unknown as number[], 2e-3);
     check('tiled  vs legacy(GPU)', r.tiled, r.legacy, 1e-3);
+    check('gemm   vs legacy(GPU)', r.gemm, r.legacy, 1e-3);
   }
 } finally {
   await browser.close();

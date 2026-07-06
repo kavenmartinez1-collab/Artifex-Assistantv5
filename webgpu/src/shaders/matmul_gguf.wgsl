@@ -634,6 +634,82 @@ fn iq2xxs_unit_acc(dw: u32, w0: u32, w1: u32, w2: u32, atBase: u32) -> f32 {
   return db * dot_acc;
 }
 
+// ── IQ2_XXS tiled GEMM (M-reuse, mirrors q2_k_tiled_r_gemm) ─────────────
+// The spec-decode verify runs M rows (pending + drafts) through the same
+// weights; the GEMV path put M in grid.y so every row re-read and re-decoded
+// every weight — an M-row verify cost ~M single forwards, which is exactly
+// why MTP Opt-1/Opt-2 lost (falsified hypotheses 1-2, ENGINEERING_LOG.md).
+// Here each lane loads + decodes its unit ONCE (C5 recipe: aligned u32 loads,
+// unpack4xU8 grid decode, XOR sign flip) and dots it against all M staged
+// activation rows. Grid.y = 1. Per-lane unit visit order (lane, TPR+lane, …)
+// and the per-unit lo/hi accumulation order match the r2 tiled kernel, so
+// the M=1 column is bit-identical to matmul_gguf_iq2_xxs_tiled.
+
+@compute @workgroup_size(TWG, 1, 1)
+fn matmul_gguf_iq2_xxs_gemm(@builtin(local_invocation_id) lid: vec3u,
+                            @builtin(workgroup_id) wid: vec3u) {
+  let tid = lid.x;
+  let TPR = TWG / TN;
+  let lane = tid % TPR;
+  let row = tid / TPR;
+  let n = (wid.x + wid.z * 65535u) * TN + row;
+  let M = params.M;
+  let K = params.K;
+  let nSB = K / 256u;
+  let nUnits = nSB * 8u;
+  let nChunks = (nUnits + TPR - 1u) / TPR;
+  let nVec = (TWG / TN) * 8u;
+  let valid = n < params.N;
+
+  var acc: array<f32, MAXM>;
+  for (var mi = 0u; mi < M; mi = mi + 1u) { acc[mi] = 0.0; }
+
+  for (var c = 0u; c < nChunks; c = c + 1u) {
+    workgroupBarrier();
+    tile_stage_m(tid, M, c * TPR * 32u, K);
+    workgroupBarrier();
+
+    let u = c * TPR + lane;
+    if (u < nUnits && valid) {
+      // All global loads before decode ALU (same as the r2 tiled body).
+      let b = (n * nSB + u / 8u) * 17u;        // block word 0 (f16 d)
+      let q = b + (u % 8u) * 2u;               // unit's aux bytes @ byte 2
+      let dw = W[b];
+      let w0 = W[q];
+      let w1 = W[q + 1u];
+      let w2 = W[q + 2u];
+      let d = unpack2x16float(dw).x;
+      let aux0 = (w0 >> 16u) | (w1 << 16u);    // 4 grid indices
+      let aux1 = (w1 >> 16u) | (w2 << 16u);    // 4× 7-bit sign idx + ls nibble
+      let ls = aux1 >> 28u;
+      let db = d * (0.5 + f32(ls)) * 0.25;
+      var usum: array<f32, MAXM>;
+      for (var mi = 0u; mi < M; mi = mi + 1u) { usum[mi] = 0.0; }
+      for (var l = 0u; l < 4u; l = l + 1u) {
+        let gridIdx = (aux0 >> (l * 8u)) & 0xFFu;
+        let signs = iq2xxs_sign_byte((aux1 >> (7u * l)) & 127u);
+        let mlo = vec4<f32>(unpack4xU8(IQ2XXS_GRID[gridIdx * 2u]));
+        let mhi = vec4<f32>(unpack4xU8(IQ2XXS_GRID[gridIdx * 2u + 1u]));
+        let slo = ((vec4<u32>(signs) >> vec4<u32>(0u, 1u, 2u, 3u)) & vec4<u32>(1u)) << vec4<u32>(31u);
+        let shi = ((vec4<u32>(signs) >> vec4<u32>(4u, 5u, 6u, 7u)) & vec4<u32>(1u)) << vec4<u32>(31u);
+        let wlo = bitcast<vec4<f32>>(bitcast<vec4<u32>>(mlo) ^ slo);
+        let whi = bitcast<vec4<f32>>(bitcast<vec4<u32>>(mhi) ^ shi);
+        for (var mi = 0u; mi < M; mi = mi + 1u) {
+          let at = mi * nVec + lane * 8u + l * 2u;
+          usum[mi] = usum[mi] + dot(a_tile_m[at], wlo);
+          usum[mi] = usum[mi] + dot(a_tile_m[at + 1u], whi);
+        }
+      }
+      for (var mi = 0u; mi < M; mi = mi + 1u) {
+        acc[mi] = acc[mi] + db * usum[mi];
+      }
+    }
+  }
+  for (var mi = 0u; mi < M; mi = mi + 1u) {
+    tile_reduce_store(tid, lane, n, mi, acc[mi]);
+  }
+}
+
 // ── IQ3_XXS / IQ3_S / IQ2_S grids ───────────────────────────────────────
 // iq3xxs_grid[256] / iq3s_grid[512] (u32, 4 magnitude bytes each) and
 // iq2s_grid[1024] (u64 → 2 u32 lo/hi, 8 magnitude bytes each). Generated

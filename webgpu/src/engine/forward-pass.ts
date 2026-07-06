@@ -522,6 +522,18 @@ export function createForwardPassEngine(
   const gemvSearch = typeof window === 'undefined'
     ? null : new URLSearchParams(window.location.search);
   const gemvTileEnabled = gemvSearch?.get('gemvTile') !== '0';
+  // Phase B (2026-07-02, spec-decode verify lever): hoist the 5 DeltaNet
+  // projections (QKV/A/B/Z in, out) out of the per-token ssmT loop and run each
+  // once at M=seqLen (grid.y=M) instead of seqLen× M=1 dispatches. FALSIFIED as
+  // a throughput lever (default OFF, opt-in ?batchProj=1): byte-identical but
+  // FLAT — spec=1 10.4→10.5 tok/s (noise). It cut 240 verify dispatches but
+  // added 480 slice-copies (wash), and the projections were never the
+  // bottleneck: the verify's ~2× multiplier is the irreducibly SEQUENTIAL
+  // DeltaNet recurrence (conv1d state + ssm_step + the l2norm/sigmoid/softplus/
+  // decay/RMSNormGated/gate chain) running seqLen× per layer, which no matmul
+  // batching can collapse. Same root cause as Phase A being flat/negative —
+  // see ENGINEERING_LOG.md 2026-07-02.
+  const batchProjEnabled = gemvSearch?.get('batchProj') === '1';
   // ── TDR guard: cap GPU work per submit ───────────────────────────
   // Diagnosis (2026-06-15): UD-IQ2_XXS 27B tripped DXGI_ERROR_DEVICE_HUNG when
   // its slow legacy IQ3_XXS/IQ3_S/IQ2_S GEMV kernels were packed back-to-back
@@ -619,6 +631,23 @@ export function createForwardPassEngine(
   const gemmMEnabled = gemvREnabled && gemvSearch?.get('gemmM') === '1';
   const matmulGgufRGemmPipeline = gemmMEnabled
     ? createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_q2_k_tiled_r_gemm', 'matmul-gguf-q2_k-tiled-r-gemm', gemvTileConsts)
+    : null;
+  // IQ2_XXS M-reuse GEMM (2026-07-01, spec-decode verify lever): same M-reuse
+  // idea as the Q2_K r-GEMM but on the STANDARD IQ2_XXS layout (no repack
+  // needed) with the C5/r2 decode — decode each 2-bit unit once, reuse across
+  // all M verify rows instead of re-reading weights M times (grid.y=M).
+  // FALSIFIED 2026-07-02 (default OFF, opt-in ?gemmIQ=1): correct (harness
+  // scripts/test-iq2xxs-tiled.mts, byte-identical e2e) but a NET REGRESSION on
+  // RDNA2 — spec=1 went 10.4→9.3 tok/s. The 16 KB a_tile_m staging is sized at
+  // the static MAXM=8 regardless of runtime M, collapsing workgroup occupancy
+  // on a latency-bound kernel (yesterday's finding: it needs many WGs in
+  // flight, not fatter ones). It also targets the wrong cost: attention/FFN
+  // already batch at M via grid.y; the verify's 2× multiplier is the per-token
+  // DeltaNet projections (M=1 in the ssmT loop) — that's Phase B, not this.
+  const gemmIqEnabled = gemvTileEnabled && config.sourceFormat === 'gguf'
+    && gemvSearch?.get('gemmIQ') === '1';
+  const matmulGgufIq2xxsGemmPipeline = gemmIqEnabled
+    ? createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq2_xxs_gemm', 'matmul-gguf-iq2_xxs-gemm', gemvTileConsts)
     : null;
   if (gemvREnabled) {
     const repackPipeline = createComputePipeline(device, repackQ2kWGSL, 'repack_q2k', 'repack-q2k');
@@ -953,6 +982,7 @@ export function createForwardPassEngine(
   registerCat(matmulGgufRPipeline, 'gguf_Q2_K_r');
   registerCat(matmulGgufR2Pipeline, 'gguf_Q2_K_r2');
   registerCat(matmulGgufRGemmPipeline, 'gguf_Q2_K_r_gemm');
+  registerCat(matmulGgufIq2xxsGemmPipeline, 'gguf_IQ2_XXS_gemm');
 
   // ── Matmul-Q4 GEMV pipeline selection ──────────────────────────────
   // Cached-scales variants are parameterized by (MAX_GROUPS, WG_SIZE). The
@@ -1194,6 +1224,15 @@ export function createForwardPassEngine(
   const linBBuf = isHybrid ? createStorageBuffer(device, null, linNVH * 4, 'lin-beta', true) : null;
   const linZBuf = isHybrid ? createStorageBuffer(device, null, linZDim * 4, 'lin-z', true) : null;
   const linOutBuf = isHybrid ? createStorageBuffer(device, null, linNKH * linGroupedVD * 4, 'lin-out', true) : null;
+  // Phase B: seqLen-batched projection outputs (cap = MAX_SPEC_ROWS verify
+  // rows). The 5 DeltaNet projections write these once at M=seqLen; the ssmT
+  // loop copies each token's row into the M=1 lin*Buf scratch above, leaving
+  // the recurrent loop body byte-identical.
+  const linQKVBufB = isHybrid ? createStorageBuffer(device, null, MAX_SPEC_ROWS * linQKVDim * 4, 'lin-qkv-b', true) : null;
+  const linABufB = isHybrid ? createStorageBuffer(device, null, MAX_SPEC_ROWS * linNVH * 4, 'lin-a-b', true) : null;
+  const linBBufB = isHybrid ? createStorageBuffer(device, null, MAX_SPEC_ROWS * linNVH * 4, 'lin-beta-b', true) : null;
+  const linZBufB = isHybrid ? createStorageBuffer(device, null, MAX_SPEC_ROWS * linZDim * 4, 'lin-z-b', true) : null;
+  const linOutBufB = isHybrid ? createStorageBuffer(device, null, MAX_SPEC_ROWS * linNKH * linGroupedVD * 4, 'lin-out-b', true) : null;
   const linConvOutBuf = isHybrid ? createStorageBuffer(device, null, linQKVDim * 4, 'lin-conv-out', true) : null;
   const linDecayBuf = isHybrid ? createStorageBuffer(device, null, linNVH * 4, 'lin-decay', true) : null;
   const linDtBuf = isHybrid ? createStorageBuffer(device, null, Math.max(linNVH, linNKH) * 4, 'lin-dt', true) : null;
@@ -1419,7 +1458,13 @@ export function createForwardPassEngine(
     // Capped at the kernel's MAXM (8, a WGSL const): the spec-decode verify is
     // M≤specK+1≤8, but prefill chunks are larger (seqLen up to 16), so prefill
     // falls back to the _r GEMV path (grid.y=M) to avoid OOB acc indexing.
-    const gemm = gg.repacked && M > 1 && M <= GEMM_MAX_M && matmulGgufRGemmPipeline ? matmulGgufRGemmPipeline : null;
+    // 2026-07-01: same for standard-layout IQ2_XXS (no repack needed) — this
+    // is what flattens the verify(M) cost curve for MTP spec decode on 27B.
+    const gemm = M > 1 && M <= GEMM_MAX_M
+      ? (gg.repacked
+        ? matmulGgufRGemmPipeline
+        : (gg.ggmlType === GGML_TYPES.IQ2_XXS ? matmulGgufIq2xxsGemmPipeline : null))
+      : null;
     const tiled = gemm ?? (gg.repacked
       ? (matmulGgufR2Pipeline ?? matmulGgufRPipeline)
       : fast ?? matmulGgufTiledPipelines?.[gg.ggmlType] ?? null);
@@ -2281,6 +2326,20 @@ export function createForwardPassEngine(
         const hBuf = kvCache.ssmState.hiddenStates[ssmIdx];
         const csBuf = kvCache.ssmState.convStates[ssmIdx];
 
+        // Phase B: for a multi-token verify chunk, run the 4 input projections
+        // ONCE at M=seqLen into per-token-strided B buffers, then copy each
+        // token's row into the M=1 scratch at loop top. Recurrent stages
+        // (conv1d/ssm_step + their elementwise) stay per-token & untouched, so
+        // the loop body is byte-identical. GGUF offset-bindings verify only.
+        const batchProj = ssmOffsetBindings && batchProjEnabled
+          && seqLen > 1 && seqLen <= MAX_SPEC_ROWS;
+        if (batchProj) {
+          dispatchProjection(normedBuf, lw, 'linearInProjQKV', linQKVBufB!, seqLen, linQKVDim, H, `L${l}-lin-qkv-b`, needsGpuDequant);
+          dispatchProjection(normedBuf, lw, 'linearInProjA', linABufB!, seqLen, linNVH, H, `L${l}-lin-a-b`, needsGpuDequant);
+          dispatchProjection(normedBuf, lw, 'linearInProjB', linBBufB!, seqLen, linNVH, H, `L${l}-lin-b-b`, needsGpuDequant);
+          dispatchProjection(normedBuf, lw, 'linearInProjZ', linZBufB!, seqLen, linZDim, H, `L${l}-lin-z-b`, needsGpuDequant);
+        }
+
         // Option A (chunked-prefill): the gated DeltaNet recurrence is sequential
         // by construction, but the surrounding stages (embed, full attention, FFN,
         // final norm, lm_head) all support seqLen > 1. Wrap the existing single-
@@ -2304,8 +2363,13 @@ export function createForwardPassEngine(
             await debugRead(ssmInSrc, 'L0-normed-input', 8);
           }
 
-          // 1. Fused QKV projection
-          dispatchProjection(ssmInSrc, lw, 'linearInProjQKV', linQKVBuf!, 1, linQKVDim, H, `L${l}-lin-qkv`, needsGpuDequant, ssmInIO);
+          // 1. Fused QKV projection (Phase B: copy this token's pre-projected
+          // row out of the batched buffer; else project per-token).
+          if (batchProj) {
+            batchCopy(linQKVBufB!, ssmT * linQKVDim * 4, linQKVBuf!, 0, linQKVDim * 4);
+          } else {
+            dispatchProjection(ssmInSrc, lw, 'linearInProjQKV', linQKVBuf!, 1, linQKVDim, H, `L${l}-lin-qkv`, needsGpuDequant, ssmInIO);
+          }
           if (ssmT === seqLen - 1) await maybeAudit(l, linQKVBuf!, `L${l}-lin-qkv-out`, 1, linQKVDim);
 
         // Debug: raw QKV projection output (before conv1d) — first token only
@@ -2397,9 +2461,17 @@ export function createForwardPassEngine(
         // 4. Project A, B, Z (these use the ORIGINAL normed input, not conv output)
         // NOTE: in_proj_b output is num_v_heads (32), NOT num_k_heads (16)!
         // Option A: read from per-token slice ssmInputBuf instead of multi-token normedBuf.
-        dispatchProjection(ssmInSrc, lw, 'linearInProjA', linABuf!, 1, linNVH, H, `L${l}-lin-a`, needsGpuDequant, ssmInIO);
-        dispatchProjection(ssmInSrc, lw, 'linearInProjB', linBBuf!, 1, linNVH, H, `L${l}-lin-b`, needsGpuDequant, ssmInIO);
-        dispatchProjection(ssmInSrc, lw, 'linearInProjZ', linZBuf!, 1, linZDim, H, `L${l}-lin-z`, needsGpuDequant, ssmInIO);
+        // Phase B: copy this token's pre-projected A/B/Z rows out of the batched
+        // buffers; else project per-token.
+        if (batchProj) {
+          batchCopy(linABufB!, ssmT * linNVH * 4, linABuf!, 0, linNVH * 4);
+          batchCopy(linBBufB!, ssmT * linNVH * 4, linBBuf!, 0, linNVH * 4);
+          batchCopy(linZBufB!, ssmT * linZDim * 4, linZBuf!, 0, linZDim * 4);
+        } else {
+          dispatchProjection(ssmInSrc, lw, 'linearInProjA', linABuf!, 1, linNVH, H, `L${l}-lin-a`, needsGpuDequant, ssmInIO);
+          dispatchProjection(ssmInSrc, lw, 'linearInProjB', linBBuf!, 1, linNVH, H, `L${l}-lin-b`, needsGpuDequant, ssmInIO);
+          dispatchProjection(ssmInSrc, lw, 'linearInProjZ', linZBuf!, 1, linZDim, H, `L${l}-lin-z`, needsGpuDequant, ssmInIO);
+        }
         if (ssmT === seqLen - 1) {
           await maybeAudit(l, linABuf!, `L${l}-lin-a-out`, 1, linNVH);
           await maybeAudit(l, linBBuf!, `L${l}-lin-b-out`, 1, linNVH);
@@ -2719,7 +2791,11 @@ export function createForwardPassEngine(
         // staged through ssmOutBuf and copied). Downstream stages (residual
         // add, post-attn norm, FFN) already process all seqLen tokens batched.
         const outDim = linNKH * linGroupedVD;
-        if (ssmOffsetBindings) {
+        if (batchProj) {
+          // Stash this token's gated SSM output; the batched out-proj runs once
+          // after the loop (M=seqLen) into attnProjBuf.
+          batchCopy(linOutBuf!, 0, linOutBufB!, ssmT * outDim * 4, outDim * 4);
+        } else if (ssmOffsetBindings) {
           dispatchProjection(linOutBuf!, lw, 'linearOutProj', attnProjBuf, 1, H, outDim, `L${l}-lin-out`, needsGpuDequant, { cOffset: ssmT * H * 4 });
           // Audit reads tokens 0..ssmT from attnProjBuf; last row = this token.
           if (ssmT === seqLen - 1) await maybeAudit(l, attnProjBuf, `L${l}-lin-out-out`, ssmT + 1, H);
@@ -2743,6 +2819,16 @@ export function createForwardPassEngine(
           batchCopy(ssmOutBuf!, 0, attnProjBuf, ssmT * H * 4, H * 4);
         }
       } // end per-token SSM loop (Option A)
+
+      // Phase B: single batched output projection for all verify rows. The
+      // per-token loop stashed each gated SSM output into linOutBufB; project
+      // once at M=seqLen straight into attnProjBuf (rows contiguous, matching
+      // the per-token cOffset=ssmT*H*4 layout).
+      if (batchProj) {
+        const outDim = linNKH * linGroupedVD;
+        dispatchProjection(linOutBufB!, lw, 'linearOutProj', attnProjBuf, seqLen, H, outDim, `L${l}-lin-out-b`, needsGpuDequant);
+        await maybeAudit(l, attnProjBuf, `L${l}-lin-out-out`, seqLen, H);
+      }
 
       } else {
         // ── STANDARD SOFTMAX ATTENTION ────────────────────────────────
