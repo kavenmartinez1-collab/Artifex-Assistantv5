@@ -2026,6 +2026,13 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
     destroy: () => { resetVision(); resetKV(); moe?.backend.destroy(); unloadModel(currentModel!); session = null; },
   } as InferenceSession;
 
+  // FLUX.2 TE debug/parity hook: lets Playwright harnesses drive the
+  // hidden-tap prompt embedder against a loaded klein-TE GGUF.
+  (globalThis as any).__flux2Embed = async (prompt: string) => {
+    const { embedFlux2Prompt } = await import('./diffusion/text-embedder');
+    return embedFlux2Prompt(engine, tokenizer, prompt);
+  };
+
   promptEl.disabled = false;
   sendBtn.disabled = false;
 

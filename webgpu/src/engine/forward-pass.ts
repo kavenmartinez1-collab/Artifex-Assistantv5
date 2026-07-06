@@ -343,6 +343,10 @@ export interface ForwardOutput {
    *  row ([H]) otherwise. This is the `h` the MTP head consumes (mtpDraft).
    *  Overwritten by the next forward() — consume before the next call. */
   mtpHidden?: GPUBuffer;
+  /** When opts.captureHiddenLayers: CPU copies of the residual stream at the
+   *  requested HF hidden_states indices ([seqLen × H] each), read back after
+   *  the pass completes (FLUX.2 text-encoder taps). */
+  hiddenTaps?: Map<number, Float32Array>;
 }
 
 // ── Forward Pass Engine ──────────────────────────────────────────────────
@@ -372,6 +376,20 @@ export interface ForwardOptions {
    *  batchCopy; the normal path leaves it unset and pays nothing. No-op when
    *  the model has no MTP head. */
   returnMtpHidden?: boolean;
+  /** FLUX.2 text encoder: HF hidden_states indices to capture (index k =
+   *  residual stream after 0-indexed layer k-1; the klein TE taps 9/18/27).
+   *  Copies are read back to CPU after the pass → ForwardOutput.hiddenTaps. */
+  captureHiddenLayers?: number[];
+  /** FLUX.2 text encoder: stop after this many layers (HF convention — 27
+   *  runs 0-indexed layers 0..26 then breaks before final norm work matters).
+   *  The tail (final norm + lm_head) still dispatches on the truncated
+   *  stream; callers using this option must ignore logits. 0/undefined = off. */
+  stopAfterLayer?: number;
+  /** FLUX.2 text encoder: right-pad key mask — attention keys at positions
+   *  >= validLen are masked for ALL queries (HF attention_mask semantics for
+   *  right-padded prompts). Pad QUERY rows still produce output, matching HF
+   *  hidden_states, which is what the FLUX.2 DiT consumes. 0/undefined = off. */
+  validLen?: number;
 }
 
 /** Max rows per spec-decode verify chunk — mirrors MAX_ARGMAX_ROWS. */
@@ -1127,6 +1145,8 @@ export function createForwardPassEngine(
   // MTP drafter: holds the pre-final-norm hidden rows the head consumes
   // (opts.returnMtpHidden). Lazy — only spec decode with an MTP head pays.
   let mtpHiddenBuf: GPUBuffer | null = null;
+  // FLUX.2 TE hidden taps: HF hidden_states index → snapshot buffer.
+  const hiddenTapBufs = new Map<number, GPUBuffer>();
   // MTP drafter scratch (lazy): embedded next-token [H] and the [enorm(e);
   // hnorm(h)] concat [2H] fed to eh_proj. Only mtpDraft allocates these.
   let mtpEmbedBuf: GPUBuffer | null = null;
@@ -1872,7 +1892,7 @@ export function createForwardPassEngine(
     qBuf: GPUBuffer, kCacheBuf: GPUBuffer, vCacheBuf: GPUBuffer,
     outputBuf: GPUBuffer, newSeqLen: number, cacheLen: number,
     isCausal: boolean, posOffset: number, label: string,
-    headDimOverride?: number, window?: number,
+    headDimOverride?: number, window?: number, validLen?: number,
   ) {
     if (cacheLen > MAX_ATTN_CACHE) {
       throw new Error(
@@ -1895,6 +1915,7 @@ export function createForwardPassEngine(
     u32View[6] = isCausal ? 1 : 0;
     u32View[7] = posOffset;
     u32View[8] = window ?? 0;
+    u32View[9] = validLen ?? 0; // right-pad key mask (FLUX.2 TE); 0 = off
     const paramBuf = getCachedUniform(new Uint8Array(paramData), `${label}-p`);
 
     const useSoftpick = (globalThis as any).__USE_SOFTPICK__ === true;
@@ -2303,6 +2324,11 @@ export function createForwardPassEngine(
     }
 
     // ── Transformer layers ───────────────────────────────────────────
+    // FLUX.2 TE taps: HF hidden_states index k = residual stream at the END
+    // of 0-indexed layer k-1, so capture fires when l+1 ∈ captureSet.
+    const captureSet = opts?.captureHiddenLayers?.length
+      ? new Set(opts.captureHiddenLayers) : undefined;
+    const stopAfter = opts?.stopAfterLayer ?? 0;
     for (let l = 0; l < L; l++) {
       const lw = weights.layers[l];
       const isLinearLayer = config.layers[l].kind === 'linear_attention';
@@ -3075,7 +3101,7 @@ export function createForwardPassEngine(
           dispatchAttention(
             qBuf, kvCache.keys[kvLayer], kvCache.values[kvLayer], attnOutBuf,
             seqLen, cacheLen, isCausal, pos, `L${l}-attn`,
-            dHeadL, slidingWindow,
+            dHeadL, slidingWindow, opts?.validLen,
           );
         }
 
@@ -3389,6 +3415,22 @@ export function createForwardPassEngine(
         await device.queue.onSubmittedWorkDone();
         await dumpBufStats(hiddenBuf, `layer-${l}-out`, seqLen * H, lastRowOffset, H, dumpResults);
       }
+
+      // FLUX.2 TE hidden tap: snapshot the residual stream into a dedicated
+      // buffer (copy rides the batch — no extra submit). Read back post-flush.
+      if (captureSet?.has(l + 1)) {
+        let tapBuf = hiddenTapBufs.get(l + 1);
+        if (!tapBuf || tapBuf.size < seqLen * H * 4) {
+          tapBuf?.destroy();
+          tapBuf = createStorageBuffer(device, null, seqLen * H * 4, `hidden-tap-${l + 1}`, true);
+          hiddenTapBufs.set(l + 1, tapBuf);
+        }
+        batchCopy(hiddenBuf, 0, tapBuf, 0, seqLen * H * 4);
+      }
+      // FLUX.2 TE early exit: layers past the deepest tap are never needed
+      // (klein stops at 27 of 36). Tail (final norm + lm_head) still runs on
+      // the truncated stream; callers must ignore logits.
+      if (stopAfter > 0 && l + 1 >= stopAfter) break;
     }
 
     // MTP drafter seed: tap the PRE-final-norm hidden (qwen35.cpp t_h_pre_norm)
@@ -3707,10 +3749,25 @@ export function createForwardPassEngine(
       );
     }
 
+    // FLUX.2 TE hidden taps: read captured residual streams back to CPU.
+    let hiddenTaps: Map<number, Float32Array> | undefined;
+    if (captureSet) {
+      await device.queue.onSubmittedWorkDone();
+      hiddenTaps = new Map();
+      for (const idx of captureSet) {
+        const buf = hiddenTapBufs.get(idx);
+        if (!buf) {
+          throw new Error(`[forward] hidden tap ${idx} never captured — index must be `
+            + `1..min(numLayers, stopAfterLayer)`);
+        }
+        hiddenTaps.set(idx, new Float32Array(await readBuffer(device, buf, seqLen * H * 4)));
+      }
+    }
+
     const mtpHidden = returnMtpHidden ? mtpHiddenBuf! : undefined;
     return specRows > 0
-      ? { logitsBuffer: specLogitsBuf!, logitsRows: specRows, mtpHidden }
-      : { logitsBuffer: logitsBuf, mtpHidden };
+      ? { logitsBuffer: specLogitsBuf!, logitsRows: specRows, mtpHidden, hiddenTaps }
+      : { logitsBuffer: logitsBuf, mtpHidden, hiddenTaps };
   }
 
   // ── KV Cache ───────────────────────────────────────────────────────
