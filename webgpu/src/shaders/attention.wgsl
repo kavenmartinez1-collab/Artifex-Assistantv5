@@ -32,6 +32,11 @@ struct Params {
   // q_pos - j >= window. Applied in BOTH prefill and decode (unlike the
   // causal mask, which only matters when new_seq_len > 1).
   window: u32,
+  // Right-padding key mask (FLUX.2 text encoder): keys at j >= valid_len are
+  // pad tokens and masked for ALL queries. 0 = disabled. Existing callers
+  // allocate zero-initialized 48-byte param buffers, so this reads 0 (off)
+  // on every pre-existing path.
+  valid_len: u32,
 }
 
 // Softpick (rectified softmax, arXiv:2504.20966): USE_SOFTPICK=1 replaces
@@ -103,6 +108,11 @@ fn attention(@builtin(local_invocation_id) lid: vec3u,
     // Sliding-window mask (active in decode too): mask j when
     // q_abs_pos - j >= window  ⇔  j + window <= q_abs_pos
     if (params.window > 0u && j + params.window <= q_abs_pos) {
+      scores[j] = -1e9;
+    }
+
+    // Right-padding key mask: pad keys never receive attention
+    if (params.valid_len > 0u && j >= params.valid_len) {
       scores[j] = -1e9;
     }
 
