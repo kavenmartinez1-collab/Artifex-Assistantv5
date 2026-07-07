@@ -37,6 +37,9 @@ let session: InferenceSession | null = null;
 // FLUX.2 image-gen mode: no LLM session — Send routes to runImageGeneration.
 let imageGenRepo: string | null = null;
 let imageGenBusy = false;
+// One attached reference image turns the next generation into an EDIT
+// (VAE-encoded conditioning tokens; klein supports it natively).
+let pendingEditRef: { name: string; blob: Blob } | null = null;
 
 // Conversation history (user/assistant only — system prompt is read live from
 // the UI each turn). Source of truth for windowing, sessions, and autosave.
@@ -983,7 +986,8 @@ function setVisionDescQuiet(desc: VisionDescriptor | null) {
 }
 
 function renderChips() {
-  chipsEl.style.display = (pendingImages.length + pendingFiles.length) > 0 ? 'flex' : 'none';
+  chipsEl.style.display =
+    (pendingImages.length + pendingFiles.length + (pendingEditRef ? 1 : 0)) > 0 ? 'flex' : 'none';
   chipsEl.innerHTML = '';
   const addChip = (label: string, onRemove: () => void) => {
     const chip = document.createElement('span');
@@ -1006,9 +1010,20 @@ function renderChips() {
     addChip(`📄 ${f.name} (~${Math.ceil(f.text.length / 4)} tok${f.truncated ? ', truncated' : ''})`,
       () => { pendingFiles.splice(i, 1); renderChips(); });
   });
+  if (pendingEditRef) {
+    addChip(`🖼 ${pendingEditRef.name} (edit reference)`,
+      () => { pendingEditRef = null; renderChips(); });
+  }
 }
 
 async function addPendingImage(blob: Blob, name: string) {
+  if (imageGenRepo) {
+    // Image-gen mode: the attachment is an EDIT reference (one at a time —
+    // klein supports multi-ref, but v1 keeps the UI to a single image).
+    pendingEditRef = { name, blob };
+    renderChips();
+    return;
+  }
   if (!activeVisionDesc || !visionAvailable) {
     addMessage('system', attachBtn.title);
     return;
@@ -2086,6 +2101,9 @@ function buildFlux2ImageSession(repo: string): void {
   addMessage('system',
     `FLUX.2 klein image generation ready!\n` +
     `Type a prompt to generate a 512×512 image (4-step distilled flow, no CFG).\n` +
+    `EDIT: attach an image (📎, paste, or drag-drop) and your prompt edits it ` +
+    `("make it snowy", "turn the car red"...). The reference is center-cropped ` +
+    `to the output size.\n` +
     `Flags: start with "/256 " for a smaller/faster image or "/1024 " for full ` +
     `resolution (slow — several minutes of denoising); "/seed N " pins the ` +
     `noise seed (otherwise random — the seed is shown under each image).\n` +
@@ -2122,9 +2140,17 @@ async function runImageGeneration(text: string, userDiv: HTMLElement): Promise<v
   const progressDiv = addMessage('assistant', '');
   const t0 = performance.now();
   try {
-    const { generateFlux2Image } = await import('./diffusion/flux2-image');
+    const { generateFlux2Image, preprocessRefImage } = await import('./diffusion/flux2-image');
+    // Attached reference => edit: cover-crop to the output size and let the
+    // VAE-encoded tokens condition every denoise step.
+    const editRef = pendingEditRef;
+    pendingEditRef = null;
+    renderChips();
+    const refImage = editRef
+      ? { data: await preprocessRefImage(editRef.blob, px), px }
+      : undefined;
     const res = await generateFlux2Image(gpu.device, {
-      prompt, px, seed,
+      prompt, px, seed, refImage,
       onProgress: (stage, detail) => {
         progressDiv.textContent = `[${stage}] ${detail}`;
         setStatus(`Image gen: ${detail}`);
@@ -2144,8 +2170,9 @@ async function runImageGeneration(text: string, userDiv: HTMLElement): Promise<v
     const totalS = (performance.now() - t0) / 1000;
     const t = res.timings;
     attachMeta(progressDiv,
-      `${px}×${px} | seed ${seed} | ${totalS.toFixed(0)}s`
-      + ` (TE ${(t.teMs / 1000).toFixed(0)}s · DiT ${(t.ditMs / 1000).toFixed(0)}s · VAE ${(t.vaeMs / 1000).toFixed(0)}s)`);
+      `${px}×${px}${editRef ? ` | edit of ${editRef.name}` : ''} | seed ${seed} | ${totalS.toFixed(0)}s`
+      + ` (${editRef ? `enc ${(t.encMs / 1000).toFixed(0)}s · ` : ''}TE ${(t.teMs / 1000).toFixed(0)}s`
+      + ` · DiT ${(t.ditMs / 1000).toFixed(0)}s · VAE ${(t.vaeMs / 1000).toFixed(0)}s)`);
     const asstMsg: ChatMessage = { role: 'assistant', content: md };
     linkMessage(progressDiv, asstMsg);
     chatHistory.push(userMsg, asstMsg);
@@ -2193,6 +2220,8 @@ loadBtn.addEventListener('click', async () => {
     currentModel = null;
   }
   imageGenRepo = null;
+  pendingEditRef = null;
+  renderChips();
 
   const progressEl = $('load-progress');
   loadBtn.disabled = true;
@@ -2952,6 +2981,8 @@ exportBtn.addEventListener('click', () => {
 unloadBtn.addEventListener('click', async () => {
   if (imageGenRepo) {
     imageGenRepo = null;
+    pendingEditRef = null;
+    renderChips();
     addMessage('system', 'Image-gen mode off (weights load per generation — nothing was resident).');
     setStatus('Model unloaded');
     updateFooter({ model: 'none' });

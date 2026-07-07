@@ -17,9 +17,18 @@ import { flux2Schedule, eulerStep } from './scheduler';
 const AXES = [32, 32, 32, 32];
 const THETA = 2000;
 
-/** Joint [txt(512) | img(gridH*gridW)] RoPE cos/sin tables, [S, 128] f32. */
-export function flux2RopeTables(gridH: number, gridW: number): { cos: Float32Array; sin: Float32Array } {
-  const S = FLUX2_TXT_LEN + gridH * gridW;
+/** Edit-reference latent grid: h*w tokens with time-axis id t = 10+10*i
+ *  (pipeline _prepare_image_ids, id_scale 10). */
+export interface Flux2RefGrid { h: number; w: number; t: number }
+
+/** Joint [txt(512) | img(gridH*gridW) | refs...] RoPE cos/sin tables,
+ *  [S, 128] f32. Gen img rows are (0,y,x,0); ref rows (t,y,x,0). */
+export function flux2RopeTables(
+  gridH: number, gridW: number, refs: Flux2RefGrid[] = [],
+): { cos: Float32Array; sin: Float32Array } {
+  let imgTokens = gridH * gridW;
+  for (const r of refs) imgTokens += r.h * r.w;
+  const S = FLUX2_TXT_LEN + imgTokens;
   const D = 128;
   const cos = new Float32Array(S * D), sin = new Float32Array(S * D);
   const ids = new Int32Array(S * 4);
@@ -29,6 +38,17 @@ export function flux2RopeTables(gridH: number, gridW: number): { cos: Float32Arr
       const r = FLUX2_TXT_LEN + y * gridW + x;                          // (0,y,x,0)
       ids[r * 4 + 1] = y;
       ids[r * 4 + 2] = x;
+    }
+  }
+  let row = FLUX2_TXT_LEN + gridH * gridW;
+  for (const ref of refs) {
+    for (let y = 0; y < ref.h; y++) {
+      for (let x = 0; x < ref.w; x++) {                                 // (t,y,x,0)
+        ids[row * 4 + 0] = ref.t;
+        ids[row * 4 + 1] = y;
+        ids[row * 4 + 2] = x;
+        row++;
+      }
     }
   }
   for (let s = 0; s < S; s++) {
@@ -55,6 +75,11 @@ export interface Flux2GenerateOpts {
   gridH: number;                // px / 16
   gridW: number;
   numSteps?: number;            // klein default 4
+  /** Edit conditioning: VAE-encoded+packed ref latents [sum(h*w), 128],
+   *  constant across steps, concatenated after the gen tokens. */
+  refLatents?: Float32Array;
+  /** Grid dims + time id per ref (t = 10+10*i). Order matches refLatents. */
+  refs?: Flux2RefGrid[];
   /** Transformer capture names for step 0 (parity gates). */
   captureStep0?: Set<string>;
   /** Called after each Euler update with the CURRENT latents (copy). */
@@ -64,7 +89,7 @@ export interface Flux2GenerateOpts {
 
 export class Flux2Pipeline {
   readonly transformer: Flux2Transformer;
-  private setupTokens = -1;
+  private setupKey = '';
 
   constructor(device: GPUDevice, weights: Flux2DitWeights, flopBudget?: number) {
     this.transformer = new Flux2Transformer(device, weights, flopBudget);
@@ -83,25 +108,40 @@ export class Flux2Pipeline {
     if (opts.noise.length !== tokens * 128) {
       throw new Error(`[Flux2] noise length ${opts.noise.length} != ${tokens * 128}`);
     }
-    if (this.setupTokens !== tokens) {
-      const { cos, sin } = flux2RopeTables(gridH, gridW);
-      this.transformer.setup(tokens, cos, sin);
-      this.setupTokens = tokens;
+    const refs = opts.refs ?? [];
+    let refTokens = 0;
+    for (const r of refs) refTokens += r.h * r.w;
+    if ((opts.refLatents?.length ?? 0) !== refTokens * 128) {
+      throw new Error(`[Flux2] refLatents length ${opts.refLatents?.length ?? 0} != ${refTokens * 128}`);
+    }
+    const key = `${gridH}x${gridW}` + refs.map((r) => `+${r.h}x${r.w}@${r.t}`).join('');
+    if (this.setupKey !== key) {
+      const { cos, sin } = flux2RopeTables(gridH, gridW, refs);
+      this.transformer.setup(tokens + refTokens, cos, sin);
+      this.setupKey = key;
     }
     this.transformer.setPromptEmbeds(opts.promptEmbeds);
 
+    // mu/schedule from GEN tokens only (pipeline computes it before the
+    // ref concat); refs ride along constant, noise_pred sliced to gen rows.
     const sched = flux2Schedule(tokens, numSteps);
     const latents = new Float32Array(opts.noise); // work in place
+    const work = refTokens === 0 ? latents : new Float32Array((tokens + refTokens) * 128);
+    if (refTokens > 0) work.set(opts.refLatents!, tokens * 128);
     let caps = new Map<string, Float32Array>();
 
     for (let i = 0; i < numSteps; i++) {
       opts.onProgress?.(i, numSteps);
+      if (refTokens > 0) work.set(latents, 0);
       const res = await this.transformer.step(
-        latents, sched.timesteps[i], i === 0 ? opts.captureStep0 : undefined,
+        work, sched.timesteps[i], i === 0 ? opts.captureStep0 : undefined,
       );
       if (i === 0) caps = res.caps;
-      eulerStep(latents, res.noisePred, sched.sigmas[i], sched.sigmas[i + 1]);
-      opts.onLatents?.(i, latents.slice(), res.noisePred);
+      const genPred = refTokens === 0
+        ? res.noisePred
+        : res.noisePred.subarray(0, tokens * 128) as Float32Array;
+      eulerStep(latents, genPred, sched.sigmas[i], sched.sigmas[i + 1]);
+      opts.onLatents?.(i, latents.slice(), genPred);
     }
     return { latents, caps, sigmas: sched.sigmas };
   }

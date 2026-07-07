@@ -3,6 +3,9 @@
 // lifecycle on the 12 GB target — each stage frees its weights before the
 // next loads (TE Q8 4.3 GB, DiT bf16 7.2 GB, VAE f32 0.34 GB never coexist):
 //
+//   0. (edit only) VAE ENCODER f32 0.34 GB → ref image → packed conditioning
+//           tokens (CPU) → free. Tokens ride along every DiT step with T=10
+//           position ids; noise_pred is sliced back to the gen tokens.
 //   1. TE:  Qwen3-4B Q8_0 GGUF → hidden taps 9/18/27 → prompt embeds (15.7 MB
 //           CPU) → free. A one-entry cache skips this stage when only the
 //           seed changes (the common "reroll" flow).
@@ -17,8 +20,8 @@ import { resolveFileUrl } from '../model/hf-hub';
 import { loadFlux2TextEncoder } from './flux2-te';
 import { embedFlux2Prompt } from './text-embedder';
 import { loadFlux2Dit } from './flux2-loader';
-import { Flux2Pipeline } from './flux2-pipeline';
-import { loadFlux2Vae, unpackLatents, Flux2VaeDecoder } from './vae';
+import { Flux2Pipeline, type Flux2RefGrid } from './flux2-pipeline';
+import { loadFlux2Vae, unpackLatents, packRefLatents, Flux2VaeDecoder } from './vae';
 import { randn } from './rng';
 
 export interface Flux2ImageOptions {
@@ -26,6 +29,10 @@ export interface Flux2ImageOptions {
   px: number;              // output edge in pixels (multiple of 16)
   seed: number;
   numSteps?: number;       // klein default 4
+  /** Edit mode: reference image (3, refPx, refPx) NCHW in [-1,1] (use
+   *  preprocessRefImage). VAE-encoded to constant conditioning tokens with
+   *  T=10 position ids; the denoise loop is otherwise unchanged. */
+  refImage?: { data: Float32Array; px: number };
   /** stage: 'te' | 'dit' | 'vae'; detail is a human-readable progress line. */
   onProgress?: (stage: string, detail: string) => void;
 }
@@ -34,7 +41,30 @@ export interface Flux2ImageResult {
   rgba: Uint8ClampedArray<ArrayBuffer>; // [px*px*4] straight-alpha, ready for ImageData
   width: number;
   height: number;
-  timings: { teMs: number; ditMs: number; vaeMs: number };
+  timings: { teMs: number; ditMs: number; vaeMs: number; encMs: number };
+}
+
+/** Decode + cover-crop a reference image to (3, px, px) NCHW in [-1,1].
+ *  v1 is square-only: the short side fills px, the rest center-crops
+ *  (pipeline resize_mode="crop"; canvas resampling stands in for LANCZOS). */
+export async function preprocessRefImage(blob: Blob, px: number): Promise<Float32Array> {
+  const bmp = await createImageBitmap(blob);
+  const canvas = new OffscreenCanvas(px, px);
+  const ctx = canvas.getContext('2d')!;
+  ctx.imageSmoothingQuality = 'high';
+  const s = Math.max(px / bmp.width, px / bmp.height);
+  const dw = bmp.width * s, dh = bmp.height * s;
+  ctx.drawImage(bmp, (px - dw) / 2, (px - dh) / 2, dw, dh);
+  bmp.close();
+  const { data } = ctx.getImageData(0, 0, px, px);
+  const hw = px * px;
+  const out = new Float32Array(3 * hw);
+  for (let i = 0; i < hw; i++) {
+    out[i] = data[i * 4] / 127.5 - 1;
+    out[hw + i] = data[i * 4 + 1] / 127.5 - 1;
+    out[2 * hw + i] = data[i * 4 + 2] / 127.5 - 1;
+  }
+  return out;
 }
 
 export const FLUX2_REPO = 'local/flux.2-klein-4b';
@@ -54,6 +84,33 @@ export async function generateFlux2Image(
   if (px % 16 !== 0) throw new Error(`[Flux2] px must be a multiple of 16, got ${px}`);
   const grid = px / 16; // latent token grid edge
   const progress = opts.onProgress ?? (() => {});
+  const vaeUrl = resolveFileUrl(FLUX2_REPO, 'vae/diffusion_pytorch_model.safetensors');
+
+  // ── 0) Edit reference: VAE-encode + pack (load encoder half, then free —
+  //       keeps the sequential VRAM lifecycle intact) ─────────────────────
+  let refLatents: Float32Array | undefined;
+  let refs: Flux2RefGrid[] | undefined;
+  let encMs = 0;
+  if (opts.refImage) {
+    const tEnc = performance.now();
+    progress('vae', 'loading VAE encoder (edit reference)...');
+    const enc = await loadFlux2Vae(device, vaeUrl, undefined, 'encoder');
+    try {
+      const dec = new Flux2VaeDecoder(device, enc);
+      try {
+        progress('vae', 'encoding reference image...');
+        const mode = await dec.encode(opts.refImage.data, opts.refImage.px);
+        refLatents = packRefLatents(mode, opts.refImage.px / 8, enc.bnMean, enc.bnVar);
+      } finally {
+        dec.destroy();
+      }
+    } finally {
+      enc.destroy();
+    }
+    const rg = opts.refImage.px / 16;
+    refs = [{ h: rg, w: rg, t: 10 }]; // _prepare_image_ids: T = 10+10*i
+    encMs = performance.now() - tEnc;
+  }
 
   // ── 1) Text encoder ──────────────────────────────────────────────────
   let teMs = 0;
@@ -92,6 +149,7 @@ export async function generateFlux2Image(
       const noise = randn(grid * grid * 128, seed);
       const res = await pipeline.generate({
         promptEmbeds, noise, gridH: grid, gridW: grid, numSteps,
+        refLatents, refs,
         onProgress: (i, n) => progress('dit', `denoise step ${i + 1}/${n}...`),
       });
       latents = res.latents;
@@ -106,7 +164,6 @@ export async function generateFlux2Image(
   // ── 3) VAE decode ────────────────────────────────────────────────────
   const t2 = performance.now();
   progress('vae', 'loading VAE...');
-  const vaeUrl = resolveFileUrl(FLUX2_REPO, 'vae/diffusion_pytorch_model.safetensors');
   const vae = await loadFlux2Vae(device, vaeUrl);
   let pixels: Float32Array;
   try {
@@ -131,5 +188,5 @@ export async function generateFlux2Image(
     rgba[i * 4 + 2] = (pixels[2 * hw + i] + 1) * 127.5;
     rgba[i * 4 + 3] = 255;
   }
-  return { rgba, width: px, height: px, timings: { teMs, ditMs, vaeMs } };
+  return { rgba, width: px, height: px, timings: { teMs, ditMs, vaeMs, encMs } };
 }

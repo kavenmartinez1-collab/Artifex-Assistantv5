@@ -36,8 +36,8 @@ const F32 = Math.fround;
 // ── weights ──────────────────────────────────────────────────────────────
 
 export interface Flux2VaeWeights {
-  bufs: Map<string, GPUBuffer>; // f32, decoder.* + post_quant_conv.*
-  bnMean: Float32Array;         // (128,) CPU — latent de-normalization
+  bufs: Map<string, GPUBuffer>; // f32; decoder.*+post_quant_conv.* or encoder.*+quant_conv.*
+  bnMean: Float32Array;         // (128,) CPU — latent (de-)normalization
   bnVar: Float32Array;
   totalBytes: number;
   destroy(): void;
@@ -51,12 +51,14 @@ function bf16ToF32(raw: ArrayBuffer): Float32Array {
   return out;
 }
 
-/** Loads the decode path only (decoder.*, post_quant_conv.*, bn stats).
- *  Encoder tensors are skipped until Phase 6 (edit). */
+/** Loads one VAE half + bn stats: part 'decoder' = decoder.* +
+ *  post_quant_conv.* (t2i and the edit finish), part 'encoder' = encoder.* +
+ *  quant_conv.* (edit reference conditioning). */
 export async function loadFlux2Vae(
   device: GPUDevice,
   url: string,
   onProgress?: (loadedBytes: number, totalBytes: number, name: string) => void,
+  part: 'decoder' | 'encoder' = 'decoder',
 ): Promise<Flux2VaeWeights> {
   const first8 = await fetchRange(url, 0, 8);
   if (first8.byteLength !== 8) throw new Error(`[Flux2 VAE] header-length read: ${first8.byteLength}`);
@@ -69,7 +71,9 @@ export async function loadFlux2Vae(
   const dataStart = header.headerByteLength;
 
   const want = (name: string) =>
-    name.startsWith('decoder.') || name.startsWith('post_quant_conv.') ||
+    (part === 'decoder'
+      ? name.startsWith('decoder.') || name.startsWith('post_quant_conv.')
+      : name.startsWith('encoder.') || name.startsWith('quant_conv.')) ||
     name === 'bn.running_mean' || name === 'bn.running_var';
 
   let totalBytes = 0;
@@ -137,7 +141,36 @@ export function unpackLatents(
   return out;
 }
 
-// ── decoder ──────────────────────────────────────────────────────────────
+/** Inverse companion of unpackLatents for the edit path
+ *  (_encode_vae_image): latent mode (32, l, l) -> 2x2 patchify -> bn
+ *  NORMALIZE ((x-mean)/sqrt(var+eps)) -> packed (l/2*l/2, 128) row-major.
+ *  Packed channel = c4*4 + py*2 + px. */
+export function packRefLatents(
+  mode: Float32Array, l: number,
+  bnMean: Float32Array, bnVar: Float32Array,
+): Float32Array {
+  if (mode.length !== 32 * l * l) throw new Error(`[Flux2 VAE] mode ${mode.length} != ${32 * l * l}`);
+  const g = l / 2;
+  const out = new Float32Array(g * g * 128);
+  const std = new Float32Array(128);
+  for (let c = 0; c < 128; c++) std[c] = F32(Math.sqrt(F32(bnVar[c] + BN_EPS)));
+  for (let c4 = 0; c4 < 32; c4++) {
+    for (let py = 0; py < 2; py++) {
+      for (let px = 0; px < 2; px++) {
+        const ch = c4 * 4 + py * 2 + px;
+        for (let y = 0; y < g; y++) {
+          for (let x = 0; x < g; x++) {
+            const v = F32(F32(mode[c4 * l * l + (2 * y + py) * l + 2 * x + px] - bnMean[ch]) / std[ch]);
+            out[(y * g + x) * 128 + ch] = v;
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// ── decoder + encoder ────────────────────────────────────────────────────
 
 interface UpBlock { cin: number; cout: number; upsample: boolean }
 const UP_BLOCKS: UpBlock[] = [
@@ -145,6 +178,16 @@ const UP_BLOCKS: UpBlock[] = [
   { cin: 512, cout: 512, upsample: true },
   { cin: 512, cout: 256, upsample: true },
   { cin: 256, cout: 128, upsample: false },
+];
+
+// Encoder DownEncoderBlock2D chain (2 resnets each; stride-2 downsampler with
+// asymmetric (0,1,0,1) pad after blocks 0..2). block_out_channels (128,256,512,512).
+interface DownBlock { cin: number; cout: number; down: boolean }
+const DOWN_BLOCKS: DownBlock[] = [
+  { cin: 128, cout: 128, down: true },
+  { cin: 128, cout: 256, down: true },
+  { cin: 256, cout: 512, down: true },
+  { cin: 512, cout: 512, down: false },
 ];
 
 export class Flux2VaeDecoder {
@@ -167,6 +210,7 @@ export class Flux2VaeDecoder {
     });
     this.pipes = {
       conv3: mk(conv2dWGSL, 'conv2d_3x3'),
+      convS2: mk(conv2dWGSL, 'conv2d_3x3_s2'),
       conv1: mk(conv2dWGSL, 'conv2d_1x1'),
       upsample: mk(conv2dWGSL, 'upsample_nearest_2x'),
       gn: mk(groupNormNchwWGSL, 'group_norm_nchw'),
@@ -221,17 +265,18 @@ export class Flux2VaeDecoder {
 
   // ── dispatch helpers (all NCHW batch-1, dims explicit) ─────────────────
 
-  /** conv2d_3x3/1x1, output-channel-band sliced to the flop budget. Band
-   *  starts are 64-multiples: weight off = oc0*cin*k2*4 (k2*4 in {36,4},
-   *  64*36=2304 and 64*4=256 are 256-multiples), bias off = oc0*4, out off
-   *  = oc0*hw*4 — all storage-offset aligned. */
+  /** conv2d_3x3/3x3_s2/1x1, output-channel-band sliced to the flop budget.
+   *  Band starts are 64-multiples: weight off = oc0*cin*k2*4 (k2*4 in
+   *  {36,4}, 64*36=2304 and 64*4=256 are 256-multiples), bias off = oc0*4,
+   *  out off = oc0*outHw*4 — all storage-offset aligned. h/w are INPUT dims;
+   *  convS2 halves them at the output. */
   private conv(
-    entry: 'conv3' | 'conv1', name: string,
+    entry: 'conv3' | 'convS2' | 'conv1', name: string,
     src: GPUBuffer, dst: GPUBuffer, cin: number, cout: number, h: number, w: number,
   ) {
-    const hw = h * w;
-    const k2 = entry === 'conv3' ? 9 : 1;
-    const flopPerC = 2 * k2 * cin * hw;
+    const outHw = entry === 'convS2' ? (h / 2) * (w / 2) : h * w;
+    const k2 = entry === 'conv1' ? 1 : 9;
+    const flopPerC = 2 * k2 * cin * outHw;
     let band = cout;
     if (flopPerC * cout > this.ctx.budget) {
       band = Math.max(64, Math.floor(this.ctx.budget / flopPerC / 64) * 64);
@@ -244,9 +289,9 @@ export class Flux2VaeDecoder {
         { b: 0, buf: src },
         { b: 1, buf: wt, off: oc0 * cin * k2 * 4, size: bc * cin * k2 * 4 },
         { b: 2, buf: bias, off: oc0 * 4, size: bc * 4 },
-        { b: 3, buf: dst, off: oc0 * hw * 4, size: bc * hw * 4 },
+        { b: 3, buf: dst, off: oc0 * outHw * 4, size: bc * outHw * 4 },
         { b: 4, buf: u.buf, off: u.off, size: 48 },
-      ], Math.ceil(hw / 256), bc, flopPerC * bc);
+      ], Math.ceil(outHw / 256), bc, flopPerC * bc);
     }
   }
 
@@ -331,9 +376,9 @@ export class Flux2VaeDecoder {
   }
 
   /** Mid-block Attention (heads=1, dim 512, residual): src -> dst. */
-  private attnBlock(src: GPUBuffer, dst: GPUBuffer, hw: number) {
+  private attnBlock(src: GPUBuffer, dst: GPUBuffer, hw: number,
+                    p = 'decoder.mid_block.attentions.0') {
     const { a, b, q, kt, v, ao } = this.bufs;
-    const p = 'decoder.mid_block.attentions.0';
     this.gn(`${p}.group_norm`, src, a, 512, hw);
     // to_q/k/v as 1x1 convs over the [512, hw] grid; K lands directly in the
     // [D, S] transposed layout attention_stream wants, q/v get transposed to
@@ -416,6 +461,55 @@ export class Flux2VaeDecoder {
     this.silu(this.bufs.a, this.bufs.b, 128 * h * w);
     this.conv('conv3', 'decoder.conv_out', this.bufs.b, nxt, 128, 3, h, w);
     return this.ctx.read(nxt, 0, 3 * h * w);
+  }
+
+  /** Encode a preprocessed image (3, px, px) in [-1,1] -> latent mode
+   *  (32, l, l), l = px/8. Requires the 'encoder' weight part. The posterior
+   *  mode/mean = first 32 of the 64 moment channels (sample_mode="argmax" in
+   *  the pipeline — deterministic, no RNG). Square-only in v1. */
+  async encode(image: Float32Array, px: number, onProgress?: (stage: string) => void): Promise<Float32Array> {
+    if (px % 16 !== 0) throw new Error(`[Flux2 VAE] encode px ${px} not a multiple of 16`);
+    if (image.length !== 3 * px * px) {
+      throw new Error(`[Flux2 VAE] image ${image.length} != ${3 * px * px}`);
+    }
+    const l = px / 8;
+    this.setup(l); // peak 256*(8l)^2 covers the encoder max 128*px^2
+    this.arena.reset();
+    let cur = this.bufs.s0, nxt = this.bufs.s1;
+    const swap = () => { const t = cur; cur = nxt; nxt = t; };
+    this.device.queue.writeBuffer(cur, 0, image.buffer as ArrayBuffer, image.byteOffset, image.byteLength);
+
+    onProgress?.('conv_in');
+    this.conv('conv3', 'encoder.conv_in', cur, nxt, 3, 128, px, px); swap();
+
+    let h = px, w = px;
+    for (let i = 0; i < 4; i++) {
+      onProgress?.(`down_block ${i}`);
+      const blk = DOWN_BLOCKS[i];
+      for (let r = 0; r < 2; r++) {
+        const cin = r === 0 ? blk.cin : blk.cout;
+        this.resnet(`encoder.down_blocks.${i}.resnets.${r}`, cur, nxt, cin, blk.cout, h, w);
+        swap();
+      }
+      if (blk.down) {
+        this.conv('convS2', `encoder.down_blocks.${i}.downsamplers.0.conv`, cur, nxt, blk.cout, blk.cout, h, w);
+        swap();
+        h /= 2; w /= 2;
+      }
+    }
+
+    onProgress?.('mid_block'); // h = w = l here
+    this.resnet('encoder.mid_block.resnets.0', cur, nxt, 512, 512, h, w); swap();
+    this.attnBlock(cur, nxt, h * w, 'encoder.mid_block.attentions.0'); swap();
+    this.resnet('encoder.mid_block.resnets.1', cur, nxt, 512, 512, h, w); swap();
+
+    onProgress?.('conv_out');
+    this.gn('encoder.conv_norm_out', cur, this.bufs.a, 512, h * w);
+    this.silu(this.bufs.a, this.bufs.b, 512 * h * w);
+    this.conv('conv3', 'encoder.conv_out', this.bufs.b, cur, 512, 64, h, w);
+    this.conv('conv1', 'quant_conv', cur, nxt, 64, 64, h, w);
+    // mode = mean channels: first 32 of the 64-channel moments (NCHW)
+    return this.ctx.read(nxt, 0, 32 * l * l);
   }
 
   destroy() {

@@ -8,6 +8,7 @@ RAM together (TE ~16 GB f32, DiT ~15.5 GB f32):
   ./venv/Scripts/python.exe webgpu/scripts/gen_flux2_fixture.py --stage te
   ./venv/Scripts/python.exe webgpu/scripts/gen_flux2_fixture.py --stage dit
   ./venv/Scripts/python.exe webgpu/scripts/gen_flux2_fixture.py --stage vae
+  ./venv/Scripts/python.exe webgpu/scripts/gen_flux2_fixture.py --stage edit
 
 Outputs raw little-endian .bin dumps + manifest.json into
 webgpu/scripts/flux2_fixture/. All model math runs on CPU in float32
@@ -516,10 +517,116 @@ def stage_vae(w: FixtureWriter):
 
 
 # ---------------------------------------------------------------------------
+# Stage: edit (Phase 6) -- 256px generation conditioned on the synthetic
+# 256px reference image from the vae stage. Replicates the pipeline edit
+# path: _encode_vae_image (mode + patchify + bn NORMALIZE) -> pack -> concat
+# to the latent seq every step with T=10 ids -> noise_pred[:, :n_gen].
+# Needs DiT f32 (~15.5 GB) + VAE f32 (0.34 GB) in one process.
+# ---------------------------------------------------------------------------
+def stage_edit(w: FixtureWriter):
+    from diffusers import AutoencoderKLFlux2, Flux2Transformer2DModel
+    from diffusers.utils.torch_utils import randn_tensor
+
+    assert "te.p1.prompt_embeds" in w.manifest["tensors"], "run --stage te first"
+    assert "vae.enc256.image" in w.manifest["tensors"], "run --stage vae first"
+    prompt_embeds = w.load("te.p1.prompt_embeds").unsqueeze(0)  # (1, 512, 7680)
+    ref_img = w.load("vae.enc256.image").unsqueeze(0)  # (1, 3, 256, 256) [-1,1]
+
+    print("loading VAE (f32)...")
+    vae = AutoencoderKLFlux2.from_pretrained(
+        MODEL_DIR, subfolder="vae", torch_dtype=torch.float32
+    )
+    vae.eval()
+    bn_eps = vae.config.batch_norm_eps
+    mean = vae.bn.running_mean.view(1, -1, 1, 1)
+    std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + bn_eps)
+
+    # _encode_vae_image: encode -> mode (sample_mode="argmax") -> patchify
+    # -> bn normalize; then _pack_latents
+    print("VAE encode reference image...")
+    with torch.no_grad():
+        latent_dist = vae.encode(ref_img, return_dict=False)[0]
+    mode = latent_dist.mode()  # (1, 32, 32, 32)
+    image_latents_4d = (patchify_latents(mode) - mean) / std  # (1, 128, 16, 16)
+    image_latents = pack_latents(image_latents_4d)  # (1, 256, 128)
+    # _prepare_image_ids: first (and only) reference -> T = 10
+    ref_ids = torch.cartesian_prod(
+        torch.tensor([10]), torch.arange(16), torch.arange(16), torch.arange(1)
+    ).unsqueeze(0)  # (1, 256, 4)
+    w.dump("edit.image_latents", image_latents[0])
+    w.dump("edit.image_latent_ids", ref_ids[0])
+
+    # generation latents: 256px -> (1, 128, 16, 16) -> 256 tokens
+    seed = 46
+    gen = torch.Generator("cpu").manual_seed(seed)
+    latents_4d = randn_tensor((1, 128, 16, 16), generator=gen, dtype=torch.float32)
+    latent_ids = prepare_latent_ids(latents_4d)  # T=0
+    latents = pack_latents(latents_4d)  # (1, 256, 128)
+    text_ids = prepare_text_ids(MAX_SEQ)
+    w.dump("edit.noise", latents[0])
+    w.dump("edit.latent_ids", latent_ids[0])
+    w.meta("edit.seed", seed)
+    w.meta("edit.prompt_idx", 1)
+    w.meta("edit.px", 256)
+
+    sched = make_scheduler()
+    # image_seq_len = latents.shape[1] BEFORE the ref concat (pipeline :815)
+    mu = set_timesteps(sched, latents.shape[1], NUM_STEPS)
+    w.meta("edit.mu", mu)
+
+    print("loading DiT (f32)...")
+    tr = Flux2Transformer2DModel.from_pretrained(
+        MODEL_DIR, subfolder="transformer", torch_dtype=torch.float32
+    )
+    tr.eval()
+
+    img_ids = torch.cat([latent_ids, ref_ids], dim=1)  # (1, 512, 4)
+    for i, t in enumerate(sched.timesteps):
+        latent_model_input = torch.cat([latents, image_latents], dim=1)
+        timestep = t.expand(1).to(torch.float32)
+        print(f"  edit step {i} (t={float(t):.3f})...")
+        with torch.no_grad():
+            noise_pred = tr(
+                hidden_states=latent_model_input,
+                timestep=timestep / 1000,
+                guidance=None,
+                encoder_hidden_states=prompt_embeds,
+                txt_ids=text_ids,
+                img_ids=img_ids,
+                return_dict=False,
+            )[0]
+        noise_pred = noise_pred[:, : latents.size(1)]
+        w.dump(f"edit.step{i}.noise_pred", noise_pred[0])
+        latents = sched.step(noise_pred, t, latents, return_dict=False)[0]
+        w.dump(f"edit.step{i}.latents", latents[0])
+        w.save()  # checkpoint progress (CPU runs are long)
+    del tr
+    gc.collect()
+
+    # decode the final latents (row-major ids -> plain reshape unpack)
+    grid = latents.permute(0, 2, 1).reshape(1, 128, 16, 16)
+    grid = grid * std + mean
+    lat = unpatchify_latents(grid)  # (1, 32, 32, 32)
+    print("VAE decode edited image...")
+    with torch.no_grad():
+        pix = vae.decode(lat, return_dict=False)[0]
+    w.dump("edit.pixels", pix[0])
+    try:
+        from PIL import Image
+
+        img = ((pix[0] / 2 + 0.5).clamp(0, 1) * 255).round().to(torch.uint8)
+        Image.fromarray(img.permute(1, 2, 0).numpy()).save(w.out_dir / "edit_256px.png")
+        print(f"  wrote {w.out_dir / 'edit_256px.png'}")
+    except Exception as e:  # PNG is eyeball-only, never gate on it
+        print(f"  PNG save skipped: {e}")
+    w.save()
+
+
+# ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
-        "--stage", required=True, choices=["scheduler", "te", "dit", "vae"]
+        "--stage", required=True, choices=["scheduler", "te", "dit", "vae", "edit"]
     )
     ap.add_argument(
         "--sizes",
@@ -541,6 +648,8 @@ def main():
         stage_dit(w, sizes)
     elif args.stage == "vae":
         stage_vae(w)
+    elif args.stage == "edit":
+        stage_edit(w)
     print("done.")
 
 
