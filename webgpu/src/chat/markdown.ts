@@ -29,6 +29,10 @@ function renderInline(escaped: string): string {
       return `<code>${inner}</code>`;
     }
     return part
+      // images: data-URL PNGs only (generated in-app; charset-validated so
+      // the escaped text can never smuggle attributes past the regex)
+      .replace(/!\[([^\]]*)\]\((data:image\/png;base64,[A-Za-z0-9+/=]+)\)/g,
+        '<img class="md-image" src="$2" alt="$1">')
       // links before emphasis: label may contain * that isn't emphasis
       .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
         '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')

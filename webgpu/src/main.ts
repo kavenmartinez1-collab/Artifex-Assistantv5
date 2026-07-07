@@ -34,6 +34,10 @@ let gpu: GPUContext | null = null;
 let currentModel: LoadedModel | null = null;
 let session: InferenceSession | null = null;
 
+// FLUX.2 image-gen mode: no LLM session — Send routes to runImageGeneration.
+let imageGenRepo: string | null = null;
+let imageGenBusy = false;
+
 // Conversation history (user/assistant only — system prompt is read live from
 // the UI each turn). Source of truth for windowing, sessions, and autosave.
 let chatHistory: ChatMessage[] = [];
@@ -440,6 +444,18 @@ async function renderSuggestions(): Promise<void> {
       () => pick(m.repo)));
     shown++;
   }
+
+  // FLUX.2 klein image gen: the pipeline dir has no top-level weight files,
+  // so it never appears in the models listing — probe model_index.json.
+  try {
+    const p = await fetch('/api/hf-cache/local/flux.2-klein-4b/resolve/main/model_index.json', { method: 'HEAD' });
+    if (p.ok) {
+      suggestList.appendChild(suggestRow(
+        '🎨 local/flux.2-klein-4b',
+        'FLUX.2 klein image generation · stages stream in/out of VRAM — click to load',
+        () => pick('local/flux.2-klein-4b')));
+    }
+  } catch { /* no dev server */ }
 
   // Curated downloads that fit — largest (best) first, up to 3
   const fitting = CURATED_MODELS
@@ -1271,6 +1287,10 @@ sendBtn.addEventListener('click', () => {
     : consumePendingFiles(typed);
   const userDiv = addMessage('user', displayText);
 
+  if (imageGenRepo) {
+    void runImageGeneration(sendText, userDiv);
+    return;
+  }
   if (!session) {
     addMessage('system', 'No model loaded. Load a model first.');
     return;
@@ -2054,6 +2074,94 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
   startAutoTestPoller();
 }
 
+// ─── FLUX.2 image generation (Phase 4) ───────────────────────────────────────
+
+/** Enter image-gen mode: nothing heavyweight loads up front — each Send runs
+ *  the sequential TE → DiT → VAE pipeline with per-stage VRAM lifecycle. */
+function buildFlux2ImageSession(repo: string): void {
+  session = null;
+  imageGenRepo = repo;
+  promptEl.disabled = false;
+  sendBtn.disabled = false;
+  addMessage('system',
+    `FLUX.2 klein image generation ready!\n` +
+    `Type a prompt to generate a 512×512 image (4-step distilled flow, no CFG).\n` +
+    `Flags: start with "/256 " for a smaller/faster image; "/seed N " pins the ` +
+    `noise seed (otherwise random — the seed is shown under each image).\n` +
+    `v1 loads each stage on demand (TE → DiT → VAE, ~12 GB total streamed), so ` +
+    `expect a few minutes per image; rerolling the same prompt skips the text encoder.`,
+    'image gen ready');
+  setStatus(`Ready: ${repo} (image gen)`);
+  updateFooter({ model: 'FLUX.2-klein (image gen)' });
+  markModelReady(repo);
+}
+
+/** One image-gen turn: parse inline flags, run the pipeline with live stage
+ *  progress in an assistant bubble, then swap in the PNG (markdown data-URL —
+ *  persists through history/autosave/restore like any other message). */
+async function runImageGeneration(text: string, userDiv: HTMLElement): Promise<void> {
+  if (imageGenBusy || !gpu) return;
+
+  let px = 512;
+  let seed = (Math.random() * 0x7fffffff) | 0;
+  let prompt = text.trim();
+  const sizeM = prompt.match(/^\/(256|512)\s+/);
+  if (sizeM) { px = parseInt(sizeM[1]); prompt = prompt.slice(sizeM[0].length).trim(); }
+  const seedM = prompt.match(/^\/seed\s+(\d+)\s+/);
+  if (seedM) { seed = parseInt(seedM[1]); prompt = prompt.slice(seedM[0].length).trim(); }
+  if (!prompt) { addMessage('system', 'Empty prompt.'); return; }
+
+  const userMsg: ChatMessage = { role: 'user', content: text };
+  linkMessage(userDiv, userMsg);
+  attachActions(userDiv, 'user');
+
+  imageGenBusy = true;
+  sendBtn.disabled = true;
+  setStatus('Generating image...');
+  const progressDiv = addMessage('assistant', '');
+  const t0 = performance.now();
+  try {
+    const { generateFlux2Image } = await import('./diffusion/flux2-image');
+    const res = await generateFlux2Image(gpu.device, {
+      prompt, px, seed,
+      onProgress: (stage, detail) => {
+        progressDiv.textContent = `[${stage}] ${detail}`;
+        setStatus(`Image gen: ${detail}`);
+        scrollMessages();
+      },
+    });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = res.width;
+    canvas.height = res.height;
+    canvas.getContext('2d')!.putImageData(new ImageData(res.rgba, res.width, res.height), 0, 0);
+    const dataUrl = canvas.toDataURL('image/png');
+    // Brackets/parens would break the markdown image syntax in the alt text.
+    const md = `![${prompt.slice(0, 100).replace(/[[\]()]/g, ' ')}](${dataUrl})`;
+    renderAssistant(progressDiv, md, false);
+
+    const totalS = (performance.now() - t0) / 1000;
+    const t = res.timings;
+    attachMeta(progressDiv,
+      `${px}×${px} | seed ${seed} | ${totalS.toFixed(0)}s`
+      + ` (TE ${(t.teMs / 1000).toFixed(0)}s · DiT ${(t.ditMs / 1000).toFixed(0)}s · VAE ${(t.vaeMs / 1000).toFixed(0)}s)`);
+    const asstMsg: ChatMessage = { role: 'assistant', content: md };
+    linkMessage(progressDiv, asstMsg);
+    chatHistory.push(userMsg, asstMsg);
+    autoSave(chatHistory, { model: imageGenRepo ?? 'flux2', backend: 'webgpu' });
+    setStatus(`Image generated in ${totalS.toFixed(0)}s (seed ${seed})`);
+    scrollMessages(true);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    progressDiv.textContent = `Image generation failed: ${msg}`;
+    setStatus('Image gen failed');
+    reportError('image-gen', err);
+  } finally {
+    imageGenBusy = false;
+    sendBtn.disabled = false;
+  }
+}
+
 // ─── Load Model ──────────────────────────────────────────────────────────────
 
 loadBtn.addEventListener('click', async () => {
@@ -2083,6 +2191,7 @@ loadBtn.addEventListener('click', async () => {
     unloadModel(currentModel);
     currentModel = null;
   }
+  imageGenRepo = null;
 
   const progressEl = $('load-progress');
   loadBtn.disabled = true;
@@ -2121,6 +2230,27 @@ loadBtn.addEventListener('click', async () => {
         }
       }
     } catch { /* dev server not running, use CDN */ }
+
+    // Diffusers image-gen pipeline (FLUX.2 klein): the pipeline dir carries
+    // model_index.json instead of top-level weight files, so it is invisible
+    // to the models listing above — probe the file directly.
+    if (!localFiles) {
+      try {
+        const probe = await fetch(`/api/hf-cache/${repo}/resolve/main/model_index.json`);
+        if (probe.ok) {
+          const mi = await probe.json() as { _class_name?: string };
+          if ((mi._class_name ?? '').includes('Flux2')) {
+            useLocalCache();
+            buildFlux2ImageSession(repo);
+            return;
+          }
+          addMessage('system',
+            `${repo} is a diffusers pipeline (${mi._class_name ?? 'unknown'}) — `
+            + `only FLUX.2 klein image generation is supported.`);
+          return;
+        }
+      } catch { /* no dev server — fall through to the HF flow */ }
+    }
 
     if (!usingLocalCache) {
       addMessage('system', `Connecting to HuggingFace: ${repo}...`);
@@ -2819,6 +2949,13 @@ exportBtn.addEventListener('click', () => {
 });
 
 unloadBtn.addEventListener('click', async () => {
+  if (imageGenRepo) {
+    imageGenRepo = null;
+    addMessage('system', 'Image-gen mode off (weights load per generation — nothing was resident).');
+    setStatus('Model unloaded');
+    updateFooter({ model: 'none' });
+    return;
+  }
   if (currentModel) {
     const name = currentModel.repo;
     const freed = formatBytes(currentModel.totalGPUBytes);

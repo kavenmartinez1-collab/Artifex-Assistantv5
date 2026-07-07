@@ -37,3 +37,8 @@ scripts/qwen36_*.txt
 scripts/smoke_*.txt
 scripts/*_log.txt
 scripts/iq2xxs_llamacpp_parity.txt
+
+# FLUX.2 debug evidence dumps (generated images, TE embedding dumps) — local only
+scripts/out-*.png
+scripts/*_embeds_webgpu.bin
+scripts/*_ids_webgpu.json

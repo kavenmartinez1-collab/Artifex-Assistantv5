@@ -51,11 +51,11 @@ const MOD_TOTAL = 52224;
 
 const F32 = Math.fround;
 
-interface Bind { b: number; buf: GPUBuffer; off?: number; size?: number }
+export interface Bind { b: number; buf: GPUBuffer; off?: number; size?: number }
 
 /** Uniform slot arena: one writeBuffer per dispatch into 256-byte slots so
  *  encoders never see a uniform mutated between recording and submit. */
-class UniArena {
+export class UniArena {
   private bufs: GPUBuffer[] = [];
   private used = 0;
   private readonly perBuf = 1024; // slots
@@ -77,7 +77,7 @@ class UniArena {
   destroy() { for (const b of this.bufs) b.destroy(); this.bufs = []; }
 }
 
-class Ctx {
+export class Ctx {
   private enc: GPUCommandEncoder | null = null;
   private pass: GPUComputePassEncoder | null = null;
   private cost = 0;
