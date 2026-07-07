@@ -31,7 +31,8 @@ import elementwiseWGSL from '../shaders/elementwise.wgsl?raw';
 import adalnWGSL from '../shaders/adaln.wgsl?raw';
 import ropePairsWGSL from '../shaders/rope_pairs.wgsl?raw';
 import attnStreamWGSL from '../shaders/attention_stream.wgsl?raw';
-import type { Flux2DitWeights, Flux2MatWeight } from './flux2-loader';
+import dequantQ8WGSL from '../shaders/dequant_q8.wgsl?raw';
+import type { Flux2DitWeights, Flux2DitWeightsQ8, Flux2MatWeight } from './flux2-loader';
 
 export const FLUX2_TXT_LEN = 512;
 const DIM = 3072;
@@ -136,13 +137,30 @@ export class Flux2Transformer {
   private bufs: Record<string, GPUBuffer> = {};
   private promptEmbedsSet = false;
 
+  // Q8 all-resident path (Phase 7): weights stay quantized on the GPU and
+  // each mat() dequants into a 2-slot bf16 scratch ring right before its
+  // GEMM. Dispatch order within a queue makes the reuse safe; ~11 GB/step
+  // of dequant traffic is ~1% of step time.
+  private q8: Flux2DitWeightsQ8 | null = null;
+  private scratch: GPUBuffer[] = [];
+  private scratchIdx = 0;
+
   constructor(
     private device: GPUDevice,
-    private weights: Flux2DitWeights,
+    private weights: Flux2DitWeights | Flux2DitWeightsQ8,
     flopBudget = 0.35e12,
   ) {
     this.arena = new UniArena(device);
     this.ctx = new Ctx(device, flopBudget);
+    if ('q8mats' in weights) {
+      this.q8 = weights;
+      for (let i = 0; i < 2; i++) {
+        this.scratch.push(device.createBuffer({
+          size: weights.maxMatElems * 2, // bf16
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        }));
+      }
+    }
     this.compile();
   }
 
@@ -164,11 +182,30 @@ export class Flux2Transformer {
       rope: mk(ropePairsWGSL, 'rope_pairs'),
       attn: mk(attnStreamWGSL, 'attention_stream_qt'),
       transpose: mk(attnStreamWGSL, 'transpose_khds'),
+      dequant: mk(dequantQ8WGSL, 'dequant_q8_bf16'),
     };
   }
 
+  /** bf16 path: the resident weight buffer. Q8 path: enqueue a dequant of
+   *  the tensor into the next scratch-ring slot and return that (callers
+   *  always consume the result before two more mat() calls happen, and
+   *  dispatch order within the queue serializes the reuse). */
   private mat(name: string): Flux2MatWeight {
-    const m = this.weights.mats.get(name);
+    if (this.q8) {
+      const m = this.q8.q8mats.get(name);
+      if (!m) throw new Error(`[Flux2 DiT] missing Q8 weight: ${name}`);
+      const dst = this.scratch[this.scratchIdx];
+      this.scratchIdx = (this.scratchIdx + 1) % this.scratch.length;
+      const blocks = (m.n * m.k) / 32;
+      const u = this.uni([blocks, m.sWordOff]);
+      this.ctx.dispatch(this.pipes.dequant, [
+        { b: 0, buf: m.buffer },
+        { b: 1, buf: dst, size: m.n * m.k * 2 },
+        { b: 2, buf: u.buf, off: u.off, size: 48 },
+      ], Math.ceil(blocks / 256), 1, 3 * m.n * m.k);
+      return { buffer: dst, n: m.n, k: m.k };
+    }
+    const m = (this.weights as Flux2DitWeights).mats.get(name);
     if (!m) throw new Error(`[Flux2 DiT] missing matrix weight: ${name}`);
     return m;
   }
@@ -536,6 +573,8 @@ export class Flux2Transformer {
 
   destroy() {
     this.releaseActivations();
+    for (const s of this.scratch) s.destroy();
+    this.scratch = [];
     this.arena.destroy();
   }
 }

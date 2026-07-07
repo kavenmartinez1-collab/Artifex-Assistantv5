@@ -2107,8 +2107,8 @@ function buildFlux2ImageSession(repo: string): void {
     `Flags: start with "/256 " for a smaller/faster image or "/1024 " for full ` +
     `resolution (slow — several minutes of denoising); "/seed N " pins the ` +
     `noise seed (otherwise random — the seed is shown under each image).\n` +
-    `v1 loads each stage on demand (TE → DiT → VAE, ~12 GB total streamed), so ` +
-    `expect a few minutes per image; rerolling the same prompt skips the text encoder.`,
+    `The first generation loads ~7 GB resident (TE Q4 + DiT Q8 + VAE); after ` +
+    `that every prompt goes straight to denoising. Unload frees it all.`,
     'image gen ready');
   setStatus(`Ready: ${repo} (image gen)`);
   updateFooter({ model: 'FLUX.2-klein (image gen)' });
@@ -2218,6 +2218,10 @@ loadBtn.addEventListener('click', async () => {
     resetVision();
     unloadModel(currentModel);
     currentModel = null;
+  }
+  if (imageGenRepo) {
+    const { releaseFlux2Resident } = await import('./diffusion/flux2-image');
+    releaseFlux2Resident();
   }
   imageGenRepo = null;
   pendingEditRef = null;
@@ -2980,10 +2984,12 @@ exportBtn.addEventListener('click', () => {
 
 unloadBtn.addEventListener('click', async () => {
   if (imageGenRepo) {
+    const { releaseFlux2Resident } = await import('./diffusion/flux2-image');
+    releaseFlux2Resident();
     imageGenRepo = null;
     pendingEditRef = null;
     renderChips();
-    addMessage('system', 'Image-gen mode off (weights load per generation — nothing was resident).');
+    addMessage('system', 'Image-gen mode off (resident TE/DiT/VAE weights freed).');
     setStatus('Model unloaded');
     updateFooter({ model: 'none' });
     return;

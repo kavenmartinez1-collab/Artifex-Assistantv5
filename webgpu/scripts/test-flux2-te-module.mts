@@ -19,6 +19,14 @@ const prompt = manifest.meta['te.p0.prompt'] as string;
 const validLen = manifest.meta['te.p0.valid_len'] as number;
 const peFile = manifest.tensors['te.p0.prompt_embeds'].file as string;
 
+// P7.3: override to gate the Q4_K_M TE (larger quant error than Q8's 1e-2):
+//   TE_REPO=local/flux2-te-qwen3-4b-q4_k_m TE_GGUF=flux2-te-qwen3-4b-q4_k_m.gguf \
+//   TE_TOL=5e-2 TE_TOL_ALL=1e-1 npx tsx scripts/test-flux2-te-module.mts
+const TE_REPO = process.env.TE_REPO ?? 'local/flux2-te-qwen3-4b-q8_0';
+const TE_GGUF = process.env.TE_GGUF ?? 'flux2-te-qwen3-4b-q8_0.gguf';
+const TE_TOL = Number(process.env.TE_TOL ?? '1e-2');
+const TE_TOL_ALL = Number(process.env.TE_TOL_ALL ?? '2.5e-2');
+
 const browser = await chromium.launch({
   channel: 'chrome', headless: false, args: ['--enable-unsafe-webgpu'],
 });
@@ -44,7 +52,7 @@ try {
   });
   await page.goto(`${BASE}/__te-module`);
 
-  const res: any = await page.evaluate(async ({ prompt, peFile, validLen }) => {
+  const res: any = await page.evaluate(async ({ prompt, peFile, validLen, teRepo, teGguf }) => {
     (globalThis as any).__name = (f: any) => f;
     try {
       const hub: any = await import('/src/model/hf-hub.ts');
@@ -63,7 +71,7 @@ try {
       console.log(`adapter: ${adapter.info?.vendor} ${adapter.info?.architecture}`);
 
       const t0 = Date.now();
-      const enc = await te.loadFlux2TextEncoder(device, 'local/flux2-te-qwen3-4b-q8_0', 'flux2-te-qwen3-4b-q8_0.gguf');
+      const enc = await te.loadFlux2TextEncoder(device, teRepo, teGguf);
       console.log(`TE loaded in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
       const out = await emb.embedFlux2Prompt(enc.engine, enc.tokenizer, prompt);
       enc.destroy();
@@ -82,15 +90,15 @@ try {
     } catch (e: any) {
       return { error: `${e?.message ?? e}\n${e?.stack ?? ''}` };
     }
-  }, { prompt, peFile, validLen });
+  }, { prompt, peFile, validLen, teRepo: TE_REPO, teGguf: TE_GGUF });
 
   if (res.error) {
     console.log(`FAIL: ${res.error}`);
   } else {
     console.log(`validLen ${res.validLen} (want ${validLen})`);
-    console.log(`relL2 valid rows ${res.relValid.toExponential(3)} (tol 1e-2)`);
-    console.log(`relL2 all rows   ${res.relAll.toExponential(3)} (tol 2.5e-2)`);
-    ok = res.validLen === validLen && res.relValid <= 1e-2 && res.relAll <= 2.5e-2;
+    console.log(`relL2 valid rows ${res.relValid.toExponential(3)} (tol ${TE_TOL})`);
+    console.log(`relL2 all rows   ${res.relAll.toExponential(3)} (tol ${TE_TOL_ALL})`);
+    ok = res.validLen === validLen && res.relValid <= TE_TOL && res.relAll <= TE_TOL_ALL;
   }
 } finally {
   await browser.close();

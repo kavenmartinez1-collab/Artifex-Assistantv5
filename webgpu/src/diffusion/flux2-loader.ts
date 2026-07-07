@@ -27,6 +27,125 @@ export interface Flux2DitWeights {
   destroy(): void;
 }
 
+// ── Phase 7: Q8_0 all-resident container (.artq) ─────────────────────────
+// Written by scripts/convert-flux2-dit-q8.py:
+//   'ARTQ' | u32 version | u64 jsonLen | JSON (space-padded) | data
+// Per q8_0 tensor the i8 quants and f16 scales are deinterleaved; both live
+// in ONE GPU buffer per tensor (quants at word 0, scales at sWordOff) so the
+// dequant kernel binds a single storage buffer.
+
+export interface Flux2Q8Mat {
+  buffer: GPUBuffer; // [ i8 quants N*K | pad | f16 scales N*K/32 ]
+  n: number;
+  k: number;
+  sWordOff: number;  // scale section offset in u32 words
+}
+
+export interface Flux2DitWeightsQ8 {
+  q8mats: Map<string, Flux2Q8Mat>;
+  vecs: Map<string, GPUBuffer>; // f32 norm vectors
+  totalBytes: number;
+  maxMatElems: number;          // max N*K — sizes the dequant scratch ring
+  destroy(): void;
+}
+
+interface ArtqTensor {
+  name: string;
+  shape: number[];
+  dtype: 'q8_0' | 'f32';
+  offset: number;
+  bytes: number;
+  scaleOffset?: number;
+  scaleBytes?: number;
+}
+
+export async function loadFlux2DitQ8(
+  device: GPUDevice,
+  url: string,
+  onProgress?: (loadedBytes: number, totalBytes: number, name: string) => void,
+): Promise<Flux2DitWeightsQ8> {
+  const head = await fetchRange(url, 0, 16);
+  if (head.byteLength !== 16) throw new Error(`[Flux2 Q8] header read: ${head.byteLength} bytes`);
+  const dv = new DataView(head);
+  if (dv.getUint32(0, true) !== 0x51545241) throw new Error('[Flux2 Q8] bad magic (want ARTQ)');
+  const version = dv.getUint32(4, true);
+  if (version !== 1) throw new Error(`[Flux2 Q8] unsupported version ${version}`);
+  const jsonLen = Number(dv.getBigUint64(8, true));
+  const jsonBytes = await fetchRange(url, 16, 16 + jsonLen);
+  if (jsonBytes.byteLength !== jsonLen) {
+    throw new Error(`[Flux2 Q8] json read: ${jsonBytes.byteLength} vs ${jsonLen}`);
+  }
+  const tensors = (JSON.parse(new TextDecoder().decode(jsonBytes)) as
+    { tensors: ArtqTensor[] }).tensors;
+  const dataStart = 16 + jsonLen;
+
+  let totalBytes = 0;
+  for (const t of tensors) totalBytes += t.bytes + (t.scaleBytes ?? 0);
+
+  const q8mats = new Map<string, Flux2Q8Mat>();
+  const vecs = new Map<string, GPUBuffer>();
+  let maxMatElems = 0;
+  let loaded = 0;
+
+  for (const t of tensors) {
+    if (t.dtype === 'q8_0') {
+      const [n, k] = t.shape;
+      if (n * k !== t.bytes) throw new Error(`[Flux2 Q8] ${t.name}: ${n}x${k} != ${t.bytes} quant bytes`);
+      if (t.scaleOffset! < t.offset + t.bytes || t.scaleOffset! - t.offset - t.bytes >= 64) {
+        throw new Error(`[Flux2 Q8] ${t.name}: scales not adjacent to quants`);
+      }
+      if ((n * k) / 32 * 2 !== t.scaleBytes) {
+        throw new Error(`[Flux2 Q8] ${t.name}: scaleBytes ${t.scaleBytes} != ${(n * k) / 16}`);
+      }
+      const end = t.scaleOffset! + t.scaleBytes!;
+      const raw = await fetchRange(url, dataStart + t.offset, dataStart + end);
+      if (raw.byteLength !== end - t.offset) {
+        throw new Error(`[Flux2 Q8] ${t.name}: fetched ${raw.byteLength}, want ${end - t.offset}`);
+      }
+      const buffer = device.createBuffer({
+        size: Math.ceil(raw.byteLength / 4) * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      const aligned = raw.byteLength - (raw.byteLength % 4);
+      device.queue.writeBuffer(buffer, 0, raw, 0, aligned);
+      if (raw.byteLength % 4) { // ragged f16 tail: pad the final word
+        const tail = new Uint8Array(4);
+        tail.set(new Uint8Array(raw, aligned));
+        device.queue.writeBuffer(buffer, aligned, tail);
+      }
+      q8mats.set(t.name, { buffer, n, k, sWordOff: (t.scaleOffset! - t.offset) / 4 });
+      maxMatElems = Math.max(maxMatElems, n * k);
+      loaded += raw.byteLength;
+    } else {
+      const raw = await fetchRange(url, dataStart + t.offset, dataStart + t.offset + t.bytes);
+      if (raw.byteLength !== t.bytes) {
+        throw new Error(`[Flux2 Q8] ${t.name}: fetched ${raw.byteLength}, want ${t.bytes}`);
+      }
+      const buffer = device.createBuffer({
+        size: raw.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      device.queue.writeBuffer(buffer, 0, raw);
+      vecs.set(t.name, buffer);
+      loaded += raw.byteLength;
+    }
+    onProgress?.(loaded, totalBytes, t.name);
+  }
+
+  return {
+    q8mats,
+    vecs,
+    totalBytes,
+    maxMatElems,
+    destroy() {
+      for (const m of q8mats.values()) m.buffer.destroy();
+      for (const v of vecs.values()) v.destroy();
+      q8mats.clear();
+      vecs.clear();
+    },
+  };
+}
+
 function bf16ToF32(raw: ArrayBuffer): Float32Array {
   const u16 = new Uint16Array(raw);
   const out = new Float32Array(u16.length);

@@ -11,7 +11,7 @@
 //   - klein is guidance-distilled: no CFG anywhere
 
 import { Flux2Transformer, FLUX2_TXT_LEN } from './flux2-transformer';
-import type { Flux2DitWeights } from './flux2-loader';
+import type { Flux2DitWeights, Flux2DitWeightsQ8 } from './flux2-loader';
 import { flux2Schedule, eulerStep } from './scheduler';
 
 const AXES = [32, 32, 32, 32];
@@ -91,7 +91,7 @@ export class Flux2Pipeline {
   readonly transformer: Flux2Transformer;
   private setupKey = '';
 
-  constructor(device: GPUDevice, weights: Flux2DitWeights, flopBudget?: number) {
+  constructor(device: GPUDevice, weights: Flux2DitWeights | Flux2DitWeightsQ8, flopBudget?: number) {
     this.transformer = new Flux2Transformer(device, weights, flopBudget);
   }
 
