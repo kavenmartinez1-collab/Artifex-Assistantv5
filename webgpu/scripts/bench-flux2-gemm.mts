@@ -13,6 +13,8 @@
  *
  * Run: npx tsx scripts/bench-flux2-gemm.mts        (headed)
  *      HEADLESS=1 npx tsx scripts/bench-flux2-gemm.mts  (logic smoke only)
+ *      ENTRY=matmul_bt_bf16_fast OUT_TILE=64  to bench an alternate kernel
+ *      (OUT_TILE = output tile edge per workgroup, for the dispatch grid).
  */
 import { chromium } from '@playwright/test';
 import { readFileSync } from 'node:fs';
@@ -44,6 +46,8 @@ const SHAPES = [
 ];
 
 const HEADLESS = process.env.HEADLESS === '1';
+const ENTRY = process.env.ENTRY ?? 'matmul_bt_bf16';
+const OUT_TILE = parseInt(process.env.OUT_TILE ?? '16');
 const browser = await chromium.launch({
   channel: 'chrome',
   headless: HEADLESS,
@@ -59,7 +63,7 @@ try {
     route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><meta charset=utf8><title>flux2-gemm</title>' }));
   await page.goto('http://127.0.0.1/');
 
-  const res = await page.evaluate(async ({ shaderSrc, shapes }) => {
+  const res = await page.evaluate(async ({ shaderSrc, shapes, entry, outTile }) => {
     (globalThis as any).__name = (f: any) => f; // tsx/esbuild keepNames shim
     const g = (navigator as any).gpu;
     if (!g) return { error: 'no navigator.gpu' };
@@ -81,7 +85,7 @@ try {
     if (errs.length) return { error: `shader errors:\n${errs.join('\n')}` };
     const pipeline = device.createComputePipeline({
       layout: 'auto',
-      compute: { module, entryPoint: 'matmul_bt_bf16' },
+      compute: { module, entryPoint: entry },
     });
 
     // seeded RNG (mulberry32)
@@ -128,7 +132,7 @@ try {
         ],
       });
 
-      const gx = Math.ceil(M / 16), gy = Math.ceil(N / 16);
+      const gx = Math.ceil(M / outTile), gy = Math.ceil(N / outTile);
       const runOnce = async () => {
         const enc = device.createCommandEncoder();
         const pass = enc.beginComputePass();
@@ -183,10 +187,11 @@ try {
       aBuf.destroy(); wBuf.destroy(); cBuf.destroy(); pBuf.destroy();
     }
     return { adapter: `${info.vendor ?? '?'} ${info.architecture ?? '?'} ${info.description ?? ''}`, out, lost };
-  }, { shaderSrc, shapes: SHAPES });
+  }, { shaderSrc, shapes: SHAPES, entry: ENTRY, outTile: OUT_TILE });
 
   if ((res as any).error) { console.log(`FAIL: ${(res as any).error}`); process.exit(1); }
   console.log(`adapter: ${(res as any).adapter}`);
+  console.log(`entry: ${ENTRY} (out tile ${OUT_TILE})`);
   let worstMs = 0, worstName = '', minTflops = Infinity;
   for (const r of (res as any).out) {
     if (r.error) { failed = true; console.log(`  FAIL ${r.name}: ${r.error}`); continue; }

@@ -135,6 +135,129 @@ fn attention_stream(@builtin(workgroup_id) wid: vec3u,
   }
 }
 
+// ── Q-tiled streaming attention (DiT joint attention, head_dim <= 128) ──
+// attention_stream is bandwidth-bound: every (query, head) workgroup
+// re-streams the full per-head K and V (520 GB per 1024px DiT block,
+// 1.16 s measured). This variant amortizes: one workgroup handles QT=8
+// queries, each K/V element is loaded from global memory once per tile
+// and reused across all 8 dot products in registers -> traffic / 8.
+// Same bindings/params; dispatch gx = ceil(q_slice / QT), gy = num_heads.
+// Softmax bookkeeping is done serially by threads 0..QT-1 over the chunk
+// scores in LDS (2 barrier-phases/chunk instead of 8 tree reductions).
+
+const QT: u32 = 8u;      // queries per workgroup
+const DQ: u32 = 128u;    // max head_dim for this path (DiT: 128)
+
+var<workgroup> qt_q: array<f32, 1024>;      // [QT][DQ] query tile
+var<workgroup> qt_acc: array<f32, 1024>;    // [QT][DQ] output accumulators
+var<workgroup> qt_probs: array<f32, 1024>;  // [QT][WG] scores -> probs
+var<workgroup> qt_m: array<f32, QT>;        // running max
+var<workgroup> qt_l: array<f32, QT>;        // running sum
+var<workgroup> qt_mnew: array<f32, QT>;
+var<workgroup> qt_corr: array<f32, QT>;
+
+@compute @workgroup_size(128)
+fn attention_stream_qt(@builtin(workgroup_id) wid: vec3u,
+                       @builtin(local_invocation_id) lid: vec3u) {
+  let q0 = params.q_offset + wid.x * QT;
+  let h = wid.y;
+  let t = lid.x;
+  let D = params.head_dim; // must be <= DQ
+  let H = params.num_heads;
+  let scale = 1.0 / sqrt(f32(D));
+
+  if (q0 >= params.seq_q) { return; }
+
+  for (var qq = 0u; qq < QT; qq++) {
+    let qi = q0 + qq;
+    for (var d = t; d < D; d += WG) {
+      qt_q[qq * DQ + d] = select(0.0, Q[(qi * H + h) * D + d], qi < params.seq_q);
+      qt_acc[qq * DQ + d] = 0.0;
+    }
+  }
+  if (t < QT) {
+    qt_m[t] = -1e30;
+    qt_l[t] = 0.0;
+  }
+  workgroupBarrier();
+
+  let n_chunks = (params.seq_kv + WG - 1u) / WG;
+  for (var c = 0u; c < n_chunks; c++) {
+    let j = c * WG + t;
+    let valid = j < params.seq_kv;
+
+    // 1) this thread's kv position scored against all QT queries; each K
+    //    element is read once and reused across the register dot array.
+    var dots: array<f32, QT>;
+    for (var qq = 0u; qq < QT; qq++) { dots[qq] = -1e30; }
+    if (valid) {
+      for (var qq = 0u; qq < QT; qq++) { dots[qq] = 0.0; }
+      let kt_base = h * D * params.seq_kv + j;
+      for (var d = 0u; d < D; d++) {
+        let kd = KT[kt_base + d * params.seq_kv];
+        for (var qq = 0u; qq < QT; qq++) {
+          dots[qq] = fma(qt_q[qq * DQ + d], kd, dots[qq]);
+        }
+      }
+      for (var qq = 0u; qq < QT; qq++) { dots[qq] *= scale; }
+    }
+    for (var qq = 0u; qq < QT; qq++) { qt_probs[qq * WG + t] = dots[qq]; }
+    workgroupBarrier();
+
+    // 2) per-query chunk max (serial scan by threads 0..QT-1)
+    if (t < QT) {
+      var m = qt_m[t];
+      for (var jj = 0u; jj < WG; jj++) { m = max(m, qt_probs[t * WG + jj]); }
+      qt_mnew[t] = m;
+    }
+    workgroupBarrier();
+
+    // 3) exp probs (each thread still holds its raw scores in registers)
+    for (var qq = 0u; qq < QT; qq++) {
+      var e = 0.0;
+      if (valid) { e = exp(dots[qq] - qt_mnew[qq]); }
+      qt_probs[qq * WG + t] = e;
+    }
+    workgroupBarrier();
+
+    // 4) per-query chunk sum + running-stat update
+    if (t < QT) {
+      var sum = 0.0;
+      for (var jj = 0u; jj < WG; jj++) { sum += qt_probs[t * WG + jj]; }
+      let corr = exp(qt_m[t] - qt_mnew[t]);
+      qt_corr[t] = corr;
+      qt_l[t] = qt_l[t] * corr + sum;
+      qt_m[t] = qt_mnew[t];
+    }
+    workgroupBarrier();
+
+    // 5) V accumulation: threads own disjoint d; each V element is read
+    //    once and reused across all QT accumulators.
+    let lim = min(WG, params.seq_kv - c * WG);
+    for (var d = t; d < D; d += WG) {
+      var a: array<f32, QT>;
+      for (var qq = 0u; qq < QT; qq++) { a[qq] = qt_acc[qq * DQ + d] * qt_corr[qq]; }
+      for (var jj = 0u; jj < lim; jj++) {
+        let v = V[((c * WG + jj) * H + h) * D + d];
+        for (var qq = 0u; qq < QT; qq++) {
+          a[qq] = fma(qt_probs[qq * WG + jj], v, a[qq]);
+        }
+      }
+      for (var qq = 0u; qq < QT; qq++) { qt_acc[qq * DQ + d] = a[qq]; }
+    }
+    workgroupBarrier(); // probs is rewritten next chunk
+  }
+
+  for (var qq = 0u; qq < QT; qq++) {
+    let qi = q0 + qq;
+    if (qi >= params.seq_q) { continue; }
+    let inv_l = 1.0 / qt_l[qq];
+    for (var d = t; d < D; d += WG) {
+      Out[(qi * H + h) * D + d] = qt_acc[qq * DQ + d] * inv_l;
+    }
+  }
+}
+
 // ── transpose_khds: K [S, H*D] -> KT [H, D, S] ──────────────────────────
 // Produces the transposed K layout attention_stream requires (see header).
 // Reuses this file's bindings: source K in the Q slot (@0), dest in Out (@3).

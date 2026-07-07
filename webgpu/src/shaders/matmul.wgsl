@@ -178,6 +178,102 @@ fn matmul_bt_bf16(@builtin(global_invocation_id) gid: vec3u,
   }
 }
 
+// ── Fast B-transposed bf16 GEMM (FLUX.2 DiT workhorse) ──────────────────
+// Same bindings/params as matmul_bt_bf16, but tuned for large-M GEMMs where
+// Kahan compensation is unnecessary (DiT block tolerance 5e-4; plain f32
+// accumulation over K<=27648 lands ~1e-6 rel):
+//   - 64x64 output tile per 16x16 workgroup: 4x4 outputs per thread
+//     (strided by 16 so lanes stay coalesced on loads and stores)
+//   - plain fma accumulation (no Kahan: 1 op/MAC instead of 4)
+//   - bf16 weights fetched one u32 pair at a time (each packed word read
+//     once, not twice as in matmul_bt_bf16)
+//   - LDS tiles padded to stride 17 to avoid bank conflicts
+// Dispatch grid: ceil(M/64) x ceil(N/64). K must be even (bf16 pairing).
+
+const FT: u32 = 64u;  // output tile edge
+const FK: u32 = 16u;  // K tile depth
+const FP: u32 = 17u;  // padded LDS row stride
+
+var<workgroup> fa: array<f32, 1088>; // [64][17] A tile (m-major)
+var<workgroup> fb: array<f32, 1088>; // [64][17] B tile (n-major)
+
+@compute @workgroup_size(16, 16)
+fn matmul_bt_bf16_fast(@builtin(local_invocation_id) lid: vec3u,
+                       @builtin(workgroup_id) wid: vec3u) {
+  let m0 = wid.x * FT;
+  let n0 = wid.y * FT;
+  // local_invocation_index: lid.x is the fast (in-wave) dimension.
+  let tid = lid.y * 16u + lid.x;
+
+  var acc: array<f32, 16>;
+  for (var i = 0u; i < 16u; i++) { acc[i] = 0.0; }
+
+  let num_tiles = (params.K + FK - 1u) / FK;
+  for (var t = 0u; t < num_tiles; t++) {
+    let k0 = t * FK;
+
+    // A tile: 64 rows x 16 k = 1024 f32, 4 per thread (consecutive lanes
+    // read consecutive k within a row).
+    for (var i = 0u; i < 4u; i++) {
+      let e = i * 256u + tid;
+      let r = e / FK;
+      let kk = e % FK;
+      var v = 0.0;
+      if (m0 + r < params.M && k0 + kk < params.K) {
+        v = A[(m0 + r) * params.K + k0 + kk];
+      }
+      fa[r * FP + kk] = v;
+    }
+
+    // B tile: 64 n-rows x 8 packed u32 (16 bf16) = 512 u32, 2 per thread.
+    for (var i = 0u; i < 2u; i++) {
+      let e = i * 256u + tid;
+      let nloc = e / 8u;
+      let kp = e % 8u;
+      let kk = k0 + kp * 2u;
+      var lo = 0.0;
+      var hi = 0.0;
+      if (n0 + nloc < params.N && kk < params.K) {
+        let packed = B_bf16[(n0 + nloc) * (params.K / 2u) + kk / 2u];
+        lo = bf16_to_f32(packed & 0xFFFFu);
+        hi = bf16_to_f32(packed >> 16u);
+      }
+      fb[nloc * FP + kp * 2u] = lo;
+      fb[nloc * FP + kp * 2u + 1u] = hi;
+    }
+
+    workgroupBarrier();
+
+    for (var k = 0u; k < FK; k++) {
+      var av: array<f32, 4>;
+      var bv: array<f32, 4>;
+      for (var i = 0u; i < 4u; i++) {
+        av[i] = fa[(lid.y + i * 16u) * FP + k]; // broadcast across a wave
+        bv[i] = fb[(lid.x + i * 16u) * FP + k]; // stride-17 => conflict-free
+      }
+      for (var i = 0u; i < 4u; i++) {
+        for (var j = 0u; j < 4u; j++) {
+          acc[i * 4u + j] = fma(av[i], bv[j], acc[i * 4u + j]);
+        }
+      }
+    }
+
+    workgroupBarrier();
+  }
+
+  // Store: consecutive lanes (lid.x) write consecutive columns.
+  for (var i = 0u; i < 4u; i++) {
+    let row = m0 + lid.y + i * 16u;
+    if (row >= params.M) { continue; }
+    for (var j = 0u; j < 4u; j++) {
+      let col = n0 + lid.x + j * 16u;
+      if (col < params.N) {
+        C[row * params.N + col] = acc[i * 4u + j];
+      }
+    }
+  }
+}
+
 // ── Naive matmul (for correctness testing) ──────────────────────────────
 
 @compute @workgroup_size(256)

@@ -2086,7 +2086,8 @@ function buildFlux2ImageSession(repo: string): void {
   addMessage('system',
     `FLUX.2 klein image generation ready!\n` +
     `Type a prompt to generate a 512×512 image (4-step distilled flow, no CFG).\n` +
-    `Flags: start with "/256 " for a smaller/faster image; "/seed N " pins the ` +
+    `Flags: start with "/256 " for a smaller/faster image or "/1024 " for full ` +
+    `resolution (slow — several minutes of denoising); "/seed N " pins the ` +
     `noise seed (otherwise random — the seed is shown under each image).\n` +
     `v1 loads each stage on demand (TE → DiT → VAE, ~12 GB total streamed), so ` +
     `expect a few minutes per image; rerolling the same prompt skips the text encoder.`,
@@ -2105,7 +2106,7 @@ async function runImageGeneration(text: string, userDiv: HTMLElement): Promise<v
   let px = 512;
   let seed = (Math.random() * 0x7fffffff) | 0;
   let prompt = text.trim();
-  const sizeM = prompt.match(/^\/(256|512)\s+/);
+  const sizeM = prompt.match(/^\/(256|512|1024)\s+/);
   if (sizeM) { px = parseInt(sizeM[1]); prompt = prompt.slice(sizeM[0].length).trim(); }
   const seedM = prompt.match(/^\/seed\s+(\d+)\s+/);
   if (seedM) { seed = parseInt(seedM[1]); prompt = prompt.slice(seedM[0].length).trim(); }

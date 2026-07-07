@@ -18,6 +18,9 @@
  *
  * Run: npx tsx scripts/test-flux2-attn-spike.mts
  *      HEADLESS=1 npx tsx scripts/test-flux2-attn-spike.mts  (logic smoke only)
+ *      ENTRY=attention_stream_qt QTILE=8   (q-tiled DiT variant; D=128
+ *      shapes only — the VAE D=512 shapes are skipped, they stay on the
+ *      original entry)
  */
 import { chromium } from '@playwright/test';
 import { readFileSync } from 'node:fs';
@@ -27,13 +30,17 @@ import { dirname, resolve } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const shaderSrc = readFileSync(resolve(here, '../src/shaders/attention_stream.wgsl'), 'utf8');
 
+const ENTRY = process.env.ENTRY ?? 'attention_stream';
+const QTILE = parseInt(process.env.QTILE ?? '1'); // queries per workgroup
+
 const SHAPES = [
   { name: 'joint 256px 768x24hx128d', S: 768, H: 24, D: 128 },
   { name: 'joint 512px-edit 2560x24hx128d', S: 2560, H: 24, D: 128 },
   { name: 'joint 1024px 4608x24hx128d', S: 4608, H: 24, D: 128 },
   { name: 'vae-mid 512px 4096x1hx512d', S: 4096, H: 1, D: 512 },
   { name: 'vae-mid 1024px 16384x1hx512d', S: 16384, H: 1, D: 512 },
-].map((s) => ({ ...s, gflop: (4 * s.S * s.S * s.D * s.H) / 1e9 }));
+].filter((s) => QTILE === 1 || s.D <= 128)
+ .map((s) => ({ ...s, gflop: (4 * s.S * s.S * s.D * s.H) / 1e9 }));
 
 const HEADLESS = process.env.HEADLESS === '1';
 const browser = await chromium.launch({
@@ -60,7 +67,7 @@ try {
 
     let r: any;
     try {
-      r = await page.evaluate(async ({ shaderSrc, s, sliceQ }) => {
+      r = await page.evaluate(async ({ shaderSrc, s, sliceQ, entry, qtile }) => {
         (globalThis as any).__name = (f: any) => f; // tsx/esbuild keepNames shim
         const g = (navigator as any).gpu;
         if (!g) return { error: 'no navigator.gpu' };
@@ -82,7 +89,7 @@ try {
         if (errs.length) return { error: `shader errors:\n${errs.join('\n')}` };
         const pipeline = device.createComputePipeline({
           layout: 'auto',
-          compute: { module, entryPoint: 'attention_stream' },
+          compute: { module, entryPoint: entry },
         });
 
         let seed = (0xA77E17 ^ s.S ^ (s.D << 8)) >>> 0;
@@ -145,7 +152,7 @@ try {
             const pass = enc.beginComputePass();
             pass.setPipeline(pipeline);
             pass.setBindGroup(0, binds[sl]);
-            pass.dispatchWorkgroups(qCount, H, 1);
+            pass.dispatchWorkgroups(Math.ceil(qCount / qtile), H, 1);
             pass.end();
             const t0 = performance.now();
             device.queue.submit([enc.finish()]);
@@ -209,7 +216,7 @@ try {
           totalMs: totals[best],
           maxRel,
         };
-      }, { shaderSrc, s: shape, sliceQ });
+      }, { shaderSrc, s: shape, sliceQ, entry: ENTRY, qtile: QTILE });
     } catch (e: any) {
       r = { error: `evaluate crashed (likely TDR): ${e.message?.split('\n')[0]}` };
     }

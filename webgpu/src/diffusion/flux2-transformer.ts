@@ -14,11 +14,12 @@
 //   - norm_out = AdaLayerNormContinuous: (scale, shift) = chunk(Linear(SiLU(temb)));
 //     x = LN(x)*(1+scale)+shift; then proj_out -> [Simg, 128]
 //
-// All GEMMs run matmul_bt_bf16 directly over the raw bf16 weight buffers.
+// All GEMMs run matmul_bt_bf16_fast directly over the raw bf16 weight buffers
+// (64x64 tile, plain f32 accumulation — 3.3-3.7 TFLOPS effective vs 0.63 for
+// the Kahan matmul_bt_bf16; DiT parity re-gated after the swap).
 // TDR budgeting: dispatches are cost-weighted and the queue is flushed at
 // ~FLOP_BUDGET per submit; GEMMs and attention are M/query-sliced so no single
-// dispatch exceeds the budget (Phase 0 measured ~0.63 TFLOPS effective and a
-// 2218 ms worst dispatch unsliced on the 6700 XT).
+// dispatch exceeds the budget (worst 1024px GEMM now ~214 ms unsliced).
 //
 // NOTE: the device must be created with maxBufferSize/maxStorageBufferBindingSize
 // raised to the adapter limits (mlp activations reach 339 MB at 1024px).
@@ -152,7 +153,7 @@ export class Flux2Transformer {
       compute: { module: d.createShaderModule({ code }), entryPoint: entry },
     });
     this.pipes = {
-      gemm: mk(matmulWGSL, 'matmul_bt_bf16'),
+      gemm: mk(matmulWGSL, 'matmul_bt_bf16_fast'),
       rms: mk(rmsnormWGSL, 'rmsnorm'),
       ln: mk(layernormWGSL, 'layernorm'),
       silu: mk(elementwiseWGSL, 'silu'),
@@ -161,7 +162,7 @@ export class Flux2Transformer {
       gateAdd: mk(adalnWGSL, 'gate_add'),
       concat: mk(adalnWGSL, 'concat_cols'),
       rope: mk(ropePairsWGSL, 'rope_pairs'),
-      attn: mk(attnStreamWGSL, 'attention_stream'),
+      attn: mk(attnStreamWGSL, 'attention_stream_qt'),
       transpose: mk(attnStreamWGSL, 'transpose_khds'),
     };
   }
@@ -262,7 +263,7 @@ export class Flux2Transformer {
         { b: 2, buf: c, off: cOff + m0 * N * 4, size: mS * N * 4 },
         { b: 3, buf: u.buf, off: u.off, size: 48 },
         { b: 5, buf: w.buffer, off: wRowOff * K * 2, size: wRows * K * 2 },
-      ], Math.ceil(mS / 16), Math.ceil(N / 16), per * mS);
+      ], Math.ceil(mS / 64), Math.ceil(N / 64), per * mS);
     }
   }
 
@@ -337,8 +338,11 @@ export class Flux2Transformer {
       { b: 4, buf: ut.buf, off: ut.off, size: 48 },
     ], Math.ceil(S * DIM / 256), 1, S * DIM * 8);
 
+    // attention_stream_qt: QT=8 queries per workgroup (slices stay
+    // QT-aligned so tiles never straddle a slice boundary).
+    const QT = 8;
     const perQuery = HEADS * 4 * HEAD_DIM * S;
-    const maxQ = Math.max(64, Math.floor(this.ctx.budget / perQuery));
+    const maxQ = Math.max(64, Math.floor(this.ctx.budget / perQuery / QT) * QT);
     for (let q0 = 0; q0 < S; q0 += maxQ) {
       const n = Math.min(maxQ, S - q0);
       const u = this.uni([HEADS, HEAD_DIM, S, S, q0]);
@@ -348,7 +352,7 @@ export class Flux2Transformer {
         { b: 2, buf: this.bufs.v, size: S * DIM * 4 },
         { b: 3, buf: this.bufs.attn, size: S * DIM * 4 },
         { b: 4, buf: u.buf, off: u.off, size: 48 },
-      ], n, HEADS, n * perQuery);
+      ], Math.ceil(n / QT), HEADS, n * perQuery);
     }
   }
 
