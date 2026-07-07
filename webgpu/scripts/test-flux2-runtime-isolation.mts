@@ -122,7 +122,7 @@ try {
 
       // ---- runtime Q8 TE embeds (load, embed, free BEFORE the DiT) ----
       let t0 = Date.now();
-      const te = await teMod.loadFlux2TextEncoder(device, 'local/flux2-te-qwen3-4b-q8_0', 'flux2-te-qwen3-4b-q8_0.gguf');
+      const te = await teMod.loadFlux2TextEncoder(device, 'local/flux2-te-qwen3-4b-q4_k_m', 'flux2-te-qwen3-4b-q4_k_m.gguf');
       const emb = await embMod.embedFlux2Prompt(te.engine, te.tokenizer, prompt);
       te.destroy();
       log(`TE embeds ready in ${((Date.now() - t0) / 1000).toFixed(0)}s (validLen ${emb.validLen})`);

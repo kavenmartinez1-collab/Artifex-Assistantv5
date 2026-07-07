@@ -46,7 +46,7 @@ try {
           maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
         },
       });
-      const enc = await te.loadFlux2TextEncoder(device, 'local/flux2-te-qwen3-4b-q8_0', 'flux2-te-qwen3-4b-q8_0.gguf');
+      const enc = await te.loadFlux2TextEncoder(device, 'local/flux2-te-qwen3-4b-q4_k_m', 'flux2-te-qwen3-4b-q4_k_m.gguf');
       const out = await emb.embedFlux2Prompt(enc.engine, enc.tokenizer, prompt);
       enc.destroy();
       const u8 = new Uint8Array(out.promptEmbeds.buffer);

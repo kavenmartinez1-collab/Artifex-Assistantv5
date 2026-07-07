@@ -1,7 +1,9 @@
 /**
  * FLUX.2 Phase 2 gate: text-encoder parity vs the Python fixture.
  *
- * Loads the Q8_0 klein TE (local/flux2-te-qwen3-4b-q8_0) through the real app
+ * Loads the klein TE (default: the shipped Q4_K_M — the Q8_0 it originally
+ * gated was retired in Phase 7; Q8-era numbers kept below for reference)
+ * through the real app
  * (vite dev server must already be running on 127.0.0.1:5173), drives the
  * __flux2Embed hook for both fixture prompts, and gates:
  *   - input_ids  EXACT match vs te.pX.input_ids (tokenizer + template + pad)
@@ -28,11 +30,13 @@ const fixDir = resolve(here, 'flux2_fixture');
 const manifest = JSON.parse(readFileSync(resolve(fixDir, 'manifest.json'), 'utf8'));
 
 const BASE = 'http://127.0.0.1:5173';
-const REPO = process.env.REPO ?? 'local/flux2-te-qwen3-4b-q8_0';
+const REPO = process.env.REPO ?? 'local/flux2-te-qwen3-4b-q4_k_m';
 const ADAPTER_RE = /radeon|6700|amd|rdna/i;
 const LOAD_TIMEOUT = 600_000;
-const REL_TOL_FULL = 2.5e-2;  // full 512 rows incl. pad-row Q8 accumulation
-const REL_TOL_VALID = 1e-2;   // valid rows only — the bug-sensitive gate
+// Q4_K_M tolerances (P7.3 measured valid 2.6e-2 / all 7.6e-2);
+// the Q8-era gates were 1e-2 / 2.5e-2.
+const REL_TOL_FULL = 1e-1;    // full 512 rows incl. pad-row quant accumulation
+const REL_TOL_VALID = 5e-2;   // valid rows only — the bug-sensitive gate
 
 function fixInfo(name: string): { file: string; shape: number[]; dtype: string } {
   const t = manifest.tensors[name];

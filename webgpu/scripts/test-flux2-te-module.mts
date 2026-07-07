@@ -19,13 +19,12 @@ const prompt = manifest.meta['te.p0.prompt'] as string;
 const validLen = manifest.meta['te.p0.valid_len'] as number;
 const peFile = manifest.tensors['te.p0.prompt_embeds'].file as string;
 
-// P7.3: override to gate the Q4_K_M TE (larger quant error than Q8's 1e-2):
-//   TE_REPO=local/flux2-te-qwen3-4b-q4_k_m TE_GGUF=flux2-te-qwen3-4b-q4_k_m.gguf \
-//   TE_TOL=5e-2 TE_TOL_ALL=1e-1 npx tsx scripts/test-flux2-te-module.mts
-const TE_REPO = process.env.TE_REPO ?? 'local/flux2-te-qwen3-4b-q8_0';
-const TE_GGUF = process.env.TE_GGUF ?? 'flux2-te-qwen3-4b-q8_0.gguf';
-const TE_TOL = Number(process.env.TE_TOL ?? '1e-2');
-const TE_TOL_ALL = Number(process.env.TE_TOL_ALL ?? '2.5e-2');
+// Defaults gate the SHIPPED Q4_K_M TE (P7.3 measured: valid 2.6e-2, all
+// 7.6e-2; the retired Q8 TE was ~1e-2/2.1e-2). Env-overridable.
+const TE_REPO = process.env.TE_REPO ?? 'local/flux2-te-qwen3-4b-q4_k_m';
+const TE_GGUF = process.env.TE_GGUF ?? 'flux2-te-qwen3-4b-q4_k_m.gguf';
+const TE_TOL = Number(process.env.TE_TOL ?? '5e-2');
+const TE_TOL_ALL = Number(process.env.TE_TOL_ALL ?? '1e-1');
 
 const browser = await chromium.launch({
   channel: 'chrome', headless: false, args: ['--enable-unsafe-webgpu'],
