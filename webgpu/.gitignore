@@ -27,6 +27,9 @@ docs/ENGINEERING_LOG.md
 # FLUX.2 parity fixture dumps (hundreds of MB, regenerate via scripts/gen_flux2_fixture.py)
 scripts/flux2_fixture/
 
+# Piper VITS parity fixture dumps (regenerate via scripts/gen_piper_fixture.py)
+scripts/piper_fixture/
+
 # bench evidence dumps (A/B toggles, smoke/greedy responses, page logs) — local only
 scripts/ab_*.txt
 scripts/c4_*.txt
