@@ -334,9 +334,11 @@ browseBtn.addEventListener('click', async () => {
       const ggufs = m.files.filter(f => f.toLowerCase().endsWith('.gguf')).length;
       const isLocal = isLocalRepo(m.repo);
       const icon = m.repo.startsWith('ollama/') ? '🦙 ' : isLocal ? '📁 ' : '';
-      const kind = safetensors === 0 && ggufs > 0
-        ? `${ggufs} gguf`
-        : `${safetensors} shard${safetensors !== 1 ? 's' : ''}`;
+      const kind = safetensors === 0 && ggufs === 0 && m.files.includes('model_index.json')
+        ? 'image gen pipeline'
+        : safetensors === 0 && ggufs > 0
+          ? `${ggufs} gguf`
+          : `${safetensors} shard${safetensors !== 1 ? 's' : ''}`;
       el.style.cssText = 'padding:6px 8px;cursor:pointer;border-bottom:1px solid #222;display:flex;justify-content:space-between;align-items:center';
       el.innerHTML = `
         <span style="color:${isLocal ? 'var(--accent)' : 'var(--text)'}">${icon}${m.repo}</span>

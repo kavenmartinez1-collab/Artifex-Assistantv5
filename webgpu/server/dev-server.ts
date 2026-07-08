@@ -419,11 +419,30 @@ app.get('/api/hf-cache/models', (_req, res) => {
     const sizeOf = (dir: string, files: string[]) => files.reduce((s, f) => {
       try { return s + fs.statSync(path.join(dir, f)).size; } catch { return s; }
     }, 0);
+    const dirSizeDeep = (d: string): number => {
+      let s = 0;
+      try {
+        for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+          const p = path.join(d, e.name);
+          if (e.isDirectory()) s += dirSizeDeep(p);
+          else { try { s += fs.statSync(p).size; } catch {} }
+        }
+      } catch {}
+      return s;
+    };
     const seen = new Set<string>();
     const push = (repo: string, dir: string, allFiles: string[]) => {
       if (seen.has(repo)) return;
       const files = allFiles.filter(isModelFile);
-      if (files.length === 0) return;
+      if (files.length === 0) {
+        // Diffusers-style pipeline dirs (e.g. FLUX.2 klein) keep all weights
+        // in subdirs; the only top-level marker is model_index.json.
+        if (allFiles.includes('model_index.json')) {
+          seen.add(repo);
+          models.push({ repo, files: ['model_index.json'], totalSize: dirSizeDeep(dir) });
+        }
+        return;
+      }
       seen.add(repo);
       models.push({ repo, files, totalSize: sizeOf(dir, files) });
     };
