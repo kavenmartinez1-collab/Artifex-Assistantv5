@@ -50,7 +50,13 @@ async function getEspeak() {
     espeakPromise = (async () => {
       // Resolve espeak.wasm / espeak.data next to espeak.js in both Node and the
       // browser. Emscripten's .data loader otherwise resolves against the CWD.
-      const base = new URL('./espeak/', import.meta.url);
+      // NB: the relative path is held in a variable, not passed as a string
+      // literal — that defeats vite's `new URL('literal', import.meta.url)`
+      // asset-rewrite (which mangles a trailing-slash dir into a slash-less
+      // path, so `espeak/` → `espeak` and `espeak.wasm` lands one dir too high).
+      // As a variable it stays a runtime URL resolve, correct in Node + browser.
+      const espeakDir = './espeak/';
+      const base = new URL(espeakDir, import.meta.url);
       const locateFile = (path: string): string => {
         const u = new URL(path, base);
         if (u.protocol === 'file:') {

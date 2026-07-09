@@ -21,6 +21,10 @@ dist/
 metrics.jsonl
 node_modules/
 
+# playwright headed/e2e run artifacts (traces, screenshots, error-context)
+test-results/
+playwright-report/
+
 # successor-legible engineering log (local only for now)
 docs/ENGINEERING_LOG.md
 
