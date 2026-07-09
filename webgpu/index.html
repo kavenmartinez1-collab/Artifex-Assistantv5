@@ -452,6 +452,23 @@
       </div>
 
       <div class="panel">
+        <div class="panel-title">Voice</div>
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+          <input type="checkbox" id="voice-mode" style="accent-color:var(--accent2)">
+          <label for="voice-mode" style="margin:0;cursor:pointer">Voice Mode — read replies aloud</label>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+          <button id="mic-btn" title="Click to record, click again to transcribe and send (Whisper base.en, on-device)">🎤 Speak</button>
+        </div>
+        <div style="font-size:10px;color:var(--dim);margin-top:4px">
+          🎤 records the mic and transcribes on-device (Whisper base.en, ~290 MB
+          on first use, no network), then sends it as your message. Enable Voice
+          Mode to hear each reply spoken back (Piper VITS) — a full on-device
+          voice loop. You can also click 🔊 on any single reply.
+        </div>
+      </div>
+
+      <div class="panel">
         <div class="panel-title">Actions</div>
         <div style="display:flex;gap:6px;flex-wrap:wrap">
           <button class="btn btn-dim" id="clear-btn">Clear Chat</button>

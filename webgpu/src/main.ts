@@ -567,6 +567,7 @@ function attachActions(div: HTMLElement, role: 'user' | 'assistant') {
       navigator.clipboard?.writeText(text).catch(() => {});
     });
     mkBtn('⟳ retry', 'Regenerate this response (discards it and later messages)', () => regenerateMessage(div));
+    mkBtn('🔊 speak', 'Read this response aloud (Piper VITS, on-device)', () => speakMessage(div));
   }
   div.appendChild(bar);
 }
@@ -651,6 +652,120 @@ function regenerateMessage(div: HTMLElement) {
   session.resetKV?.();
   void runGeneration(text, userDiv ?? addMessage('user', text));
 }
+
+// ─── Text-to-speech (Piper VITS, Phase P7) ──────────────────────────────────
+// 🔊 on an assistant bubble runs text → G2P → VITS → HiFiGAN (GPU) → PCM and
+// plays it through WebAudio. Voice weights (~63 MB) load once, on first use.
+
+let ttsBusy = false;
+let ttsAudioCtx: AudioContext | null = null;
+
+/** Strip markdown/code so the reader speaks prose, not syntax or data-URLs. */
+function stripForTts(md: string): string {
+  return md
+    .replace(/```[\s\S]*?```/g, ' ')          // fenced code
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')     // images (incl. data-URLs)
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')   // links → link text
+    .replace(/`([^`]*)`/g, '$1')               // inline code
+    .replace(/[*_#>|]/g, ' ')                  // md punctuation
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Play a mono f32 [-1,1] buffer through a shared AudioContext. */
+async function playPcm(pcm: Float32Array, sampleRate: number): Promise<void> {
+  ttsAudioCtx ??= new AudioContext();
+  if (ttsAudioCtx.state === 'suspended') await ttsAudioCtx.resume();
+  const buf = ttsAudioCtx.createBuffer(1, pcm.length, sampleRate);
+  // Fresh ArrayBuffer-backed copy: copyToChannel rejects a possibly-shared source.
+  const chan = new Float32Array(pcm.length);
+  chan.set(pcm);
+  buf.copyToChannel(chan, 0);
+  const src = ttsAudioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ttsAudioCtx.destination);
+  src.start();
+  await new Promise<void>((resolve) => { src.onended = () => resolve(); });
+}
+
+async function speakMessage(div: HTMLElement) {
+  if (ttsBusy) return;
+  const msg = (div as any).__msg as ChatMessage | undefined;
+  const text = stripForTts(msg?.content ?? div.textContent ?? '');
+  if (!text) return;
+
+  ttsBusy = true;
+  setStatus('Synthesizing speech...');
+  try {
+    const { speak } = await import('./audio/tts');
+    const res = await speak(gpu?.device ?? null, text, {}, (loaded, total) => {
+      if (total) setStatus(`Loading voice ${(loaded / 1e6).toFixed(0)}/${(total / 1e6).toFixed(0)} MB`);
+    });
+    setStatus(`Speaking (${(res.audio.length / res.sampleRate).toFixed(1)}s)`);
+    await playPcm(res.audio, res.sampleRate);
+    setStatus('Ready');
+  } catch (err) {
+    setStatus('TTS failed');
+    reportError('tts', err);
+  } finally {
+    ttsBusy = false;
+  }
+}
+
+// ─── Speech-to-text (Whisper base.en, Phase W5/W6) ──────────────────────────
+// 🎤 records the mic, transcribes on-device (mel → encoder → decoder → greedy,
+// all parity-gated) and sends the text as a chat turn. With Voice Mode on, the
+// reply is spoken back — closing the full mic → STT → LLM → TTS loop.
+
+let micRec: { stop(): Promise<Float32Array>; cancel(): void } | null = null;
+
+async function toggleMic() {
+  const btn = $('mic-btn') as HTMLButtonElement;
+
+  if (micRec) {
+    // second click: stop, transcribe, and send
+    const rec = micRec;
+    micRec = null;
+    btn.textContent = '🎤 Speak';
+    btn.classList.remove('recording');
+    setStatus('Transcribing...');
+    try {
+      const audio = await rec.stop();
+      const { transcribe } = await import('./audio/stt');
+      const text = await transcribe(audio, (loaded, total) => {
+        if (total) setStatus(`Loading STT ${(loaded / 1e6).toFixed(0)}/${(total / 1e6).toFixed(0)} MB`);
+      });
+      if (!text) { setStatus('No speech detected'); return; }
+      if (!session) {
+        addMessage('user', text);
+        addMessage('system', 'No model loaded. Load a model to reply.');
+        setStatus('Ready');
+        return;
+      }
+      const userDiv = addMessage('user', text);
+      setStatus('Ready');
+      void runGeneration(text, userDiv);
+    } catch (err) {
+      setStatus('Mic/STT failed');
+      reportError('stt', err);
+    }
+    return;
+  }
+
+  // first click: start recording
+  try {
+    const { startMic } = await import('./audio/mic');
+    micRec = await startMic();
+    btn.textContent = '⏹ Stop';
+    btn.classList.add('recording');
+    setStatus('Recording… click Stop when done');
+  } catch (err) {
+    setStatus('Microphone access denied');
+    reportError('mic', err);
+  }
+}
+
+$('mic-btn')?.addEventListener('click', () => void toggleMic());
 
 /** Toggle Send/Stop while a generation is in flight. */
 function setGenerating(on: boolean) {
@@ -1399,6 +1514,10 @@ async function runGeneration(text: string, userDiv: HTMLElement): Promise<void> 
     // The message that enters history on the next hop: the user's text first,
     // then tool results on later hops (already pushed to chatHistory directly).
     let pendingUser: ChatMessage | null = userMsg;
+    // Voice Mode reads only the FINAL human-facing answer (not intermediate
+    // tool-call hops), so we remember the last reply bubble and speak it once
+    // the loop settles.
+    let lastReplyDiv: HTMLElement | null = null;
 
     for (let hop = 0; hop <= MAX_TOOL_HOPS; hop++) {
       let systemPrompt = ($('system-prompt') as HTMLTextAreaElement).value.trim();
@@ -1467,6 +1586,7 @@ async function runGeneration(text: string, userDiv: HTMLElement): Promise<void> 
       chatHistory.push(asstMsg);
       linkMessage(responseDiv, asstMsg);
       attachActions(responseDiv, 'assistant');
+      lastReplyDiv = responseDiv;
       autoSave(chatHistory, { model: currentModel?.repo ?? 'unknown', backend: 'webgpu' });
 
       attachMeta(responseDiv,
@@ -1491,6 +1611,12 @@ async function runGeneration(text: string, userDiv: HTMLElement): Promise<void> 
       chatHistory.push({ role: 'user', content: toolResult });
       const preview = toolResult.length > 500 ? toolResult.slice(0, 500) + ' …' : toolResult;
       addMessage('system', `🔧 ${preview}`);
+    }
+
+    // Voice Mode: speak the settled answer (fire-and-forget — a TTS failure
+    // must not break the chat turn; speakMessage surfaces it via status).
+    if (lastReplyDiv && ($('voice-mode') as HTMLInputElement | null)?.checked) {
+      void speakMessage(lastReplyDiv);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -2316,6 +2442,50 @@ loadBtn.addEventListener('click', async () => {
       `GPU needed: ~${formatBytes(preview.tensorCount * 4 * (preview.totalBytes / preview.tensorCount / 2))} (float32)`,
       'model preview'
     );
+
+    // Piper VITS is a TTS voice, not an LLM — there is no chat engine to build.
+    // Loading it just warms the TTS voice cache so the 🔊 button (and Voice
+    // Mode) is instant. A short utterance forces weights + espeak + GPU decoder
+    // fully online.
+    if (preview.config.model_type === 'piper-vits') {
+      setStatus('Loading TTS voice...');
+      try {
+        const { speak } = await import('./audio/tts');
+        await speak(gpu.device, 'Voice ready.', {}, (loaded, total) => {
+          if (total) progressEl.textContent =
+            `Voice ${(loaded / 1e6).toFixed(0)}/${(total / 1e6).toFixed(0)} MB`;
+        });
+        addMessage('system',
+          `TTS voice "${preview.config.voice ?? repo}" ready. Enable Voice Mode, `
+          + `or click 🔊 on any assistant reply.`, 'voice ready');
+        setStatus('TTS voice ready');
+      } catch (err) {
+        addMessage('system', `TTS voice load failed: ${err instanceof Error ? err.message : String(err)}`);
+        setStatus('TTS voice load failed');
+        reportError('tts-voice-load', err);
+      }
+      return;
+    }
+
+    if (preview.config.model_type === 'whisper-stt') {
+      setStatus('Loading STT model...');
+      try {
+        const { loadWhisper } = await import('./audio/whisper-loader');
+        await loadWhisper((loaded, total) => {
+          if (total) progressEl.textContent =
+            `STT ${(loaded / 1e6).toFixed(0)}/${(total / 1e6).toFixed(0)} MB`;
+        });
+        addMessage('system',
+          `Speech-to-text model "${preview.config.variant ?? repo}" ready. `
+          + `Click 🎤 Speak in the Voice panel to dictate a message.`, 'stt ready');
+        setStatus('STT model ready');
+      } catch (err) {
+        addMessage('system', `STT model load failed: ${err instanceof Error ? err.message : String(err)}`);
+        setStatus('STT model load failed');
+        reportError('stt-model-load', err);
+      }
+      return;
+    }
 
     // Decide whether to keep BF16 weights native on GPU (halves VRAM)
     // Enable when: (a) unquantized model too big for f32, OR (b) mixed-precision GPTQ with BF16 tensors
