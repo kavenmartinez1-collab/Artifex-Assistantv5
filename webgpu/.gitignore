@@ -30,6 +30,14 @@ scripts/flux2_fixture/
 # Piper VITS parity fixture dumps (regenerate via scripts/gen_piper_fixture.py)
 scripts/piper_fixture/
 
+# espeak-ng WASM build: keep the recipe (build.sh, espeak_bridge.c), ignore the
+# heavy toolchain/source/build trees. Built artifacts in src/audio/espeak/ are
+# committed, so a fresh checkout does not need to rebuild.
+scripts/espeak-build/emsdk/
+scripts/espeak-build/espeak-ng/
+scripts/espeak-build/build-espeak/
+scripts/espeak-build/espeak-ng-data/
+
 # bench evidence dumps (A/B toggles, smoke/greedy responses, page logs) — local only
 scripts/ab_*.txt
 scripts/c4_*.txt
