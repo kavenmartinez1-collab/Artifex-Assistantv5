@@ -453,6 +453,12 @@
 
       <div class="panel">
         <div class="panel-title">Voice</div>
+        <div style="font-size:11px;background:#5a1e1e;color:#ffd7d7;border:1px solid #a33;border-radius:4px;padding:6px;margin-bottom:8px">
+          ⚠️ <strong>Voice Mode is currently broken.</strong> The isolated
+          TTS→STT runtime is verified, but the live mic → transcribe → LLM →
+          spoken-reply loop does not work end-to-end in the app yet. Do not rely
+          on it.
+        </div>
         <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
           <input type="checkbox" id="voice-mode" style="accent-color:var(--accent2)">
           <label for="voice-mode" style="margin:0;cursor:pointer">Voice Mode — read replies aloud</label>
