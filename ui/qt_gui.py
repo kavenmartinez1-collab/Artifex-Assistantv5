@@ -1275,6 +1275,11 @@ class ArtifexMainWindow(QMainWindow):
 
         if result.output_type == "text":
             bubble.add_text(result.content or "(empty)")
+            # Register in history so COPY reaches the full (untruncated) text
+            self.messages.append({"role": "assistant", "content": result.content or ""})
+            saved_to = result.metadata.get("saved_to")
+            if saved_to:
+                bubble.add_text(f"Full text saved: {saved_to}")
 
         elif result.output_type == "image":
             path = result.metadata.get("stored_path") or result.metadata.get("saved_to")

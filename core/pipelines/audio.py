@@ -290,6 +290,17 @@ class AudioPipeline(BasePipeline):
         if source_is_video:
             meta["extracted_from_video"] = True
 
+        # Persist the full transcript — chat UIs may truncate long text for display
+        try:
+            os.makedirs("output", exist_ok=True)
+            base = os.path.splitext(os.path.basename(audio_path))[0]
+            txt_path = os.path.join("output", f"{base}.transcript.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            meta["saved_to"] = os.path.abspath(txt_path)
+        except OSError:
+            pass
+
         return PipelineResult(
             success=True,
             output_type="text",
