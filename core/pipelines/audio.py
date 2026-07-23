@@ -273,6 +273,7 @@ class AudioPipeline(BasePipeline):
                     "task": "transcribe",
                     "condition_on_prev_tokens": False,
                     "no_speech_threshold": 0.6,
+                    "logprob_threshold": -1.0,
                     "compression_ratio_threshold": 2.4,
                 },
             )
