@@ -274,6 +274,7 @@ class AudioPipeline(BasePipeline):
                     "condition_on_prev_tokens": False,
                     "no_speech_threshold": 0.6,
                     "logprob_threshold": -1.0,
+                    "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
                     "compression_ratio_threshold": 2.4,
                 },
             )
