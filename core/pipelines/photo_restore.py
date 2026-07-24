@@ -156,6 +156,36 @@ class PhotoRestorePipeline(BasePipeline):
     def is_loaded(self) -> bool:
         return self._ready
 
+    # ── Pixelation detection ───────────────────────────────────────────
+
+    @staticmethod
+    def estimate_pixel_factor(image, max_factor=16, min_factor=3,
+                              tol_db=32.0) -> int:
+        """Detect nearest-neighbor pixelation; return the block factor.
+
+        Box-downscale by each candidate factor and reconstruct with nearest
+        neighbor; if the reconstruction still matches the original (high
+        PSNR), the image only really contains 1/factor of its pixels.
+        Returns 1 for genuinely detailed images.
+        """
+        import numpy as np
+        from PIL import Image
+
+        g = image.convert("L")
+        src = np.asarray(g, np.float32)
+        w, h = g.size
+        best = 1
+        for f in range(2, max_factor + 1):
+            tw, th = max(1, round(w / f)), max(1, round(h / f))
+            recon = np.asarray(
+                g.resize((tw, th), Image.BOX).resize((w, h), Image.NEAREST),
+                np.float32)
+            mse = float(((src - recon) ** 2).mean())
+            psnr = 99.0 if mse < 1e-3 else 10 * np.log10(255.0 ** 2 / mse)
+            if psnr >= tol_db:
+                best = f
+        return best if best >= min_factor else 1
+
     # ── Stage 1: classical clean ───────────────────────────────────────
 
     @staticmethod
@@ -315,17 +345,45 @@ class PhotoRestorePipeline(BasePipeline):
 
             timings = {}
 
+            # Pixelated sources (tiny image blown up into blocks): collapse
+            # back to true resolution first, otherwise every later stage
+            # just sharpens the blocks.
+            denoise, smooth_radius = params.denoise, params.smooth_radius
+            strength = params.strength
+            factor = self.estimate_pixel_factor(source) \
+                if params.depixelate else 1
+            work = source
+            if factor > 1:
+                true_size = (max(1, round(source.width / factor)),
+                             max(1, round(source.height / factor)))
+                if status_callback:
+                    status_callback(
+                        f"Pixelated source (~{factor}x blocks) — rebuilding "
+                        f"from {true_size[0]}x{true_size[1]}")
+                work = source.resize(true_size, Image.BOX)
+                # Every true pixel is precious now — barely touch them
+                denoise = min(denoise, 2.0)
+                smooth_radius = min(smooth_radius, 1)
+                strength = max(strength, 0.4)
+
             # Stage 1 — classical clean
             if status_callback:
                 status_callback("Stage 1/3: classical clean...")
             t0 = time.time()
             cleaned = self.classical_clean(
-                source, denoise=params.denoise,
-                smooth_radius=params.smooth_radius,
+                work, denoise=denoise,
+                smooth_radius=smooth_radius,
                 auto_levels=params.auto_levels)
             timings["clean_s"] = round(time.time() - t0, 2)
             p1 = os.path.join(out_dir, f"{base}_{stamp}_1_cleaned.png")
             cleaned.save(p1)
+
+            # Depixelated images are tiny — SR to a workable size so the
+            # AI stage has canvas to invent texture on.
+            if factor > 1:
+                while max(cleaned.size) < 320:
+                    cleaned = self._upscale(cleaned, 4, params.tile,
+                                            status_callback)
 
             # Stage 2 — AI restore
             if status_callback:
@@ -335,7 +393,7 @@ class PhotoRestorePipeline(BasePipeline):
                 "restored old photograph, sharp focus, natural colors, "
                 "high quality photo")
             restored, method = self._ai_restore(
-                cleaned, prompt, params.strength, params.num_steps,
+                cleaned, prompt, strength, params.num_steps,
                 params.guidance_scale, status_callback)
             timings["restore_s"] = round(time.time() - t0, 2)
             p2 = os.path.join(out_dir, f"{base}_{stamp}_2_restored.png")
@@ -363,6 +421,7 @@ class PhotoRestorePipeline(BasePipeline):
                         (f"Upscaled x{params.upscale}", p3),
                     ],
                     "restore_method": method,
+                    "depixelate_factor": factor,
                     "timings": timings,
                     "source_size": list(source.size),
                     "final_size": list(upscaled.size),

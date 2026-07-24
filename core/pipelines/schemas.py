@@ -118,6 +118,8 @@ class PhotoRestoreInput(BaseModel):
     denoise: float = 7.0           # non-local means h, 0 disables
     smooth_radius: int = 4         # bilateral circle-of-interest radius
     auto_levels: bool = True
+    depixelate: bool = True        # auto-detect blocky sources, rebuild
+                                   # from true resolution
     # Stage 3 (upscale)
     upscale: int = 2               # 2 or 4
     tile: int = 512
