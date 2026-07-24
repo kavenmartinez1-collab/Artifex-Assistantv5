@@ -30,37 +30,43 @@ VRAM_PRESETS = [
     (30, {
         "label": "32 GB+",
         "img2img_model": "black-forest-labs/FLUX.1-dev",
-        "max_side": 2048, "tile": 1024, "sr_model": "realesrgan-x4plus",
+        "max_side": 2048, "tile": 1024, "work_res": 1024,
+        "sr_model": "realesrgan-x4plus",
         "note": "FLUX.1-dev img2img, everything resident, no offload.",
     }),
     (22, {
         "label": "24 GB",
         "img2img_model": "stabilityai/stable-diffusion-xl-base-1.0",
-        "max_side": 1536, "tile": 800, "sr_model": "realesrgan-x4plus",
+        "max_side": 1536, "tile": 800, "work_res": 1024,
+        "sr_model": "realesrgan-x4plus",
         "note": "SDXL img2img fully resident + x4plus upscaler.",
     }),
     (15, {
         "label": "16 GB",
         "img2img_model": "stabilityai/stable-diffusion-xl-base-1.0",
-        "max_side": 1024, "tile": 512, "sr_model": "realesrgan-x4plus",
+        "max_side": 1024, "tile": 512, "work_res": 1024,
+        "sr_model": "realesrgan-x4plus",
         "note": "SDXL img2img fp16.",
     }),
     (11, {
         "label": "12 GB",
         "img2img_model": "stable-diffusion-v1-5/stable-diffusion-v1-5",
-        "max_side": 1024, "tile": 512, "sr_model": "realesrgan-x4plus",
+        "max_side": 1024, "tile": 512, "work_res": 640,
+        "sr_model": "realesrgan-x4plus",
         "note": "SD 1.5 img2img; SDXL possible with CPU offload.",
     }),
     (7, {
         "label": "8 GB",
         "img2img_model": "stable-diffusion-v1-5/stable-diffusion-v1-5",
-        "max_side": 768, "tile": 400, "sr_model": "realesr-general-x4v3",
+        "max_side": 768, "tile": 400, "work_res": 512,
+        "sr_model": "realesr-general-x4v3",
         "note": "SD 1.5 at 768px + compact upscaler.",
     }),
     (0, {
         "label": "4 GB / CPU",
         "img2img_model": None,
-        "max_side": 1024, "tile": 256, "sr_model": "realesr-general-x4v3",
+        "max_side": 1024, "tile": 256, "work_res": 512,
+        "sr_model": "realesr-general-x4v3",
         "note": "Classical clean + GFPGAN faces + compact upscaler; "
                 "skip diffusion.",
     }),
@@ -378,12 +384,23 @@ class PhotoRestorePipeline(BasePipeline):
             p1 = os.path.join(out_dir, f"{base}_{stamp}_1_cleaned.png")
             cleaned.save(p1)
 
-            # Depixelated images are tiny — SR to a workable size so the
-            # AI stage has canvas to invent texture on.
+            # Depixelated images are tiny — SR up to the diffusion model's
+            # native working resolution (small inputs make diffusion
+            # hallucinate garbage); 320 is enough when no model is loaded.
             if factor > 1:
-                while max(cleaned.size) < 320:
+                if self.img2img is not None:
+                    from core.device import gpu_info
+                    target = pick_preset(gpu_info.total_gb)["work_res"]
+                else:
+                    target = 320
+                while max(cleaned.size) < target:
                     cleaned = self._upscale(cleaned, 4, params.tile,
                                             status_callback)
+                if max(cleaned.size) > target:
+                    r = target / max(cleaned.size)
+                    cleaned = cleaned.resize(
+                        (round(cleaned.width * r), round(cleaned.height * r)),
+                        Image.LANCZOS)
 
             # Stage 2 — AI restore
             if status_callback:
