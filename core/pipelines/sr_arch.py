@@ -210,6 +210,14 @@ def upscale_tiled(net: nn.Module, image, scale: int, device="cuda",
         np.array(image.convert("RGB"), dtype=np.float32) / 255.0
     ).permute(2, 0, 1).unsqueeze(0).to(device=param.device, dtype=param.dtype)
 
+    # RRDBNet pixel_unshuffles at scale 2 (by 2) and scale 1 (by 4), so
+    # dimensions must divide evenly — reflect-pad, crop after upscaling.
+    orig_h, orig_w = img.shape[2], img.shape[3]
+    mod = 2 if scale == 2 else 4 if scale == 1 else 1
+    pad_h, pad_w = (-orig_h) % mod, (-orig_w) % mod
+    if pad_h or pad_w:
+        img = F.pad(img, (0, pad_w, 0, pad_h), mode="reflect")
+
     _, _, h, w = img.shape
     if tile <= 0 or (h <= tile and w <= tile):
         out = net(img)
@@ -236,5 +244,6 @@ def upscale_tiled(net: nn.Module, image, scale: int, device="cuda",
                     patch[:, :, oy0:oy0 + (y1 - y0) * scale,
                           ox0:ox0 + (x1 - x0) * scale]
 
+    out = out[:, :, :orig_h * scale, :orig_w * scale]
     out = out.squeeze(0).float().clamp_(0, 1).permute(1, 2, 0).cpu().numpy()
     return Image.fromarray((out * 255.0).round().astype(np.uint8))
