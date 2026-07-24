@@ -73,6 +73,15 @@ VRAM_PRESETS = [
 ]
 
 
+REALISM_PROMPT = ("photorealistic photograph of this exact scene, realistic "
+                  "materials and textures, natural lighting, sharp detail, "
+                  "shot on a DSLR camera, high resolution photo")
+REALISM_NEGATIVE = ("pixel art, pixelated, blocky, mosaic, cartoon, "
+                    "illustration, painting, drawing, render, low quality, "
+                    "jpeg artifacts, watermark, text, blurry, out of focus, "
+                    "soft focus, hazy, bokeh")
+
+
 def pick_preset(vram_gb: float) -> dict:
     """Return the recommended preset for a given VRAM size."""
     for min_gb, preset in VRAM_PRESETS:
@@ -232,7 +241,8 @@ class PhotoRestorePipeline(BasePipeline):
     # ── Stage 2: AI restore ────────────────────────────────────────────
 
     def _ai_restore(self, image, prompt, strength, num_steps,
-                    guidance_scale, status_callback=None):
+                    guidance_scale, status_callback=None,
+                    negative_prompt=""):
         """Generative repair. Returns (image, method) — method '' if skipped."""
         if self.img2img is not None:
             if status_callback:
@@ -244,6 +254,8 @@ class PhotoRestorePipeline(BasePipeline):
                 "num_inference_steps": num_steps,
                 "guidance_scale": guidance_scale,
             }
+            if negative_prompt:
+                gen_kwargs["negative_prompt"] = negative_prompt
             if "strength" in inspect.signature(
                     self.img2img.__call__).parameters:
                 gen_kwargs["strength"] = strength
@@ -356,6 +368,12 @@ class PhotoRestorePipeline(BasePipeline):
             # just sharpens the blocks.
             denoise, smooth_radius = params.denoise, params.smooth_radius
             strength = params.strength
+            realism = params.realism and self.img2img is not None
+            if params.realism and self.img2img is None and status_callback:
+                status_callback("Realism mode needs a diffusion model "
+                                "loaded — running normal restore instead.")
+            if realism:
+                strength = max(strength, 0.7)
             factor = self.estimate_pixel_factor(source) \
                 if params.depixelate else 1
             work = source
@@ -402,16 +420,42 @@ class PhotoRestorePipeline(BasePipeline):
                         (round(cleaned.width * r), round(cleaned.height * r)),
                         Image.LANCZOS)
 
+            # Realism mode: blur away the source's stylization (pixel
+            # blocks, hard cartoon edges) at working resolution so the
+            # structure pass re-renders subject and scene instead of
+            # imitating the style.
+            if realism:
+                from PIL import ImageFilter
+                from core.device import gpu_info
+                work_res = pick_preset(gpu_info.total_gb)["work_res"]
+                r = work_res / max(cleaned.size)
+                cleaned = cleaned.resize(
+                    (round(cleaned.width * r), round(cleaned.height * r)),
+                    Image.LANCZOS).filter(ImageFilter.GaussianBlur(5))
+
             # Stage 2 — AI restore
             if status_callback:
                 status_callback("Stage 2/3: AI restore...")
             t0 = time.time()
             prompt = params.prompt or (
+                REALISM_PROMPT if realism else
                 "restored old photograph, sharp focus, natural colors, "
                 "high quality photo")
+            negative = REALISM_NEGATIVE if realism else ""
             restored, method = self._ai_restore(
                 cleaned, prompt, strength, params.num_steps,
-                params.guidance_scale, status_callback)
+                params.guidance_scale, status_callback,
+                negative_prompt=negative)
+            if realism and method:
+                # Second pass regenerates the fine detail the blurred
+                # structure pass could not commit to.
+                if status_callback:
+                    status_callback("Realism detail pass...")
+                restored, method = self._ai_restore(
+                    restored, prompt, 0.45, params.num_steps,
+                    params.guidance_scale, status_callback,
+                    negative_prompt=negative)
+                method = "realism"
             timings["restore_s"] = round(time.time() - t0, 2)
             p2 = os.path.join(out_dir, f"{base}_{stamp}_2_restored.png")
             restored.save(p2)

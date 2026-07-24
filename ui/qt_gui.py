@@ -686,6 +686,20 @@ class ArtifexMainWindow(QMainWindow):
         vision_layout.addStretch()
         input_layout.addWidget(self._vision_ctrl)
 
+        # Photo Restore-specific controls
+        self._restore_ctrl = QWidget()
+        restore_layout = QHBoxLayout(self._restore_ctrl)
+        restore_layout.setContentsMargins(0, 0, 0, 0)
+        self._restore_realism_cb = QCheckBox("Realism mode")
+        self._restore_realism_cb.setToolTip(
+            "Remake the image as a realistic photo (pixel art, drawings, "
+            "game art). Needs a diffusion model loaded. A one-line prompt "
+            "describing the subject dramatically improves results."
+        )
+        restore_layout.addWidget(self._restore_realism_cb)
+        restore_layout.addStretch()
+        input_layout.addWidget(self._restore_ctrl)
+
         # Mode hint bar — contextual instructions
         self._hint_label = QLabel("")
         self._hint_label.setStyleSheet(
@@ -926,6 +940,7 @@ class ArtifexMainWindow(QMainWindow):
         })
         self._mic_recorder.setVisible(mode in {"Audio STT", "Voice Assistant"})
         self._vision_ctrl.setVisible(mode == "Vision")
+        self._restore_ctrl.setVisible(mode == "Photo Restore")
 
         # Update hint text
         hints = {
@@ -1117,7 +1132,8 @@ class ArtifexMainWindow(QMainWindow):
             files = self._drop_zone.attached_files
             if files:
                 kwargs = {"image_path": files[0], "prompt": prompt,
-                          "strength": 0.3, "num_steps": 30, "upscale": 2}
+                          "strength": 0.3, "num_steps": 30, "upscale": 2,
+                          "realism": self._restore_realism_cb.isChecked()}
         elif mode == "Vision":
             files = self._drop_zone.attached_files
             if files:

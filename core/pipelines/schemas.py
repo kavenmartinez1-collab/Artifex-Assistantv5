@@ -114,6 +114,8 @@ class PhotoRestoreInput(BaseModel):
     strength: float = 0.3          # low = repair, high = reinvent
     num_steps: int = 30
     guidance_scale: float = 7.5
+    realism: bool = False          # remake stylized art as a realistic
+                                   # photo (needs a diffusion model)
     # Stage 1 (classical clean)
     denoise: float = 7.0           # non-local means h, 0 disables
     smooth_radius: int = 4         # bilateral circle-of-interest radius
