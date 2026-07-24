@@ -63,6 +63,12 @@ def _ensure_registered():
         pass  # diffusers not installed
 
     try:
+        from core.pipelines.photo_restore import PhotoRestorePipeline
+        _register_pipeline("photo-restoration", PhotoRestorePipeline)
+    except ImportError:
+        pass  # opencv not installed
+
+    try:
         from core.pipelines.music import MusicPipeline
         _register_pipeline("text-to-music", MusicPipeline)
     except ImportError:

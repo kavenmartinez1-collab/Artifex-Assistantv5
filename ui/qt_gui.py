@@ -54,7 +54,7 @@ from tools.agent_tools import get_assistant_tools_prompt, get_tool_output_limit
 
 # Pipeline mode definitions
 _PIPELINE_MODES = [
-    "Chat", "Code", "Image Gen", "Image Edit", "Vision",
+    "Chat", "Code", "Image Gen", "Image Edit", "Photo Restore", "Vision",
     "3D (ShapE)", "Audio TTS", "Audio STT", "Music Gen", "Video Gen",
     "Voice Assistant",
 ]
@@ -64,6 +64,7 @@ _PIPELINE_MAP = {
     "Code": "text-generation",
     "Image Gen": "text-to-image",
     "Image Edit": "image-to-image",
+    "Photo Restore": "photo-restoration",
     "Vision": "image-text-to-text",
     "3D (ShapE)": "shap-e",
     "Audio TTS": "text-to-audio",
@@ -73,7 +74,7 @@ _PIPELINE_MAP = {
     "Voice Assistant": "voice-assistant",
 }
 
-_FILE_INPUT_MODES = {"Vision", "Audio STT", "Image Edit"}
+_FILE_INPUT_MODES = {"Vision", "Audio STT", "Image Edit", "Photo Restore"}
 _PROMPT_MODES = {"Chat", "Code", "Image Gen", "Image Edit", "Vision",
                  "3D (ShapE)", "Audio TTS", "Music Gen", "Video Gen",
                  "Voice Assistant"}
@@ -112,6 +113,21 @@ at load. Below is what works for each mode.</p>
   <li><code>stabilityai/stable-diffusion-xl-base-1.0</code></li>
   <li><code>runwayml/stable-diffusion-v1-5</code></li>
   <li><code>black-forest-labs/FLUX.1-schnell</code></li>
+</ul>
+
+<h3>Photo Restore</h3>
+<p><b>Type:</b> Optional diffusion model for the AI-restore stage
+(<b>transformers</b> backend). With <b>no model selected</b> the pipeline
+still runs: classical clean &rarr; GFPGAN faces (if installed) &rarr;
+Real-ESRGAN upscale (auto-downloads, ~64&nbsp;MB).</p>
+<p>Recommended img2img model by GPU VRAM:</p>
+<ul>
+  <li><b>4&nbsp;GB:</b> none &mdash; classical + upscale only</li>
+  <li><b>8&nbsp;GB:</b> <code>stable-diffusion-v1-5/stable-diffusion-v1-5</code> (&le;768px)</li>
+  <li><b>12&nbsp;GB:</b> <code>stable-diffusion-v1-5/stable-diffusion-v1-5</code></li>
+  <li><b>16&nbsp;GB:</b> <code>stabilityai/stable-diffusion-xl-base-1.0</code></li>
+  <li><b>24&nbsp;GB:</b> <code>stabilityai/stable-diffusion-xl-base-1.0</code> (fully resident)</li>
+  <li><b>32&nbsp;GB:</b> <code>black-forest-labs/FLUX.1-dev</code></li>
 </ul>
 
 <h3>3D (ShapE)</h3>
@@ -906,7 +922,7 @@ class ArtifexMainWindow(QMainWindow):
         mode = self._mode_combo.currentText()
         needs_file = mode in _FILE_INPUT_MODES
         self._drop_zone.setVisible(needs_file or mode in {
-            "Image Gen", "Vision", "Image Edit"
+            "Image Gen", "Vision", "Image Edit", "Photo Restore"
         })
         self._mic_recorder.setVisible(mode in {"Audio STT", "Voice Assistant"})
         self._vision_ctrl.setVisible(mode == "Vision")
@@ -917,6 +933,8 @@ class ArtifexMainWindow(QMainWindow):
             "Code": "Describe what you want to build, then EXECUTE",
             "Image Gen": "Describe the image you want to generate",
             "Image Edit": "Drop an image above, then describe the edit",
+            "Photo Restore": "Drop an old/damaged photo above — prompt is "
+                             "optional (guides the AI restore stage)",
             "Vision": "Drop an image or video above, then ask a question about it",
             "3D (ShapE)": "Describe a 3D object to generate",
             "Audio TTS": "Type text to convert to speech",
@@ -1095,6 +1113,11 @@ class ArtifexMainWindow(QMainWindow):
                           "strength": 0.75, "num_steps": 30}
                 if "klein" in (get_active_model_path() or "").lower():
                     kwargs.update({"num_steps": 4, "guidance_scale": 1.0})
+        elif mode == "Photo Restore":
+            files = self._drop_zone.attached_files
+            if files:
+                kwargs = {"image_path": files[0], "prompt": prompt,
+                          "strength": 0.3, "num_steps": 30, "upscale": 2}
         elif mode == "Vision":
             files = self._drop_zone.attached_files
             if files:
@@ -1282,8 +1305,23 @@ class ArtifexMainWindow(QMainWindow):
                 bubble.add_text(f"Full text saved: {saved_to}")
 
         elif result.output_type == "image":
+            stage_paths = result.metadata.get("stage_paths")
             path = result.metadata.get("stored_path") or result.metadata.get("saved_to")
-            if path and os.path.isfile(path):
+            if stage_paths:
+                # Photo Restore: show the full comparison strip
+                final_path = path if path and os.path.isfile(path) else None
+                for label, spath in stage_paths:
+                    if os.path.isfile(spath):
+                        bubble.add_image(spath)
+                        bubble.add_text(f"{label} — {os.path.basename(spath)}")
+                        final_path = spath
+                if final_path:
+                    self._preview_viewer.set_image(final_path)
+                    self._preview_label.setText(os.path.basename(final_path))
+                    self._tabs.setCurrentIndex(1)  # Preview tab
+                else:
+                    bubble.add_text("Restoration finished (no file paths)")
+            elif path and os.path.isfile(path):
                 bubble.add_image(path)
                 bubble.add_text(f"Saved: {os.path.basename(path)}")
                 self._preview_viewer.set_image(path)

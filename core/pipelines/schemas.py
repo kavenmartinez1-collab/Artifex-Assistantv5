@@ -105,6 +105,25 @@ class ImageEditInput(BaseModel):
     output_path: Optional[str] = None
 
 
+# ── Photo Restoration ──────────────────────────────────────────────────
+
+class PhotoRestoreInput(BaseModel):
+    image_path: str = ""
+    prompt: str = ""
+    # Stage 2 (AI restore)
+    strength: float = 0.3          # low = repair, high = reinvent
+    num_steps: int = 30
+    guidance_scale: float = 7.5
+    # Stage 1 (classical clean)
+    denoise: float = 7.0           # non-local means h, 0 disables
+    smooth_radius: int = 4         # bilateral circle-of-interest radius
+    auto_levels: bool = True
+    # Stage 3 (upscale)
+    upscale: int = 2               # 2 or 4
+    tile: int = 512
+    output_path: Optional[str] = None
+
+
 # ── Voice Assistant ────────────────────────────────────────────────────
 
 class VoiceAssistantInput(BaseModel):
