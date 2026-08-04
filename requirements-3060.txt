@@ -27,7 +27,7 @@ safetensors==0.7.0
 
 # ── Image / 3D / Video generation ────────────────────────────────────
 diffusers==0.30.0
-opencv-python-headless>=4.10  # photo restoration (classical clean stage)
+opencv-python-headless==5.0.0.93  # photo restoration (classical clean stage)
 Pillow==12.0.0
 imageio==2.37.3
 imageio-ffmpeg==0.6.0
