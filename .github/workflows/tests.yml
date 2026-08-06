@@ -42,9 +42,13 @@ jobs:
           cache: npm
           cache-dependency-path: webgpu/package-lock.json
 
+      # `npm ci` installs the lockfile exactly and fails if it has drifted.
+      # No `|| npm install` fallback: that would silently re-resolve version
+      # ranges and run lifecycle scripts — the exact path supply-chain worms
+      # rely on. A lockfile problem should fail the build, not route around it.
       - name: Install WebGPU dependencies
         working-directory: webgpu
-        run: npm ci --ignore-scripts || npm install
+        run: npm ci --ignore-scripts
 
       - name: TypeScript strict type-check
         working-directory: webgpu
