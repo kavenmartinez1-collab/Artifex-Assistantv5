@@ -20,6 +20,7 @@ ratchet, circuit breaker, and human gate apply at ALL levels.
 """
 
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -204,6 +205,7 @@ class AgentRunner:
         if goal:
             history.append({"role": "user", "content": goal})
         consecutive_failures = 0
+        format_retries = 0
 
         for rnd in range(1, self.config.max_rounds + 1):
             self._round = rnd
@@ -229,6 +231,18 @@ class AgentRunner:
 
             done = detect_done(resp)
             actions = extract_agent_actions(resp)
+            if done is None and not actions:
+                # No actions and no @done. Distinguish "model is finished and
+                # says so in prose" from "model TRIED to act but the call was
+                # malformed" (e.g. Qwen3.6 <tool_call> repetition collapse,
+                # empty fences). The latter gets corrective feedback and
+                # another round instead of being misread as a final answer.
+                if format_retries < 2 and self._looks_like_failed_tool_attempt(resp):
+                    format_retries += 1
+                    self.emit(AgentEvent("format_retry", round=rnd,
+                                         reason="malformed tool invocation"))
+                    history.append({"role": "user", "content": self._format_nudge()})
+                    continue
             if done is not None or not actions:
                 summary = done if done else resp.strip()
                 self.emit(AgentEvent("done", summary=summary, round=rnd))
@@ -459,6 +473,37 @@ class AgentRunner:
                 if not rok:
                     break
             pending_edits.clear()
+
+    @staticmethod
+    def _looks_like_failed_tool_attempt(resp: str) -> bool:
+        """Did the model clearly TRY to invoke tooling that didn't parse?
+
+        Signals: a native <tool_call> tag that produced no action (Qwen3.6
+        repetition collapse emits bare `<tool_call>` lines), or an opened
+        code fence with no body. Plain prose returns False — that is a
+        legitimate final answer.
+        """
+        if not resp:
+            return False
+        if "<tool_call" in resp:
+            return True
+        if re.search(r"```(?:bash|sh|shell|powershell|cmd|python|py|edit)\s*(?:```|$)",
+                     resp.strip()):
+            return True
+        return False
+
+    @staticmethod
+    def _format_nudge() -> str:
+        return (
+            "[FORMAT ERROR — automated] Your last message tried to invoke a "
+            "tool but no valid action could be parsed. Use EXACTLY this "
+            "syntax, each on its own line:\n"
+            '@read_file("path")  @glob("pattern")  @grep("pattern", "path")  '
+            '@find_symbol("name")\n'
+            "```bash\n<command>\n```  or  ```python\n<code>\n```\n"
+            "Do NOT write <tool_call> tags. Retry the intended action now, "
+            'or emit @done("summary") if the GOAL is already complete.'
+        )
 
     def _feedback(self, outputs: List[str]) -> str:
         body = "\n\n".join(outputs) if outputs else "(no output)"

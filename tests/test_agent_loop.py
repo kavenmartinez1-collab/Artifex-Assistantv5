@@ -269,3 +269,47 @@ def test_auto_revert_on_failed_run(monkeypatch):
     runner._on_action_complete(failed, False, pending)
     assert reverts == ["foo.py"]                  # failed run rolled the edit back
     assert pending == []
+
+
+class TestFormatRetry:
+    def test_malformed_tool_call_gets_retry_then_recovers(self):
+        # Round 1: Qwen-style <tool_call> repetition collapse (no parseable
+        # action). Round 2 (after the corrective nudge): a valid action.
+        # Round 3: clean @done.
+        responses = [
+            "I'll look now.\n<tool_call>\n<tool_call>\n<tool_call>\nreturn",
+            '@glob("**/*.py")',
+            '@done("all set")',
+        ]
+        engine = FakeEngine(responses)
+        events = []
+        runner = AgentRunner(
+            engine, build_system_prompt=lambda: "sys",
+            emit=events.append,
+            config=RunConfig(autonomy=AutonomyLevel.FULL_AUTO, framing=True),
+        )
+        result = runner.run("goal", [])
+        assert result.status == "done"
+        assert result.summary == "all set"
+        assert any(e.kind == "format_retry" for e in events)
+
+    def test_prose_answer_still_finishes(self):
+        engine = FakeEngine(["The answer is 42. Nothing to run."])
+        runner = AgentRunner(
+            engine, build_system_prompt=lambda: "sys",
+            config=RunConfig(autonomy=AutonomyLevel.FULL_AUTO),
+        )
+        result = runner.run("goal", [])
+        assert result.status == "done"
+        assert result.rounds == 1
+
+    def test_retry_cap_prevents_loops(self):
+        engine = FakeEngine(["<tool_call>"] * 6)
+        runner = AgentRunner(
+            engine, build_system_prompt=lambda: "sys",
+            config=RunConfig(autonomy=AutonomyLevel.FULL_AUTO),
+        )
+        result = runner.run("goal", [])
+        # two retries then the third garbage round ends the run
+        assert result.status == "done"
+        assert result.rounds == 3

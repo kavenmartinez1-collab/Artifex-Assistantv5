@@ -262,10 +262,19 @@ def get_tool_output_limit(tool_type=None):
 _last_search_results = []
 
 
-def _extract_fenced_blocks(text, languages):
+def _extract_fenced_blocks(text, languages, validate=None):
     """Extract content from fenced code blocks using string scanning.
 
     Safe for arbitrarily large input — O(n) with no regex backtracking.
+
+    validate: optional callable(content) -> bool used to pick the CLOSING
+    fence. When the block's content itself contains ``` (a python block
+    writing a markdown file with code fences inside a string literal — a
+    real Qwen3.6 agent behavior that used to truncate the code mid-string),
+    the first close fence is wrong. With a validator, each candidate close
+    is tried in order and the first whose content validates wins; if none
+    validates, the first fence is used (legacy behavior, so genuinely
+    broken code still surfaces its own error).
     """
     blocks = []
     pos = 0
@@ -281,12 +290,43 @@ def _extract_fenced_blocks(text, languages):
             pos = fence_start + 3
             continue
         content_start = line_end + 1
-        close = text.find("```", content_start)
-        if close == -1:
+
+        candidates = []
+        search = content_start
+        while True:
+            c = text.find("```", search)
+            if c == -1:
+                break
+            candidates.append(c)
+            search = c + 3
+        if not candidates:
             break
+
+        close = None
+        if validate is not None:
+            for c in candidates:
+                try:
+                    if validate(text[content_start:c]):
+                        close = c
+                        break
+                except Exception:
+                    continue
+        if close is None:
+            close = candidates[0]
+
         blocks.append(text[content_start:close])
         pos = close + 3
     return blocks
+
+
+def _python_parses(code):
+    """AST-validity check used to disambiguate nested fences in ```python```."""
+    import ast
+    try:
+        ast.parse(code)
+        return True
+    except SyntaxError:
+        return False
 
 
 _MARKER_TOOL_NAMES = (
@@ -504,8 +544,9 @@ def extract_agent_actions(response):
                 if _is_likely_command(line):
                     actions.append(AgentAction("shell", line, line))
 
-    # --- Python code blocks ---
-    python_blocks = _extract_fenced_blocks(response, {"python", "py"})
+    # --- Python code blocks (AST-validated close: content may embed ```) ---
+    python_blocks = _extract_fenced_blocks(response, {"python", "py"},
+                                           validate=_python_parses)
     for block in python_blocks:
         code = block.strip()
         if not code:
@@ -730,11 +771,24 @@ def _get_clean_env():
     Strips secrets via scrub_env() so child processes never see API keys,
     cloud credentials, or the agent key. Then layers on the encoding hints
     we actually want children to inherit.
+
+    Also puts the venv's Scripts/bin dir at the front of PATH so shell
+    commands resolve `python`/`pip`/`pytest` to the SAME interpreter that
+    ```python``` blocks use. Without this the agent lives in a split-brain
+    world: python blocks ran in the venv while `python -m pytest` in a
+    shell hit the bare system Python (no pytest) and `pip` wasn't found
+    at all (agent_bench s3 failure mode).
     """
     env = scrub_env()
     env["PYTHONIOENCODING"] = "utf-8"
     if IS_WINDOWS:
         env["PYTHONUTF8"] = "1"
+    bin_dir = os.path.dirname(_PYTHON_BIN) if os.path.isabs(_PYTHON_BIN) else ""
+    if bin_dir:
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        venv_root = os.path.dirname(bin_dir)
+        if os.path.isfile(os.path.join(venv_root, "pyvenv.cfg")):
+            env["VIRTUAL_ENV"] = venv_root
     return env
 
 
@@ -771,8 +825,22 @@ def run_shell_command(command, timeout=300, cwd=None):
                 ps_cmd = _bash_to_powershell(command) if use_bash else command
                 ps_bin = shutil.which("pwsh") or shutil.which("powershell")
                 if ps_bin:
+                    # Windows PowerShell 5.1 writes UTF-16 for `>` redirects,
+                    # producing NUL-riddled files no downstream tool can read
+                    # (agent_bench s5: result.txt was UTF-16 "57"). Force
+                    # UTF-8 for redirects and console output.
+                    # python3/pip3 don't exist in a Windows venv Scripts dir —
+                    # python3 resolves to the Microsoft Store alias stub.
+                    # Shim both onto the venv interpreter.
+                    ps_prelude = (
+                        "$PSDefaultParameterValues['Out-File:Encoding']='utf8'; "
+                        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+                        "function python3 { & python @args }; "
+                        "function pip3 { & pip @args }; "
+                    )
                     result = subprocess.run(
-                        [ps_bin, "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                        [ps_bin, "-NoProfile", "-NonInteractive", "-Command",
+                         ps_prelude + ps_cmd],
                         capture_output=True, text=True, timeout=timeout,
                         cwd=cwd, env=_get_clean_env(),
                         encoding="utf-8", errors="replace",

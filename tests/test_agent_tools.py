@@ -211,3 +211,63 @@ class TestEmptyOldEdit:
             '3. **@search("query")** - web search\n'
         )
         assert extract_agent_actions(response) == []
+
+
+class TestNestedFencePython:
+    """Python blocks writing markdown-with-code-fences must not truncate."""
+
+    def test_python_block_containing_markdown_fences(self):
+        response = (
+            "```python\n"
+            'content = """# Report\n'
+            "Usage example:\n"
+            "```python\n"
+            "parse_header(line)\n"
+            "```\n"
+            '"""\n'
+            'open("report.md", "w").write(content)\n'
+            "```\n"
+        )
+        actions = extract_agent_actions(response)
+        py = [a for a in actions if a.type == "python"]
+        assert len(py) == 1
+        import ast
+        ast.parse(py[0].content)  # must be complete, valid code
+        assert 'open("report.md", "w")' in py[0].content
+
+    def test_broken_python_still_first_fence(self):
+        # No candidate parses -> legacy first-fence behavior, so the
+        # model's own syntax error surfaces unchanged.
+        response = "```python\ndef broken(:\n```\nprose after\n"
+        actions = extract_agent_actions(response)
+        py = [a for a in actions if a.type == "python"]
+        assert len(py) == 1
+        assert py[0].content.strip() == "def broken(:"
+
+
+class TestShellRedirectEncoding:
+    def test_powershell_redirect_writes_utf8(self, tmp_path):
+        # PS 5.1 default `>` is UTF-16 — the executor must force UTF-8 so
+        # redirected files are readable by python/read_file downstream.
+        import sys
+        if sys.platform != "win32":
+            import pytest
+            pytest.skip("Windows-only")
+        from tools.agent_tools import run_shell_command
+        out_file = tmp_path / "r.txt"
+        ok, _ = run_shell_command(f'echo 57 > "{out_file}"', cwd=str(tmp_path))
+        assert ok
+        raw = out_file.read_bytes()
+        assert b"\x00" not in raw, f"UTF-16 leak: {raw[:20]!r}"
+        assert "57" in raw.decode("utf-8-sig")
+
+    def test_shell_python_is_venv_python(self, tmp_path):
+        import sys
+        if sys.platform != "win32":
+            import pytest
+            pytest.skip("Windows-only")
+        from tools.agent_tools import run_shell_command, _PYTHON_BIN
+        ok, out = run_shell_command(
+            'python -c "import sys; print(sys.executable)"', cwd=str(tmp_path))
+        assert ok
+        assert out.strip().lower() == _PYTHON_BIN.lower(), out
