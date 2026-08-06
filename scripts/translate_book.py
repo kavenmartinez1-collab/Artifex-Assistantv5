@@ -234,7 +234,13 @@ def cmd_translate(pages_arg: str, name: str, src_lang: str = "Spanish"):
             [{"role": "system", "content": system_prompt},
              {"role": "user", "content": user}],
             max_tokens=3072, temperature=0.25,
-            enable_thinking=False, sampling=sampling)
+            enable_thinking=False, sampling=sampling,
+            # raw_output: skip chat-response cleanup. The anti-repetition
+            # truncator false-fires on legitimately repetitive material
+            # (baptism registers, genealogy tree listings) and amputated
+            # whole passages; finish_reason=stop already proves the model
+            # ended naturally.
+            raw_output=True)
         dt = time.monotonic() - t0
         gen = dict(engine._last_gen_stats)
         results.append(out.strip())
