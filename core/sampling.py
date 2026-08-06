@@ -51,10 +51,17 @@ _NEUTRAL = {
 }
 
 # The platform preset contract. balanced/deterministic/creative/reference
-# mirror webgpu/src/main.ts SAMPLER_PRESETS exactly (temperature included);
-# "agent" starts from the Qwen3-series recommended thinking configuration
-# (temp 0.6 / top_p 0.95 / top_k 20 / min_p 0) and is tuned by agent_bench
-# results — see agent_bench/README.md for the measured comparison.
+# mirror webgpu/src/main.ts SAMPLER_PRESETS exactly (temperature included).
+#
+# "agent" — the Qwen3-series recommended thinking configuration (temp 0.6 /
+# top_p 0.95 / top_k 20 / min_p 0), validated by agent_bench on
+# Qwen3.6-35B-A3B (2026-08-05): 1.000 on the 6-scenario full suite with
+# proper run-the-test-before-done discipline. Measured alternatives:
+# greedy also scored 1.000 but repeats failed attempts verbatim on retries;
+# presence_penalty=1.0 (best micro discipline, 0.95) proactively breaks
+# <tool_call> repetition collapse but once skipped test verification
+# (0.967 full) — use it if collapse recurs; the agent loop's format-retry
+# already handles collapse reactively. Full data: agent_bench/TUNING_REPORT.md.
 PRESETS = {
     "balanced": {
         "temperature": 0.7, "top_k": 40, "top_p": 0.9,
