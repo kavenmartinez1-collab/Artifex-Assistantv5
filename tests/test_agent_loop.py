@@ -313,3 +313,21 @@ class TestFormatRetry:
         # two retries then the third garbage round ends the run
         assert result.status == "done"
         assert result.rounds == 3
+
+    def test_malformed_edit_block_gets_retry(self):
+        # An ```edit``` fence that parses to no action (bad structure) must
+        # trigger the nudge, not end the run as a prose "done".
+        responses = [
+            "```edit\nFILE x.py\nOLDNEW garbage\n```",
+            '@done("gave up cleanly")',
+        ]
+        engine = FakeEngine(responses)
+        events = []
+        runner = AgentRunner(
+            engine, build_system_prompt=lambda: "sys",
+            emit=events.append,
+            config=RunConfig(autonomy=AutonomyLevel.FULL_AUTO),
+        )
+        result = runner.run("goal", [])
+        assert any(e.kind == "format_retry" for e in events)
+        assert result.summary == "gave up cleanly"

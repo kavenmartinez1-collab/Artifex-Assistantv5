@@ -652,7 +652,9 @@ def extract_agent_actions(response):
     edit_blocks = _extract_fenced_blocks(response, {"edit"})
     for block in edit_blocks:
         file_m = re.search(r"^FILE:[ \t]*(.+)$", block, re.MULTILINE)
-        old_m = re.search(r"^OLD:[ \t]*\n(.*?)\nNEW:", block, re.DOTALL | re.MULTILINE)
+        # \n? before NEW: — an empty OLD (create-file form) is written as
+        # "OLD:\nNEW:" with no blank line between them.
+        old_m = re.search(r"^OLD:[ \t]*\n?(.*?)\n?NEW:", block, re.DOTALL | re.MULTILINE)
         # \Z (absolute end), NOT $: with MULTILINE, a lazy (.*?)$ stops at the
         # FIRST newline, silently truncating every multi-line NEW replacement
         # to its first line (found via agent_bench edit_block_format probe).
@@ -1929,6 +1931,24 @@ def run_edit_file(content):
         path = os.path.join(os.getcwd(), path)
 
     if not os.path.isfile(path):
+        # Create-file form: empty OLD + nonexistent target. Models reach for
+        # this constantly (observed across Qwen3.6 bench runs); it is safe
+        # and unambiguous, so support it instead of erroring.
+        if not old_str.strip():
+            if path.endswith(".py"):
+                try:
+                    compile(new_str, path, "exec")
+                except SyntaxError as e:
+                    return False, f"New file has a Python syntax error: {e}"
+            try:
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(new_str if new_str.endswith("\n") or not new_str
+                            else new_str + "\n")
+            except OSError as e:
+                return False, f"Cannot create {path}: {e}"
+            n_lines = new_str.count("\n") + 1
+            return True, f"Created {os.path.basename(path)} ({n_lines} lines)"
         return False, f"File not found: {path}"
 
     # Read with encoding fallback

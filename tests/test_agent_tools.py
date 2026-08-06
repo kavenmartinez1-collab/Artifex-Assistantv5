@@ -295,3 +295,51 @@ class TestHeredocExtraction:
         from tools.agent_tools import _is_bash_syntax
         assert _is_bash_syntax("cat > f.py << 'EOF'")
         assert _is_bash_syntax("tee out.txt <<DOC")
+
+
+class TestCreateFileEdit:
+    def test_empty_old_creates_new_file(self, tmp_path):
+        import os
+        from tools.agent_tools import extract_agent_actions, run_edit_file
+        response = (
+            "```edit\n"
+            "FILE: wordcount.py\n"
+            "OLD:\n"
+            "NEW:\n"
+            "import sys\n"
+            "print(len(open(sys.argv[1]).read().split()))\n"
+            "```\n"
+        )
+        actions = extract_agent_actions(response)
+        edits = [a for a in actions if a.type == "edit_file"]
+        assert len(edits) == 1, [a.type for a in actions]
+        path, old, new = edits[0].content.split("\x00")
+        assert old == "" and "import sys" in new
+        cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            ok, out = run_edit_file(edits[0].content)
+        finally:
+            os.chdir(cwd)
+        assert ok, out
+        assert "Created" in out
+        assert (tmp_path / "wordcount.py").read_text(encoding="utf-8").startswith("import sys")
+
+    def test_empty_old_on_existing_file_still_errors(self, tmp_path):
+        from tools.agent_tools import run_edit_file
+        target = tmp_path / "f.py"
+        target.write_text("x = 1\n", encoding="utf-8")
+        ok, out = run_edit_file(f"{target}\x00\x00new")
+        assert not ok and "OLD is empty" in out
+
+    def test_create_file_bad_python_rejected(self, tmp_path):
+        import os
+        from tools.agent_tools import run_edit_file
+        cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            ok, out = run_edit_file("bad.py\x00\x00def broken(:")
+        finally:
+            os.chdir(cwd)
+        assert not ok and "syntax error" in out.lower()
+        assert not (tmp_path / "bad.py").exists()

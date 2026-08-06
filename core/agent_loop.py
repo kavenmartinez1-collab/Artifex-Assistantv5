@@ -487,8 +487,10 @@ class AgentRunner:
             return False
         if "<tool_call" in resp:
             return True
-        if re.search(r"```(?:bash|sh|shell|powershell|cmd|python|py|edit)\s*(?:```|$)",
-                     resp.strip()):
+        # Caller only reaches here when ZERO actions parsed — so any fenced
+        # tool block in the text is by definition a failed invocation
+        # (malformed edit, empty body, unknown structure).
+        if re.search(r"```(?:bash|sh|shell|powershell|cmd|python|py|edit)\b", resp):
             return True
         return False
 
