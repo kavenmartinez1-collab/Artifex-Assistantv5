@@ -153,6 +153,9 @@ def _is_bash_syntax(command):
     # Bash operators
     if "&&" in command or "||" in command:
         return True
+    # Heredocs are bash-only — PowerShell has no equivalent syntax
+    if re.search(r"<<-?\s*['\"]?[A-Za-z_]\w*", command):
+        return True
     # Bash redirects with fd: 2>&1, 2>/dev/null
     if re.search(r"\d+>&\d+|/dev/null", command):
         return True
@@ -524,6 +527,17 @@ def extract_agent_actions(response):
         # Filter out lines that are tool markers (not shell commands)
         lines = [l for l in lines if not _TOOL_MARKER_RE.match(l)]
         if not lines:
+            continue
+
+        # Heredocs must survive as ONE command — line-splitting executes the
+        # document BODY as commands (observed: python source fed line-by-line
+        # into PowerShell). The whole block goes to bash, which understands it.
+        if re.search(r"<<-?\s*['\"]?[A-Za-z_]\w*", lines[0]) or any(
+                re.search(r"\bcat\b.*<<-?\s*['\"]?[A-Za-z_]\w*", l) for l in lines):
+            heredoc_block = "\n".join(lines).strip()
+            if heredoc_block:
+                display = lines[0].strip()[:80]
+                actions.append(AgentAction("shell", heredoc_block, display))
             continue
 
         # If it's a multi-line pipeline (PowerShell piped command), keep as one

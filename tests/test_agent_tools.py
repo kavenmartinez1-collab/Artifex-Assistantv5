@@ -271,3 +271,27 @@ class TestShellRedirectEncoding:
             'python -c "import sys; print(sys.executable)"', cwd=str(tmp_path))
         assert ok
         assert out.strip().lower() == _PYTHON_BIN.lower(), out
+
+
+class TestHeredocExtraction:
+    def test_heredoc_block_stays_single_command(self):
+        response = (
+            "```bash\n"
+            "cat > wordcount.py << 'EOF'\n"
+            "import sys\n"
+            'with open(sys.argv[1], "r") as f:\n'
+            "    words = f.read().split()\n"
+            "print(len(words))\n"
+            "EOF\n"
+            "```\n"
+        )
+        actions = extract_agent_actions(response)
+        shells = [a for a in actions if a.type == "shell"]
+        assert len(shells) == 1, [a.content for a in actions]
+        assert "<< 'EOF'" in shells[0].content
+        assert "print(len(words))" in shells[0].content
+
+    def test_heredoc_routes_to_bash(self):
+        from tools.agent_tools import _is_bash_syntax
+        assert _is_bash_syntax("cat > f.py << 'EOF'")
+        assert _is_bash_syntax("tee out.txt <<DOC")
