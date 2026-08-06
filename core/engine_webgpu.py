@@ -178,6 +178,7 @@ class WebGpuEngine(BaseEngine):
 
         full_text = ""
         started = time.monotonic()
+        last_event = started
         try:
             while True:
                 if time.monotonic() - started > REQUEST_TIMEOUT_S:
@@ -190,14 +191,20 @@ class WebGpuEngine(BaseEngine):
                         raise ConnectionError(
                             "WebGPU browser page detached mid-generation "
                             "(closed tab / crashed page?)")
-                    if time.monotonic() - started > EVENT_TIMEOUT_S and not full_text:
+                    # Liveness keys off events (the page heartbeats every
+                    # ~8 s while generating — long prefills are silent
+                    # token-wise but not event-wise).
+                    if time.monotonic() - last_event > EVENT_TIMEOUT_S:
                         bridge.state.cancel(job.id)
                         raise TimeoutError(
-                            "WebGPU page produced no output — is a model "
-                            "loaded and idle in the browser?")
+                            "WebGPU page stopped responding mid-generation "
+                            "(no events, page still polling?)")
                     continue
 
+                last_event = time.monotonic()
                 etype = event.get("type")
+                if etype == "ping":
+                    continue
                 if etype == "token":
                     piece = event.get("text", "")
                     if piece:

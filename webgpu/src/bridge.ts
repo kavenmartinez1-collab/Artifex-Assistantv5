@@ -147,8 +147,16 @@ async function runJob(
       { enableThinking: job.enableThinking !== false },
     );
 
+    // Prefill on big models produces NOTHING for a minute or more; without
+    // traffic the Python side declared the page detached mid-generation.
+    // Heartbeat every 8 s keeps the liveness window fed while we work.
+    let lastBeat = Date.now();
     const flusher = setInterval(() => {
       flush();
+      if (Date.now() - lastBeat > 8000) {
+        lastBeat = Date.now();
+        void send({ type: 'ping' });
+      }
       if (cancelled) handle.abort();
     }, 80);
 
