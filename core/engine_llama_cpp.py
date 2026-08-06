@@ -170,6 +170,11 @@ def _read_gguf_kv_params(gguf_path: str) -> dict | None:
 class LlamaCppEngine(BaseEngine):
     """llama.cpp server backend — manages a llama-server process per model."""
 
+    # llama-server thinking arrives as a separate reasoning_content SSE field
+    # that generate_streaming re-wraps in explicit <think>...</think> tags, so
+    # the stream does NOT begin inside a thinking block.
+    stream_starts_in_think = False
+
     def __init__(self, model_name: str, model_config: dict):
         self.model_name = model_name
         self.model_path = model_config["path"]
@@ -649,28 +654,44 @@ class LlamaCppEngine(BaseEngine):
                            grammar=None, response_format=None,
                            raw_output=False,
                            web_tools=False,
-                           on_telemetry=None) -> str:
+                           on_telemetry=None,
+                           sampling=None) -> str:
         """Stream from llama-server's OpenAI-compatible /v1/chat/completions.
 
         Thinking is handled via <think> tags in the content stream (same as
         Transformers path).  The server-side streaming layer applies ThinkFilter.
 
+        sampling: optional dict of llama-server sampler params (core.sampling
+        preset or hand-built).  When None, DEFAULT_SAMPLING is sent so the
+        full sampler chain is always explicit — llama-server's compiled-in
+        request defaults (min_p=0.05, top_k=40, ...) never apply silently.
+        A "temperature" key inside sampling overrides the positional arg
+        (presets carry their own temperature; plain callers keep theirs).
+
         web_tools is accepted-and-ignored — local llama.cpp models don't
         have native tool execution; Artifex's @search/@web_read
         post-processor in api/server.py handles tools for this backend.
         """
+        from core.sampling import DEFAULT_SAMPLING, SAMPLING_PAYLOAD_KEYS
+
         self.load()
         self._last_gen_stats = {}
 
         req_messages = list(messages)
 
+        samp = dict(DEFAULT_SAMPLING) if sampling is None else dict(sampling)
         payload = {
             "model": self.model_name,
             "messages": req_messages,
             "stream": True,
-            "temperature": temperature,
+            "temperature": samp.pop("temperature", temperature),
             "cache_prompt": True,
+            # llama-server omits token usage from the stream unless asked.
+            "stream_options": {"include_usage": True},
         }
+        for key in SAMPLING_PAYLOAD_KEYS:
+            if key in samp:
+                payload[key] = samp[key]
         if not enable_thinking:
             # Qwen3.x chat templates gate the think block on an
             # `enable_thinking` template variable — not a `/no_think` text
@@ -713,6 +734,20 @@ class LlamaCppEngine(BaseEngine):
                         except json.JSONDecodeError:
                             continue
 
+                        # usage/timings arrive in a final chunk whose choices
+                        # array is EMPTY — read them before the choices gate
+                        # or they are silently skipped.
+                        usage = chunk.get("usage")
+                        if usage:
+                            self._last_gen_stats["prompt_tokens"] = usage.get("prompt_tokens", 0)
+                            self._last_gen_stats["completion_tokens"] = usage.get("completion_tokens", 0)
+                        timings = chunk.get("timings")
+                        if timings:
+                            self._last_gen_stats["prompt_per_second"] = timings.get("prompt_per_second")
+                            self._last_gen_stats["predicted_per_second"] = timings.get("predicted_per_second")
+                            self._last_gen_stats["prompt_n"] = timings.get("prompt_n")
+                            self._last_gen_stats["cache_n"] = timings.get("cache_n")
+
                         choices = chunk.get("choices", [])
                         if not choices:
                             continue
@@ -746,10 +781,6 @@ class LlamaCppEngine(BaseEngine):
                         if finish:
                             self._last_gen_stats["finish_reason"] = finish
 
-                        usage = chunk.get("usage")
-                        if usage:
-                            self._last_gen_stats["prompt_tokens"] = usage.get("prompt_tokens", 0)
-                            self._last_gen_stats["completion_tokens"] = usage.get("completion_tokens", 0)
 
                 break  # success — exit retry loop
 

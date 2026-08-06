@@ -1952,6 +1952,24 @@ class ArtifexMainWindow(QMainWindow):
             "Guided: auto-run safe reads, confirm writes / MEDIUM+\n"
             "Full-auto: run everything policy allows (CRITICAL + ratchet still stop it)")
         goal_row.addWidget(self._auto_level)
+        goal_row.addWidget(QLabel("Sampling:"))
+        self._auto_preset = QComboBox()
+        from core.sampling import list_presets
+        for name in list_presets():
+            self._auto_preset.addItem(name.capitalize())
+        self._auto_preset.setCurrentText("Agent")
+        self._auto_preset.setToolTip(
+            "Sampler preset for this run (core/sampling.py — same contract as "
+            "the WebGPU dropdown).\nAgent is tuned for tool-use discipline; "
+            "see agent_bench/ for the measurements.")
+        goal_row.addWidget(self._auto_preset)
+        self._auto_thinking = QCheckBox("Thinking")
+        self._auto_thinking.setChecked(True)
+        self._auto_thinking.setToolTip(
+            "Let the model reason in a <think> block before each action.\n"
+            "Costs tokens/latency per round; measurably better tool discipline "
+            "on Qwen3.6 (agent_bench).")
+        goal_row.addWidget(self._auto_thinking)
         rb.addLayout(goal_row)
 
         btn_row = QHBoxLayout()
@@ -2180,12 +2198,17 @@ class ArtifexMainWindow(QMainWindow):
 
         self._auto_control = RunControl()
         cfg = RunConfig.default(level)
+        cfg.sampler_preset = self._auto_preset.currentText().lower()
+        cfg.enable_thinking = self._auto_thinking.isChecked()
         # Run on a private copy of the conversation so the chat stays clean;
         # the final summary is folded back into the conversation at the end.
         history = [dict(m) for m in self.messages]
 
         self._auto_log.clear()
-        self._auto_append(f"▶ GOAL: {goal}\n  autonomy: {self._auto_level.currentText()}")
+        self._auto_append(
+            f"▶ GOAL: {goal}\n  autonomy: {self._auto_level.currentText()}"
+            f"  sampling: {cfg.sampler_preset}"
+            f"  thinking: {'on' if cfg.enable_thinking else 'off'}")
 
         self._auto_worker = AutonomousWorker(
             self.engine, goal, history,

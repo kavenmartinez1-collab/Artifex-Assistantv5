@@ -64,6 +64,11 @@ def _detect_safe_num_gpu(model_size_gb=None):
 class OllamaEngine(BaseEngine):
     """Ollama HTTP backend — delegates inference to a locally running Ollama server."""
 
+    # Ollama delivers thinking as a separate "thinking" field that
+    # generate_streaming re-wraps in explicit <think>...</think> tags,
+    # so the stream does not begin inside a thinking block.
+    stream_starts_in_think = False
+
     def __init__(self, model_name: str, base_url: str = OLLAMA_BASE_URL):
         self.model_name = model_name
         self.base_url = base_url.rstrip("/")
@@ -165,8 +170,13 @@ class OllamaEngine(BaseEngine):
                            grammar=None, response_format=None,
                            raw_output=False,
                            web_tools=False,
-                           on_telemetry=None) -> str:
+                           on_telemetry=None,
+                           sampling=None) -> str:
         """Stream a response from the Ollama /api/chat endpoint (localhost only).
+
+        sampling: optional explicit sampler dict (core.sampling preset).
+        Supported keys map 1:1 onto Ollama options; DRY/XTC are ignored.
+        When None, the legacy hardcoded repeat_penalty=1.15 defaults apply.
 
         web_tools is accepted-and-ignored — Ollama models use the
         @search/@web_read post-processor in api/server.py for tools.
@@ -185,6 +195,15 @@ class OllamaEngine(BaseEngine):
             "repeat_last_n": 128,
             "num_batch": 1024,
         }
+        if sampling:
+            _OLLAMA_SAMPLING_KEYS = (
+                "temperature", "top_k", "top_p", "min_p", "typical_p",
+                "repeat_penalty", "repeat_last_n",
+                "presence_penalty", "frequency_penalty", "seed",
+            )
+            for key in _OLLAMA_SAMPLING_KEYS:
+                if key in sampling:
+                    options[key] = sampling[key]
         est_tokens = estimate_prompt_tokens(messages)
         options["num_ctx"] = compute_safe_ctx(self.model_name, est_tokens, model_config)
 

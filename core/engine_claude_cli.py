@@ -174,12 +174,13 @@ class ClaudeCliEngine(BaseEngine):
                            grammar=None, response_format=None,
                            raw_output=False,
                            web_tools=False,
-                           on_telemetry=None) -> str:
+                           on_telemetry=None,
+                           sampling=None) -> str:
         """Run inference via the claude CLI.
 
         The CLI doesn't expose sampling controls (temperature,
-        max_tokens), grammar, or response_format, so those args are
-        accepted-and-ignored to satisfy the BaseEngine contract.
+        max_tokens, sampling dict), grammar, or response_format, so those
+        args are accepted-and-ignored to satisfy the BaseEngine contract.
 
         Multi-turn history is folded into a single user prompt with
         role markers — `claude --print` is single-turn.  Image parts

@@ -1140,8 +1140,14 @@ class TransformersEngine(BaseEngine):
                            grammar=None, response_format=None,
                            raw_output=False,
                            web_tools=False,
-                           on_telemetry=None) -> str:
+                           on_telemetry=None,
+                           sampling=None) -> str:
         """Run streaming inference on the local transformers model.
+
+        sampling: optional explicit sampler dict (core.sampling preset).
+        Maps temperature/top_p/top_k/min_p/repeat_penalty onto HF generate
+        kwargs; llama.cpp-only knobs (DRY, XTC, typical_p order) are ignored.
+        When None, the legacy hardcoded repetition_penalty=1.15 applies.
 
         web_tools is accepted-and-ignored — transformers models use the
         @search/@web_read post-processor in api/server.py for tools.
@@ -1265,25 +1271,34 @@ class TransformersEngine(BaseEngine):
 
         effective_max = max_tokens if max_tokens and max_tokens > 0 else 8192
 
+        samp = dict(sampling) if sampling else {}
+        effective_temp = samp.get("temperature", temperature)
+
         # temperature=0 means greedy decoding. transformers v5 rejects
         # temperature<=0 with do_sample=True (TemperatureLogitsWarper would
         # divide by zero), so route the two cases explicitly: positive
         # temperature → sampling, zero/None → do_sample=False (argmax).
-        sampling = temperature is not None and temperature > 0
+        do_sample = effective_temp is not None and effective_temp > 0
 
         gen_kwargs = dict(
             **inputs,
             streamer=streamer,
             max_new_tokens=effective_max,
-            do_sample=sampling,
+            do_sample=do_sample,
             use_cache=True,
-            repetition_penalty=1.15,
+            repetition_penalty=samp.get("repeat_penalty", 1.15),
             eos_token_id=list(eos_ids) if eos_ids else tokenizer.eos_token_id,
             pad_token_id=pad_id,
             stopping_criteria=StoppingCriteriaList([stop_criteria]),
         )
-        if sampling:
-            gen_kwargs["temperature"] = temperature
+        if do_sample:
+            gen_kwargs["temperature"] = effective_temp
+            if "top_p" in samp:
+                gen_kwargs["top_p"] = samp["top_p"]
+            if samp.get("top_k", 0) > 0:
+                gen_kwargs["top_k"] = samp["top_k"]
+            if "min_p" in samp:
+                gen_kwargs["min_p"] = samp["min_p"]
         if past_kv is not None:
             gen_kwargs["past_key_values"] = past_kv
 

@@ -289,6 +289,149 @@ def _extract_fenced_blocks(text, languages):
     return blocks
 
 
+_MARKER_TOOL_NAMES = (
+    "search|read_file|read_function|find_symbol|find_references"
+    "|grep|glob|web_read|download|trace_imports|architecture"
+)
+
+# Hybrid syntax some chat-template-trained models (Qwen3.x under --jinja)
+# emit: the marker wrapped in their native tool-call tag, e.g.
+#   <tool_call>:glob("config.ini")   or   <tool_call>@grep("x", ".")
+# Normalized back to plain @marker form before marker matching.
+_HYBRID_TOOL_CALL_RE = re.compile(
+    rf'<tool_call>\s*[:@]?\s*({_MARKER_TOOL_NAMES}|done|finish)\s*\(',
+)
+
+# Fully-native JSON tool calls: <tool_call>{"name": ..., "arguments": ...}</tool_call>
+_JSON_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+# Argument-name aliases seen in the wild for the JSON form.
+_JSON_ARG_ALIASES = {
+    "path": ("path", "file", "filepath", "file_path", "filename"),
+    "pattern": ("pattern", "glob", "query"),
+    "name": ("name", "symbol", "function", "function_name"),
+    "query": ("query", "q", "search", "text"),
+    "url": ("url", "link", "href"),
+    "command": ("command", "cmd", "shell"),
+    "code": ("code", "script", "source"),
+}
+
+
+def _json_arg(args, canonical):
+    for key in _JSON_ARG_ALIASES.get(canonical, (canonical,)):
+        if key in args and args[key] is not None:
+            return str(args[key])
+    return None
+
+
+def _strip_inline_code(text):
+    """Blank out `inline code` spans OUTSIDE fenced blocks.
+
+    The system prompt promises that backticked tool markers are inert
+    ("when listing tools, use prose or backticks") — without this, a model
+    politely listing its tools in a table fires every one of them.
+    Fenced ``` blocks are preserved untouched (shell/python/edit extraction
+    and the marker-recovery path depend on their contents).
+    """
+    out = []
+    pos = 0
+    while True:
+        fence = text.find("```", pos)
+        segment = text[pos: fence if fence != -1 else len(text)]
+        out.append(re.sub(r"`[^`\n]*`", "``", segment))
+        if fence == -1:
+            break
+        close = text.find("```", fence + 3)
+        if close == -1:
+            out.append(text[fence:])
+            break
+        out.append(text[fence:close + 3])
+        pos = close + 3
+    return "".join(out)
+
+
+def _extract_json_tool_calls(response):
+    """Parse native <tool_call>{JSON}</tool_call> calls into AgentActions.
+
+    Qwen3.x models running under llama-server --jinja are trained on this
+    format and occasionally fall back to it despite the @marker prompt.
+    Only tools with an existing executor are mapped; unknown names are
+    ignored (better a stall than a hallucinated capability).
+    """
+    actions = []
+    for m in _JSON_TOOL_CALL_RE.finditer(response):
+        try:
+            obj = json.loads(m.group(1))
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        name = str(obj.get("name", "")).lower().strip()
+        args = obj.get("arguments") or obj.get("parameters") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, ValueError):
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
+
+        if name == "read_file":
+            path = _json_arg(args, "path")
+            if path:
+                actions.append(AgentAction("read_file", f"{path}|1",
+                                           f'read_file: "{path}"'))
+        elif name == "read_function":
+            path, fn = _json_arg(args, "path"), _json_arg(args, "name")
+            if path and fn:
+                actions.append(AgentAction("read_function", f"{path}|{fn}",
+                                           f'read_function: "{fn}" in {os.path.basename(path)}'))
+        elif name == "glob":
+            pattern = _json_arg(args, "pattern")
+            if pattern:
+                actions.append(AgentAction("glob", pattern, f'glob: "{pattern}"'))
+        elif name == "grep":
+            pattern, path = _json_arg(args, "pattern"), _json_arg(args, "path") or "."
+            if pattern:
+                actions.append(AgentAction("grep", f"{pattern}|{path}|",
+                                           f'grep: "{pattern}" in {path}'))
+        elif name == "search":
+            query = _json_arg(args, "query")
+            if query:
+                actions.append(AgentAction("search", query, f'search: "{query}"'))
+        elif name == "web_read":
+            ref = _json_arg(args, "url")
+            if ref:
+                actions.append(AgentAction("web_read", ref, f"web_read: {ref}"))
+        elif name == "find_symbol":
+            sym = _json_arg(args, "name")
+            if sym:
+                actions.append(AgentAction("find_symbol", sym,
+                                           f'find_symbol: "{sym}"'))
+        elif name == "find_references":
+            sym = _json_arg(args, "name")
+            if sym:
+                actions.append(AgentAction("find_references", sym,
+                                           f'find_references: "{sym}"'))
+        elif name == "trace_imports":
+            path = _json_arg(args, "path")
+            if path:
+                actions.append(AgentAction("trace_imports", path,
+                                           f'trace_imports: "{path}"'))
+        elif name == "architecture":
+            actions.append(AgentAction("architecture", "", "architecture: project map"))
+        elif name in ("shell", "bash", "run_shell", "execute"):
+            cmd = _json_arg(args, "command")
+            if cmd:
+                actions.append(AgentAction("shell", cmd, cmd[:80]))
+        elif name in ("python", "run_python"):
+            code = _json_arg(args, "code")
+            if code:
+                first = code.strip().split("\n")[0]
+                actions.append(AgentAction("python", code, first[:80]))
+    return actions
+
+
 def extract_agent_actions(response):
     """
     Extract executable actions from an ASSISTANT mode response.
@@ -297,10 +440,22 @@ def extract_agent_actions(response):
       1. ```bash / ```sh / ```shell / ```cmd / ```powershell blocks -> shell actions
       2. ```python / ```py blocks -> python actions
       3. @search("query") markers -> search actions
+      4. Native <tool_call> forms (hybrid @marker and JSON) from
+         chat-template-trained models
+
+    Markers inside `inline code` spans are documentation, not calls, and are
+    ignored (fenced blocks keep their existing semantics).
 
     Returns list of AgentAction tuples.
     """
     actions = []
+
+    # Marker regexes run against a normalized copy: inline code spans blanked
+    # (backticked mentions stay inert) and native tool-call wrappers folded
+    # back into @marker form. Fenced-block extraction uses the raw response.
+    marker_text = _strip_inline_code(response)
+    marker_text = _HYBRID_TOOL_CALL_RE.sub(r"@\1(", marker_text)
+    marker_text = marker_text.replace("</tool_call>", "")
 
     # Tool marker pattern — lines that are @tool(...) calls, not shell commands.
     # Some models (especially Ollama) mistakenly wrap these in code blocks.
@@ -357,14 +512,14 @@ def extract_agent_actions(response):
         actions.append(AgentAction("python", code, display))
 
     # --- Web search markers ---
-    search_matches = re.findall(r'@search\(["\'](.+?)["\']\)', response)
+    search_matches = re.findall(r'@search\(["\'](.+?)["\']\)', marker_text)
     for query in search_matches:
         actions.append(AgentAction("search", query, f'search: "{query}"'))
 
     # --- File read markers: @read_file("path") or @read_file("path", chunk=N) ---
     read_file_matches = re.findall(
         r'@read_file\(["\'](.+?)["\']\s*(?:,\s*chunk\s*=\s*(\d+))?\)',
-        response,
+        marker_text,
     )
     for filepath, chunk in read_file_matches:
         chunk_num = chunk if chunk else "1"
@@ -377,7 +532,7 @@ def extract_agent_actions(response):
     # --- Web read markers: @web_read("url") or @web_read(N) ---
     web_read_matches = re.findall(
         r'@web_read\((?:["\'](.+?)["\']|(\d+))\)',
-        response,
+        marker_text,
     )
     for url, num in web_read_matches:
         ref = url if url else num
@@ -387,7 +542,7 @@ def extract_agent_actions(response):
     # --- Download markers: @download("url") or @download("url", "filename") ---
     download_matches = re.findall(
         r'@download\(["\'](.+?)["\']\s*(?:,\s*["\'](.+?)["\'])?\)',
-        response,
+        marker_text,
     )
     for dl_url, dl_name in download_matches:
         content = f"{dl_url}|{dl_name}" if dl_name else dl_url
@@ -398,7 +553,7 @@ def extract_agent_actions(response):
     # --- Glob markers: @glob("pattern") or @glob("pattern", "base_dir") or @glob("pattern", "+all") ---
     glob_matches = re.findall(
         r'@glob\(["\'](.+?)["\']\s*(?:,\s*["\'](.+?)["\'])?\s*(?:,\s*["\'](.+?)["\'])?\)',
-        response,
+        marker_text,
     )
     for pattern, arg2, arg3 in glob_matches:
         # arg2 can be a base_dir or "+all" flag; arg3 is optional "+all" if arg2 was a dir
@@ -419,7 +574,7 @@ def extract_agent_actions(response):
     # --- Grep markers: @grep("pattern", "path") or @grep("pattern", "path", "flags") ---
     grep_matches = re.findall(
         r'@grep\(["\'](.+?)["\']\s*,\s*["\'](.+?)["\']\s*(?:,\s*["\']([^"\']*)["\'])?\)',
-        response,
+        marker_text,
     )
     for pattern, path, flags in grep_matches:
         content = f"{pattern}|{path}|{flags}"
@@ -437,7 +592,10 @@ def extract_agent_actions(response):
     for block in edit_blocks:
         file_m = re.search(r"^FILE:[ \t]*(.+)$", block, re.MULTILINE)
         old_m = re.search(r"^OLD:[ \t]*\n(.*?)\nNEW:", block, re.DOTALL | re.MULTILINE)
-        new_m = re.search(r"^NEW:[ \t]*\n(.*?)$", block, re.DOTALL | re.MULTILINE)
+        # \Z (absolute end), NOT $: with MULTILINE, a lazy (.*?)$ stops at the
+        # FIRST newline, silently truncating every multi-line NEW replacement
+        # to its first line (found via agent_bench edit_block_format probe).
+        new_m = re.search(r"^NEW:[ \t]*\n(.*?)\s*\Z", block, re.DOTALL | re.MULTILINE)
         if not (file_m and old_m and new_m):
             continue
         path = file_m.group(1).strip()
@@ -454,7 +612,7 @@ def extract_agent_actions(response):
     # @find_symbol("name") or @find_symbol("name", "class")
     sym_matches = re.findall(
         r'@find_symbol\(["\'](.+?)["\']\s*(?:,\s*["\'](\w+)["\'])?\)',
-        response,
+        marker_text,
     )
     for name, kind in sym_matches:
         content = f"{name}|{kind}" if kind else name
@@ -462,23 +620,23 @@ def extract_agent_actions(response):
         actions.append(AgentAction("find_symbol", content, display))
 
     # @find_references("symbol")
-    ref_matches = re.findall(r'@find_references\(["\'](.+?)["\']\)', response)
+    ref_matches = re.findall(r'@find_references\(["\'](.+?)["\']\)', marker_text)
     for name in ref_matches:
         actions.append(AgentAction("find_references", name, f'find_references: "{name}"'))
 
     # @trace_imports("filepath")
-    imp_matches = re.findall(r'@trace_imports\(["\'](.+?)["\']\)', response)
+    imp_matches = re.findall(r'@trace_imports\(["\'](.+?)["\']\)', marker_text)
     for path in imp_matches:
         actions.append(AgentAction("trace_imports", path, f'trace_imports: "{path}"'))
 
     # @architecture()
-    if re.search(r'@architecture\(\s*\)', response):
+    if re.search(r'@architecture\(\s*\)', marker_text):
         actions.append(AgentAction("architecture", "", "architecture: project map"))
 
     # @read_function("filepath", "function_name")
     read_fn_matches = re.findall(
         r'@read_function\(["\'](.+?)["\']\s*,\s*["\'](.+?)["\']\)',
-        response,
+        marker_text,
     )
     for fpath, fname in read_fn_matches:
         content = f"{fpath}|{fname}"
@@ -488,7 +646,7 @@ def extract_agent_actions(response):
     # --- Gemma 4 tool call format: <|tool_call>call:func{k:v,...}<tool_call|> ---
     gemma_tool_calls = re.findall(
         r'<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>',
-        response, re.DOTALL,
+        marker_text, re.DOTALL,
     )
     for func_name, args_str in gemma_tool_calls:
         # Parse Gemma 4 arguments: key:<|"|>value<|"|> or key:plain_value
@@ -510,6 +668,9 @@ def extract_agent_actions(response):
             display = f'{func_name}({", ".join(f"{k}={v}" for k, v in args.items())})'
             actions.append(AgentAction("shell", f"# Gemma tool: {display}",
                                        f"tool: {display}"))
+
+    # --- Native JSON tool calls: <tool_call>{"name": ...}</tool_call> ---
+    actions.extend(_extract_json_tool_calls(response))
 
     return actions
 
@@ -1696,6 +1857,14 @@ def run_edit_file(content):
 
     if original is None:
         return False, "Cannot decode file — unsupported encoding."
+
+    if not old_str.strip():
+        # "".count() is len+1, which used to surface as a baffling
+        # "appears N times" error. Teach instead.
+        return False, (
+            "OLD is empty — provide the exact existing text to replace. "
+            "To create a new file, use a python code block instead."
+        )
 
     count = original.count(old_str)
     if count == 0:

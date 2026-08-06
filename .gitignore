@@ -115,3 +115,7 @@ control-center/node_modules/
 
 # ── Third-party source for in-tree backend builds (llama.cpp, etc.) ──
 vendor/
+
+# ── Agent bench runtime artifacts (agent_bench/ code IS tracked) ────
+agent_bench/workspace/
+agent_bench/results/

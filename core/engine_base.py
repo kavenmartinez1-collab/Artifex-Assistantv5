@@ -53,13 +53,18 @@ class BaseEngine(ABC):
                            enable_thinking=True,
                            grammar=None, response_format=None,
                            web_tools=False,
-                           on_telemetry=None) -> str:
+                           on_telemetry=None,
+                           sampling=None) -> str:
         """Run streaming inference.
 
         Args:
             messages: list of {role, content} dicts
             max_tokens: max new tokens to generate
             temperature: sampling temperature
+            sampling: optional fully-explicit sampler dict (see core.sampling
+                presets — top_k/top_p/min_p/repeat_penalty/dry_*/seed/...).
+                Backends apply what they support and ignore the rest. When it
+                contains "temperature", that overrides the positional arg.
             on_token: callback(str) for each new chunk (raw, includes thinking)
             on_complete: callback(str) with final cleaned response
             enable_thinking: if True, model generates <think> reasoning blocks

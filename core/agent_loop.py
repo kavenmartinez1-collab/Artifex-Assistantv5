@@ -82,6 +82,12 @@ class RunConfig:
     max_tokens: int = 2048
     temperature: float = 0.7
     enable_thinking: bool = True
+    # Sampler selection for the run. `sampling` (explicit dict) wins over
+    # `sampler_preset` (name resolved via core.sampling.get_preset). When a
+    # resolved dict carries "temperature", it overrides the field above —
+    # presets own the full sampler chain. None/None keeps engine defaults.
+    sampler_preset: Optional[str] = None
+    sampling: Optional[dict] = None
     always_confirm_types: tuple = ("edit_file", "download")  # GUIDED always asks
     auto_approve_max_risk: str = "LOW"                       # GUIDED auto-runs <= this
     framing: bool = True   # wrap the prompt with the autonomous preamble + GOAL
@@ -367,6 +373,37 @@ class AgentRunner:
             active = trim_messages_to_context(active, int(ctx * 0.85))
         return active
 
+    def _resolved_sampling(self) -> Optional[dict]:
+        """Sampler dict for this run: explicit config.sampling > named preset."""
+        if self.config.sampling is not None:
+            return dict(self.config.sampling)
+        if self.config.sampler_preset:
+            from core.sampling import get_preset
+            return get_preset(self.config.sampler_preset)
+        return None
+
+    def _engine_gen_kwargs(self) -> dict:
+        """Optional generate_streaming kwargs the engine's signature accepts.
+
+        Engines predate the sampling/enable_thinking wiring (and tests use
+        minimal fakes), so only pass what the callee can take instead of
+        blowing up with TypeError on older signatures.
+        """
+        import inspect
+        try:
+            params = inspect.signature(self.engine.generate_streaming).parameters
+        except (TypeError, ValueError):
+            return {}
+        has_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD
+                         for p in params.values())
+        kwargs = {}
+        if has_var_kw or "enable_thinking" in params:
+            kwargs["enable_thinking"] = self.config.enable_thinking
+        samp = self._resolved_sampling()
+        if samp is not None and (has_var_kw or "sampling" in params):
+            kwargs["sampling"] = samp
+        return kwargs
+
     def _generate(self, active) -> str:
         from core.inference import ThinkFilter
         parts: List[str] = []
@@ -378,11 +415,18 @@ class AgentRunner:
         def on_think(t):
             self.emit(AgentEvent("thinking_chunk", text=t, round=self._round))
 
-        tf = ThinkFilter(on_response=on_resp, on_thinking=on_think)
+        # Engines that emit explicit <think> tags (llama.cpp, ollama) start
+        # the stream OUTSIDE a think block; transformers pre-fills <think>.
+        # With thinking disabled there is no leading think block either way.
+        starts_in_think = (bool(getattr(self.engine, "stream_starts_in_think", True))
+                           and self.config.enable_thinking)
+        tf = ThinkFilter(on_response=on_resp, on_thinking=on_think,
+                         starts_in_think=starts_in_think)
         try:
             resp = self.engine.generate_streaming(
                 active, max_tokens=self.config.max_tokens,
-                temperature=self.config.temperature, on_token=tf.feed)
+                temperature=self.config.temperature, on_token=tf.feed,
+                **self._engine_gen_kwargs())
         except Exception as e:
             _log.exception("agent_loop generation failed")
             self.emit(AgentEvent("error", reason=str(e), round=self._round))

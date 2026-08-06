@@ -105,3 +105,100 @@ class TestExtractAgentActions:
         assert len(shell_actions) == 1
         assert shell_actions[0].content == "ls -la"
         assert len(read_actions) == 1
+
+
+class TestEditBlockParsing:
+    """Regression: multi-line NEW content must survive extraction intact."""
+
+    def test_multiline_new_not_truncated(self):
+        # A lazy (.*?)$ with MULTILINE used to stop NEW at its first line,
+        # silently truncating every multi-line replacement (agent_bench find).
+        response = (
+            "```edit\n"
+            "FILE: mathx.py\n"
+            "OLD:\n"
+            "def add(a, b):\n"
+            "    return a - b\n"
+            "NEW:\n"
+            "def add(a, b):\n"
+            "    return a + b\n"
+            "```"
+        )
+        actions = extract_agent_actions(response)
+        edits = [a for a in actions if a.type == "edit_file"]
+        assert len(edits) == 1
+        path, old, new = edits[0].content.split("\x00")
+        assert path == "mathx.py"
+        assert old == "def add(a, b):\n    return a - b"
+        assert new == "def add(a, b):\n    return a + b"
+
+    def test_single_line_new_still_works(self):
+        response = (
+            "```edit\nFILE: x.py\nOLD:\na = 1\nNEW:\na = 2\n```"
+        )
+        actions = extract_agent_actions(response)
+        edits = [a for a in actions if a.type == "edit_file"]
+        assert len(edits) == 1
+        _, old, new = edits[0].content.split("\x00")
+        assert (old, new) == ("a = 1", "a = 2")
+
+
+class TestMarkerNormalization:
+    """Inline-code inertness + native <tool_call> tolerance (agent_bench finds)."""
+
+    def test_backticked_markers_are_inert(self):
+        # The system prompt promises backticked markers don't execute —
+        # a model listing its tools in a table must fire nothing.
+        response = (
+            "Here are my tools:\n\n"
+            "| Tool | Purpose |\n"
+            "|------|---------|\n"
+            '| `@read_file("path")` | Read a file |\n'
+            '| `@glob("**/*.py")` | Find files |\n'
+            '| `@search("query")` | Web search |\n'
+            "| `@architecture()` | Project map |\n"
+        )
+        assert extract_agent_actions(response) == []
+
+    def test_unbackticked_marker_still_fires(self):
+        response = 'Reading it now.\n@read_file("config.ini")\n'
+        actions = extract_agent_actions(response)
+        assert [a.type for a in actions] == ["read_file"]
+
+    def test_hybrid_tool_call_marker(self):
+        # Qwen3.x sometimes wraps a marker in its native tag:
+        response = '<tool_call>:glob("config.ini")\n'
+        actions = extract_agent_actions(response)
+        assert [a.type for a in actions] == ["glob"]
+        assert actions[0].content == "config.ini"
+
+    def test_json_tool_call(self):
+        response = ('<tool_call>{"name": "read_file", '
+                    '"arguments": {"path": "app/main.py"}}</tool_call>')
+        actions = extract_agent_actions(response)
+        assert [a.type for a in actions] == ["read_file"]
+        assert actions[0].content == "app/main.py|1"
+
+    def test_json_tool_call_shell(self):
+        response = ('<tool_call>{"name": "shell", '
+                    '"arguments": {"command": "pytest -q"}}</tool_call>')
+        actions = extract_agent_actions(response)
+        assert [a.type for a in actions] == ["shell"]
+        assert actions[0].content == "pytest -q"
+
+    def test_json_tool_call_unknown_name_ignored(self):
+        response = ('<tool_call>{"name": "launch_missiles", '
+                    '"arguments": {"target": "moon"}}</tool_call>')
+        assert extract_agent_actions(response) == []
+
+
+class TestEmptyOldEdit:
+    def test_empty_old_gets_clear_error(self, tmp_path):
+        import os
+        target = tmp_path / "f.py"
+        target.write_text("x = 1\n", encoding="utf-8")
+        from tools.agent_tools import run_edit_file
+        ok, out = run_edit_file(f"{target}\x00\x00new text")
+        assert not ok
+        assert "OLD is empty" in out
+        assert target.read_text(encoding="utf-8") == "x = 1\n"
