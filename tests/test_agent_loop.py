@@ -331,3 +331,31 @@ class TestFormatRetry:
         result = runner.run("goal", [])
         assert any(e.kind == "format_retry" for e in events)
         assert result.summary == "gave up cleanly"
+
+    def test_announce_stall_gets_nudge(self):
+        responses = [
+            "I'll find the definition.\n\n**Step 1:** Find where it is defined.",
+            '@grep("parse_header", "app")',
+            '@done("found it")',
+        ]
+        engine = FakeEngine(responses)
+        events = []
+        runner = AgentRunner(
+            engine, build_system_prompt=lambda: "sys",
+            emit=events.append,
+            config=RunConfig(autonomy=AutonomyLevel.FULL_AUTO),
+        )
+        result = runner.run("goal", [])
+        assert result.status == "done"
+        assert result.summary == "found it"
+        assert any(e.kind == "format_retry" and "plan" in e.reason for e in events)
+
+    def test_plain_final_answer_not_stalled(self):
+        engine = FakeEngine(["The port is 8443. Everything you asked is complete."])
+        runner = AgentRunner(
+            engine, build_system_prompt=lambda: "sys",
+            config=RunConfig(autonomy=AutonomyLevel.FULL_AUTO),
+        )
+        result = runner.run("goal", [])
+        assert result.status == "done"
+        assert result.rounds == 1
