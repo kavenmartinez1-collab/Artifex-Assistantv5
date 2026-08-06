@@ -82,6 +82,31 @@ REALISM_NEGATIVE = ("pixel art, pixelated, blocky, mosaic, cartoon, "
                     "soft focus, hazy, bokeh")
 
 
+def _weights_dir() -> str:
+    """Absolute cache dir for SR / GFPGAN weights.
+
+    Dot-prefixed so scan_local_models() skips it — these are bare .pth
+    checkpoints, not a selectable diffusers model. An older build wrote
+    them to models/restoration, which the model list did offer, and
+    picking it crashed the loader; migrate anything left there.
+    """
+    from core.config import BASE_DIR
+    dest = os.path.join(BASE_DIR, "models", ".restoration")
+    legacy = os.path.join(BASE_DIR, "models", "restoration")
+    os.makedirs(dest, exist_ok=True)
+    if os.path.isdir(legacy):
+        try:
+            for name in os.listdir(legacy):
+                target = os.path.join(dest, name)
+                if not os.path.exists(target):
+                    os.replace(os.path.join(legacy, name), target)
+            if not os.listdir(legacy):
+                os.rmdir(legacy)
+        except OSError:
+            pass
+    return dest
+
+
 def pick_preset(vram_gb: float) -> dict:
     """Return the recommended preset for a given VRAM size."""
     for min_gb, preset in VRAM_PRESETS:
@@ -104,7 +129,7 @@ class PhotoRestorePipeline(BasePipeline):
         self._sr_net = None
         self._sr_name = None
         self._gfpgan = None
-        self._weights_dir = os.path.join("models", "restoration")
+        self._weights_dir = _weights_dir()
 
     # ── Loading ────────────────────────────────────────────────────────
 
@@ -122,6 +147,18 @@ class PhotoRestorePipeline(BasePipeline):
                 "opencv-python-headless is required for photo restoration.\n"
                 "Install with: pip install opencv-python-headless"
             )
+
+        # A local path with no model_index.json is not a diffusers pipeline
+        # (weights cache, LLM folder, ...). Stage 2 is optional, so warn and
+        # fall through to classical clean + GFPGAN + upscale rather than
+        # failing the whole run.
+        if model_path and os.path.isdir(model_path) and not os.path.isfile(
+                os.path.join(model_path, "model_index.json")):
+            if status_callback:
+                status_callback(
+                    f"'{os.path.basename(model_path)}' is not a diffusion "
+                    "model — skipping the AI restore stage.")
+            model_path = ""
 
         if model_path:
             try:

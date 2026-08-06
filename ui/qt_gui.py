@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QComboBox, QLineEdit, QTextEdit, QPlainTextEdit,
     QTabWidget, QGroupBox, QCheckBox, QSlider, QProgressBar,
     QListWidget, QListWidgetItem, QStatusBar, QFrame, QFileDialog, QMessageBox,
-    QSizePolicy, QApplication,
+    QSizePolicy, QApplication, QSpinBox, QDoubleSpinBox,
 )
 
 from ui.qt_theme import (
@@ -78,6 +78,15 @@ _FILE_INPUT_MODES = {"Vision", "Audio STT", "Image Edit", "Photo Restore"}
 _PROMPT_MODES = {"Chat", "Code", "Image Gen", "Image Edit", "Vision",
                  "3D (ShapE)", "Audio TTS", "Music Gen", "Video Gen",
                  "Voice Assistant"}
+
+# Spin box widths by digit count. The theme gives inputs 6px side padding
+# and a 1px border, and Qt draws its own up/down buttons on top of that, so
+# the visible text area is much narrower than the widget — sized too tight,
+# the number is what gets clipped.
+_SPIN_CHROME = 2 * (6 + 1) + 20   # padding + border + stepper buttons
+_SPIN_W2 = _SPIN_CHROME + 34      # "20"
+_SPIN_W3 = _SPIN_CHROME + 46      # "100"
+_SPIN_W4 = _SPIN_CHROME + 60      # "2048" / "0.30"
 
 
 _MODEL_GUIDE_HTML = """
@@ -686,18 +695,102 @@ class ArtifexMainWindow(QMainWindow):
         vision_layout.addStretch()
         input_layout.addWidget(self._vision_ctrl)
 
-        # Photo Restore-specific controls
+        # Photo Restore-specific controls. Two rows: stage-1 classical
+        # cleanup + output, then the stage-2 diffusion settings.
         self._restore_ctrl = QWidget()
-        restore_layout = QHBoxLayout(self._restore_ctrl)
+        restore_layout = QVBoxLayout(self._restore_ctrl)
         restore_layout.setContentsMargins(0, 0, 0, 0)
+        restore_layout.setSpacing(2)
+
+        row1 = QHBoxLayout()
+        row1.setContentsMargins(0, 0, 0, 0)
+        row1.setSpacing(6)
+
+        row1.addWidget(QLabel("Grain:"))
+        self._restore_denoise = QSpinBox()
+        self._restore_denoise.setRange(0, 20)
+        self._restore_denoise.setValue(7)
+        self._restore_denoise.setFixedWidth(_SPIN_W2)
+        self._restore_denoise.setToolTip(
+            "Grain removal strength (non-local means). 0 disables it.")
+        row1.addWidget(self._restore_denoise)
+
+        row1.addWidget(QLabel("Smooth:"))
+        self._restore_smooth = QSpinBox()
+        self._restore_smooth.setRange(0, 10)
+        self._restore_smooth.setValue(4)
+        self._restore_smooth.setFixedWidth(_SPIN_W2)
+        self._restore_smooth.setToolTip(
+            "Color smoothing radius (bilateral circle of interest). "
+            "0 disables it.")
+        row1.addWidget(self._restore_smooth)
+
+        self._restore_levels_cb = QCheckBox("Auto contrast")
+        self._restore_levels_cb.setChecked(True)
+        self._restore_levels_cb.setToolTip(
+            "CLAHE lightness recovery for faded photos. Colors untouched.")
+        row1.addWidget(self._restore_levels_cb)
+
+        self._restore_depix_cb = QCheckBox("Fix pixelation")
+        self._restore_depix_cb.setChecked(True)
+        self._restore_depix_cb.setToolTip(
+            "Auto-detect blocky sources and rebuild from their true "
+            "resolution instead of sharpening the blocks.")
+        row1.addWidget(self._restore_depix_cb)
+
+        row1.addWidget(QLabel("Upscale:"))
+        self._restore_upscale = QComboBox()
+        self._restore_upscale.addItems(["2x", "4x"])
+        self._restore_upscale.setFixedWidth(72)
+        self._restore_upscale.setToolTip("Final Real-ESRGAN upscale factor.")
+        row1.addWidget(self._restore_upscale)
+        row1.addStretch()
+        restore_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSpacing(6)
+
+        row2.addWidget(QLabel("Diffusion strength:"))
+        self._restore_strength = QDoubleSpinBox()
+        self._restore_strength.setRange(0.1, 0.9)
+        self._restore_strength.setSingleStep(0.05)
+        self._restore_strength.setValue(0.3)
+        self._restore_strength.setFixedWidth(_SPIN_W4)
+        self._restore_strength.setToolTip(
+            "Low = faithful repair, high = creative reinvention. "
+            "Realism mode raises this automatically.")
+        row2.addWidget(self._restore_strength)
+
+        row2.addWidget(QLabel("Steps:"))
+        self._restore_steps = QSpinBox()
+        self._restore_steps.setRange(1, 100)
+        self._restore_steps.setValue(30)
+        self._restore_steps.setFixedWidth(_SPIN_W3)
+        self._restore_steps.setToolTip("Diffusion steps for the AI restore stage.")
+        row2.addWidget(self._restore_steps)
+
+        row2.addWidget(QLabel("Tile:"))
+        self._restore_tile = QSpinBox()
+        self._restore_tile.setRange(128, 2048)
+        self._restore_tile.setSingleStep(64)
+        self._restore_tile.setValue(512)
+        self._restore_tile.setFixedWidth(_SPIN_W4)
+        self._restore_tile.setToolTip(
+            "Upscaler tile size in px. Lower if the upscale stage runs out "
+            "of VRAM.")
+        row2.addWidget(self._restore_tile)
+
         self._restore_realism_cb = QCheckBox("Realism mode")
         self._restore_realism_cb.setToolTip(
             "Remake the image as a realistic photo (pixel art, drawings, "
             "game art). Needs a diffusion model loaded. A one-line prompt "
             "describing the subject dramatically improves results."
         )
-        restore_layout.addWidget(self._restore_realism_cb)
-        restore_layout.addStretch()
+        row2.addWidget(self._restore_realism_cb)
+        row2.addStretch()
+        restore_layout.addLayout(row2)
+
         input_layout.addWidget(self._restore_ctrl)
 
         # Mode hint bar — contextual instructions
@@ -948,8 +1041,9 @@ class ArtifexMainWindow(QMainWindow):
             "Code": "Describe what you want to build, then EXECUTE",
             "Image Gen": "Describe the image you want to generate",
             "Image Edit": "Drop an image above, then describe the edit",
-            "Photo Restore": "Drop an old/damaged photo above — prompt is "
-                             "optional (guides the AI restore stage)",
+            "Photo Restore": "Drop an old/damaged photo above — prompt and "
+                             "model are both optional (a diffusion model "
+                             "enables the AI restore stage)",
             "Vision": "Drop an image or video above, then ask a question about it",
             "3D (ShapE)": "Describe a 3D object to generate",
             "Audio TTS": "Type text to convert to speech",
@@ -1131,9 +1225,18 @@ class ArtifexMainWindow(QMainWindow):
         elif mode == "Photo Restore":
             files = self._drop_zone.attached_files
             if files:
-                kwargs = {"image_path": files[0], "prompt": prompt,
-                          "strength": 0.3, "num_steps": 30, "upscale": 2,
-                          "realism": self._restore_realism_cb.isChecked()}
+                kwargs = {
+                    "image_path": files[0], "prompt": prompt,
+                    "strength": self._restore_strength.value(),
+                    "num_steps": self._restore_steps.value(),
+                    "denoise": float(self._restore_denoise.value()),
+                    "smooth_radius": self._restore_smooth.value(),
+                    "auto_levels": self._restore_levels_cb.isChecked(),
+                    "depixelate": self._restore_depix_cb.isChecked(),
+                    "upscale": 4 if self._restore_upscale.currentIndex() else 2,
+                    "tile": self._restore_tile.value(),
+                    "realism": self._restore_realism_cb.isChecked(),
+                }
         elif mode == "Vision":
             files = self._drop_zone.attached_files
             if files:
