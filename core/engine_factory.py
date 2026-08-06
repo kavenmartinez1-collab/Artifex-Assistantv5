@@ -14,10 +14,14 @@ def create_engine():
     """Create an engine instance for the currently active backend.
 
     Returns:
-        BaseEngine — OllamaEngine, LlamaCppEngine, ClaudeCliEngine, or
-        TransformersEngine.
+        BaseEngine — OllamaEngine, LlamaCppEngine, ClaudeCliEngine,
+        WebGpuEngine, or TransformersEngine.
     """
     backend = get_active_backend()
+
+    if backend == "webgpu":
+        from core.engine_webgpu import WebGpuEngine
+        return WebGpuEngine()
 
     if backend == "ollama":
         from core.engine_ollama import OllamaEngine

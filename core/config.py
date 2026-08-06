@@ -74,7 +74,7 @@ def set_active_backend(name):
     global _active_backend
     need_refresh = False
     with _config_lock:
-        if name in ("transformers", "ollama", "llama_cpp", "claude_cli"):
+        if name in ("transformers", "ollama", "llama_cpp", "claude_cli", "webgpu"):
             _active_backend = name
             need_refresh = (name == "ollama" and not OLLAMA_MODELS)
         else:
@@ -394,6 +394,10 @@ def set_active_model(name):
     """
     global _active_model
     with _config_lock:
+        if _active_backend == "webgpu":
+            # The browser owns model choice; any name is display-only.
+            _active_model = name
+            return True
         if _active_backend == "ollama":
             if name in OLLAMA_MODELS:
                 _active_model = name
@@ -435,6 +439,13 @@ def set_active_model(name):
 
 def get_active_model_name():
     """Get display name of the currently active model."""
+    if _active_backend == "webgpu":
+        try:
+            from core.webgpu_bridge import get_bridge
+            info = get_bridge().state.session_info or {}
+            return info.get("model") or "(browser session)"
+        except Exception:
+            return "(browser session)"
     if _active_backend == "ollama":
         return get_active_ollama_model()
     if _active_backend == "llama_cpp":
@@ -485,6 +496,9 @@ def get_active_claude_cli_model():
 
 def get_model_names():
     """Get list of available model names for current backend."""
+    if _active_backend == "webgpu":
+        # Model choice lives in the browser page — one synthetic entry.
+        return ["(browser session)"]
     from core.model_discovery import get_model_names_for_backend
     names = get_model_names_for_backend(_active_backend)
     if not names and _active_backend == "ollama":

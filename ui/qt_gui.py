@@ -420,7 +420,7 @@ class ArtifexMainWindow(QMainWindow):
         be_layout = QHBoxLayout()
         be_layout.addWidget(QLabel("Engine:"))
         self._backend_combo = QComboBox()
-        self._backend_combo.addItems(["transformers", "ollama", "llama_cpp"])
+        self._backend_combo.addItems(["transformers", "ollama", "llama_cpp", "webgpu"])
         self._backend_combo.setCurrentText(get_active_backend())
         be_layout.addWidget(self._backend_combo)
         bg_layout.addLayout(be_layout)

@@ -33,6 +33,9 @@ import type { GenerationHandle } from './engine/generate';
 let gpu: GPUContext | null = null;
 let currentModel: LoadedModel | null = null;
 let session: InferenceSession | null = null;
+// Repo string of the last session markModelReady() announced — consumed by
+// the Python-framework bridge (src/bridge.ts) for its hello handshake.
+let bridgeReadyRepo: string | null = null;
 
 // FLUX.2 image-gen mode: no LLM session — Send routes to runImageGeneration.
 let imageGenRepo: string | null = null;
@@ -176,7 +179,7 @@ const dryVal = $('dry-val');
 // Presets resolve to concrete slider values. Each preset defines the full
 // sampler stack. `custom` is not a preset — it's the state when the user
 // hand-edits any slider.
-type PresetName = 'balanced' | 'deterministic' | 'creative' | 'reference';
+type PresetName = 'balanced' | 'deterministic' | 'creative' | 'reference' | 'agent';
 interface PresetValues {
   temperature: number; topP: number; topK: number;
   minP: number; repPen: number; dryMult: number;
@@ -191,6 +194,10 @@ const PRESETS: Record<PresetName, PresetValues> = {
   creative:      { temperature: 0.9, topP: 0.95, topK: 50, minP: 0.05, repPen: 1.0, dryMult: 0.8  },
   // Matches HuggingFace transformers generate() do_sample=True defaults
   reference:     { temperature: 1.0, topP: 1.0,  topK: 50, minP: 0,    repPen: 1.0, dryMult: 0    },
+  // Qwen3-recommended thinking config, validated for autonomous tool-use by
+  // agent_bench on Qwen3.6-35B (1.000 full suite) — mirror of the Python
+  // core/sampling.py "agent" preset for framework-bridged agent runs.
+  agent:         { temperature: 0.6, topP: 0.95, topK: 20, minP: 0,    repPen: 1.0, dryMult: 0    },
 };
 
 let suppressPresetFlip = false;
@@ -3300,6 +3307,7 @@ presetSelect.addEventListener('change', persistUISettings);
 
 /** Called by both load paths once the engine is ready. */
 function markModelReady(repo: string): void {
+  bridgeReadyRepo = repo;
   try { localStorage.setItem(UI_STORE + 'last-model', repo); } catch {}
   // Mid-chat model switch: history is text-level, so it carries over — the
   // new model just re-prefills it on the next send.
@@ -3350,5 +3358,23 @@ if (import.meta.env.PROD && 'serviceWorker' in navigator) {
   navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`)
     .catch(err => console.warn('[PWA] service worker registration failed:', err));
 }
+
+// Python-framework bridge: lets the Qt GUI / CLI / agent loop use this
+// page's session as a backend ("webgpu" in the engine dropdown). Costs one
+// failed localhost fetch per 10 s when the Python side isn't running.
+void import('./bridge').then(({ startBridgeClient }) => {
+  startBridgeClient(
+    () => session,
+    () => ({
+      ready: session !== null,
+      model: bridgeReadyRepo ?? undefined,
+      ctx: session?.config
+        ? Math.min((session.config as any).maxPositionEmbeddings || 8192, 8192, MAX_ATTN_SEQ_LEN)
+        : undefined,
+      arch: session?.config ? (session.config as any).modelType : undefined,
+    }),
+    (msg) => addMessage('system', msg, 'bridge'),
+  );
+});
 
 init();
