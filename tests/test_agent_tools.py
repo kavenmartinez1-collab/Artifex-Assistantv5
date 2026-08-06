@@ -202,3 +202,12 @@ class TestEmptyOldEdit:
         assert not ok
         assert "OLD is empty" in out
         assert target.read_text(encoding="utf-8") == "x = 1\n"
+
+    def test_bold_wrapped_markers_are_inert(self):
+        response = (
+            "My tools:\n"
+            '1. **@architecture()** - project map\n'
+            '2. **@read_file("path")** - read a file\n'
+            '3. **@search("query")** - web search\n'
+        )
+        assert extract_agent_actions(response) == []

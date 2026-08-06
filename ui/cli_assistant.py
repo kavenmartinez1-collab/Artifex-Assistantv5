@@ -720,6 +720,9 @@ def run_assistant():
                     continue
                 run_cfg = RunConfig.default(cli_autonomy)
                 run_cfg.max_rounds = MAX_AGENT_ROUNDS
+                # Autonomous runs use the bench-tuned agent preset (see
+                # core/sampling.py + agent_bench/TUNING_REPORT.md).
+                run_cfg.sampler_preset = "agent"
                 if cli_autonomy == AutonomyLevel.FULL_AUTO:
                     print(f"{Fore.YELLOW}  Full-auto — all policy-allowed actions run unattended; "
                           f"CRITICAL + ratchet still stop it.{Style.RESET_ALL}")

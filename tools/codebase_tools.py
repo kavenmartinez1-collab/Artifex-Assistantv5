@@ -673,11 +673,25 @@ def run_find_symbol(content: str) -> Tuple[bool, str]:
     if not name:
         return False, "Usage: @find_symbol(\"name\") or @find_symbol(\"name\", \"class\")"
 
+    # Common model drift: "find config.ini" pattern-matches to find_symbol.
+    # A filename is not a symbol — redirect to the right tool instead of
+    # returning an unhelpful empty result (observed on Qwen3.6, agent_bench).
+    if re.search(r"\.[A-Za-z0-9]{1,6}$", name) or "/" in name or "\\" in name:
+        return True, (
+            f"'{name}' looks like a FILE name, not a code symbol. "
+            f'Use @glob("**/{name}") to locate the file, then '
+            f'@read_file("path") to read it. @find_symbol is for '
+            f"functions/classes/methods."
+        )
+
     idx = _get_index()
     results = idx.find_symbol(name, kind)
 
     if not results:
-        return True, f"No definitions found for '{name}'"
+        return True, (
+            f"No definitions found for '{name}'. If you were looking for a "
+            f"file, use @glob; for free-text matches, use @grep."
+        )
 
     lines = [f"Found {len(results)} definition(s) for '{name}':"]
     for sym in results[:15]:

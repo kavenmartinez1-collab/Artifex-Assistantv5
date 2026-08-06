@@ -325,20 +325,26 @@ def _json_arg(args, canonical):
 
 
 def _strip_inline_code(text):
-    """Blank out `inline code` spans OUTSIDE fenced blocks.
+    """Blank out `inline code` spans and **bold-wrapped markers** OUTSIDE
+    fenced blocks.
 
     The system prompt promises that backticked tool markers are inert
     ("when listing tools, use prose or backticks") — without this, a model
-    politely listing its tools in a table fires every one of them.
-    Fenced ``` blocks are preserved untouched (shell/python/edit extraction
-    and the marker-recovery path depend on their contents).
+    politely listing its tools in a table fires every one of them. Models
+    also render tool listings as **@tool("path")** bold items (observed on
+    Qwen3.6 via agent_bench); a marker fully enclosed in bold is
+    documentation, not a call. Fenced ``` blocks are preserved untouched
+    (shell/python/edit extraction and the marker-recovery path depend on
+    their contents).
     """
     out = []
     pos = 0
     while True:
         fence = text.find("```", pos)
         segment = text[pos: fence if fence != -1 else len(text)]
-        out.append(re.sub(r"`[^`\n]*`", "``", segment))
+        segment = re.sub(r"`[^`\n]*`", "``", segment)
+        segment = re.sub(r"\*\*@[^*\n]{0,200}\*\*", "**", segment)
+        out.append(segment)
         if fence == -1:
             break
         close = text.find("```", fence + 3)

@@ -190,6 +190,7 @@ class AgentRunner:
         self._round = 0
         self._actions_run = 0
         self._t0 = 0.0
+        self._gen_error = ""
         self.goal = ""
 
     # ── public ──────────────────────────────────────────────────────────────
@@ -217,6 +218,10 @@ class AgentRunner:
             self._set_system_prompt(history)
             active = self._active_messages(history)
             resp = self._generate(active)
+            if not resp and self._gen_error:
+                # Engine failure, not a model choice — don't report a clean
+                # "done" (empty resp with no actions would read as one).
+                return self._finish(f"stopped:error:{self._gen_error}", history)
             history.append({"role": "assistant", "content": resp})
             if self.km:
                 self._safe(lambda: self.km.add_from_ai_response(resp))
@@ -406,6 +411,7 @@ class AgentRunner:
 
     def _generate(self, active) -> str:
         from core.inference import ThinkFilter
+        self._gen_error = ""
         parts: List[str] = []
 
         def on_resp(t):
@@ -429,6 +435,7 @@ class AgentRunner:
                 **self._engine_gen_kwargs())
         except Exception as e:
             _log.exception("agent_loop generation failed")
+            self._gen_error = type(e).__name__
             self.emit(AgentEvent("error", reason=str(e), round=self._round))
             self._safe(tf.flush)
             return ""
