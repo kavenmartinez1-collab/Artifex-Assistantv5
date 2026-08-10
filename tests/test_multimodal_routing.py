@@ -224,6 +224,76 @@ class TestPickVisionModelBackendAware(unittest.TestCase):
         self.assertNotEqual(picked, "qwen3-vl-4b-instruct")
 
 
+class TestExplicitTextModelImageReroute(unittest.TestCase):
+    """An image-bearing request that explicitly names a text-only
+    llama.cpp launch (no --mmproj) must be rerouted to the vision
+    sibling instead of being forwarded — llama-server 500s with
+    'image input is not supported' otherwise. Auto-sentinel requests
+    already routed correctly; this covers explicit names (the Kbot
+    Revit auto-crop path, which pins the active model's name)."""
+
+    _MODELS = {
+        "qwen-text": {"extra_flags": ["-fa", "on"]},
+        "qwen-vision": {"extra_flags": ["--mmproj", "/path/proj.gguf"]},
+    }
+
+    def test_explicit_text_model_with_images_reroutes(self):
+        from api.server import _resolve_model_for_request
+        with patch("core.config.refresh_ollama_models"), \
+             patch("core.config.get_llama_cpp_models",
+                   return_value=dict(self._MODELS)):
+            picked = _resolve_model_for_request(
+                "qwen-text", has_images=True, backend="llama_cpp")
+        self.assertEqual(picked, "qwen-vision")
+
+    def test_explicit_vision_model_with_images_unchanged(self):
+        from api.server import _resolve_model_for_request
+        with patch("core.config.refresh_ollama_models"), \
+             patch("core.config.get_llama_cpp_models",
+                   return_value=dict(self._MODELS)):
+            picked = _resolve_model_for_request(
+                "qwen-vision", has_images=True, backend="llama_cpp")
+        self.assertEqual(picked, "qwen-vision")
+
+    def test_explicit_text_model_without_images_unchanged(self):
+        from api.server import _resolve_model_for_request
+        with patch("core.config.refresh_ollama_models"), \
+             patch("core.config.get_llama_cpp_models",
+                   return_value=dict(self._MODELS)):
+            picked = _resolve_model_for_request(
+                "qwen-text", has_images=False, backend="llama_cpp")
+        self.assertEqual(picked, "qwen-text")
+
+    def test_no_vision_entry_raises_clear_400(self):
+        from fastapi import HTTPException
+        from api.server import _resolve_model_for_request
+        with patch("core.config.refresh_ollama_models"), \
+             patch("core.config.get_llama_cpp_models", return_value={
+                 "qwen-text": {"extra_flags": ["-fa", "on"]},
+             }):
+            with self.assertRaises(HTTPException) as ctx:
+                _resolve_model_for_request(
+                    "qwen-text", has_images=True, backend="llama_cpp")
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("text-only", ctx.exception.detail)
+
+    def test_name_pattern_match_without_mmproj_not_used(self):
+        """_pick_vision_model may fall back to name-pattern matches that
+        have no --mmproj; forwarding to one of those would still 500.
+        The reroute must require --mmproj on the picked entry."""
+        from fastapi import HTTPException
+        from api.server import _resolve_model_for_request
+        with patch("core.config.refresh_ollama_models"), \
+             patch("core.config.get_llama_cpp_models", return_value={
+                 "qwen-text": {"extra_flags": []},
+                 "qwen3-vl-2b": {"extra_flags": []},
+             }):
+            with self.assertRaises(HTTPException) as ctx:
+                _resolve_model_for_request(
+                    "qwen-text", has_images=True, backend="llama_cpp")
+        self.assertEqual(ctx.exception.status_code, 400)
+
+
 class TestSetActiveModelLogging(unittest.TestCase):
     """set_active_model must log when it can't switch — silent False
     return was the trap that hid the wrong-backend routing bug."""

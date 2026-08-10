@@ -479,7 +479,9 @@ def _resolve_model_for_request(requested, has_images: bool, backend: str) -> str
           - multimodal request → a vision-capable model from `backend`,
             falling back to the active model if none matches
           - text-only request → the active model
-      • Real installed name → returned unchanged
+      • Real installed name → returned unchanged, except an image-bearing
+        request naming a text-only llama.cpp launch (no --mmproj) is
+        rerouted to the vision-capable entry (400 if none is configured)
       • Unknown explicit name → 400 with the list of available models,
         so typos surface immediately instead of being forwarded to the
         backend (where they become opaque 404s)
@@ -551,6 +553,30 @@ def _resolve_model_for_request(requested, has_images: bool, backend: str) -> str
         from core.config import get_llama_cpp_models
         lcpp_models = get_llama_cpp_models()
         if requested in lcpp_models:
+            # An explicitly named text-only launch (no --mmproj) can't take
+            # image input — llama-server 500s on it. Reroute to the vision
+            # sibling instead of forwarding a doomed request.
+            flags = lcpp_models[requested].get("extra_flags") or []
+            if has_images and "--mmproj" not in flags:
+                picked = _pick_vision_model("llama_cpp")
+                picked_flags = (
+                    (lcpp_models.get(picked) or {}).get("extra_flags") or []
+                )
+                if picked and picked != requested and "--mmproj" in picked_flags:
+                    _log.info(
+                        "Rerouting image request: '%s' has no --mmproj; "
+                        "using '%s' instead", requested, picked,
+                    )
+                    return picked
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Model '{requested}' is text-only (launched without "
+                        f"--mmproj) and this request contains image input. "
+                        f"No vision-capable entry (--mmproj in extra_flags) "
+                        f"found in llama_cpp_config.json to reroute to."
+                    ),
+                )
             return requested
         available = sorted(lcpp_models.keys())
         raise HTTPException(
