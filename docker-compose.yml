@@ -13,7 +13,9 @@ services:
   web-gateway:
     build: ./web-gateway
     ports:
-      - "8080:8080"
+      # Loopback only — Artifex talks to the gateway on the same host, and
+      # the gateway runs with auth disabled, so don't publish it to the LAN.
+      - "127.0.0.1:8080:8080"
     environment:
       - SEARXNG_URL=http://searxng:8080
       - QUARANTINE_DIR=/quarantine
