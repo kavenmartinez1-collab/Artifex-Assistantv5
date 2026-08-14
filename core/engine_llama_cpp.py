@@ -39,7 +39,11 @@ _KV_QUANT_BPE = {
 # finer tiers are right for tight-VRAM cards where wasted KV is the binding
 # constraint.  On a 24 GB card with q4_0 KV on a 27B model, the cost per
 # tier is roughly 576 / 1152 / 2304 / 4608 MB.
-CTX_TIERS = (32_000, 64_000, 128_000, 256_000)
+# 224_000 added 2026-08-14 for qwen3.8-27b: probe-measured on the RTX 4090
+# at 229376 ctx → 1.26 GB free (vs 0.48 GB at 262144, too thin for prod).
+# Without this rung, any num_ctx cap between 128K and 256K silently topped
+# out at the 128_000 tier.
+CTX_TIERS = (32_000, 64_000, 128_000, 224_000, 256_000)
 
 # Snap-up margin: when the request need is within this many tokens of the
 # next tier, choose the next tier.  Buffers in-flight context growth from

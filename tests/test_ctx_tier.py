@@ -44,10 +44,16 @@ class TestPickCtxTier:
         # 100K + 8K = 108K → 128K
         assert pick_ctx_tier(100_000) == 128_000
 
-    def test_very_large_request_picks_256k(self):
+    def test_very_large_request_picks_224k(self):
         from core.engine_llama_cpp import pick_ctx_tier
-        # 200K + 8K = 208K → 256K
-        assert pick_ctx_tier(200_000) == 256_000
+        # 200K + 8K = 208K → 224K (tier added for qwen3.8; leaner than
+        # jumping straight to 256K, which leaves <0.5 GB free on the 4090)
+        assert pick_ctx_tier(200_000) == 224_000
+
+    def test_beyond_224k_picks_256k(self):
+        from core.engine_llama_cpp import pick_ctx_tier
+        # 230K + 8K = 238K → past the 224K tier, next rung is 256K
+        assert pick_ctx_tier(230_000) == 256_000
 
     def test_overflow_returns_largest_tier(self):
         from core.engine_llama_cpp import pick_ctx_tier
