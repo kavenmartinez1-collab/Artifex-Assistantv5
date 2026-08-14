@@ -1,6 +1,7 @@
 /**
- * Real-GPU correctness for the IQ3_XXS / IQ3_S / IQ2_S legacy GEMV kernels
- * (matmul_gguf_iq3_xxs / _iq3_s / _iq2_s). The CPU-port audit (test-iq-parity)
+ * Real-GPU correctness for the grid-codebook IQ legacy GEMV kernels
+ * (matmul_gguf_iq3_xxs / _iq3_s / _iq2_s / _iq2_xxs / _iq2_xs / _iq1_m).
+ * The CPU-port audit (test-iq-parity)
  * proves the dequant math; this proves the actual WGSL shader COMPILES and the
  * kernel produces the right GEMV — catching shader-validation errors, grid
  * array placement, and runtime OOB that tsc + CPU parity cannot (per the
@@ -40,7 +41,26 @@ const CASES: Case[] = [
   { name: 'IQ3_XXS', entry: 'matmul_gguf_iq3_xxs', ggmlType: GGML_TYPES.IQ3_XXS, rawBytesPerSB: 98 },
   { name: 'IQ3_S', entry: 'matmul_gguf_iq3_s', ggmlType: GGML_TYPES.IQ3_S, rawBytesPerSB: 110 },
   { name: 'IQ2_S', entry: 'matmul_gguf_iq2_s', ggmlType: GGML_TYPES.IQ2_S, rawBytesPerSB: 82 },
+  { name: 'IQ2_XXS', entry: 'matmul_gguf_iq2_xxs', ggmlType: GGML_TYPES.IQ2_XXS, rawBytesPerSB: 66 },
+  { name: 'IQ2_XS', entry: 'matmul_gguf_iq2_xs', ggmlType: GGML_TYPES.IQ2_XS, rawBytesPerSB: 74 },
+  { name: 'IQ1_M', entry: 'matmul_gguf_iq1_m', ggmlType: GGML_TYPES.IQ1_M, rawBytesPerSB: 56 },
 ];
+
+/** Force a sane positive f16 superblock scale into the block at `base`.
+ *  Most IQ types keep the f16 `d` in the first two bytes; IQ1_M has no `d`
+ *  field and instead scatters its f16 across the TOP NIBBLE of each of the
+ *  four scale u16s at offset 48 (result bits 0-3 from s0 .. 12-15 from s3). */
+function stampScale(dv: DataView, ggmlType: number, base: number, dBits: number): void {
+  if (ggmlType !== GGML_TYPES.IQ1_M) {
+    dv.setUint16(base, dBits, true);
+    return;
+  }
+  for (let k = 0; k < 4; k++) {
+    const off = base + 48 + 2 * k;
+    const lo = dv.getUint16(off, true) & 0x0fff;
+    dv.setUint16(off, lo | (((dBits >> (4 * k)) & 0xf) << 12), true);
+  }
+}
 
 const N = 8;        // output columns (weight rows)
 const SB = 2;       // superblocks per row → K = 512
@@ -51,11 +71,11 @@ const problems = CASES.map((c) => {
   const rng = mulberry32(0xA11CE ^ c.ggmlType);
   const raw = new Uint8Array(N * SB * c.rawBytesPerSB);
   for (let i = 0; i < raw.length; i++) raw[i] = Math.floor(rng() * 256);
-  // Force a sane positive f16 scale (d @ byte 0 of every superblock) so the
-  // result isn't dominated by NaN/Inf from a random scale word.
+  // Force a sane positive f16 scale into every superblock so the result isn't
+  // dominated by NaN/Inf from a random scale word.
   const dv = new DataView(raw.buffer);
   const dBits = 0x2C00; // f16 0.0625
-  for (let b = 0; b < N * SB; b++) dv.setUint16(b * c.rawBytesPerSB, dBits, true);
+  for (let b = 0; b < N * SB; b++) stampScale(dv, c.ggmlType, b * c.rawBytesPerSB, dBits);
 
   const ref = dequantGGML(c.ggmlType, raw, N * K);           // [N, K] row-major
   const W = repackGGUFForGPU(c.ggmlType, raw, N * K) as Uint32Array;

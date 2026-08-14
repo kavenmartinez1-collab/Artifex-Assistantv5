@@ -816,13 +816,19 @@ function f32ToF16Bits(v: number): number {
   return sign | (exp << 10) | frac;
 }
 
-/** Generate random valid GGUF blocks for `n` elements of the given type. */
+/** Generate random valid GGUF blocks for `n` elements of the given type.
+ *  Every bit pattern in the grid-codebook IQ types is a legal code (grid and
+ *  sign indices are masked to the table size by construction), so raw random
+ *  bytes make valid blocks — only the f16 scale fields need stamping. */
 function makeGGUFTestBlocks(ggmlType: number, n: number, rng: () => number): Uint8Array {
   const layouts: Record<number, { blockElems: number; typeSize: number }> = {
     8: { blockElems: 32, typeSize: 34 },    // Q8_0
     12: { blockElems: 256, typeSize: 144 }, // Q4_K
     13: { blockElems: 256, typeSize: 176 }, // Q5_K
     14: { blockElems: 256, typeSize: 210 }, // Q6_K
+    16: { blockElems: 256, typeSize: 66 },  // IQ2_XXS
+    17: { blockElems: 256, typeSize: 74 },  // IQ2_XS
+    29: { blockElems: 256, typeSize: 56 },  // IQ1_M
   };
   const { blockElems, typeSize } = layouts[ggmlType];
   const nb = n / blockElems;
@@ -837,6 +843,19 @@ function makeGGUFTestBlocks(ggmlType: number, n: number, rng: () => number): Uin
       dv.setUint16(base, f32ToF16Bits(0.01 + rng() * 0.02), true);          // d
     } else if (ggmlType === 14) {
       dv.setUint16(base + 208, f32ToF16Bits(0.002 + rng() * 0.004), true);  // d (scales are i8)
+    } else if (ggmlType === 16 || ggmlType === 17) {
+      dv.setUint16(base, f32ToF16Bits(0.005 + rng() * 0.01), true);         // d only (no dmin)
+    } else if (ggmlType === 29) {
+      // IQ1_M has no d field: the f16 scale lives in the TOP NIBBLE of each of
+      // the four scale u16s @48 (result bits 0-3 from s0, 4-7 from s1, 8-11
+      // from s2, 12-15 from s3). Stamp those nibbles and leave the low 12 bits
+      // random — they hold the 3-bit sub-scales, valid at any value.
+      const bits = f32ToF16Bits(0.004 + rng() * 0.008);
+      for (let k = 0; k < 4; k++) {
+        const off = base + 48 + 2 * k;
+        const lo = dv.getUint16(off, true) & 0x0fff;
+        dv.setUint16(off, lo | (((bits >> (4 * k)) & 0xf) << 12), true);
+      }
     } else {
       dv.setUint16(base, f32ToF16Bits(0.005 + rng() * 0.01), true);         // d
       dv.setUint16(base + 2, f32ToF16Bits(rng() * 0.005), true);            // dmin
@@ -896,6 +915,13 @@ const testGGUFQ5K = (d: GPUDevice) =>
   runGGUFMatmulTest(d, 'GGUF Q5_K matmul', 'matmul_gguf_q5_k', 13, 3, 70, 512);
 const testGGUFQ6K = (d: GPUDevice) =>
   runGGUFMatmulTest(d, 'GGUF Q6_K matmul', 'matmul_gguf_q6_k', 14, 3, 70, 512);
+// Grid-codebook IQ quants carried by UD-IQ2_XXS style mixed builds.
+const testGGUFIQ2XXS = (d: GPUDevice) =>
+  runGGUFMatmulTest(d, 'GGUF IQ2_XXS matmul', 'matmul_gguf_iq2_xxs', 16, 3, 70, 512);
+const testGGUFIQ2XS = (d: GPUDevice) =>
+  runGGUFMatmulTest(d, 'GGUF IQ2_XS matmul', 'matmul_gguf_iq2_xs', 17, 3, 70, 512);
+const testGGUFIQ1M = (d: GPUDevice) =>
+  runGGUFMatmulTest(d, 'GGUF IQ1_M matmul', 'matmul_gguf_iq1_m', 29, 3, 70, 512);
 // N > 65535 exercises the wid.z row-chunking path (lm_head is N=248320)
 const testGGUFQ8_0Wide = (d: GPUDevice) =>
   runGGUFMatmulTest(d, 'GGUF Q8_0 matmul (N>65535)', 'matmul_gguf_q8_0', 8, 1, 65600, 64);
@@ -917,6 +943,9 @@ export async function runKernelTests(device: GPUDevice): Promise<TestResult[]> {
     { name: 'GGUF Q4_K matmul', fn: testGGUFQ4K },
     { name: 'GGUF Q5_K matmul', fn: testGGUFQ5K },
     { name: 'GGUF Q6_K matmul', fn: testGGUFQ6K },
+    { name: 'GGUF IQ2_XXS matmul', fn: testGGUFIQ2XXS },
+    { name: 'GGUF IQ2_XS matmul', fn: testGGUFIQ2XS },
+    { name: 'GGUF IQ1_M matmul', fn: testGGUFIQ1M },
     { name: 'GGUF Q8_0 matmul (N>65535)', fn: testGGUFQ8_0Wide },
     { name: 'Softmax', fn: testSoftmax },
     { name: 'RMSNorm', fn: testRMSNorm },

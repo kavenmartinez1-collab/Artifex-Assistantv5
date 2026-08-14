@@ -527,9 +527,11 @@ export function createForwardPassEngine(
       [GGML_TYPES.IQ4_NL]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq4_nl', 'matmul-gguf-iq4_nl'),
       [GGML_TYPES.IQ4_XS]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq4_xs', 'matmul-gguf-iq4_xs'),
       [GGML_TYPES.IQ2_XXS]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq2_xxs', 'matmul-gguf-iq2_xxs'),
+      [GGML_TYPES.IQ2_XS]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq2_xs', 'matmul-gguf-iq2_xs'),
       [GGML_TYPES.IQ3_XXS]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq3_xxs', 'matmul-gguf-iq3_xxs'),
       [GGML_TYPES.IQ3_S]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq3_s', 'matmul-gguf-iq3_s'),
       [GGML_TYPES.IQ2_S]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq2_s', 'matmul-gguf-iq2_s'),
+      [GGML_TYPES.IQ1_M]: createComputePipeline(device, matmulGgufWGSL, 'matmul_gguf_iq1_m', 'matmul-gguf-iq1_m'),
     } : null;
   // Lever 2: multi-output tiled GEMV — TN output rows per workgroup share a
   // staged activation tile (legacy kernels re-read the full activation vector
