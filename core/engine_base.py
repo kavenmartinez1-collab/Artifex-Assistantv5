@@ -53,6 +53,7 @@ class BaseEngine(ABC):
                            enable_thinking=True,
                            grammar=None, response_format=None,
                            web_tools=False,
+                           reasoning_effort=None,
                            on_telemetry=None,
                            sampling=None) -> str:
         """Run streaming inference.
@@ -79,6 +80,11 @@ class BaseEngine(ABC):
                 api/server.py instead) should accept and ignore the
                 flag.  claude_cli maps it to `--allowedTools
                 WebSearch,WebFetch`.
+            reasoning_effort: optional "low"/"medium"/"high"/"xhigh" cap on
+                how long a thinking-mode model deliberates.  Only meaningful
+                where the chat template exposes it (llama.cpp forwards it as
+                chat_template_kwargs); other backends should accept and
+                ignore it.  Ignored when enable_thinking is False.
 
         Returns:
             The final response string (thinking stripped).

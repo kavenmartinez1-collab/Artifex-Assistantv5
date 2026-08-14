@@ -1140,6 +1140,7 @@ class TransformersEngine(BaseEngine):
                            grammar=None, response_format=None,
                            raw_output=False,
                            web_tools=False,
+                           reasoning_effort=None,
                            on_telemetry=None,
                            sampling=None) -> str:
         """Run streaming inference on the local transformers model.
@@ -1151,6 +1152,9 @@ class TransformersEngine(BaseEngine):
 
         web_tools is accepted-and-ignored — transformers models use the
         @search/@web_read post-processor in api/server.py for tools.
+
+        reasoning_effort is accepted for BaseEngine signature parity and
+        ignored — the chat templates applied here don't expose it.
 
         on_telemetry, if provided, receives one forward-pass telemetry frame
         per generated token (per-layer norms + MoE expert routing). See

@@ -417,6 +417,26 @@ def _infer_backend_from_model(name) -> str | None:
     return None
 
 
+_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+
+
+def _validate_reasoning_effort(value):
+    """Normalize options.reasoning_effort, dropping anything unrecognized.
+
+    Some thinking-mode chat templates (Qwen3.8's, for one) default the
+    reasoning budget to "xhigh", which can deliberate unboundedly on hard
+    structured tasks — measured at 16K reasoning tokens with no answer
+    ever emitted.  Callers bound it per request with this option.
+
+    An unknown value is ignored with a warning rather than raising 400: a
+    typo in an optional knob shouldn't fail the whole generation.
+    """
+    if value is None or value in _REASONING_EFFORTS:
+        return value
+    _log.warning("Ignoring invalid reasoning_effort %r", value)
+    return None
+
+
 def _pick_vision_model(backend: str) -> str | None:
     """Find a vision-capable model installed on `backend`.
 
@@ -867,7 +887,8 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
                              out_queue: queue.Queue,
                              grammar=None, response_format=None,
                              enable_thinking=True,
-                             web_tools=False):
+                             web_tools=False,
+                             reasoning_effort=None):
     """Stream from Transformers/llama.cpp/claude_cli engine into a queue.
     Runs in a background thread.
 
@@ -877,6 +898,9 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
     web_tools forwards to engines that have native tool support
     (claude_cli → --allowedTools).  Engines without it accept and
     ignore the flag.
+
+    reasoning_effort bounds thinking depth on templates that expose it;
+    only the llama_cpp engine acts on it, the rest accept and ignore.
     """
     tf = ThinkFilter(
         on_response=lambda t: out_queue.put(("content", t)),
@@ -898,6 +922,7 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
             raw_output=True,
             enable_thinking=enable_thinking,
             web_tools=web_tools,
+            reasoning_effort=reasoning_effort,
         )
         tf.flush()
 
@@ -962,7 +987,8 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                              temperature: float, options: dict,
                              use_web_tools: bool, backend: str,
                              grammar=None, response_format=None,
-                             enable_thinking=True):
+                             enable_thinking=True,
+                             reasoning_effort=None):
     """Full streaming generator with optional tool execution loop.
 
     Yields SSE events. Handles both Ollama and Transformers backends.
@@ -1005,6 +1031,7 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                 target=_stream_transformers_raw,
                 args=(engine, current_messages, max_tokens, temperature, q,
                       grammar, response_format, enable_thinking, use_web_tools),
+                kwargs={"reasoning_effort": reasoning_effort},
                 daemon=True,
             )
 
@@ -1099,6 +1126,7 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                     target=_stream_transformers_raw,
                     args=(engine, current_messages, max_tokens, temperature, q_final,
                           grammar, response_format, enable_thinking),
+                    kwargs={"reasoning_effort": reasoning_effort},
                     daemon=True,
                 )
             t.start()
@@ -1355,6 +1383,12 @@ def create_app():
         use_web_tools = body.web_tools or False
         options = body.options or {}
         enable_thinking = options.get("think", True)
+        # Per-request reasoning depth for thinking-mode models. Invalid
+        # values are dropped with a warning, never 400'd — see
+        # _validate_reasoning_effort.
+        reasoning_effort = _validate_reasoning_effort(
+            options.get("reasoning_effort")
+        )
         backend = (
             body.backend
             or _infer_backend_from_model(body.model)
@@ -1436,6 +1470,7 @@ def create_app():
                             grammar=body.grammar,
                             response_format=body.response_format,
                             enable_thinking=enable_thinking,
+                            reasoning_effort=reasoning_effort,
                         ):
                             yield chunk
                 except Exception as e:
@@ -1495,6 +1530,7 @@ def create_app():
                     raw_output=True,
                     enable_thinking=enable_thinking,
                     web_tools=use_web_tools,
+                    reasoning_effort=reasoning_effort,
                 ),
             )
             response = response or ""

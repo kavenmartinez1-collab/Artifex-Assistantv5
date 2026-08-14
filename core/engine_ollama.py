@@ -170,6 +170,7 @@ class OllamaEngine(BaseEngine):
                            grammar=None, response_format=None,
                            raw_output=False,
                            web_tools=False,
+                           reasoning_effort=None,
                            on_telemetry=None,
                            sampling=None) -> str:
         """Stream a response from the Ollama /api/chat endpoint (localhost only).
@@ -180,6 +181,9 @@ class OllamaEngine(BaseEngine):
 
         web_tools is accepted-and-ignored — Ollama models use the
         @search/@web_read post-processor in api/server.py for tools.
+
+        reasoning_effort is accepted for BaseEngine signature parity and
+        ignored — Ollama has no per-request effort control.
         """
         self.load()
 

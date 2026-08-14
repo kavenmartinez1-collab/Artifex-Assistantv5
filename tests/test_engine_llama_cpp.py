@@ -214,6 +214,85 @@ class TestEnableThinking(unittest.TestCase):
         self.assertNotIn("reasoning_format", body)
 
     @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_reasoning_effort_in_chat_template_kwargs(self, mock_urlopen):
+        """A valid reasoning_effort rides along in chat_template_kwargs."""
+        engine = self._make_engine()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.__iter__ = MagicMock(return_value=iter([
+            b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]))
+        mock_urlopen.return_value = mock_resp
+
+        engine.generate_streaming(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=100, temperature=0.7,
+            enable_thinking=True,
+            reasoning_effort="medium",
+        )
+
+        call_args = mock_urlopen.call_args
+        req = call_args[0][0]
+        body = json.loads(req.data.decode())
+        self.assertEqual(body["chat_template_kwargs"],
+                         {"reasoning_effort": "medium"})
+        # Thinking is still on — no reasoning_format override.
+        self.assertNotIn("reasoning_format", body)
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_reasoning_effort_omitted_by_default(self, mock_urlopen):
+        """No reasoning_effort argument leaves the payload untouched."""
+        engine = self._make_engine()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.__iter__ = MagicMock(return_value=iter([
+            b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]))
+        mock_urlopen.return_value = mock_resp
+
+        engine.generate_streaming(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=100, temperature=0.7,
+            enable_thinking=True,
+        )
+
+        call_args = mock_urlopen.call_args
+        req = call_args[0][0]
+        body = json.loads(req.data.decode())
+        self.assertNotIn("chat_template_kwargs", body)
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_reasoning_effort_does_not_clobber_disabled_thinking(self, mock_urlopen):
+        """With thinking off, the enable_thinking kwarg wins — there is no
+        think block left to budget."""
+        engine = self._make_engine()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.__iter__ = MagicMock(return_value=iter([
+            b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]))
+        mock_urlopen.return_value = mock_resp
+
+        engine.generate_streaming(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=100, temperature=0.7,
+            enable_thinking=False,
+            reasoning_effort="low",
+        )
+
+        call_args = mock_urlopen.call_args
+        req = call_args[0][0]
+        body = json.loads(req.data.decode())
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(body["reasoning_format"], "none")
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
     def test_reasoning_content_wrapped_in_think_tags(self, mock_urlopen):
         """When llama-server emits reasoning_content, on_token receives <think> tags."""
         engine = self._make_engine()

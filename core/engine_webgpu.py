@@ -151,6 +151,7 @@ class WebGpuEngine(BaseEngine):
                            grammar=None, response_format=None,
                            raw_output=False,
                            web_tools=False,
+                           reasoning_effort=None,
                            on_telemetry=None,
                            sampling=None) -> str:
         """Run one chat generation in the attached browser session.
@@ -158,6 +159,8 @@ class WebGpuEngine(BaseEngine):
         grammar/response_format are not supported by the WebGPU engine and
         are accepted-and-ignored (logged) per the BaseEngine contract;
         web_tools likewise (handled by the api/server.py post-processor).
+        reasoning_effort is also accepted and ignored — the in-browser
+        runtime has no per-request effort control.
         """
         self.load()
         if grammar or response_format:

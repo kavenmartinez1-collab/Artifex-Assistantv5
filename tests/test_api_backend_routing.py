@@ -156,3 +156,26 @@ def test_vision_request_rejects_llama_cpp_at_pydantic_layer():
         assert False, "Should have raised ValidationError"
     except ValidationError:
         pass
+
+
+def test_reasoning_effort_accepts_known_levels():
+    """options.reasoning_effort passes through unchanged for valid levels."""
+    from api.server import _validate_reasoning_effort
+    for level in ("low", "medium", "high", "xhigh"):
+        assert _validate_reasoning_effort(level) == level
+
+
+def test_reasoning_effort_absent_is_none():
+    """Omitting the option keeps default behaviour (nothing sent downstream)."""
+    from api.server import _validate_reasoning_effort
+    assert _validate_reasoning_effort(None) is None
+
+
+def test_invalid_reasoning_effort_ignored_not_raised():
+    """A bad value is dropped with a warning, never an error.
+
+    The knob is optional; a typo must not fail an otherwise-valid request.
+    """
+    from api.server import _validate_reasoning_effort
+    for bad in ("XHIGH", "extreme", "", 3, [], {"a": 1}):
+        assert _validate_reasoning_effort(bad) is None, bad

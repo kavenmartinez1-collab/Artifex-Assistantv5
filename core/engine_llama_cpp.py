@@ -658,6 +658,7 @@ class LlamaCppEngine(BaseEngine):
                            grammar=None, response_format=None,
                            raw_output=False,
                            web_tools=False,
+                           reasoning_effort=None,
                            on_telemetry=None,
                            sampling=None) -> str:
         """Stream from llama-server's OpenAI-compatible /v1/chat/completions.
@@ -675,6 +676,11 @@ class LlamaCppEngine(BaseEngine):
         web_tools is accepted-and-ignored — local llama.cpp models don't
         have native tool execution; Artifex's @search/@web_read
         post-processor in api/server.py handles tools for this backend.
+
+        reasoning_effort ("low"/"medium"/"high"/"xhigh") rides along in
+        chat_template_kwargs for templates that read it.  It only applies
+        when thinking is on — with enable_thinking=False there is no think
+        block to budget.
         """
         from core.sampling import DEFAULT_SAMPLING, SAMPLING_PAYLOAD_KEYS
 
@@ -704,6 +710,14 @@ class LlamaCppEngine(BaseEngine):
             # leaking raw <think>...</think> into the response.
             payload["chat_template_kwargs"] = {"enable_thinking": False}
             payload["reasoning_format"] = "none"
+        elif reasoning_effort:
+            # Qwen3.8's template defaults reasoning effort to "xhigh", which
+            # can deliberate unboundedly on hard structured tasks (measured:
+            # 16K reasoning tokens with no answer emitted).  Callers bound it
+            # per request with options.reasoning_effort.
+            payload["chat_template_kwargs"] = {
+                "reasoning_effort": reasoning_effort,
+            }
         if max_tokens and max_tokens > 0:
             payload["max_tokens"] = max_tokens
         if grammar:
