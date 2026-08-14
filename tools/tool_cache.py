@@ -22,7 +22,12 @@ from core.config import BASE_DIR
 # ===== CONFIGURATION =====
 
 # Outputs shorter than this (chars) stay inline — no caching needed.
-CACHE_THRESHOLD = 800
+# 800 was the 8K-context-era value; at modern 32K+ ctx windows it fired on
+# nearly every grep/search/web result and the model often answered from the
+# lossy summary instead of drilling into the cache. ~8000 chars (~2K tokens)
+# keeps typical results inline and reserves caching for genuinely huge
+# outputs.
+CACHE_THRESHOLD = int(os.environ.get("ARTIFEX_TOOL_CACHE_THRESHOLD", "8000"))
 
 # Directory for cached tool outputs (auto-created).
 CACHE_DIR = os.path.join(BASE_DIR, ".tool_cache")
@@ -260,7 +265,9 @@ def maybe_cache_output(tool_type, display, output):
         )
     return (
         f"{summary}\n"
-        f"[Cached: {rel_path} — use @read_file(\"{rel_path}\") ONLY if you need a specific detail not shown above]"
+        f"[TRUNCATED — the summary above is INCOMPLETE. Full output saved to "
+        f"{rel_path}. If anything you need might be missing, run "
+        f"@read_file(\"{rel_path}\") NOW, before answering.]"
     )
 
 

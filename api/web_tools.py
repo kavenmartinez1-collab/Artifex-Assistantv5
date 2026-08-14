@@ -26,6 +26,11 @@ GATEWAY_AUTH_TOKEN = os.getenv("GATEWAY_AUTH_TOKEN", "")
 
 MAX_TOOL_ROUNDS = 10
 
+# Max chars of extracted page text forwarded to the model per @web_read.
+# 4000 was the 8K-ctx-era value; at modern ctx windows a fuller page beats
+# a lossy cut, and this path DROPS the tail (no cache to drill into).
+WEB_READ_MAX_CHARS = int(os.getenv("ARTIFEX_WEB_READ_MAX_CHARS", "12000"))
+
 # ── Tool-call regex patterns ─────────────────────────────────────────────────
 
 # Match @search("query") with regular, smart, or NO quotes
@@ -214,9 +219,15 @@ def execute_web_tools(tools: list[dict], search_cache: list[dict]) -> str:
             if warnings:
                 header += f"\n[Security warnings: {'; '.join(warnings)}]"
 
-            # Truncate to ~4000 chars to leave room in context
-            if len(text) > 4000:
-                text = text[:4000] + "\n\n[...content truncated. Key content above.]"
+            # Truncate very large pages to leave room in context. The tail
+            # is DROPPED on this path (no cache file to drill into), so the
+            # limit errs generous and the message is honest about the loss.
+            if len(text) > WEB_READ_MAX_CHARS:
+                text = text[:WEB_READ_MAX_CHARS] + (
+                    "\n\n[TRUNCATED — the page continues beyond this point "
+                    "and the rest is NOT available. If the answer may be in "
+                    "the missing part, say so rather than guessing.]"
+                )
 
             results.append(f"[Web page content]\n{header}\n{text}")
 

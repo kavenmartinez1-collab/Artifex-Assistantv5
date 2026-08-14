@@ -1355,7 +1355,9 @@ def run_read_function(content):
 
 _WEB_READ_MAX_BODY = 5_242_880   # 5 MB max download (PDFs can be larger)
 _WEB_READ_TIMEOUT = 20           # seconds (PDFs need more time)
-_WEB_READ_TRUNCATE = 3500        # chars of clean text to return
+# chars of clean text to return; 3500 was the 8K-ctx-era value — at modern
+# ctx windows a fuller page beats a lossy cut.
+_WEB_READ_TRUNCATE = int(os.environ.get("ARTIFEX_WEB_READ_TRUNCATE", "12000"))
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
