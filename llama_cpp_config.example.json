@@ -1,40 +1,43 @@
 {
-  "_comment": "llama.cpp server config. Copy to llama_cpp_config.json and update paths.",
-  "server_path": "/path/to/llama-mainline/llama.cpp/build/bin/llama-server",
+  "_comment": "llama.cpp server config. Copy to llama_cpp_config.json and update paths. Reference numbers below were measured on an RTX 4090 (24 GB) with Qwen3.8-27B UD-Q4_K_XL; scale to your card.",
+  "server_path": "/path/to/llama.cpp/build/bin/llama-server",
   "default_port": 8081,
   "models": {
-    "qwen3.6-27b-256k": {
-      "_comment": "C3-256K: max context, q4_0 KV, no spec-dec. ~22 GB VRAM. No --cache-reuse (breaks hybrid DeltaNet state).",
-      "path": "/path/to/Qwen3.6-27B-Q4_K_M.gguf",
+    "qwen3.8-27b-mtp": {
+      "_comment": "Text config with built-in MTP speculative decoding (needs an MTP-capable llama.cpp build). Measured on a 4090: 78-84 tok/s generation at 75-81% draft acceptance, ~1150 tok/s prefill. num_ctx 229376 leaves ~1.26 GB free on a 24 GB card; the full native 262144 also loads but with <0.5 GB headroom. Pairs with the 224_000 rung in core/engine_llama_cpp.py CTX_TIERS. Thinking-mode default effort is xhigh, which can deliberate unboundedly on hard structured tasks — structured-output callers should pass chat_template_kwargs {\"reasoning_effort\": \"medium\"}. No --cache-reuse (breaks hybrid DeltaNet state).",
+      "path": "/path/to/Qwen3.8-27B-UD-Q4_K_XL.gguf",
       "num_gpu_layers": 99,
-      "num_ctx": 262144,
+      "num_ctx": 229376,
       "extra_flags": [
         "-fa", "on",
         "-ctk", "q4_0", "-ctv", "q4_0",
-        "--swa-full",
         "-np", "1",
+        "-fit", "off",
+        "--no-mmap",
+        "--spec-type", "draft-mtp",
+        "--spec-draft-n-max", "3",
         "--jinja",
         "--reasoning-format", "deepseek",
         "--metrics"
       ]
     },
-    "qwen3.6-27b-32k-specd": {
-      "_comment": "C1-agg-32K: 32K ctx + Qwen3.5-4B spec-dec + vision. q4_0 KV keeps 32K KV in the same VRAM envelope 8K@q8_0 used. Mid-context multimodal default — survey/parse stages with image tokens + thinking budget exceed 8K, so this is the safer floor.",
-      "path": "/path/to/Qwen3.6-27B-Q4_K_M.gguf",
+    "qwen3.8-27b-mtp-vision": {
+      "_comment": "Vision config: same GGUF plus the ~930 MB mmproj projector (Qwen3.8 is a native VLM). Give it its own entry with --mmproj in extra_flags — that flag is how the request router detects vision capability and auto-reroutes image-bearing requests here. ctx is tier-aligned at 128K; on a 4090 that leaves ~2.4 GB free with the projector resident. MTP draft decoding runs during image requests on the same build.",
+      "path": "/path/to/Qwen3.8-27B-UD-Q4_K_XL.gguf",
       "num_gpu_layers": 99,
-      "num_ctx": 32000,
+      "num_ctx": 131072,
       "extra_flags": [
         "-fa", "on",
         "-ctk", "q4_0", "-ctv", "q4_0",
-        "--swa-full",
         "-np", "1",
-        "-md", "/path/to/Qwen3.5-4B-Q4_K_M.gguf",
-        "-ngld", "99", "-cd", "8192",
-        "--spec-draft-n-max", "16", "--spec-draft-n-min", "4", "--spec-draft-p-min", "0.5",
+        "-fit", "off",
+        "--no-mmap",
+        "--spec-type", "draft-mtp",
+        "--spec-draft-n-max", "3",
         "--jinja",
         "--reasoning-format", "deepseek",
         "--metrics",
-        "--mmproj", "/path/to/mmproj-F16.gguf"
+        "--mmproj", "/path/to/Qwen3.8-mmproj-F16.gguf"
       ]
     }
   }
