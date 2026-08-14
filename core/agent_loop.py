@@ -294,7 +294,11 @@ class AgentRunner:
 
                 self.emit(AgentEvent("action_started", action=action, round=rnd))
                 try:
-                    ok, out = run_agent_action(action)
+                    # policy_check=False: this loop already ran check_policy
+                    # (blocked/approval handling above) — re-checking inside
+                    # run_agent_action would double-count the audit-log and
+                    # circuit-breaker hooks for the same action.
+                    ok, out = run_agent_action(action, policy_check=False)
                 except Exception as e:  # executor blew up — treat as failure
                     ok, out = False, f"ERROR: {e}"
                 out = out or ""

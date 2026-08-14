@@ -2108,11 +2108,49 @@ def agent_auto_exec_enabled() -> bool:
     return bool(AGENT_KEY)
 
 
-def run_agent_action(action):
+def run_agent_action(action, confirm_cb=None, policy_check=True):
     """
     Dispatch an AgentAction to the appropriate executor.
     Returns (success, output) tuple.
+
+    Policy enforcement happens HERE, not only at call sites. The sandbox
+    policy engine used to be consulted solely by callers that opted in
+    (the AgentRunner loop did; the voice pipeline and the Qt action
+    worker did not), which left those surfaces running model-authored
+    actions with no injection screening, blocklist, or egress checks.
+    Centralizing the gate means every current and future caller is
+    screened by default.
+
+    Args:
+        action: AgentAction to execute.
+        confirm_cb: callable(action, decision) -> bool for actions the
+            policy marks requires_confirmation. A surface where the human
+            already approved the action (e.g. the Qt click-to-run panel)
+            passes a callback returning True. When None, confirmation-
+            required actions are refused rather than silently executed.
+        policy_check: set False ONLY by callers that already ran
+            check_policy and obtained approval for this exact action
+            (the AgentRunner loop) — re-checking would double-count the
+            audit-log and circuit-breaker hooks.
     """
+    if policy_check:
+        from core.sandbox import check_policy
+        decision = check_policy(action.type, action.content)
+        if not decision.allowed:
+            return False, (
+                f"[BLOCKED by sandbox policy — {decision.risk_level.name}] "
+                f"{decision.reason}"
+            )
+        if decision.requires_confirmation:
+            if confirm_cb is None:
+                return False, (
+                    f"[NOT RUN — requires confirmation ({decision.risk_level.name})] "
+                    f"This surface has no confirmation flow; action refused: "
+                    f"{action.display if hasattr(action, 'display') else action.type}"
+                )
+            if not confirm_cb(action, decision):
+                return False, "[NOT RUN — confirmation declined]"
+
     if action.type == "shell":
         return run_shell_command(action.content, cwd=os.getcwd())
     elif action.type == "python":

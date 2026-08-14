@@ -48,11 +48,18 @@ def build_runner(responses, monkeypatch, *, autonomy=AutonomyLevel.FULL_AUTO,
                  run_action=None, max_consecutive_failures=3, control=None):
     calls = {"actions": []}
 
-    def default_action(a):
+    def default_action(a, **kwargs):
+        # **kwargs mirrors run_agent_action's real signature — the loop
+        # passes policy_check=False since it pre-gates via check_policy.
         calls["actions"].append(a)
         return True, f"out:{a.display}"
 
-    monkeypatch.setattr("core.agent_loop.run_agent_action", run_action or default_action)
+    action_fn = run_action or default_action
+
+    def _accepting_kwargs(a, **kwargs):
+        return action_fn(a) if run_action else default_action(a, **kwargs)
+
+    monkeypatch.setattr("core.agent_loop.run_agent_action", _accepting_kwargs)
     cfg = RunConfig.default(autonomy)
     cfg.max_rounds = max_rounds
     cfg.max_consecutive_failures = max_consecutive_failures

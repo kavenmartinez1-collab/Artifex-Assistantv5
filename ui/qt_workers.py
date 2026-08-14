@@ -234,7 +234,13 @@ class ActionWorker(QThread):
                 display = getattr(action, "display", str(action))
                 self.status_changed.emit(f"Running: {display}")
                 try:
-                    success, output = run_agent_action(action)
+                    # The user clicked this action in the panel, so consent
+                    # is established — the confirm_cb accepts. The policy
+                    # screen (injection validator, blocklist, egress) still
+                    # runs inside run_agent_action; a click is consent, not
+                    # a safety review.
+                    success, output = run_agent_action(
+                        action, confirm_cb=lambda _a, _d: True)
                     self.output_ready.emit(display, output or "(no output)")
                 except Exception as e:
                     self.output_ready.emit(display, f"ERROR: {e}")
