@@ -324,5 +324,81 @@ class TestVramBaseline:
         assert result["system_reserve_mb"] == high_baseline
 
 
+# ── Tensor-split VRAM accounting ───────────────────────────────────────
+
+
+class TestTensorSplitEstimate:
+    """-ts / --tensor-split scales the per-device weight and KV estimate.
+
+    Without this the gate asks one card for the whole model and rejects
+    every split launch, which is precisely the case a split exists to serve.
+    """
+
+    MODEL_MB = 1024  # 1 GiB file, MODEL_OVERHEAD_FACTOR applied by the pool
+
+    def _fresh_pool(self):
+        from core.gpu_pool import GPUPool
+        GPUPool._instance = None
+        return GPUPool()
+
+    def _estimate(self, extra_flags, device_index=0):
+        pool = self._fresh_pool()
+        fake_dev = MagicMock(memory_used_mb=0.0)
+        with patch.object(pool, "refresh_device", return_value=fake_dev), \
+             patch("core.gpu_pool.read_gguf_kv_params", return_value=None), \
+             patch("os.path.getsize", return_value=1024 * 1024 * self.MODEL_MB):
+            return pool.estimate_allocation_mb(
+                "/fake.gguf", num_ctx=8192, extra_flags=extra_flags,
+                device_index=device_index,
+            )
+
+    def test_no_split_keeps_full_weight(self):
+        from core.gpu_pool import MODEL_OVERHEAD_FACTOR
+        baseline = self._estimate(["-fa", "on"])
+        assert baseline["model_weight_mb"] == pytest.approx(
+            self.MODEL_MB * MODEL_OVERHEAD_FACTOR
+        )
+
+    def test_split_scales_weight_to_device_share(self):
+        """-ts 5,11 on device 0 → 5/16 of the unsplit weight."""
+        full = self._estimate(["-fa", "on"])["model_weight_mb"]
+        split = self._estimate(["-sm", "layer", "-ts", "5,11"])["model_weight_mb"]
+        assert split == pytest.approx(full * (5 / 16))
+
+    def test_split_uses_correct_index_for_second_device(self):
+        full = self._estimate(["-ts", "5,11"])["model_weight_mb"]
+        second = self._estimate(["-ts", "5,11"], device_index=1)["model_weight_mb"]
+        assert second == pytest.approx(full / (5 / 16) * (11 / 16))
+
+    def test_fractional_shares_normalise(self):
+        """Relative shares: 0.3125/0.6875 must match 5,11."""
+        a = self._estimate(["-ts", "5,11"])["model_weight_mb"]
+        b = self._estimate(["-ts", "0.3125,0.6875"])["model_weight_mb"]
+        assert a == pytest.approx(b)
+
+    def test_device_beyond_split_list_falls_back_to_max_share(self):
+        """Pool may enumerate fewer devices than the split spans."""
+        full = self._estimate(["-fa", "on"])["model_weight_mb"]
+        out = self._estimate(["-ts", "5,11"], device_index=7)["model_weight_mb"]
+        assert out == pytest.approx(full * (11 / 16))
+
+    def test_long_flag_spelling_honoured(self):
+        a = self._estimate(["-ts", "5,11"])["model_weight_mb"]
+        b = self._estimate(["--tensor-split", "5,11"])["model_weight_mb"]
+        assert a == pytest.approx(b)
+
+    def test_malformed_split_leaves_estimate_unscaled(self):
+        """Garbage must not silently shrink the gate."""
+        full = self._estimate(["-fa", "on"])["model_weight_mb"]
+        assert self._estimate(["-ts", "abc"])["model_weight_mb"] == pytest.approx(full)
+        assert self._estimate(["-ts"])["model_weight_mb"] == pytest.approx(full)
+        assert self._estimate(["-ts", "0,0"])["model_weight_mb"] == pytest.approx(full)
+
+    def test_kv_rides_the_split(self):
+        full = self._estimate(["-fa", "on"])["kv_cache_mb"]
+        split = self._estimate(["-ts", "5,11"])["kv_cache_mb"]
+        assert split == pytest.approx(full * (5 / 16))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

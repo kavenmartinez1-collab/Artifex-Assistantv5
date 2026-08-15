@@ -620,6 +620,46 @@ class GPUPool:
             )
             model_weight_mb = adjusted_mb
 
+        # Multi-GPU layer split: -ts / --tensor-split spreads layers across
+        # devices, so only this device's share is resident here.  Without
+        # this the gate demands the whole model on one card and rejects
+        # every split config by construction — the reason to split is that
+        # no single GPU has room for the whole weight.  Shares are relative:
+        # llama.cpp normalises the list, so "5,11" and "0.31,0.69" agree.
+        split_fraction = 1.0
+        if extra_flags:
+            for i, f in enumerate(extra_flags):
+                if f in ("-ts", "--tensor-split") and i + 1 < len(extra_flags):
+                    try:
+                        shares = [
+                            float(x)
+                            for x in extra_flags[i + 1].replace("/", ",").split(",")
+                            if x.strip()
+                        ]
+                    except ValueError:
+                        break
+                    total = sum(shares)
+                    if shares and total > 0:
+                        # device_index addresses the pool's own enumeration.
+                        # When it runs past the split list — the pool sees
+                        # only CUDA devices, but a Vulkan split may span a
+                        # non-CUDA card — fall back to the largest share so
+                        # the gate errs high rather than waving a model in.
+                        if device_index < len(shares):
+                            split_fraction = shares[device_index] / total
+                        else:
+                            split_fraction = max(shares) / total
+                    break
+
+        if split_fraction < 1.0 and model_weight_mb > 0:
+            _log.info(
+                "Tensor split: model_weight scaled %.0f → %.0f MB "
+                "(device %d share=%.3f)",
+                model_weight_mb, model_weight_mb * split_fraction,
+                device_index, split_fraction,
+            )
+            model_weight_mb *= split_fraction
+
         result["model_weight_mb"] = model_weight_mb
 
         if arch is not None:
@@ -637,6 +677,11 @@ class GPUPool:
             )
             kv_cache_bytes = kv_per_token_bytes * num_ctx
             kv_cache_mb = kv_cache_bytes / (1024 * 1024)
+            # Under -sm layer a layer's KV lives on whichever device holds
+            # the layer, so KV rides the same split as the weights.  (The
+            # no-arch fallback below derives KV from the already-scaled
+            # weight, so it needs no separate adjustment.)
+            kv_cache_mb *= split_fraction
             result["kv_cache_mb"] = kv_cache_mb
 
             _log.debug("VRAM estimate KV: %d attn_layers * %d kv_heads * "
