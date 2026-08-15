@@ -447,6 +447,48 @@
     white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px;
   }
 
+  /* ── Files view ─────────────────────────────────────── */
+  #files-bar {
+    display: flex; align-items: center; gap: 8px; flex: none;
+    padding: 6px calc(var(--gut) + var(--sar)) 6px calc(var(--gut) + var(--sal));
+    background: var(--panel2); border-bottom: 1px solid var(--border);
+  }
+  #files-bar button {
+    flex: none; min-width: var(--tap); min-height: var(--tap);
+    background: none; border: 1px solid var(--border); color: var(--text);
+    border-radius: 10px; font-size: 16px; padding: 0;
+  }
+  #files-path {
+    flex: 1; min-width: 0; font-family: var(--mono); font-size: 12px;
+    color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #files-scroll {
+    flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
+    -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+  }
+  #files-viewer { padding: 10px calc(var(--gut) + var(--sar)) 10px calc(var(--gut) + var(--sal)); }
+  #files-viewer .fv-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  #files-viewer .fv-head button {
+    flex: none; min-height: var(--tap); padding: 0 12px; border-radius: 10px;
+    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    font-size: 13px;
+  }
+  #fv-name {
+    flex: 1; min-width: 0; font-family: var(--mono); font-size: 13px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .fv-note {
+    font-size: 12px; color: var(--warn); margin-bottom: 8px; overflow-wrap: anywhere;
+  }
+  #fv-code pre { max-height: none; }
+  #files-foot {
+    flex: none; display: flex; gap: 8px;
+    padding: 8px calc(var(--gut) + var(--sar))
+             calc(var(--sab) + 8px) calc(var(--gut) + var(--sal));
+    background: var(--panel); border-top: 1px solid var(--border);
+  }
+  #files-foot .btn { min-height: var(--tap); }
+
   /* ── Sidebar (chat sessions + agent runs) ───────────── */
   #sidebar {
     position: fixed; top: 0; left: 0; bottom: 0;
@@ -491,13 +533,15 @@
     color: var(--err); border: 1px solid rgba(248,81,73,.45);
     font-size: 11.5px; font-weight: 700;
   }
-  .rr .st {
+  .fr .sr-t { font-family: var(--mono); font-size: 13px; }
+  .rr .st, .fr .st { margin-left: 4px; }
+  .st {
     flex: none; font-size: 9.5px; letter-spacing: .5px; padding: 2px 7px;
     border-radius: 20px; border: 1px solid var(--border); color: var(--dim);
   }
-  .rr .st.live { color: var(--accent); border-color: rgba(88,166,255,.5); }
-  .rr .st.bad { color: var(--err); border-color: rgba(248,81,73,.45); }
-  .rr .st.ok { color: var(--ok); border-color: rgba(63,185,80,.45); }
+  .st.live { color: var(--accent); border-color: rgba(88,166,255,.5); }
+  .st.bad { color: var(--err); border-color: rgba(248,81,73,.45); }
+  .st.ok { color: var(--ok); border-color: rgba(63,185,80,.45); }
 
   /* ── Settings drawer ────────────────────────────────── */
   #backdrop, #side-backdrop {
@@ -596,6 +640,7 @@
   <div id="tabs">
     <button id="tab-chat" class="on" onclick="showTab('chat')">Chat</button>
     <button id="tab-agent" onclick="showTab('agent')">Agent<span class="pip"></span></button>
+    <button id="tab-files" onclick="showTab('files')">Files</button>
   </div>
 </header>
 
@@ -635,6 +680,14 @@
         </div>
         <div class="hint" id="autonomy-hint"></div>
       </div>
+      <div style="margin-top:10px">
+        <div style="font-size:11px;letter-spacing:1.5px;color:var(--dim);margin-bottom:6px">CONTEXT</div>
+        <div class="seg" id="agentctx-seg">
+          <button data-v="16384" class="on">16k</button>
+          <button data-v="32768">32k</button>
+          <button data-v="49152">48k</button>
+        </div>
+      </div>
       <button id="agent-start" onclick="startAgentRun()">Start run</button>
       <div class="hint">Runs in a fresh workspace under output/agent_runs/. One run at a time.</div>
     </details>
@@ -666,6 +719,42 @@
   </div>
 </div>
 
+<div id="files-view" class="view hidden">
+  <div id="files-bar">
+    <button id="files-up" class="hidden" aria-label="Parent folder" onclick="filesUp()">&#8593;</button>
+    <div id="files-path"></div>
+    <button id="files-reload" aria-label="Refresh" onclick="reloadDir()">&#8635;</button>
+  </div>
+  <div class="scroll-wrap">
+    <div id="files-scroll">
+      <div id="files-browse">
+        <div id="file-list"><div class="sb-empty">Loading...</div></div>
+      </div>
+      <div id="files-viewer" class="hidden">
+        <div class="fv-head">
+          <button onclick="closeViewer()">&#8592; Back</button>
+          <div id="fv-name"></div>
+        </div>
+        <div id="fv-note" class="fv-note hidden"></div>
+        <div class="cb" id="fv-code">
+          <div class="cb-h">
+            <span class="lang" id="fv-lang">file</span>
+            <button type="button" onclick="copyCode(this)">copy</button>
+          </div>
+          <pre><code id="fv-content"></code></pre>
+        </div>
+        <div style="margin-top:10px">
+          <button class="btn" id="fv-download" onclick="downloadCurrent()">Download</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="files-foot">
+    <input type="file" id="file-input" style="display:none">
+    <button class="btn" id="upload-btn" onclick="pickUpload()">Upload to this folder</button>
+  </div>
+</div>
+
 <div id="side-backdrop" onclick="closeSidebar()"></div>
 <div id="sidebar">
   <div class="sb-head">
@@ -692,6 +781,16 @@
     <select id="model-select"><option value="">(connect first)</option></select>
   </div>
   <div class="panel">
+    <div class="pt">ENGINE</div>
+    <div class="hint" id="engine-info">Tap Refresh to check what is loaded.</div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn" onclick="refreshEngine()">Refresh</button>
+      <button class="btn" id="engine-reload-btn" onclick="reloadEngine()">Reload at full ctx</button>
+    </div>
+    <button class="btn hidden" id="engine-jump" style="margin-top:8px">Go to the live run</button>
+    <div class="hint">A reload relaunches llama-server at the model's full configured context. Takes 30-60 s.</div>
+  </div>
+  <div class="panel">
     <div class="pt">REASONING EFFORT</div>
     <div class="seg" id="effort-seg">
       <button data-v="low">low</button><button data-v="medium" class="on">med</button>
@@ -712,6 +811,17 @@
           inputmode="numeric">
       </div>
     </div>
+  </div>
+  <div class="panel">
+    <div class="pt">HISTORY BUDGET</div>
+    <select id="hist-budget">
+      <option value="24000">24k chars (short)</option>
+      <option value="48000">48k chars (default)</option>
+      <option value="96000">96k chars</option>
+      <option value="144000">144k chars</option>
+      <option value="192000">192k chars (max)</option>
+    </select>
+    <div class="hint">Past 80% of this, the older half of the conversation is auto-compacted into a summary before the next send - like /compact.</div>
   </div>
   <div class="panel">
     <div class="pt">WEB SEARCH</div>
@@ -786,10 +896,21 @@ CAPABILITIES IN THIS CHAT:
 - This app's AGENT tab DOES have those tools: it runs commands and reads/writes files on the user's PC, with user approval for risky steps. If the user asks for anything that needs their machine (files, directories, running programs, system info), tell them to switch to the Agent tab and phrase it as a goal.`;
 }
 
-// History caps forwarded to the model each turn (mirrors the Kbot proxy's
-// server-side trim: latest message always survives, older ones drop first).
-const MAX_HISTORY_MESSAGES = 30;
-const MAX_HISTORY_CHARS = 32000;
+// Sliding context. The char budget is a user setting; past COMPACT_AT of it
+// the older half of the conversation is summarized away (see autoCompact)
+// instead of being silently dropped. trimmedHistory() is the hard floor that
+// still applies if a compaction fails.
+const MAX_HISTORY_MESSAGES = 60;
+const DEFAULT_HISTORY_BUDGET = 48000;
+const COMPACT_AT = 0.8;
+const COMPACT_TAG = "[EARLIER CONVERSATION — AUTO-COMPACTED SUMMARY]";
+const COMPACT_SYSTEM =
+  "Summarize this conversation prefix into a dense factual synopsis preserving " +
+  "all names, paths, numbers, decisions, and open questions. Output only the synopsis.";
+function historyBudget() {
+  const n = parseInt($("hist-budget").value, 10);
+  return (isNaN(n) || n < 4000) ? DEFAULT_HISTORY_BUDGET : n;
+}
 
 // Re-render cadence while streaming. Every token re-rendered the whole
 // message before; on a long answer that is O(n^2) markdown work and the
@@ -809,6 +930,8 @@ const store = {
     localStorage.setItem("ax_web", $("web-toggle").checked ? "1" : "0");
     localStorage.setItem("ax_sysprompt", $("system-prompt").value);
     localStorage.setItem("ax_autonomy", currentAutonomy());
+    localStorage.setItem("ax_histbudget", $("hist-budget").value);
+    localStorage.setItem("ax_agentctx", currentAgentCtx());
   },
   restore() {
     $("api-key").value = this.k;
@@ -818,6 +941,9 @@ const store = {
     $("system-prompt").value = localStorage.getItem("ax_sysprompt") || DEFAULT_SYSTEM_PROMPT;
     setEffort(localStorage.getItem("ax_effort") || "medium");
     setAutonomy(localStorage.getItem("ax_autonomy") || "guided");
+    $("hist-budget").value = localStorage.getItem("ax_histbudget") || String(DEFAULT_HISTORY_BUDGET);
+    if (!$("hist-budget").value) $("hist-budget").value = String(DEFAULT_HISTORY_BUDGET);
+    segSet("agentctx-seg", localStorage.getItem("ax_agentctx") || "16384");
     // ax_conv is legacy: transcripts now live on the server. Anything still
     // here is migrated into a session on first boot, then the key is dropped.
     try { legacyConv = JSON.parse(localStorage.getItem(LEGACY_CONV_KEY) || "[]"); } catch (e) {}
@@ -841,6 +967,7 @@ function currentEffort() { return segValue("effort-seg", "medium"); }
 function setEffort(v) { segSet("effort-seg", v); }
 function currentAutonomy() { return segValue("autonomy-seg", "guided"); }
 function setAutonomy(v) { segSet("autonomy-seg", v); autonomyHint(); }
+function currentAgentCtx() { return segValue("agentctx-seg", "16384"); }
 
 const AUTONOMY_HINTS = {
   guided: "Auto-runs low-risk reads; asks before writes and anything MEDIUM+.",
@@ -853,18 +980,24 @@ document.querySelectorAll("#effort-seg button").forEach(b =>
   b.addEventListener("click", () => { setEffort(b.dataset.v); store.save(); }));
 document.querySelectorAll("#autonomy-seg button").forEach(b =>
   b.addEventListener("click", () => { setAutonomy(b.dataset.v); store.save(); }));
+document.querySelectorAll("#agentctx-seg button").forEach(b =>
+  b.addEventListener("click", () => { segSet("agentctx-seg", b.dataset.v); store.save(); }));
+$("hist-budget").addEventListener("change", () => store.save());
 
 // ── Tabs ─────────────────────────────────────────────────
 function showTab(name) {
   activeTab = name;
   $("chat-view").classList.toggle("hidden", name !== "chat");
   $("agent-view").classList.toggle("hidden", name !== "agent");
+  $("files-view").classList.toggle("hidden", name !== "files");
   $("tab-chat").classList.toggle("on", name === "chat");
   $("tab-agent").classList.toggle("on", name === "agent");
+  $("tab-files").classList.toggle("on", name === "files");
   if (name === "agent") {
     $("tab-agent").classList.remove("unread");
     scrollAgentToBottom();
   }
+  if (name === "files" && !filesLoaded) loadDir("");   // lazy first listing
 }
 
 // ── Drawer ───────────────────────────────────────────────
@@ -1526,18 +1659,87 @@ async function bootSession() {
   }
 }
 
-// ── History trim before send ─────────────────────────────
+// ── Sliding context ──────────────────────────────────────
+// Hard floor, used verbatim when a compaction is unnecessary or fails.
 function trimmedHistory() {
   if (conversation.length <= 1) return conversation.slice();
+  const budget = historyBudget();
   const kept = [];
   let chars = 0;
   for (let i = conversation.length - 1; i >= 0; i--) {
     const c = (conversation[i].content || "").length;
-    if (kept.length && (chars + c > MAX_HISTORY_CHARS || kept.length >= MAX_HISTORY_MESSAGES)) break;
+    if (kept.length && (chars + c > budget || kept.length >= MAX_HISTORY_MESSAGES)) break;
     kept.unshift(conversation[i]);
     chars += c;
   }
   return kept;
+}
+
+function convChars() {
+  let n = 0;
+  for (const m of conversation) n += ((m && m.content) || "").length;
+  return n;
+}
+function isCompactSummary(m) {
+  return !!m && m.role === "user" && String(m.content || "").indexOf(COMPACT_TAG) === 0;
+}
+
+// How many of the oldest messages to fold away, or 0 for "don't".
+function compactCut() {
+  const n = conversation.length;
+  if (n < 6) return 0;                                  // nothing worth folding
+  if (convChars() <= historyBudget() * COMPACT_AT) return 0;
+  const cut = Math.floor(n / 2);
+  if (cut < 2) return 0;
+  let headChars = 0, summaryChars = 0;
+  for (let i = 0; i < cut; i++) {
+    const c = ((conversation[i] && conversation[i].content) || "").length;
+    headChars += c;
+    if (isCompactSummary(conversation[i])) summaryChars += c;
+  }
+  if (!headChars) return 0;
+  // Don't compact a compaction. If the older half is a previous synopsis plus
+  // only a little new text, a second pass would spend a model call re-decaying
+  // text that is already compressed. Require real new material first. (A
+  // synopsis is capped at 800 tokens, so this stays true at any budget.)
+  if (summaryChars && (headChars - summaryChars) < 4000) return 0;
+  return cut;
+}
+
+// Replace the older half with one synopsis message. Never throws, never
+// blocks the send: on any failure the caller falls through to trimmedHistory.
+async function autoCompact(signal, onStatus) {
+  const cut = compactCut();
+  if (!cut) return 0;
+  const head = conversation.slice(0, cut);
+  if (onStatus) onStatus("compacting context...");
+  try {
+    const r = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      signal: signal,
+      body: JSON.stringify({
+        model: $("model-select").value || undefined,
+        messages: [{ role: "system", content: COMPACT_SYSTEM }]
+          .concat(head.map(m => ({ role: m.role, content: String(m.content || "") })))
+          .concat([{ role: "user", content: "Produce the synopsis now." }]),
+        stream: false,
+        web_tools: false,
+        temperature: 0.3,
+        max_tokens: 800,
+        options: { reasoning_effort: "low" },
+      }),
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const data = await r.json();
+    const choice = (data.choices || [])[0] || {};
+    const text = String((choice.message && choice.message.content) || "").trim();
+    if (!text) throw new Error("empty synopsis");
+    conversation.splice(0, cut, { role: "user", content: COMPACT_TAG + "\n" + text });
+    return cut;
+  } catch (e) {
+    return 0;              // silent fallback to the hard trim
+  }
 }
 
 // ── Chat ─────────────────────────────────────────────────
@@ -1616,6 +1818,20 @@ async function sendMessage() {
   const newSegment = () => { flushRender(); segText = ""; answerEl = null; };
 
   try {
+    // Slide the window before building the payload: if the conversation has
+    // outgrown its budget, fold the older half into a synopsis first. Status
+    // shows where tool-status lines do; failure falls through to the trim.
+    if (compactCut()) {
+      const statusEl = addBlock(Object.assign(document.createElement("div"),
+        { className: "tool-status", textContent: "Compacting context..." }));
+      const folded = await autoCompact(aborter.signal, null);
+      if (folded) {
+        statusEl.textContent = "— compacted " + folded + " earlier messages —";
+      } else {
+        statusEl.remove();
+      }
+    }
+
     const webOn = $("web-toggle").checked;
     let sys = $("system-prompt").value.trim() || DEFAULT_SYSTEM_PROMPT;
     sys += "\n\nTODAY'S DATE: " + new Date().toDateString();
@@ -1766,6 +1982,278 @@ async function sendMessage() {
 function clearChat() {
   toggleDrawer();
   newChat();
+}
+
+// ═════════════════════════════════════════════════════════
+// Files tab — the agent's filesystem sandbox, browsable from the phone.
+// Every path the server hands back is absolute and already sandbox-checked;
+// 403 bodies carry the sandbox's own reason string, which we surface as-is.
+// ═════════════════════════════════════════════════════════
+let filesPath = "";        // "" until the first listing resolves
+let filesParent = null;
+let filesLoaded = false;
+let filesBusy = false;
+let viewerFile = null;     // {path, name} currently open in the viewer
+
+function fmtSize(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  if (n < 1024 * 1024 * 1024) return (n / 1048576).toFixed(1) + " MB";
+  return (n / 1073741824).toFixed(2) + " GB";
+}
+function pathSep(p) { return /\\/.test(p) ? "\\" : "/"; }
+function joinPath(dir, name) {
+  return String(dir).replace(/[\\/]+$/, "") + pathSep(dir) + name;
+}
+function shortPath(p) {
+  const parts = String(p).split(/[\\/]/).filter(Boolean);
+  if (parts.length <= 2) return p;
+  return "..." + pathSep(p) + parts.slice(-2).join(pathSep(p));
+}
+function fileExt(name) {
+  const m = /\.([A-Za-z0-9_+-]{1,12})$/.exec(String(name));
+  return m ? m[1].toLowerCase() : "file";
+}
+// Pull the useful part out of an error body: the sandbox reason for a 403,
+// FastAPI's detail otherwise.
+async function errText(r) {
+  let d = null;
+  try { d = await r.json(); } catch (e) {}
+  const detail = d && d.detail;
+  if (typeof detail === "string" && detail) return detail;
+  if (detail && detail.message) return detail.message;
+  return "HTTP " + r.status;
+}
+
+function fileRow(e, dir) {
+  const full = joinPath(dir, e.name);
+  const row = el("div", "sr fr");
+  const main = el("div", "sr-main");
+  main.appendChild(el("div", "sr-t", (e.dir ? "\u{1F4C1} " : "") + e.name));
+  main.appendChild(el("div", "sr-m", e.dir
+    ? "folder"
+    : fmtSize(e.size) + "  -  " + relTime(e.mtime)));
+  row.appendChild(main);
+  if (!e.dir) row.appendChild(el("span", "st", fileExt(e.name)));
+  row.onclick = () => (e.dir ? loadDir(full) : openFile(full, e.name));
+  return row;
+}
+
+async function loadDir(path) {
+  const box = $("file-list");
+  closeViewer();
+  filesLoaded = true;
+  box.innerHTML = "";
+  box.appendChild(el("div", "sb-empty", "Loading..."));
+  if (!store.k) { box.innerHTML = ""; box.appendChild(el("div", "sb-empty", "Add your API key first.")); return; }
+  try {
+    const q = path ? "?path=" + encodeURIComponent(path) : "";
+    const r = await fetch("/v1/files" + q, { headers: authHeaders() });
+    if (!r.ok) {
+      const msg = await errText(r);
+      box.innerHTML = "";
+      box.appendChild(el("div", "sb-empty", msg));
+      return;
+    }
+    const data = await r.json();
+    filesPath = data.path || "";
+    filesParent = data.parent || null;
+    $("files-path").textContent = shortPath(filesPath);
+    $("files-up").classList.toggle("hidden", !filesParent);
+    box.innerHTML = "";
+    const entries = data.entries || [];
+    if (data.truncated) box.appendChild(el("div", "sb-empty", "Showing the first 500 entries."));
+    if (!entries.length) box.appendChild(el("div", "sb-empty", "Empty folder."));
+    for (const e of entries) box.appendChild(fileRow(e, filesPath));
+  } catch (e) {
+    box.innerHTML = "";
+    box.appendChild(el("div", "sb-empty", "Could not list files: " + e.message));
+  }
+}
+function filesUp() { if (filesParent) loadDir(filesParent); }
+function reloadDir() { loadDir(filesPath); }
+
+function closeViewer() {
+  viewerFile = null;
+  $("files-viewer").classList.add("hidden");
+  $("files-browse").classList.remove("hidden");
+}
+async function openFile(path, name) {
+  try {
+    const r = await fetch("/v1/files/read?path=" + encodeURIComponent(path), { headers: authHeaders() });
+    if (!r.ok) {
+      const msg = await errText(r);
+      const box = $("file-list");
+      box.insertBefore(el("div", "sb-empty", msg), box.firstChild);
+      return;
+    }
+    const data = await r.json();
+    viewerFile = { path: path, name: name };
+    $("fv-name").textContent = name;
+    $("fv-lang").textContent = fileExt(name);
+    const note = $("fv-note");
+    const notes = [];
+    if (data.truncated) notes.push("Truncated at 512 KB - download for the whole file.");
+    if (data.binary) notes.push("Binary file (" + fmtSize(data.size) + ") - not shown.");
+    note.textContent = notes.join(" ");
+    note.classList.toggle("hidden", !notes.length);
+    // Binary: no text pane at all, just the size note + Download.
+    $("fv-code").classList.toggle("hidden", !!data.binary);
+    $("fv-content").textContent = data.binary ? "" : (data.content || "");
+    $("files-browse").classList.add("hidden");
+    $("files-viewer").classList.remove("hidden");
+    $("files-scroll").scrollTop = 0;
+  } catch (e) {
+    const box = $("file-list");
+    box.insertBefore(el("div", "sb-empty", "Could not read: " + e.message), box.firstChild);
+  }
+}
+
+// The download route needs the bearer header, so a plain <a href> can't be
+// used: fetch it as a blob and click an object URL instead.
+async function downloadPath(path, name) {
+  const btn = $("fv-download");
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "downloading...";
+  try {
+    const r = await fetch("/v1/files/download?path=" + encodeURIComponent(path), { headers: authHeaders() });
+    if (!r.ok) throw new Error(await errText(r));
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name || "download";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 20000);
+    btn.textContent = "saved";
+    setTimeout(() => { btn.textContent = label; }, 1500);
+  } catch (e) {
+    btn.textContent = "failed: " + e.message;
+    setTimeout(() => { btn.textContent = label; }, 2500);
+  } finally {
+    btn.disabled = false;
+  }
+}
+function downloadCurrent() {
+  if (viewerFile) downloadPath(viewerFile.path, viewerFile.name);
+}
+
+// Upload: raw body PUT (no multipart on the server), so the File object goes
+// straight into fetch. Works for camera-roll photos too.
+function pickUpload() { if (!filesBusy) $("file-input").click(); }
+async function uploadFile(file) {
+  const btn = $("upload-btn");
+  if (filesBusy || !file) return;
+  if (!filesPath) { btn.textContent = "Open a folder first"; setTimeout(() => resetUpload(), 2000); return; }
+  if (!/^[^\\/:*?"<>|\x00-\x1f]{1,120}$/.test(file.name)) {
+    btn.textContent = "Bad filename";
+    setTimeout(() => resetUpload(), 2500);
+    return;
+  }
+  filesBusy = true;
+  btn.disabled = true;
+  btn.textContent = "uploading " + fmtSize(file.size) + "...";
+  try {
+    const r = await fetch("/v1/files/upload?dir=" + encodeURIComponent(filesPath) +
+                          "&name=" + encodeURIComponent(file.name), {
+      method: "PUT", headers: authHeaders(), body: file,
+    });
+    if (!r.ok) throw new Error(await errText(r));
+    btn.textContent = "uploaded";
+    filesBusy = false;
+    await loadDir(filesPath);
+    setTimeout(() => resetUpload(), 1200);
+  } catch (e) {
+    btn.textContent = "failed: " + e.message;
+    setTimeout(() => resetUpload(), 3000);
+  } finally {
+    filesBusy = false;
+    btn.disabled = false;
+  }
+}
+function resetUpload() {
+  const btn = $("upload-btn");
+  btn.disabled = false;
+  btn.textContent = "Upload to this folder";
+}
+$("file-input").addEventListener("change", function () {
+  const f = this.files && this.files[0];
+  this.value = "";                     // allow re-picking the same file
+  if (f) uploadFile(f);
+});
+
+// ═════════════════════════════════════════════════════════
+// Engine panel (settings drawer)
+// ═════════════════════════════════════════════════════════
+async function refreshEngine() {
+  const box = $("engine-info");
+  if (!store.k) { box.textContent = "Add your API key first."; return; }
+  box.textContent = "checking...";
+  $("engine-jump").classList.add("hidden");
+  try {
+    const r = await fetch("/v1/engine", { headers: authHeaders() });
+    if (!r.ok) throw new Error(await errText(r));
+    const e = await r.json();
+    if (!e.model && !e.loaded) {
+      box.textContent = "Not loaded - the next chat request loads it.";
+      return;
+    }
+    // ctx can be null while the engine is mid-relaunch; fall back to the
+    // queue's tier, and say "?" rather than inventing a number.
+    const ctx = e.ctx || e.queue_tier || null;
+    const bits = [e.model || "(unknown model)"];
+    if (e.backend) bits.push(e.backend);
+    bits.push("ctx " + (ctx ? ctx : "?") + (e.ctx_cap ? " / cap " + e.ctx_cap : ""));
+    if (!e.loaded) bits.push("not loaded");
+    box.textContent = bits.join("  -  ");
+  } catch (err) {
+    box.textContent = "Engine state unavailable: " + err.message;
+  }
+}
+
+async function reloadEngine() {
+  const btn = $("engine-reload-btn");
+  const box = $("engine-info");
+  if (btn.disabled) return;
+  if (!store.k) { box.textContent = "Add your API key first."; return; }
+  btn.disabled = true;
+  btn.textContent = "reloading...";
+  box.textContent = "Relaunching at full context - this takes 30-60 s.";
+  $("engine-jump").classList.add("hidden");
+  try {
+    const r = await fetch("/v1/engine/reload", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: "{}",                       // empty body = the model's full cap
+    });
+    let data = null;
+    try { data = await r.json(); } catch (e) {}
+    if (r.status === 409) {
+      const d = data && data.detail;
+      if (d && d.run_id) {
+        box.textContent = (d.message || "An agent run is active") + ".";
+        const jump = $("engine-jump");
+        jump.classList.remove("hidden");
+        jump.onclick = () => { toggleDrawer(); openRun(d.run_id); };
+      } else {
+        box.textContent = typeof d === "string" ? d : "Nothing is loaded yet.";
+      }
+      return;
+    }
+    if (!r.ok) { box.textContent = "Reload failed: " + (await errText(r)); return; }
+    box.textContent = "Reloaded " + ((data && data.model) || "") +
+      " at ctx " + ((data && data.ctx) || "?");
+    refreshEngine();
+  } catch (e) {
+    box.textContent = "Reload failed: " + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Reload at full ctx";
+  }
 }
 
 // ═════════════════════════════════════════════════════════
@@ -1995,6 +2483,7 @@ async function startAgentRun() {
         goal: goal,
         autonomy: currentAutonomy(),
         reasoning_effort: currentEffort(),
+        context_window: parseInt(currentAgentCtx(), 10) || 16384,
         temperature: Math.max(0, Math.min(2, parseFloat($("temperature").value) || 0.7)),
       }),
     });
