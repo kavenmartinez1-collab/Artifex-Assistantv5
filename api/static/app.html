@@ -1,0 +1,1786 @@
+<!DOCTYPE html>
+<!--
+  Artifex phone client — single-file web app served by the API at /app.
+
+  Talks to the API's own endpoints on the same origin (no CORS, no proxy):
+    GET  /health                        status dot + web_gateway availability
+    GET  /v1/models                     model picker (local backends only)
+    POST /v1/chat/completions           streaming chat, extended OpenAI SSE
+    POST /v1/agent/runs                 start an agent run  -> {run_id, folder}
+    GET  /v1/agent/runs/{id}            snapshot (status + pending approval)
+    GET  /v1/agent/runs/{id}/events     SSE event feed (?since=<index>)
+    POST /v1/agent/runs/{id}/approval   {"decision": approve|deny|stop}
+    POST /v1/agent/runs/{id}/stop       abort the run
+
+  The streaming UI (thinking collapse, tool-status blocks, segment reset
+  after tools) is ported from Kbot Web Suite's assistant page, adapted from
+  its proxy dialect to this API's native SSE fields:
+    delta.x_thinking   thinking tokens
+    delta.content      answer tokens
+    x_tool_status      ["Searching: ...", ...] while @search/@web_read run
+    x_tool_done        tools finished, a fresh model segment follows
+    x_usage            {prompt_tokens, completion_tokens} on the last chunk
+
+  Markdown is rendered by the tiny renderer below — no libraries, no CDN.
+  Order matters for safety: fenced code is lifted out to placeholders FIRST,
+  then the remainder is HTML-escaped, then block/inline transforms run over
+  already-escaped text, then the fences come back as <pre><code> blocks.
+
+  Auth is a bearer key pasted once into Settings and kept in localStorage.
+  The page itself is static and unauthenticated; every API call it makes
+  carries the key. Served over the tailnet (plain HTTP inside WireGuard),
+  so there is no secure context: no service worker, no true PWA install,
+  and navigator.clipboard is unavailable — copy falls back to execCommand.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d1117">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Artifex</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #1c2129; --border: #2d333b;
+    --text: #e6edf3; --dim: #8b949e; --accent: #58a6ff; --user: #1f3a5f;
+    --err: #f85149; --ok: #3fb950; --warn: #d29922; --think: #a5760a;
+    --orange: #db6d28; --code-bg: #0a0d12;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; height: 100%; overscroll-behavior: none; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+    height: 100dvh;
+  }
+  .hidden { display: none !important; }
+
+  /* ── Header ─────────────────────────────────────────── */
+  header {
+    display: flex; flex-direction: column;
+    padding: calc(env(safe-area-inset-top) + 8px) 0 0;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    flex: none;
+  }
+  header .hrow { display: flex; align-items: center; gap: 10px; padding: 0 14px 8px; }
+  header .brand { font-weight: 700; letter-spacing: 2px; font-size: 15px; }
+  header .brand span { color: var(--accent); font-weight: 400; }
+  #status-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--dim); flex: none;
+  }
+  #status-dot.ok { background: var(--ok); }
+  #status-dot.err { background: var(--err); }
+  header .spacer { flex: 1; }
+  #model-badge {
+    font-size: 11px; color: var(--dim); max-width: 40vw;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #gear-btn {
+    background: none; border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 6px 10px; font-size: 15px;
+  }
+  #tabs { display: flex; padding: 0 8px; gap: 2px; }
+  #tabs button {
+    background: none; border: none; color: var(--dim);
+    padding: 7px 14px 8px; font-size: 13.5px; font-weight: 600;
+    border-bottom: 2px solid transparent; position: relative;
+  }
+  #tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
+  #tabs button .pip {
+    display: none; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent); margin-left: 6px; vertical-align: 1px;
+  }
+  #tabs button.live .pip { display: inline-block; animation: pulse 1.4s infinite; }
+  #tabs button.unread .pip { display: inline-block; background: var(--warn); }
+  @keyframes pulse { 50% { opacity: .25; } }
+
+  /* ── View shell ─────────────────────────────────────── */
+  .view { flex: 1; display: flex; flex-direction: column; min-height: 0; position: relative; }
+
+  /* ── Messages ───────────────────────────────────────── */
+  #messages {
+    flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 12px 12px 4px;
+  }
+  .welcome { text-align: center; color: var(--dim); margin-top: 18vh; }
+  .welcome .t { font-size: 22px; font-weight: 700; letter-spacing: 3px; color: var(--text); }
+  .welcome .t span { color: var(--accent); font-weight: 300; }
+  .welcome .s { margin-top: 8px; font-size: 13px; }
+  .msg { margin: 0 0 14px; max-width: 94%; }
+  .msg .meta { font-size: 11px; color: var(--dim); margin: 0 4px 3px; }
+  .msg .body {
+    padding: 9px 12px; border-radius: 12px; word-wrap: break-word;
+    overflow-wrap: anywhere; white-space: normal;
+  }
+  .msg-user { margin-left: auto; }
+  .msg-user .meta { text-align: right; }
+  .msg-user .body { background: var(--user); border: 1px solid #2b4a75; }
+  .msg-assistant .body { background: var(--panel); border: 1px solid var(--border); }
+  details.thinking {
+    border-left: 3px solid var(--think); background: rgba(165,118,10,.07);
+    border-radius: 6px; padding: 5px 9px; margin: 0 0 8px; font-size: 13px;
+  }
+  details.thinking summary { color: var(--think); cursor: pointer; font-size: 12px; }
+  details.thinking .tb {
+    color: var(--dim); white-space: pre-wrap; margin-top: 5px;
+    max-height: 150px; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  }
+  .tool-status {
+    border-left: 3px solid var(--accent); background: rgba(88,166,255,.07);
+    border-radius: 6px; padding: 6px 9px; margin: 8px 0; font-size: 12.5px; color: var(--dim);
+  }
+  .err-text { color: var(--err); }
+  .finish-note { font-size: 11.5px; color: var(--warn); margin-top: 6px; }
+  .cursor {
+    display: inline-block; width: 8px; height: 15px; vertical-align: -2px;
+    background: var(--accent); animation: blink 1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  #stats {
+    font-size: 11px; color: var(--dim); text-align: center;
+    padding: 2px 0 4px; flex: none; display: none;
+  }
+  .to-bottom {
+    /* clears the composer / agent bar that sits below the scroll area */
+    position: absolute; right: 12px; z-index: 4;
+    bottom: calc(env(safe-area-inset-bottom) + 64px);
+    width: 38px; height: 38px; border-radius: 50%;
+    background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); font-size: 16px; line-height: 1;
+    box-shadow: 0 3px 10px rgba(0,0,0,.45);
+  }
+
+  /* ── Markdown ───────────────────────────────────────── */
+  .md > :first-child { margin-top: 0; }
+  .md > :last-child { margin-bottom: 0; }
+  .md p { margin: 0 0 9px; }
+  .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
+    margin: 15px 0 7px; line-height: 1.25; font-weight: 650;
+  }
+  .md h1 { font-size: 19px; } .md h2 { font-size: 17px; } .md h3 { font-size: 15.5px; }
+  .md h4, .md h5, .md h6 { font-size: 14px; color: var(--dim); }
+  .md h1, .md h2 { border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+  .md ul, .md ol { margin: 6px 0 9px; padding-left: 21px; }
+  .md li { margin: 3px 0; }
+  .md li > ul, .md li > ol { margin: 3px 0 2px; }
+  .md blockquote {
+    margin: 9px 0; padding: 3px 0 3px 11px;
+    border-left: 3px solid var(--border); color: var(--dim);
+  }
+  .md blockquote > :last-child { margin-bottom: 0; }
+  .md hr { border: none; border-top: 1px solid var(--border); margin: 13px 0; }
+  .md a { color: var(--accent); text-decoration: none; border-bottom: 1px solid rgba(88,166,255,.35); }
+  .md .tw {
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+    margin: 9px 0; border: 1px solid var(--border); border-radius: 8px;
+  }
+  .md table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  .md th, .md td { border-bottom: 1px solid var(--border); padding: 6px 10px; text-align: left; white-space: nowrap; }
+  .md thead th { background: var(--panel2); font-weight: 650; }
+  .md tbody tr:last-child td { border-bottom: none; }
+  .body pre, .md pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 9px; overflow-x: auto; -webkit-overflow-scrolling: touch;
+    font-size: 12.5px; margin: 9px 0; font-family: var(--mono); line-height: 1.45;
+  }
+  .body code, .md code {
+    background: var(--code-bg); border-radius: 4px; padding: 1px 5px;
+    font-size: 12.5px; font-family: var(--mono);
+  }
+  .body pre code, .md pre code { background: none; padding: 0; font-size: inherit; }
+  .cb { margin: 9px 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .cb-h {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 6px 4px 10px; background: var(--panel2);
+    border-bottom: 1px solid var(--border); font-size: 11px; color: var(--dim);
+  }
+  .cb-h .lang { letter-spacing: .5px; text-transform: lowercase; }
+  .cb-h button {
+    margin-left: auto; background: none; border: 1px solid var(--border);
+    color: var(--dim); border-radius: 6px; padding: 3px 10px; font-size: 11px;
+  }
+  .cb-h button.done { color: var(--ok); border-color: rgba(63,185,80,.45); }
+  .cb pre { margin: 0; border: none; border-radius: 0; }
+
+  /* ── Input bar ──────────────────────────────────────── */
+  #input-bar {
+    display: flex; gap: 8px; align-items: flex-end;
+    padding: 8px 10px calc(env(safe-area-inset-bottom) + 8px);
+    background: var(--panel); border-top: 1px solid var(--border); flex: none;
+  }
+  #chat-input {
+    flex: 1; resize: none; border-radius: 12px; border: 1px solid var(--border);
+    background: var(--panel2); color: var(--text); padding: 10px 12px;
+    font: 16px/1.4 inherit; max-height: 120px; min-height: 42px;
+  }
+  #chat-input:focus { outline: none; border-color: var(--accent); }
+  #send-btn {
+    border: none; border-radius: 12px; background: var(--accent); color: #06121f;
+    font-weight: 700; font-size: 15px; padding: 0 18px; height: 42px; flex: none;
+  }
+  #send-btn.stop { background: var(--err); color: #fff; }
+  #send-btn:disabled { opacity: .45; }
+
+  /* ── Agent view ─────────────────────────────────────── */
+  #agent-scroll {
+    flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 12px 12px 6px;
+  }
+  #agent-setup {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 10px 12px 12px; margin-bottom: 12px;
+  }
+  #agent-setup > summary {
+    list-style: none; cursor: pointer; color: var(--dim);
+    font-size: 11px; letter-spacing: 1.5px; margin: 0 0 9px;
+  }
+  #agent-setup > summary::-webkit-details-marker { display: none; }
+  #agent-setup[open] > summary { margin-bottom: 10px; }
+  #agent-goal {
+    width: 100%; background: var(--panel2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 10px; padding: 10px 11px;
+    font: 16px/1.4 inherit; resize: vertical; min-height: 74px;
+  }
+  #agent-goal:focus { outline: none; border-color: var(--accent); }
+  #agent-start {
+    width: 100%; margin-top: 10px; border: none; border-radius: 10px;
+    background: var(--accent); color: #06121f; font-weight: 700;
+    font-size: 15px; padding: 11px 0;
+  }
+  #agent-start:disabled { opacity: .4; }
+  #agent-bar {
+    display: flex; align-items: center; gap: 10px; flex: none;
+    padding: 8px 12px calc(env(safe-area-inset-bottom) + 8px);
+    background: var(--panel); border-top: 1px solid var(--border);
+  }
+  #agent-status {
+    flex: 1; font-size: 12px; color: var(--dim);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #agent-stop {
+    border: 1px solid rgba(248,81,73,.5); background: rgba(248,81,73,.12);
+    color: var(--err); border-radius: 10px; padding: 8px 16px;
+    font-size: 14px; font-weight: 600; flex: none;
+  }
+  #approval {
+    flex: none; margin: 0; padding: 11px 12px;
+    background: rgba(210,153,34,.09); border-top: 2px solid var(--warn);
+  }
+  #approval .ap-t {
+    font-size: 11px; letter-spacing: 1.5px; color: var(--warn); margin-bottom: 7px;
+  }
+  #approval .ap-what {
+    font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere;
+    max-height: 100px; overflow-y: auto; margin-bottom: 3px;
+  }
+  #approval .ap-why { font-size: 12px; color: var(--dim); margin-bottom: 9px; overflow-wrap: anywhere; }
+  #approval .ap-btns { display: flex; gap: 8px; }
+  #approval .ap-btns button {
+    flex: 1; border-radius: 10px; padding: 10px 0; font-size: 14px;
+    font-weight: 600; border: 1px solid var(--border); background: var(--panel2);
+    color: var(--text);
+  }
+  #approval .ap-btns button.go { background: var(--ok); border-color: var(--ok); color: #06210d; }
+  #approval .ap-btns button.no { color: var(--err); border-color: rgba(248,81,73,.45); }
+
+  .ev { margin: 0 0 9px; font-size: 13.5px; }
+  .ev-round {
+    display: flex; align-items: center; gap: 9px; color: var(--dim);
+    font-size: 10.5px; letter-spacing: 2px; margin: 16px 0 10px;
+  }
+  .ev-round:before, .ev-round:after { content: ""; flex: 1; height: 1px; background: var(--border); }
+  .ev-note {
+    font-size: 12.5px; color: var(--dim); padding: 5px 2px; overflow-wrap: anywhere;
+  }
+  .ev-note.warn { color: var(--warn); }
+  .ev-note.bad { color: var(--err); }
+  .ev-note.good { color: var(--ok); }
+  .ev-msg {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 9px 11px; overflow-wrap: anywhere;
+  }
+  .ev-stream {
+    background: var(--panel); border: 1px dashed var(--border);
+    border-radius: 10px; padding: 9px 11px;
+  }
+  .ev-stream .live-txt { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .ev-final {
+    border: 1px solid var(--border); border-left: 3px solid var(--ok);
+    border-radius: 10px; padding: 9px 11px; background: var(--panel);
+  }
+  .ev-final.bad { border-left-color: var(--err); }
+  .ev-final .ft { font-size: 11px; letter-spacing: 1.5px; color: var(--dim); margin-bottom: 5px; }
+  .chip {
+    display: flex; gap: 9px; align-items: flex-start;
+    background: var(--panel); border: 1px solid var(--border);
+    border-left: 3px solid var(--dim); border-radius: 10px; padding: 8px 10px;
+  }
+  .chip.r-SAFE, .chip.r-LOW { border-left-color: var(--ok); }
+  .chip.r-MEDIUM { border-left-color: var(--warn); }
+  .chip.r-HIGH { border-left-color: var(--orange); }
+  .chip.r-CRITICAL { border-left-color: var(--err); }
+  .chip .cmain { flex: 1; min-width: 0; }
+  .chip .chead { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
+  .chip .ctype {
+    font-size: 10.5px; letter-spacing: 1px; text-transform: uppercase; color: var(--dim);
+  }
+  .chip .risk {
+    font-size: 9.5px; letter-spacing: 1px; padding: 1px 6px; border-radius: 20px;
+    border: 1px solid var(--border); color: var(--dim);
+  }
+  .chip.r-MEDIUM .risk { color: var(--warn); border-color: rgba(210,153,34,.45); }
+  .chip.r-HIGH .risk { color: var(--orange); border-color: rgba(219,109,40,.45); }
+  .chip.r-CRITICAL .risk { color: var(--err); border-color: rgba(248,81,73,.45); }
+  .chip .cdisp { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+  .chip .cwhy { font-size: 11.5px; color: var(--dim); margin-top: 3px; overflow-wrap: anywhere; }
+  .chip .cstate { font-size: 15px; line-height: 1.2; flex: none; color: var(--dim); }
+  .chip .cstate.run { color: var(--accent); animation: pulse 1.2s infinite; }
+  .chip .cstate.ok { color: var(--ok); }
+  .chip .cstate.bad { color: var(--err); }
+  .chip details { margin-top: 6px; }
+  .chip details summary { font-size: 11.5px; color: var(--dim); cursor: pointer; }
+  .chip details pre {
+    margin: 6px 0 0; max-height: 260px; overflow: auto; white-space: pre-wrap;
+    overflow-wrap: anywhere; font-size: 12px;
+  }
+
+  /* ── Settings drawer ────────────────────────────────── */
+  #backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,.55);
+    opacity: 0; pointer-events: none; transition: opacity .18s; z-index: 8;
+  }
+  #backdrop.open { opacity: 1; pointer-events: auto; }
+  #drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(340px, 88vw);
+    background: var(--panel); border-left: 1px solid var(--border); z-index: 9;
+    transform: translateX(102%); transition: transform .2s ease-out;
+    overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: calc(env(safe-area-inset-top) + 12px) 14px
+             calc(env(safe-area-inset-bottom) + 16px);
+  }
+  #drawer.open { transform: translateX(0); }
+  .panel { margin-bottom: 16px; }
+  .panel .pt { font-size: 11px; letter-spacing: 1.5px; color: var(--dim); margin-bottom: 6px; }
+  .panel input[type=password], .panel input[type=number], .panel select, .panel textarea {
+    width: 100%; background: var(--panel2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 8px; padding: 9px 10px; font: 16px inherit;
+  }
+  .panel textarea { font-size: 13px; min-height: 110px; resize: vertical; }
+  .seg { display: flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .seg button {
+    flex: 1; background: var(--panel2); border: none; color: var(--dim);
+    padding: 9px 0; font-size: 13px; border-right: 1px solid var(--border);
+  }
+  .seg button:last-child { border-right: none; }
+  .seg button.on { background: var(--accent); color: #06121f; font-weight: 700; }
+  .row { display: flex; gap: 10px; }
+  .row > * { flex: 1; }
+  .hint { font-size: 11.5px; color: var(--dim); margin-top: 5px; }
+  .toggle-row {
+    display: flex; align-items: center; justify-content: space-between;
+    background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px;
+  }
+  .btn {
+    width: 100%; border: 1px solid var(--border); background: var(--panel2);
+    color: var(--text); border-radius: 8px; padding: 10px; font-size: 14px;
+  }
+  .btn.danger { color: var(--err); border-color: rgba(248,81,73,.4); }
+  label.sw { position: relative; display: inline-block; width: 44px; height: 26px; flex: none; }
+  label.sw input { display: none; }
+  label.sw .sl {
+    position: absolute; inset: 0; background: var(--border); border-radius: 13px; transition: .15s;
+  }
+  label.sw .sl:before {
+    content: ""; position: absolute; width: 20px; height: 20px; border-radius: 50%;
+    background: var(--dim); top: 3px; left: 3px; transition: .15s;
+  }
+  label.sw input:checked + .sl { background: var(--accent); }
+  label.sw input:checked + .sl:before { background: #06121f; transform: translateX(18px); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="hrow">
+    <div id="status-dot"></div>
+    <div class="brand">ARTIFEX<span> V5</span></div>
+    <div class="spacer"></div>
+    <div id="model-badge"></div>
+    <button id="gear-btn" onclick="toggleDrawer()">&#9881;</button>
+  </div>
+  <div id="tabs">
+    <button id="tab-chat" class="on" onclick="showTab('chat')">Chat</button>
+    <button id="tab-agent" onclick="showTab('agent')">Agent<span class="pip"></span></button>
+  </div>
+</header>
+
+<div id="chat-view" class="view">
+  <div id="messages">
+    <div class="welcome">
+      <div class="t">ARTIFEX<span> Assistant</span></div>
+      <div class="s">Local AI on your own hardware, over your own wire.</div>
+      <div class="s" id="welcome-hint">Open &#9881; Settings and paste your API key to begin.</div>
+    </div>
+  </div>
+  <button id="chat-to-bottom" class="to-bottom hidden" onclick="scrollChatToBottom()">&#8595;</button>
+  <div id="stats"></div>
+  <div id="input-bar">
+    <textarea id="chat-input" placeholder="Message Artifex..." rows="1"></textarea>
+    <button id="send-btn" onclick="sendOrStop()">Send</button>
+  </div>
+</div>
+
+<div id="agent-view" class="view hidden">
+  <div id="agent-scroll">
+    <details id="agent-setup" open>
+      <summary>NEW RUN</summary>
+      <textarea id="agent-goal" spellcheck="false"
+        placeholder="Goal — e.g. list the .py files here and write their names to files.txt"></textarea>
+      <div style="margin-top:10px">
+        <div class="pt" style="font-size:11px;letter-spacing:1.5px;color:var(--dim);margin-bottom:6px">AUTONOMY</div>
+        <div class="seg" id="autonomy-seg">
+          <button data-v="guided" class="on">guided</button>
+          <button data-v="full_auto">full auto</button>
+          <button data-v="manual">manual</button>
+        </div>
+        <div class="hint" id="autonomy-hint"></div>
+      </div>
+      <button id="agent-start" onclick="startAgentRun()">Start run</button>
+      <div class="hint">Runs in a fresh workspace under output/agent_runs/. One run at a time.</div>
+    </details>
+    <div id="agent-feed"></div>
+  </div>
+  <button id="agent-to-bottom" class="to-bottom hidden" onclick="scrollAgentToBottom()">&#8595;</button>
+  <div id="approval" class="hidden">
+    <div class="ap-t">APPROVAL REQUIRED</div>
+    <div class="ap-what" id="ap-what"></div>
+    <div class="ap-why" id="ap-why"></div>
+    <div class="ap-btns">
+      <button class="go" onclick="answerApproval('approve')" id="ap-approve">Approve</button>
+      <button onclick="answerApproval('deny')" id="ap-deny">Deny</button>
+      <button class="no" onclick="answerApproval('stop')">Stop</button>
+    </div>
+  </div>
+  <div id="agent-bar">
+    <span id="agent-status">No run.</span>
+    <button id="agent-stop" class="hidden" onclick="stopAgentRun()">Stop</button>
+  </div>
+</div>
+
+<div id="backdrop" onclick="toggleDrawer()"></div>
+<div id="drawer">
+  <div class="panel">
+    <div class="pt">API KEY</div>
+    <input type="password" id="api-key" placeholder="bearer key" autocomplete="off">
+    <div class="hint">The server's ARTIFEX_API_KEY value. Stored only in this browser.</div>
+  </div>
+  <div class="panel">
+    <div class="pt">MODEL</div>
+    <select id="model-select"><option value="">(connect first)</option></select>
+  </div>
+  <div class="panel">
+    <div class="pt">REASONING EFFORT</div>
+    <div class="seg" id="effort-seg">
+      <button data-v="low">low</button><button data-v="medium" class="on">med</button>
+      <button data-v="high">high</button><button data-v="xhigh">xhigh</button>
+    </div>
+    <div class="hint">medium is the sweet spot; xhigh can think past the token budget and return nothing on easy prompts. Agent runs use this too.</div>
+  </div>
+  <div class="panel">
+    <div class="row">
+      <div>
+        <div class="pt">TEMPERATURE</div>
+        <input type="number" id="temperature" value="0.7" min="0" max="2" step="0.1">
+      </div>
+      <div>
+        <div class="pt">MAX TOKENS</div>
+        <input type="number" id="max-tokens" value="12288" min="256" step="256">
+      </div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="pt">WEB SEARCH</div>
+    <div class="toggle-row">
+      <span id="web-label">Web tools</span>
+      <label class="sw"><input type="checkbox" id="web-toggle"><span class="sl"></span></label>
+    </div>
+    <div class="hint" id="web-hint"></div>
+  </div>
+  <div class="panel">
+    <div class="pt">SYSTEM PROMPT</div>
+    <textarea id="system-prompt" spellcheck="false"></textarea>
+    <div class="hint">Date and tool instructions are appended automatically. Chat only — agent runs build their own.</div>
+  </div>
+  <div class="panel"><button class="btn danger" onclick="clearChat()">Clear conversation</button></div>
+  <div class="panel"><div class="hint" id="conn-info"></div></div>
+</div>
+
+<script>
+"use strict";
+// ── State ────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const messagesDiv = $("messages");
+const inputEl = $("chat-input");
+const sendBtn = $("send-btn");
+
+let conversation = [];         // [{role, content}]
+let isStreaming = false;
+let aborter = null;
+let gatewayUp = false;
+let activeTab = "chat";
+
+const DEFAULT_SYSTEM_PROMPT =
+`You are Artifex, a local AI assistant running on the user's own hardware.
+
+CRITICAL RULES:
+- Think BRIEFLY. Keep internal reasoning short.
+- Be DIRECT. Lead with the answer, not the reasoning. Skip filler and preamble.
+- One clear response per question. Do not pad with caveats unless asked.
+- Format responses with markdown when helpful (lists, code blocks, tables).
+- If you don't know something and cannot search for it, say so in one sentence.`;
+
+const TOOL_PROMPT =
+`
+
+TOOLS AVAILABLE:
+You can search the web and read pages using these markers in your response:
+- @search("query") - Search the web. Returns numbered results with titles, URLs, and snippets.
+- @web_read(N) - Read the full page of search result N.
+- @web_read("https://example.com") - Read a specific URL directly.
+The system executes the tool and returns results to you automatically; then give a final answer using the retrieved data. Use tools for current events or facts you are unsure of; do NOT use them for general knowledge, math, or coding.`;
+
+// History caps forwarded to the model each turn (mirrors the Kbot proxy's
+// server-side trim: latest message always survives, older ones drop first).
+const MAX_HISTORY_MESSAGES = 30;
+const MAX_HISTORY_CHARS = 32000;
+
+// Re-render cadence while streaming. Every token re-rendered the whole
+// message before; on a long answer that is O(n^2) markdown work and the
+// phone drops frames. 120 ms still reads as continuous.
+const RENDER_INTERVAL_MS = 120;
+const PIN_SLACK_PX = 60;       // "already at the bottom" tolerance
+
+// ── Persistence ──────────────────────────────────────────
+const store = {
+  get k() { return localStorage.getItem("ax_key") || ""; },
+  save() {
+    localStorage.setItem("ax_key", $("api-key").value.trim());
+    localStorage.setItem("ax_model", $("model-select").value);
+    localStorage.setItem("ax_effort", currentEffort());
+    localStorage.setItem("ax_temp", $("temperature").value);
+    localStorage.setItem("ax_maxtok", $("max-tokens").value);
+    localStorage.setItem("ax_web", $("web-toggle").checked ? "1" : "0");
+    localStorage.setItem("ax_sysprompt", $("system-prompt").value);
+    localStorage.setItem("ax_autonomy", currentAutonomy());
+  },
+  saveConv() {
+    try {
+      let c = conversation;
+      // Cap stored history so localStorage never fills up.
+      while (JSON.stringify(c).length > 400000) c = c.slice(2);
+      localStorage.setItem("ax_conv", JSON.stringify(c));
+    } catch (e) {}
+  },
+  restore() {
+    $("api-key").value = this.k;
+    $("temperature").value = localStorage.getItem("ax_temp") || "0.7";
+    $("max-tokens").value = localStorage.getItem("ax_maxtok") || "12288";
+    $("web-toggle").checked = localStorage.getItem("ax_web") === "1";
+    $("system-prompt").value = localStorage.getItem("ax_sysprompt") || DEFAULT_SYSTEM_PROMPT;
+    setEffort(localStorage.getItem("ax_effort") || "medium");
+    setAutonomy(localStorage.getItem("ax_autonomy") || "guided");
+    try { conversation = JSON.parse(localStorage.getItem("ax_conv") || "[]"); } catch (e) {}
+  },
+};
+
+function authHeaders(extra) {
+  return Object.assign({ "Authorization": "Bearer " + store.k }, extra || {});
+}
+
+// ── Segmented controls ───────────────────────────────────
+function segValue(id, fallback) {
+  const on = document.querySelector("#" + id + " button.on");
+  return on ? on.dataset.v : fallback;
+}
+function segSet(id, v) {
+  document.querySelectorAll("#" + id + " button").forEach(b =>
+    b.classList.toggle("on", b.dataset.v === v));
+}
+function currentEffort() { return segValue("effort-seg", "medium"); }
+function setEffort(v) { segSet("effort-seg", v); }
+function currentAutonomy() { return segValue("autonomy-seg", "guided"); }
+function setAutonomy(v) { segSet("autonomy-seg", v); autonomyHint(); }
+
+const AUTONOMY_HINTS = {
+  guided: "Auto-runs low-risk reads; asks before writes and anything MEDIUM+.",
+  full_auto: "Runs everything policy allows without asking. Only CRITICAL stops for you.",
+  manual: "Asks before every single action.",
+};
+function autonomyHint() { $("autonomy-hint").textContent = AUTONOMY_HINTS[currentAutonomy()] || ""; }
+
+document.querySelectorAll("#effort-seg button").forEach(b =>
+  b.addEventListener("click", () => { setEffort(b.dataset.v); store.save(); }));
+document.querySelectorAll("#autonomy-seg button").forEach(b =>
+  b.addEventListener("click", () => { setAutonomy(b.dataset.v); store.save(); }));
+
+// ── Tabs ─────────────────────────────────────────────────
+function showTab(name) {
+  activeTab = name;
+  $("chat-view").classList.toggle("hidden", name !== "chat");
+  $("agent-view").classList.toggle("hidden", name !== "agent");
+  $("tab-chat").classList.toggle("on", name === "chat");
+  $("tab-agent").classList.toggle("on", name === "agent");
+  if (name === "agent") {
+    $("tab-agent").classList.remove("unread");
+    scrollAgentToBottom();
+  }
+}
+
+// ── Drawer ───────────────────────────────────────────────
+function toggleDrawer() {
+  const opening = !$("drawer").classList.contains("open");
+  $("drawer").classList.toggle("open");
+  $("backdrop").classList.toggle("open");
+  if (!opening) { store.save(); connect(); }   // closing = apply settings
+}
+
+// ── Connection / models ──────────────────────────────────
+async function connect() {
+  const dot = $("status-dot");
+  if (!store.k) { dot.className = ""; return; }
+  try {
+    const h = await fetch("/health", { headers: authHeaders() });
+    if (h.status === 401) throw new Error("bad key");
+    const health = await h.json();
+    gatewayUp = !!health.web_gateway;
+    dot.className = "ok";
+    $("conn-info").textContent =
+      "backend: " + (health.backend || "?") +
+      " - gateway: " + (gatewayUp ? "up" : "down") +
+      " - " + (health.models ? health.models.count + " models" : "");
+    $("web-hint").textContent = gatewayUp ? "" :
+      "Gateway offline (Docker not running on the PC). Toggle stays available; searches will fail until it's up.";
+    await loadModels();
+    $("welcome-hint") && ($("welcome-hint").textContent = "Type a message below to start.");
+    if (!agentRunId) agentBoot();
+  } catch (e) {
+    dot.className = "err";
+    $("conn-info").textContent = "Cannot reach API: " + e.message;
+  }
+}
+
+async function loadModels() {
+  const r = await fetch("/v1/models", { headers: authHeaders() });
+  if (!r.ok) return;
+  const body = await r.json();
+  const local = (body.data || []).filter(m =>
+    ["llama_cpp", "ollama", "transformers"].includes(m.x_backend));
+  const sel = $("model-select");
+  const saved = localStorage.getItem("ax_model");
+  sel.innerHTML = "";
+  let chosen = "";
+  for (const m of local) {
+    const o = document.createElement("option");
+    o.value = m.id;
+    o.textContent = (m.x_active ? "* " : "") + m.id + " (" + m.x_backend + ")";
+    if (m.id === saved) chosen = m.id;
+    if (!chosen && m.x_active) chosen = m.id;
+    sel.appendChild(o);
+  }
+  if (chosen) sel.value = chosen;
+  $("model-badge").textContent = sel.value;
+}
+$("model-select").addEventListener("change", () => {
+  $("model-badge").textContent = $("model-select").value;
+  store.save();
+});
+
+// ═════════════════════════════════════════════════════════
+// Markdown
+//
+// Pipeline (order is the safety property — never reorder):
+//   1. lift fenced code out to \0F<n>\0 placeholders (raw text kept aside)
+//   2. HTML-escape everything that is left
+//   3. line-based block transforms over escaped text
+//      (note: block regexes must match ENTITIES, e.g. &gt; for a quote)
+//   4. inline transforms, themselves placeholder-protected for code/links
+//   5. restore the fences as <pre><code> with a language label + copy button
+// ═════════════════════════════════════════════════════════
+const ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+function escapeHtml(t) {
+  return String(t == null ? "" : t).replace(/[&<>"']/g, c => ESC_MAP[c]);
+}
+
+function safeUrl(u) {
+  const s = String(u || "").trim();
+  if (/^(https?:|mailto:|tel:|#|\/)/i.test(s)) return s;
+  if (/^[\w.+-]+@[\w.-]+\.\w+$/.test(s)) return "mailto:" + s;
+  return "";
+}
+
+// 1. Fence extraction — line based (regexes over fences are fragile once
+// the content itself contains backticks or the stream cuts mid-block).
+function extractFences(src, out) {
+  const lines = String(src == null ? "" : src).split("\n");
+  const kept = [];
+  let i = 0;
+  while (i < lines.length) {
+    const m = /^ {0,3}(`{3,}|~{3,})[ \t]*([^\s`]*)[ \t]*$/.exec(lines[i]);
+    if (!m) { kept.push(lines[i]); i++; continue; }
+    const marker = m[1].charAt(0), need = m[1].length, lang = m[2] || "";
+    const buf = [];
+    let j = i + 1, closed = false;
+    for (; j < lines.length; j++) {
+      const t = lines[j].trim();
+      if (t.length >= need && t.split("").every(ch => ch === marker)) { closed = true; break; }
+      buf.push(lines[j]);
+    }
+    out.push({ lang: lang, code: buf.join("\n"), open: !closed });
+    kept.push("\u0000F" + (out.length - 1) + "\u0000");
+    i = closed ? j + 1 : lines.length;
+  }
+  return kept.join("\n");
+}
+
+function codeBlockHtml(f) {
+  const label = escapeHtml(f.lang || "code");
+  return '<div class="cb"><div class="cb-h"><span class="lang">' + label +
+    '</span><button type="button" onclick="copyCode(this)">copy</button></div>' +
+    "<pre><code>" + escapeHtml(f.code) + "</code></pre></div>";
+}
+
+function copyCode(btn) {
+  const wrap = btn.closest(".cb");
+  const codeEl = wrap ? wrap.querySelector("code") : null;
+  const text = codeEl ? codeEl.textContent : "";
+  const flash = () => {
+    btn.textContent = "copied";
+    btn.classList.add("done");
+    setTimeout(() => { btn.textContent = "copy"; btn.classList.remove("done"); }, 1300);
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(flash, () => legacyCopy(text, flash));
+  } else {
+    legacyCopy(text, flash);   // plain-HTTP tailnet: no clipboard API
+  }
+}
+function legacyCopy(text, flash) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0";
+  document.body.appendChild(ta);
+  try {
+    // iOS refuses select() on a readonly textarea; a range selection works.
+    ta.contentEditable = "true";
+    const range = document.createRange();
+    range.selectNodeContents(ta);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    ta.setSelectionRange(0, text.length);
+    if (document.execCommand("copy")) flash();
+  } catch (e) {}
+  ta.remove();
+}
+
+// 4. Inline
+function mdInline(s) {
+  const codes = [], links = [];
+  let t = String(s);
+
+  t = t.replace(/`([^`\n]+)`/g, (m, c) => {
+    codes.push(c);
+    return "\u0000C" + (codes.length - 1) + "\u0000";
+  });
+
+  // [label](url "title")
+  t = t.replace(/\[([^\]\n]*)\]\(([^()\s]+)(?:[ \t]+&quot;[^)]*&quot;)?\)/g, (m, label, url) => {
+    const href = safeUrl(url.replace(/&amp;/g, "&"));
+    if (!href) return m;
+    links.push('<a href="' + escapeHtml(href) + '" target="_blank" rel="noopener noreferrer">' +
+      (label || escapeHtml(href)) + "</a>");
+    return "\u0000L" + (links.length - 1) + "\u0000";
+  });
+  // bare autolink
+  t = t.replace(/(^|[\s(])(https?:\/\/[^\s<>()]+[^\s<>().,;:!?'"])/g, (m, pre, url) => {
+    const href = safeUrl(url.replace(/&amp;/g, "&"));
+    if (!href) return m;
+    links.push('<a href="' + escapeHtml(href) + '" target="_blank" rel="noopener noreferrer">' +
+      escapeHtml(href) + "</a>");
+    return pre + "\u0000L" + (links.length - 1) + "\u0000";
+  });
+
+  t = t.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+  t = t.replace(/\*\*([^\s*][\s\S]*?)\*\*/g, "<strong>$1</strong>");
+  t = t.replace(/__([^\s_][\s\S]*?)__/g, "<strong>$1</strong>");
+  t = t.replace(/(^|[^\w*])\*([^\s*][^*\n]*?)\*(?!\*)/g, "$1<em>$2</em>");
+  t = t.replace(/(^|[^\w_])_([^\s_][^_\n]*?)_(?![\w_])/g, "$1<em>$2</em>");
+
+  t = t.replace(/\u0000L(\d+)\u0000/g, (m, n) => links[+n]);
+  t = t.replace(/\u0000C(\d+)\u0000/g, (m, n) => "<code>" + codes[+n] + "</code>");
+  return t;
+}
+
+// 3. Blocks
+function splitRow(line) {
+  let s = line.trim();
+  if (s.charAt(0) === "|") s = s.slice(1);
+  if (s.charAt(s.length - 1) === "|") s = s.slice(0, -1);
+  return s.split("|");
+}
+function isTableSep(line) {
+  if (!line || line.indexOf("|") === -1) return false;
+  const cells = splitRow(line);
+  if (!cells.length) return false;
+  return cells.every(c => /^:?-{1,}:?$/.test(c.trim()));
+}
+function listItem(line) {
+  const m = /^(\s*)([-*+]|\d{1,9}[.)])[ \t]+(.*)$/.exec(line);
+  if (!m) return null;
+  return {
+    indent: m[1].replace(/\t/g, "  ").length,
+    ordered: !/^[-*+]$/.test(m[2]),
+    num: parseInt(m[2], 10),
+    text: m[3],
+  };
+}
+function buildList(items, pos) {
+  const base = items[pos].indent, ordered = items[pos].ordered;
+  const parts = [];
+  let i = pos;
+  while (i < items.length && items[i].indent >= base) {
+    if (items[i].indent > base) {
+      const sub = buildList(items, i);
+      if (parts.length) parts[parts.length - 1] += sub.html;
+      else parts.push(sub.html);
+      i = sub.next;
+      continue;
+    }
+    if (items[i].ordered !== ordered) break;
+    parts.push(items[i].text.split("\n").map(mdInline).join("<br>"));
+    i++;
+  }
+  const tag = ordered ? "ol" : "ul";
+  const start = (ordered && items[pos].num > 1) ? ' start="' + items[pos].num + '"' : "";
+  return {
+    html: "<" + tag + start + ">" + parts.map(p => "<li>" + p + "</li>").join("") + "</" + tag + ">",
+    next: i,
+  };
+}
+
+function mdBlocks(text) {
+  const lines = String(text).split("\n");
+  const out = [];
+  let para = [];
+  const flush = () => { if (para.length) { out.push("<p>" + para.join("<br>") + "</p>"); para = []; } };
+  let i = 0;
+
+  while (i < lines.length) {
+    const raw = lines[i], line = raw.trim();
+
+    if (/^\u0000F\d+\u0000$/.test(line)) { flush(); out.push(line); i++; continue; }
+    if (!line) { flush(); i++; continue; }
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(line)) { flush(); out.push("<hr>"); i++; continue; }
+
+    let m = /^(#{1,6})[ \t]+(.*)$/.exec(line);
+    if (m) {
+      flush();
+      const n = m[1].length;
+      out.push("<h" + n + ">" + mdInline(m[2].replace(/[ \t]+#+$/, "").trim()) + "</h" + n + ">");
+      i++; continue;
+    }
+
+    if (/^&gt;/.test(line)) {
+      flush();
+      const buf = [];
+      while (i < lines.length && /^&gt;/.test(lines[i].trim())) {
+        buf.push(lines[i].trim().replace(/^&gt;[ \t]?/, ""));
+        i++;
+      }
+      out.push("<blockquote>" + mdBlocks(buf.join("\n")) + "</blockquote>");
+      continue;
+    }
+
+    if (raw.indexOf("|") !== -1 && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+      flush();
+      const head = splitRow(raw);
+      const aligns = splitRow(lines[i + 1]).map(c => {
+        const s = c.trim();
+        if (/^:-+:$/.test(s)) return "center";
+        if (/^-+:$/.test(s)) return "right";
+        if (/^:-+$/.test(s)) return "left";
+        return "";
+      });
+      i += 2;
+      const cellStyle = n => aligns[n] ? ' style="text-align:' + aligns[n] + '"' : "";
+      let html = '<div class="tw"><table><thead><tr>';
+      head.forEach((c, n) => { html += "<th" + cellStyle(n) + ">" + mdInline(c.trim()) + "</th>"; });
+      html += "</tr></thead><tbody>";
+      while (i < lines.length && lines[i].trim() && lines[i].indexOf("|") !== -1) {
+        const cells = splitRow(lines[i]);
+        html += "<tr>";
+        for (let n = 0; n < head.length; n++) {
+          html += "<td" + cellStyle(n) + ">" + mdInline((cells[n] || "").trim()) + "</td>";
+        }
+        html += "</tr>";
+        i++;
+      }
+      html += "</tbody></table></div>";
+      out.push(html);
+      continue;
+    }
+
+    if (listItem(raw)) {
+      flush();
+      const items = [];
+      while (i < lines.length) {
+        const li = listItem(lines[i]);
+        if (li) { items.push(li); i++; continue; }
+        if (!lines[i].trim()) {
+          if (i + 1 < lines.length && listItem(lines[i + 1])) { i++; continue; }
+          break;
+        }
+        if (items.length && /^\s+\S/.test(lines[i])) {
+          items[items.length - 1].text += "\n" + lines[i].trim();
+          i++; continue;
+        }
+        break;
+      }
+      out.push(buildList(items, 0).html);
+      continue;
+    }
+
+    para.push(mdInline(line));
+    i++;
+  }
+  flush();
+  return out.join("\n");
+}
+
+function renderMarkdown(src) {
+  // NUL is the placeholder delimiter; a literal NUL in the input could
+  // forge a reference to a fence/code/link slot that doesn't exist and
+  // throw mid-render. Strip it before anything else.
+  src = String(src == null ? "" : src).replace(/\u0000/g, "");
+  const fences = [];
+  let t = extractFences(src, fences);
+  t = escapeHtml(t);
+  t = mdBlocks(t);
+  return t.replace(/\u0000F(\d+)\u0000/g, (m, n) => codeBlockHtml(fences[+n]));
+}
+// Kept for the plain (non-markdown) side: user turns stay literal.
+function renderPlain(text) { return escapeHtml(text).replace(/\n/g, "<br>"); }
+
+// ── Scroll pinning ───────────────────────────────────────
+function isPinned(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < PIN_SLACK_PX;
+}
+function pinTo(el) { el.scrollTop = el.scrollHeight; }
+function scrollChatToBottom() { pinTo(messagesDiv); updateToBottom(); }
+function scrollAgentToBottom() { pinTo($("agent-scroll")); updateToBottom(); }
+function updateToBottom() {
+  $("chat-to-bottom").classList.toggle("hidden", isPinned(messagesDiv));
+  $("agent-to-bottom").classList.toggle("hidden", isPinned($("agent-scroll")));
+}
+messagesDiv.addEventListener("scroll", updateToBottom, { passive: true });
+$("agent-scroll").addEventListener("scroll", updateToBottom, { passive: true });
+
+// ── Chat rendering ───────────────────────────────────────
+function appendMessage(role, content) {
+  const w = messagesDiv.querySelector(".welcome");
+  if (w) w.remove();
+  const pinned = isPinned(messagesDiv);
+  const bubble = document.createElement("div");
+  bubble.className = "msg msg-" + role;
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.textContent = role === "user" ? "You" : "Artifex";
+  const body = document.createElement("div");
+  body.className = "body";
+  if (content) {
+    body.innerHTML = role === "user"
+      ? renderPlain(content)
+      : '<div class="md">' + renderMarkdown(content) + "</div>";
+  }
+  bubble.appendChild(meta);
+  bubble.appendChild(body);
+  messagesDiv.appendChild(bubble);
+  if (pinned || role === "user") pinTo(messagesDiv);
+  updateToBottom();
+  return body;
+}
+function renderHistory() {
+  for (const m of conversation) appendMessage(m.role === "user" ? "user" : "assistant", m.content);
+  pinTo(messagesDiv);
+}
+
+// ── History trim before send ─────────────────────────────
+function trimmedHistory() {
+  if (conversation.length <= 1) return conversation.slice();
+  const kept = [];
+  let chars = 0;
+  for (let i = conversation.length - 1; i >= 0; i--) {
+    const c = (conversation[i].content || "").length;
+    if (kept.length && (chars + c > MAX_HISTORY_CHARS || kept.length >= MAX_HISTORY_MESSAGES)) break;
+    kept.unshift(conversation[i]);
+    chars += c;
+  }
+  return kept;
+}
+
+// ── Chat ─────────────────────────────────────────────────
+function sendOrStop() {
+  if (isStreaming) { if (aborter) aborter.abort(); return; }
+  sendMessage();
+}
+
+async function sendMessage() {
+  const text = inputEl.value.trim();
+  if (!text || isStreaming) return;
+  if (!store.k) { toggleDrawer(); return; }
+
+  appendMessage("user", text);
+  conversation.push({ role: "user", content: text });
+  inputEl.value = "";
+  inputEl.style.height = "auto";
+
+  const body = appendMessage("assistant", "");
+  const cursor = document.createElement("span");
+  cursor.className = "cursor";
+  body.appendChild(cursor);
+
+  let thinkingEl = null, thinkingBody = null, thinkingText = "";
+  let segText = "";              // current model segment (what history keeps)
+  let answerEl = null;           // live markdown target for that segment
+  let sawContent = false;
+  let finishReason = "";
+  let usage = null;
+  let renderTimer = null;
+  const t0 = Date.now();
+
+  isStreaming = true;
+  sendBtn.textContent = "Stop";
+  sendBtn.classList.add("stop");
+  aborter = new AbortController();
+
+  const collapseThinking = () => {
+    if (thinkingEl && thinkingEl.open) {
+      thinkingEl.open = false;
+      thinkingEl.querySelector("summary").textContent =
+        "Thought for " + ((Date.now() - t0) / 1000).toFixed(1) + "s";
+    }
+  };
+  // Blocks are appended in arrival order and updated in place — no full
+  // rebuild, so error notes and tool cards survive the next token.
+  const addBlock = el => {
+    const pinned = isPinned(messagesDiv);
+    body.insertBefore(el, cursor);
+    if (pinned) pinTo(messagesDiv);
+    updateToBottom();
+    return el;
+  };
+  const paintAnswer = () => {
+    if (!answerEl) {
+      answerEl = document.createElement("div");
+      answerEl.className = "md";
+      addBlock(answerEl);
+    }
+    const pinned = isPinned(messagesDiv);
+    answerEl.innerHTML = renderMarkdown(segText);
+    if (pinned) pinTo(messagesDiv);
+    updateToBottom();
+  };
+  const scheduleRender = () => {
+    if (renderTimer) return;
+    renderTimer = setTimeout(() => { renderTimer = null; paintAnswer(); }, RENDER_INTERVAL_MS);
+  };
+  const flushRender = () => {
+    if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+    if (segText) paintAnswer();
+  };
+  const newSegment = () => { flushRender(); segText = ""; answerEl = null; };
+
+  try {
+    const webOn = $("web-toggle").checked;
+    let sys = $("system-prompt").value.trim() || DEFAULT_SYSTEM_PROMPT;
+    sys += "\n\nTODAY'S DATE: " + new Date().toDateString();
+    if (webOn) sys += TOOL_PROMPT;
+
+    const payload = {
+      model: $("model-select").value || undefined,
+      messages: [{ role: "system", content: sys }, ...trimmedHistory()],
+      stream: true,
+      web_tools: webOn,
+      temperature: parseFloat($("temperature").value) || 0.7,
+      max_tokens: parseInt($("max-tokens").value) || 12288,
+      options: { reasoning_effort: currentEffort() },
+    };
+
+    const resp = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload),
+      signal: aborter.signal,
+    });
+    if (resp.status === 401) throw new Error("Invalid API key - check Settings");
+    if (!resp.ok) throw new Error("Server returned " + resp.status);
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const payload = line.slice(6).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let data;
+        try { data = JSON.parse(payload); } catch (e) { continue; }
+
+        // ── Extended events (top-level) ──────────────
+        if (data.error) {
+          const msg = typeof data.error === "string" ? data.error :
+                      (data.error.message || JSON.stringify(data.error));
+          flushRender();
+          addBlock(Object.assign(document.createElement("div"),
+            { className: "err-text", textContent: msg }));
+          continue;
+        }
+        if (data.x_tool_status) {
+          collapseThinking();
+          newSegment();          // status card lands below the text so far
+          const el = document.createElement("div");
+          el.className = "tool-status";
+          el.innerHTML = "&#x1F50D; " + data.x_tool_status.map(escapeHtml).join("<br>");
+          addBlock(el);
+          continue;
+        }
+        if (data.x_tool_done) {
+          // Tools finished: the model starts a fresh segment. Keep what is
+          // rendered, reset accumulators so the follow-up streams cleanly.
+          newSegment();
+          thinkingEl = null; thinkingBody = null; thinkingText = "";
+          continue;
+        }
+        if (data.x_usage) usage = data.x_usage;
+
+        // ── OpenAI-format chunk ──────────────────────
+        const choice = (data.choices || [])[0];
+        if (!choice) continue;
+        const delta = choice.delta || {};
+        if (choice.finish_reason) finishReason = choice.finish_reason;
+
+        if (delta.x_thinking) {
+          if (!thinkingEl) {
+            thinkingEl = document.createElement("details");
+            thinkingEl.className = "thinking";
+            thinkingEl.open = true;
+            const s = document.createElement("summary");
+            s.textContent = "Thinking...";
+            thinkingBody = document.createElement("div");
+            thinkingBody.className = "tb";
+            thinkingEl.appendChild(s);
+            thinkingEl.appendChild(thinkingBody);
+            addBlock(thinkingEl);
+          }
+          // Plain text nodes: no markdown pass, no string rebuild per token.
+          thinkingText += delta.x_thinking;
+          thinkingBody.appendChild(document.createTextNode(delta.x_thinking));
+          thinkingBody.scrollTop = thinkingBody.scrollHeight;
+          if (isPinned(messagesDiv)) pinTo(messagesDiv);
+        }
+        if (delta.content) {
+          collapseThinking();
+          segText += delta.content;
+          sawContent = true;
+          scheduleRender();
+        }
+      }
+    }
+  } catch (err) {
+    flushRender();
+    if (err.name === "AbortError") {
+      addBlock(Object.assign(document.createElement("div"),
+        { className: "finish-note", textContent: "- stopped -" }));
+    } else {
+      addBlock(Object.assign(document.createElement("div"),
+        { className: "err-text", textContent: "Error: " + err.message }));
+    }
+  } finally {
+    if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+    if (segText) paintAnswer();          // one final, complete markdown pass
+    cursor.remove();
+    collapseThinking();
+    if (finishReason === "length") {
+      const n = document.createElement("div");
+      n.className = "finish-note";
+      n.textContent = "Hit the max-token limit" +
+        (segText ? "" : " before any answer text (thinking consumed the budget - lower the effort or raise max tokens)");
+      body.appendChild(n);
+    }
+    if (!sawContent && !thinkingText && !body.textContent.trim()) {
+      body.innerHTML = '<span class="err-text">(empty response)</span>';
+    }
+    if (segText) conversation.push({ role: "assistant", content: segText });
+    store.saveConv();
+    if (usage) {
+      const el = ((Date.now() - t0) / 1000);
+      $("stats").style.display = "block";
+      $("stats").textContent =
+        "prompt " + (usage.prompt_tokens || 0) + " tok - out " + (usage.completion_tokens || 0) +
+        " tok - " + (el > 0 ? ((usage.completion_tokens || 0) / el).toFixed(1) : "?") + " tok/s - " +
+        el.toFixed(1) + "s";
+    }
+    isStreaming = false;
+    aborter = null;
+    sendBtn.textContent = "Send";
+    sendBtn.classList.remove("stop");
+    updateToBottom();
+  }
+}
+
+function clearChat() {
+  conversation = [];
+  store.saveConv();
+  messagesDiv.innerHTML =
+    '<div class="welcome"><div class="t">ARTIFEX<span> Assistant</span></div>' +
+    '<div class="s">Type a message below to start.</div></div>';
+  $("stats").style.display = "none";
+  toggleDrawer();
+}
+
+// ═════════════════════════════════════════════════════════
+// Agent tab
+//
+// One run at a time server-side (409 carries the live run's id, which we
+// attach to instead of erroring). The SSE feed needs the bearer header, so
+// it is a streaming fetch, not EventSource. run_id + the last event index
+// ("i") are persisted so a backgrounded phone can reattach with ?since=.
+// ═════════════════════════════════════════════════════════
+const RUN_KEY = "ax_run_id", RUN_I_KEY = "ax_run_i";
+let agentRunId = null;
+let agentLastI = -1;
+let agentAborter = null;
+let agentStreaming = false;
+let agentDone = true;             // no live run known
+let agentSawEnd = false;
+let agentRetryTimer = null;
+let agentRetries = 0;
+let agStream = null;              // live chunk block {wrap, think, tb, txt}
+let agChip = null;                // chip for the action currently in flight
+
+const feed = () => $("agent-feed");
+
+function isTerminalStatus(s) {
+  s = String(s || "");
+  return s.indexOf("done") === 0 || s.indexOf("stopped") === 0 || s.indexOf("error") === 0;
+}
+function rememberRun() {
+  if (agentRunId) {
+    localStorage.setItem(RUN_KEY, agentRunId);
+    localStorage.setItem(RUN_I_KEY, String(agentLastI));
+  }
+}
+function forgetRun() {
+  localStorage.removeItem(RUN_KEY);
+  localStorage.removeItem(RUN_I_KEY);
+}
+
+function el(tag, cls, txt) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (txt != null) e.textContent = txt;
+  return e;
+}
+function feedAdd(node) {
+  const box = $("agent-scroll");
+  const pinned = isPinned(box);
+  feed().appendChild(node);
+  if (pinned) pinTo(box);
+  updateToBottom();
+  if (activeTab !== "agent") $("tab-agent").classList.add("unread");
+  return node;
+}
+function agentNote(text, cls) {
+  return feedAdd(el("div", "ev ev-note" + (cls ? " " + cls : ""), text));
+}
+function setAgentStatus(text) { $("agent-status").textContent = text; }
+function updateAgentUi() {
+  const live = !!agentRunId && !agentDone;
+  $("agent-start").disabled = live;
+  $("agent-stop").classList.toggle("hidden", !live);
+  $("tab-agent").classList.toggle("live", live);
+}
+
+// ── Live chunk block (assistant/thinking tokens, live listeners only) ──
+//
+// The server flushes persisted events before the live chunk ring in the same
+// batch, so the tail tokens of a round can arrive AFTER that round's
+// assistant_message. agGenerating gates them: true from round_start (and from
+// a fresh attach, where the round may already be underway) until the
+// consolidated message lands.
+let agGenerating = true;
+function agentChunk(text, thinking) {
+  if (!text || !agGenerating) return;
+  if (!agStream) {
+    const wrap = el("div", "ev ev-stream");
+    const think = el("details", "thinking");
+    think.open = true;
+    think.appendChild(el("summary", null, "Thinking..."));
+    const tb = el("div", "tb");
+    think.appendChild(tb);
+    think.classList.add("hidden");
+    const txt = el("div", "live-txt");
+    wrap.appendChild(think);
+    wrap.appendChild(txt);
+    agStream = { wrap: wrap, think: think, tb: tb, txt: txt };
+    feedAdd(wrap);
+  }
+  const box = $("agent-scroll");
+  const pinned = isPinned(box);
+  if (thinking) {
+    agStream.think.classList.remove("hidden");
+    agStream.tb.appendChild(document.createTextNode(text));
+    agStream.tb.scrollTop = agStream.tb.scrollHeight;
+  } else {
+    if (agStream.think.open) agStream.think.open = false;
+    agStream.txt.appendChild(document.createTextNode(text));
+  }
+  if (pinned) pinTo(box);
+}
+function agentEndChunks() {
+  if (agStream) { agStream.wrap.remove(); agStream = null; }
+}
+
+// ── Action chips ──────────────────────────────────────────
+function agentChip(ev) {
+  const a = ev.action || {};
+  const risk = ev.risk || "";
+  const wrap = el("div", "ev chip r-" + (risk || "NONE"));
+  const state = el("span", "cstate", "○");
+  const main = el("div", "cmain");
+  const head = el("div", "chead");
+  head.appendChild(el("span", "ctype", a.type || "action"));
+  if (risk) head.appendChild(el("span", "risk", risk));
+  main.appendChild(head);
+  main.appendChild(el("div", "cdisp", a.display || ""));
+  if (ev.policy_reason) main.appendChild(el("div", "cwhy", ev.policy_reason));
+  wrap.appendChild(main);
+  wrap.appendChild(state);
+  wrap._state = state;
+  wrap._main = main;
+  agChip = wrap;
+  return feedAdd(wrap);
+}
+function chipState(glyph, cls, why) {
+  if (!agChip) return null;
+  agChip._state.textContent = glyph;
+  agChip._state.className = "cstate" + (cls ? " " + cls : "");
+  if (why) {
+    const w = el("div", "cwhy", why);
+    agChip._main.appendChild(w);
+  }
+  return agChip;
+}
+function chipOutput(text) {
+  if (!agChip || !text) return;
+  const d = el("details");
+  d.appendChild(el("summary", null, "output (" + text.length + " chars)"));
+  d.appendChild(el("pre", null, text));
+  agChip._main.appendChild(d);
+}
+
+// ── Approval ──────────────────────────────────────────────
+let approvalKind = "action";   // "action" | "gate"
+function showApproval(payload, kind) {
+  approvalKind = kind || "action";
+  const a = (payload && payload.action) || null;
+  const risk = payload && payload.risk ? payload.risk : "";
+  $("ap-what").textContent = a
+    ? (a.type || "action") + "  " + (a.display || "")
+    : (payload && payload.reason ? payload.reason : "The run is waiting on you.");
+  const why = [];
+  if (risk) why.push("risk " + risk);
+  if (a && payload && payload.reason) why.push(payload.reason);
+  $("ap-why").textContent = why.join(" - ");
+  $("ap-approve").textContent = approvalKind === "gate" ? "Continue" : "Approve";
+  $("ap-deny").classList.toggle("hidden", approvalKind === "gate");
+  $("approval").classList.remove("hidden");
+  setAgentStatus("awaiting your approval");
+  if (activeTab !== "agent") $("tab-agent").classList.add("unread");
+}
+function hideApproval() { $("approval").classList.add("hidden"); }
+
+async function answerApproval(decision) {
+  if (!agentRunId) return;
+  hideApproval();
+  if (decision === "stop") agentSawEnd = false;
+  try {
+    const r = await fetch("/v1/agent/runs/" + agentRunId + "/approval", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ decision: decision }),
+    });
+    if (r.status === 409) { agentNote("That prompt was already answered.", "warn"); return; }
+    if (!r.ok) { agentNote("Approval failed: HTTP " + r.status, "bad"); return; }
+    agentNote("You chose: " + decision, "warn");
+  } catch (e) {
+    agentNote("Approval failed: " + e.message, "bad");
+  }
+}
+
+// ── Start / stop ──────────────────────────────────────────
+async function startAgentRun() {
+  const goal = $("agent-goal").value.trim();
+  if (!goal) { $("agent-goal").focus(); return; }
+  if (!store.k) { toggleDrawer(); return; }
+  $("agent-start").disabled = true;
+  setAgentStatus("starting...");
+  try {
+    const r = await fetch("/v1/agent/runs", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        goal: goal,
+        autonomy: currentAutonomy(),
+        reasoning_effort: currentEffort(),
+        temperature: Math.max(0, Math.min(2, parseFloat($("temperature").value) || 0.7)),
+      }),
+    });
+    let data = null;
+    try { data = await r.json(); } catch (e) {}
+    if (r.status === 409 && data && data.detail && data.detail.run_id) {
+      agentNote("A run is already active - attaching to it.", "warn");
+      beginRun(data.detail.run_id, 0, true);
+      return;
+    }
+    if (r.status === 401) { agentNote("Invalid API key - check Settings.", "bad"); setAgentStatus("no run"); updateAgentUi(); return; }
+    if (!r.ok) {
+      const d = data && data.detail;
+      agentNote("Could not start: " + (typeof d === "string" ? d : "HTTP " + r.status), "bad");
+      setAgentStatus("no run");
+      updateAgentUi();
+      return;
+    }
+    feed().innerHTML = "";
+    $("agent-setup").open = false;
+    agentNote("Goal: " + goal);
+    if (data.folder) agentNote("Workspace: " + data.folder);
+    beginRun(data.run_id, 0, false);
+  } catch (e) {
+    agentNote("Could not start: " + e.message, "bad");
+    setAgentStatus("no run");
+    updateAgentUi();
+  }
+}
+
+function beginRun(runId, since, attaching) {
+  agentRunId = runId;
+  agentDone = false;
+  agentLastI = since > 0 ? since - 1 : -1;
+  agentRetries = 0;
+  agChip = null;
+  agentEndChunks();
+  rememberRun();
+  updateAgentUi();
+  if (attaching) {
+    $("agent-setup").open = false;
+    agentNote("Attached to run " + runId + ".");
+  }
+  agentAttach(since);
+}
+
+async function stopAgentRun() {
+  if (!agentRunId) return;
+  setAgentStatus("stopping...");
+  hideApproval();
+  try {
+    const r = await fetch("/v1/agent/runs/" + agentRunId + "/stop", {
+      method: "POST", headers: authHeaders(),
+    });
+    if (!r.ok) agentNote("Stop failed: HTTP " + r.status, "bad");
+    else agentNote("Stop requested.", "warn");
+  } catch (e) {
+    agentNote("Stop failed: " + e.message, "bad");
+  }
+}
+
+// ── SSE attach / reattach ─────────────────────────────────
+function agentDetach() {
+  if (agentRetryTimer) { clearTimeout(agentRetryTimer); agentRetryTimer = null; }
+  if (agentAborter) { try { agentAborter.abort(); } catch (e) {} agentAborter = null; }
+  agentStreaming = false;
+}
+
+async function agentAttach(since) {
+  if (!agentRunId) return;
+  agentDetach();
+  const runId = agentRunId;
+  const ac = new AbortController();
+  agentAborter = ac;
+  agentStreaming = true;
+  agentSawEnd = false;
+  agGenerating = true;
+  setAgentStatus("run " + runId + " - connected");
+  updateAgentUi();
+  try {
+    const r = await fetch("/v1/agent/runs/" + runId + "/events?since=" + Math.max(0, since), {
+      headers: authHeaders(), signal: ac.signal,
+    });
+    if (r.status === 404) { agentNote("Run " + runId + " is gone.", "warn"); finishRun("gone", ""); return; }
+    if (r.status === 401) {
+      // Retrying with the same bad key would just spin the backoff.
+      agentNote("Invalid API key - check Settings, then reopen this tab.", "bad");
+      agentDone = true; agentDetach(); updateAgentUi();
+      setAgentStatus("unauthorized");
+      return;
+    }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buf += dec.decode(chunk.value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        if (line.charAt(0) === ":") continue;            // ": ping" keepalive
+        if (!line.startsWith("data:")) continue;
+        const p = line.slice(5).trim();
+        if (!p || p === "[DONE]") continue;
+        let d;
+        try { d = JSON.parse(p); } catch (e) { continue; }
+        agentRetries = 0;
+        agentEvent(d);
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError" && agentRunId === runId) {
+      agentNote("Event stream dropped (" + e.message + ").", "warn");
+    }
+  } finally {
+    agentStreaming = false;
+    if (agentAborter === ac) agentAborter = null;
+    if (agentRunId === runId && !agentSawEnd && !agentDone) scheduleReattach();
+    updateAgentUi();
+  }
+}
+
+function scheduleReattach() {
+  if (agentRetryTimer || !agentRunId) return;
+  if (agentRetries > 40) { setAgentStatus("disconnected - pull to reload"); return; }
+  agentRetries++;
+  setAgentStatus("reconnecting...");
+  agentRetryTimer = setTimeout(async () => {
+    agentRetryTimer = null;
+    if (!agentRunId || agentDone) return;
+    try {
+      const r = await fetch("/v1/agent/runs/" + agentRunId, { headers: authHeaders() });
+      if (!r.ok) { finishRun("gone", ""); return; }
+      const s = await r.json();
+      if (isTerminalStatus(s.status)) { renderFinal(s.status, s.summary); return; }
+      if (s.pending_approval) showApproval(s.pending_approval, s.pending_approval.action ? "action" : "gate");
+      agentAttach(agentLastI + 1);
+    } catch (e) {
+      scheduleReattach();
+    }
+  }, Math.min(2000 + agentRetries * 500, 8000));
+}
+
+function finishRun(status, summary) {
+  agentDone = true;
+  agGenerating = false;
+  agentEndChunks();
+  hideApproval();
+  agentDetach();
+  forgetRun();
+  setAgentStatus(status ? "run " + status : "no run");
+  updateAgentUi();
+}
+
+function renderFinal(status, summary) {
+  const bad = String(status).indexOf("done") !== 0;
+  const box = el("div", "ev ev-final" + (bad ? " bad" : ""));
+  box.appendChild(el("div", "ft", String(status || "finished").toUpperCase()));
+  if (summary) {
+    const md = el("div", "md");
+    md.innerHTML = renderMarkdown(summary);
+    box.appendChild(md);
+  }
+  feedAdd(box);
+  finishRun(status, summary);
+}
+
+// ── Event dispatch ────────────────────────────────────────
+function agentEvent(ev) {
+  const k = ev.kind;
+  if (typeof ev.i === "number") {
+    if (ev.i > agentLastI) { agentLastI = ev.i; rememberRun(); }
+  }
+  if (k === "assistant_chunk") { agentChunk(ev.text || "", false); return; }
+  if (k === "thinking_chunk") { agentChunk(ev.text || "", true); return; }
+
+  // Any persisted event closes the live-token block and, except for the
+  // ones that raise it, dismisses a stale approval panel.
+  agentEndChunks();
+  if (k !== "approval_required" && k !== "gate_pause" && k !== "breaker_tripped") hideApproval();
+
+  switch (k) {
+    case "round_start":
+      agChip = null;
+      agGenerating = true;
+      feedAdd(el("div", "ev ev-round", "ROUND " + (ev.round || "?")));
+      setAgentStatus("run " + agentRunId + " - round " + (ev.round || "?"));
+      break;
+    case "assistant_message": {
+      agGenerating = false;
+      const box = el("div", "ev ev-msg md");
+      box.innerHTML = renderMarkdown(ev.text || "");
+      feedAdd(box);
+      break;
+    }
+    case "action_proposed":
+      agentChip(ev);
+      break;
+    case "action_started":
+      chipState("▶", "run");
+      setAgentStatus("running " + ((ev.action && ev.action.type) || "action"));
+      break;
+    case "action_result":
+      chipState(ev.success ? "✓" : "✗", ev.success ? "ok" : "bad");
+      chipOutput(ev.output || "");
+      agChip = null;
+      break;
+    case "blocked":
+      chipState("⊘", "bad", ev.reason ? "blocked: " + ev.reason : "blocked by policy");
+      agChip = null;
+      break;
+    case "approval_required":
+      chipState("?", "");
+      showApproval({
+        action: ev.action || null,
+        risk: ev.risk || "",
+        reason: ev.policy_reason || "",
+      }, "action");
+      break;
+    case "gate_pause":
+      agentNote("Human gate: " + (ev.reason || ""), "warn");
+      showApproval({ reason: "Human gate: " + (ev.reason || "") }, "gate");
+      break;
+    case "breaker_tripped":
+      agentNote("Circuit breaker: " + (ev.reason || ""), "warn");
+      showApproval({ reason: "Circuit breaker: " + (ev.reason || "") }, "gate");
+      break;
+    case "format_retry":
+      agentNote("Nudged the model: " + (ev.reason || ""), "warn");
+      break;
+    case "git":
+      agentNote(ev.text || "git", "");
+      break;
+    case "error":
+      agentNote("Error: " + (ev.reason || ""), "bad");
+      break;
+    case "stopped":
+      agentNote("Stopped: " + (ev.reason || ""), "warn");
+      break;
+    case "done": {
+      const box = el("div", "ev ev-final");
+      box.appendChild(el("div", "ft", "DONE"));
+      if (ev.summary) {
+        const md = el("div", "md");
+        md.innerHTML = renderMarkdown(ev.summary);
+        box.appendChild(md);
+      }
+      feedAdd(box);
+      break;
+    }
+    case "end":
+      // Synthesized by the SSE endpoint once the run is terminal. The
+      // "done" event above already printed the summary; keep this terse.
+      agentNote("— run " + (ev.status || "finished") + " —", "good");
+      agentSawEnd = true;
+      finishRun(ev.status || "finished", ev.summary || "");
+      break;
+    default:
+      agentNote(k + (ev.reason ? ": " + ev.reason : ""), "");
+  }
+}
+
+// ── Reattach on load / on returning to the tab ────────────
+let agentBooting = false;
+async function agentBoot() {
+  const id = localStorage.getItem(RUN_KEY);
+  if (!id || !store.k || agentRunId || agentBooting) return;
+  let lastI = parseInt(localStorage.getItem(RUN_I_KEY) || "-1", 10);
+  if (isNaN(lastI)) lastI = -1;
+  agentBooting = true;
+  try {
+    const r = await fetch("/v1/agent/runs/" + id, { headers: authHeaders() });
+    if (!r.ok) { forgetRun(); return; }
+    const s = await r.json();
+    if (isTerminalStatus(s.status)) {
+      forgetRun();
+      return;
+    }
+    agentRunId = id;
+    agentLastI = lastI;
+    agentDone = false;
+    agentRetries = 0;
+    $("agent-setup").open = false;
+    feed().innerHTML = "";
+    agentNote("Reattached to run " + id + " (" + s.status + ").");
+    if (s.goal) agentNote("Goal: " + s.goal);
+    if (s.pending_approval) {
+      showApproval(s.pending_approval, s.pending_approval.action ? "action" : "gate");
+    }
+    updateAgentUi();
+    agentAttach(agentLastI + 1);
+  } catch (e) {
+    /* offline: leave the stored run alone, boot will retry on reconnect */
+  } finally {
+    agentBooting = false;
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  if (agentRunId && !agentDone && !agentStreaming && !agentRetryTimer) {
+    agentRetries = 0;
+    scheduleReattach();
+  }
+});
+
+// ── Input behaviors ──────────────────────────────────────
+inputEl.addEventListener("input", function () {
+  this.style.height = "auto";
+  this.style.height = Math.min(this.scrollHeight, 120) + "px";
+});
+inputEl.addEventListener("keydown", function (e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+$("api-key").addEventListener("change", () => store.save());
+
+// ── Boot ─────────────────────────────────────────────────
+store.restore();
+autonomyHint();
+updateAgentUi();
+if (conversation.length) renderHistory();
+connect();
+agentBoot();
+</script>
+</body>
+</html>

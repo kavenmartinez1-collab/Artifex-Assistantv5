@@ -1265,6 +1265,36 @@ def create_app():
 
     get_model_queue().register_transformers_unload(_unload_transformers_engine)
 
+    # ─── Phone client ────────────────────────────────────────────────────
+    # Single-file web app (api/static/app.html) served on the same origin
+    # as the API so its fetches need no CORS entries.  The page itself is
+    # static and holds no secrets — every API call it makes carries the
+    # bearer key the user pastes into its settings — so this route is
+    # deliberately unauthenticated, like a login page.
+
+    @app.get("/app", include_in_schema=False)
+    async def phone_app():
+        from fastapi.responses import FileResponse
+        return FileResponse(
+            os.path.join(os.path.dirname(__file__), "static", "app.html"),
+            media_type="text/html",
+        )
+
+    # ─── Agent runs ──────────────────────────────────────────────────────
+    # The autonomous loop (core.agent_loop) over REST: start goals, stream
+    # events, answer approval prompts. Same runner the Qt GUI drives.
+
+    from api.agent_api import register_agent_routes
+    register_agent_routes(
+        app,
+        check_auth=_check_auth,
+        get_engine=_get_engine,
+        default_workspace_root=os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "output", "agent_runs",
+        ),
+    )
+
     # ─── Health ───────────────────────────────────────────────────────────
 
     @app.get("/health")
