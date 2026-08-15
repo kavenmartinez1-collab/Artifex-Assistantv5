@@ -111,14 +111,17 @@ class ModelQueue:
             self._current_model != model
             or self._current_backend != backend
         )
-        # Tier change within the same llama_cpp model also requires a
-        # relaunch (you can't grow -c without restarting llama-server).
+        # Tier INCREASE within the same llama_cpp model requires a relaunch
+        # (you can't grow -c without restarting llama-server). A smaller
+        # request after a big one keeps the larger ctx: relaunching downward
+        # buys nothing (KV VRAM was already committed and fits) and costs a
+        # full cold load — minutes with --no-mmap — on every size ping-pong.
         needs_tier_relaunch = (
             not needs_switch
             and backend == "llama_cpp"
             and ctx_tier is not None
             and self._current_ctx_tier is not None
-            and ctx_tier != self._current_ctx_tier
+            and ctx_tier > self._current_ctx_tier
         )
 
         if needs_switch or needs_tier_relaunch:
@@ -161,7 +164,14 @@ class ModelQueue:
 
         self._current_model = model
         self._current_backend = backend
-        self._current_ctx_tier = ctx_tier
+        # On a skipped downgrade the server still runs the LARGER ctx —
+        # record that, or the next mid-size request "upgrades" from the
+        # smaller recorded tier and relaunches for nothing.
+        if (not needs_switch and not needs_tier_relaunch
+                and self._current_ctx_tier is not None and ctx_tier is not None):
+            self._current_ctx_tier = max(self._current_ctx_tier, ctx_tier)
+        else:
+            self._current_ctx_tier = ctx_tier
         self._last_request_at = time.time()
         self._stats["total_requests"] += 1
 

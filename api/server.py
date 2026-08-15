@@ -1284,6 +1284,69 @@ def create_app():
     # The autonomous loop (core.agent_loop) over REST: start goals, stream
     # events, answer approval prompts. Same runner the Qt GUI drives.
 
+    # ─── Engine control ──────────────────────────────────────────────────
+    # Remote ops for the phone: see what's loaded and force a relaunch at a
+    # chosen ctx. Tier upgrades happen automatically per request; this is
+    # the manual lever for "reload it big right now".
+
+    class EngineReloadRequest(BaseModel):
+        ctx_tier: Optional[int] = Field(None, ge=2048, le=262144)
+
+    @app.get("/v1/engine")
+    async def engine_state(request: Request):
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        mq = get_model_queue()
+        eng = _engine  # cached only — never load as a side effect of a GET
+        tier = eng.current_tier() if (eng and hasattr(eng, "current_tier")) else None
+        cap = getattr(eng, "_configured_num_ctx", None) if eng else None
+        return {
+            "model": mq._current_model,
+            "backend": mq._current_backend,
+            "loaded": bool(eng and eng.is_loaded()),
+            "ctx": tier or None,
+            "ctx_cap": cap,
+            "queue_tier": mq._current_ctx_tier,
+        }
+
+    @app.post("/v1/engine/reload")
+    async def engine_reload(body: EngineReloadRequest, request: Request):
+        """Relaunch llama-server, at body.ctx_tier or the model's full cap."""
+        if not _check_auth(request):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        from api.agent_api import _runs, _runs_lock
+        with _runs_lock:
+            live = next((r for r in _runs.values() if not r.terminal), None)
+        if live is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "An agent run is active — stop it first",
+                        "run_id": live.id})
+        mq = get_model_queue()
+        async with mq._lock:
+            if not mq._current_model:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Nothing loaded yet — any chat request loads the engine")
+            # Resolve "no tier given" to the model's configured cap BEFORE
+            # unloading: load()'s adoption path only refuses a smaller
+            # still-running server when an explicit target ctx is set —
+            # with None it would happily re-adopt the old small server and
+            # the reload would be a silent no-op.
+            target = body.ctx_tier
+            if target is None and _engine is not None:
+                target = getattr(_engine, "_configured_num_ctx", None)
+            await mq._unload_engine()
+            loop = asyncio.get_event_loop()
+            eng = await loop.run_in_executor(
+                None, lambda: _get_engine(ctx_tier=target))
+            mq._current_ctx_tier = (
+                eng.current_tier() if hasattr(eng, "current_tier") else body.ctx_tier)
+            _log.info("Engine reloaded via /v1/engine/reload at ctx=%s",
+                      mq._current_ctx_tier)
+            return {"ok": True, "model": mq._current_model,
+                    "ctx": mq._current_ctx_tier}
+
     # ─── Chat sessions ───────────────────────────────────────────────────
     # Server-side conversation store so any device can list and resume
     # previous chats; the phone client syncs after each exchange.
@@ -1291,6 +1354,14 @@ def create_app():
     from core.config import SESSION_DIR
     from api.session_api import register_session_routes
     register_session_routes(app, check_auth=_check_auth, session_dir=SESSION_DIR)
+
+    # ─── Workspace files ─────────────────────────────────────────────────
+    # Browse/read/download/upload within the agent's exact sandbox reach.
+
+    from core.config import BASE_DIR
+    from api.files_api import register_file_routes
+    register_file_routes(app, check_auth=_check_auth,
+                         default_root=os.path.abspath(BASE_DIR))
 
     from api.agent_api import register_agent_routes
     register_agent_routes(

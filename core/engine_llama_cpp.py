@@ -244,20 +244,23 @@ class LlamaCppEngine(BaseEngine):
         except Exception:
             return False
 
-    def _served_model_path(self) -> str | None:
-        """Model path reported by the server on our port (GET /props).
+    def _served_props(self) -> tuple[str | None, int | None]:
+        """(model_path, n_ctx) reported by the server on our port (GET /props).
 
-        Returns None when it can't be determined — endpoint missing,
-        timeout, unexpected shape.  Callers must treat None as "unknown
-        model", not as a match.
+        Either element is None when it can't be determined — endpoint
+        missing, timeout, unexpected shape.  Callers must treat None as
+        "unknown", not as a match.
         """
         try:
             req = urllib.request.Request(f"{self._base_url}/props")
             with urllib.request.urlopen(req, timeout=3) as resp:
                 data = json.loads(resp.read())
-            return data.get("model_path") or None
+            n_ctx = (data.get("default_generation_settings") or {}).get("n_ctx") \
+                or data.get("n_ctx")
+            return (data.get("model_path") or None,
+                    int(n_ctx) if n_ctx else None)
         except Exception:
-            return None
+            return None, None
 
     def _get_kv_quant_bpe(self):
         """(bpe_k, bpe_v) from -ctk/-ctv in extra_flags.  Defaults to f16."""
@@ -368,28 +371,43 @@ class LlamaCppEngine(BaseEngine):
         # would turn a model switch into a no-op that returns wrong-model
         # completions.
         if self._is_server_healthy():
-            served = self._served_model_path()
+            served, served_ctx = self._served_props()
             ours = os.path.basename(self.model_path).casefold()
-            if served and os.path.basename(served).casefold() == ours:
+            ctx_ok = not (self._target_ctx and served_ctx
+                          and served_ctx < self._target_ctx)
+            if served and os.path.basename(served).casefold() == ours and ctx_ok:
                 self._loaded = True
                 self._adopted = True
+                # Record the ADOPTED server's real ctx: current_tier() must
+                # report what actually serves, and the queue's tier-upgrade
+                # comparison is meaningless against a stale/unset value.
+                if served_ctx:
+                    self._num_ctx = served_ctx
                 _log.info(
-                    "Adopting existing llama-server on port %d (verified: %s)",
-                    self.port, os.path.basename(served),
+                    "Adopting existing llama-server on port %d (verified: %s, ctx=%s)",
+                    self.port, os.path.basename(served), served_ctx,
                 )
                 if status_callback:
                     status_callback(f"llama-server already running — {self.model_name}")
                 return
-            # Wrong model, or a build too old to report one (served is
-            # None): reclaim the port and launch our own.  This is the
-            # stale-orphan path that adopted-server termination used to
-            # cover from the unload side.
-            _log.warning(
-                "Healthy llama-server on port %d serves %r, not %r — "
-                "terminating it and launching our own",
-                self.port, served, os.path.basename(self.model_path),
-            )
-            self._kill_listener_on_port()
+            if served and os.path.basename(served).casefold() == ours and not ctx_ok:
+                _log.warning(
+                    "Healthy llama-server on port %d serves ctx=%s but %d is "
+                    "needed — terminating it and relaunching bigger",
+                    self.port, served_ctx, self._target_ctx,
+                )
+                self._kill_listener_on_port()
+            else:
+                # Wrong model, or a build too old to report one (served is
+                # None): reclaim the port and launch our own.  This is the
+                # stale-orphan path that adopted-server termination used to
+                # cover from the unload side.
+                _log.warning(
+                    "Healthy llama-server on port %d serves %r, not %r — "
+                    "terminating it and launching our own",
+                    self.port, served, os.path.basename(self.model_path),
+                )
+                self._kill_listener_on_port()
 
         if not os.path.isfile(self.model_path):
             raise FileNotFoundError(f"Model GGUF not found: {self.model_path}")
