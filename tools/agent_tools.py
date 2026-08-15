@@ -2033,17 +2033,24 @@ def git_commit_edit(file_path: str, summary: str) -> tuple[bool, str]:
 
     Only commits if the file is inside a git repo and has changes.
     Commit message includes [agent] prefix for easy filtering.
+
+    The commit is pathspec-limited to this one file. A bare `git commit`
+    commits everything already in the index, so an agent edit inside a repo
+    that had unrelated staged work (the API's default workspace root lives
+    under the repo's output/) would sweep that work into an [agent] commit —
+    and git_revert_last would then revert it too.
     """
     repo = _find_git_root(file_path)
     if not repo:
         return False, "Not inside a git repository."
+    abs_path = os.path.abspath(file_path)
     try:
         subprocess.run(
-            ["git", "add", "--", os.path.abspath(file_path)],
+            ["git", "add", "--", abs_path],
             cwd=repo, capture_output=True, text=True, timeout=10,
         )
         result = subprocess.run(
-            ["git", "commit", "-m", f"[agent] {summary}"],
+            ["git", "commit", "-m", f"[agent] {summary}", "--", abs_path],
             cwd=repo, capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
