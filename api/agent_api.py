@@ -12,6 +12,7 @@ Endpoints (all bearer-authed via the check_auth callable the server passes in):
     GET  /v1/agent/runs/{id}               snapshot: status + pending approval
     GET  /v1/agent/runs/{id}/events        SSE: replay buffered events, then live
     POST /v1/agent/runs/{id}/approval      {"decision": "approve"|"deny"|"stop"}
+    POST /v1/agent/runs/{id}/message       follow-up: steer live / revive done
     POST /v1/agent/runs/{id}/stop          abort the run
 
 Design notes:
@@ -85,6 +86,10 @@ class AgentRunRequest(BaseModel):
 
 class ApprovalRequest(BaseModel):
     decision: str = Field(..., description="approve | deny | stop")
+
+
+class RunMessageRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="Follow-up user message for the run")
 
 
 # ── Run state ────────────────────────────────────────────────────────────
@@ -226,19 +231,33 @@ class AgentRun:
 
 # ── Worker ───────────────────────────────────────────────────────────────
 
-def _worker(run: AgentRun, get_engine):
+def _worker(run: AgentRun, get_engine, goal: str | None = None):
+    goal = run.goal if goal is None else goal
     old_cwd = os.getcwd()
     try:
         engine = get_engine()
 
         def build_system_prompt() -> str:
-            return (
-                "You are Artifex, an autonomous local agent running on the "
-                "user's own Windows PC.\n"
-                f"WORKSPACE: {run.folder}\n"
-                "You are already cd'd into the workspace; relative paths "
-                "resolve there. Prefer relative paths for files you create."
-            )
+            # Same prompt stack the Qt GUI uses — the full tool catalog
+            # (@read_file/@glob/@sysinfo/edit blocks/...) plus the sensed
+            # environment. The earlier 4-line stub documented NO tools, so
+            # phone-started runs guessed at their own capabilities.
+            from core.prompts import build_assistant_prompt
+            from tools.agent_tools import get_assistant_tools_prompt
+            try:
+                return build_assistant_prompt(
+                    get_assistant_tools_prompt(),
+                    os.getcwd(),
+                    workspace_text=run.folder,
+                )
+            except Exception:
+                _log.exception("full prompt build failed; using minimal prompt")
+                return (
+                    "You are Artifex, an autonomous local agent running on "
+                    f"the user's own PC.\nWORKSPACE: {run.folder}\n"
+                    "You are already cd'd into the workspace; relative paths "
+                    "resolve there."
+                )
 
         os.chdir(run.folder)
         with run._cond:
@@ -252,7 +271,7 @@ def _worker(run: AgentRun, get_engine):
             config=run.config,
             control=run.control,
         )
-        result = runner.run(run.goal, run.history)
+        result = runner.run(goal, run.history)
         run.finish(result.status, result.summary)
         _log.info("Agent run %s finished: %s (%d rounds, %d actions)",
                   run.id, result.status, result.rounds, result.actions_run)
@@ -377,6 +396,52 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
         if not run.answer_approval(decision):
             raise HTTPException(status_code=409, detail="Run is not awaiting approval")
         return {"ok": True, "decision": decision}
+
+    @app.post("/v1/agent/runs/{run_id}/message")
+    async def send_message(run_id: str, body: RunMessageRequest, request: Request):
+        """Follow-up user message: steer a live run, or continue a finished one.
+
+        Live run: the text is queued and picked up at the next round boundary
+        (the loop emits a user_message event at the actual pickup point). A
+        message queued in the run's final round is dropped when the run ends —
+        the client sees the terminal status and can resend, which revives.
+
+        Terminal run: the run restarts in place — same workspace, same history,
+        same event stream (indices continue) — with the text as the new goal.
+        Counts against the single-live-run rule like any other start.
+        """
+        _auth(request)
+        text = body.text.strip()
+        if not text:
+            raise HTTPException(status_code=422, detail="Empty message")
+        run = _get_run(run_id)
+
+        with _runs_lock:
+            if not run.terminal:
+                run.control.inject_message(text)
+                return {"queued": True, "run_id": run.id, "status": run.status}
+
+            live = next((r for r in _runs.values() if not r.terminal), None)
+            if live is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"message": "A run is already active", "run_id": live.id},
+                )
+            # Revive: reset control state and re-enter "starting" while the
+            # registry lock is held so _prune_finished can't reap us mid-flip.
+            run.control.reset()
+            run.summary = ""
+            run.finished_at = None
+            run.status = "starting"
+
+        run.emit(AgentEvent("user_message", text=text, round=0))
+        run.thread = threading.Thread(
+            target=_worker, args=(run, get_engine), kwargs={"goal": text},
+            name=f"agent-run-{run.id}", daemon=True,
+        )
+        run.thread.start()
+        _log.info("Agent run %s revived with follow-up: %r", run.id, text[:120])
+        return {"revived": True, "run_id": run.id, "status": run.status}
 
     @app.post("/v1/agent/runs/{run_id}/stop")
     async def stop_run(run_id: str, request: Request):

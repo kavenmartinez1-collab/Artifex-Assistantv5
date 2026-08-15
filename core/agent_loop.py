@@ -144,6 +144,19 @@ class RunControl:
     def __init__(self):
         self._stop = threading.Event()
         self._pause = threading.Event()
+        self._msg_lock = threading.Lock()
+        self._messages: list[str] = []
+
+    def inject_message(self, text: str):
+        """Queue a user follow-up for the loop to pick up at the next round
+        boundary. Safe from any thread; the loop drains via drain_messages()."""
+        with self._msg_lock:
+            self._messages.append(text)
+
+    def drain_messages(self) -> list[str]:
+        with self._msg_lock:
+            out, self._messages[:] = list(self._messages), []
+            return out
 
     def request_stop(self):
         self._stop.set()
@@ -233,6 +246,13 @@ class AgentRunner:
             if self._over_wall_clock():
                 self.emit(AgentEvent("stopped", reason="time limit", round=rnd))
                 return self._finish("stopped:timeout", history)
+
+            # Follow-up messages from the host (phone/GUI) land between
+            # rounds as ordinary user turns, so the next generation sees
+            # them exactly like mid-task steering in a chat.
+            for injected in self.control.drain_messages():
+                history.append({"role": "user", "content": injected})
+                self.emit(AgentEvent("user_message", text=injected, round=rnd))
 
             self.emit(AgentEvent("round_start", round=rnd))
             self._set_system_prompt(history)
