@@ -7,13 +7,19 @@ through core.sandbox.fs_sandbox.check_path (deny list first, then allowed
 roots), so the file panel can see precisely what an agent action could
 touch and nothing more.
 
-    GET /v1/files?path=<dir>            list a directory (default: repo root)
+    GET /v1/files?path=<dir>            list a directory (default: the jail root)
     GET /v1/files/read?path=<file>      text content, capped, truncation flagged
     GET /v1/files/download?path=<file>  raw file
     PUT /v1/files/upload?dir=&name=     raw request body -> dir/name
 
 Upload takes the raw body (filename in the query) instead of multipart so
 no new dependency (python-multipart) enters the tree.
+
+Reach is JAILED to the root passed at registration (the agent-runs
+directory) — an artifact space, not a repo browser. The wider fs sandbox
+check still runs on top (deny list, symlink resolution), but nothing
+outside the jail is listable, readable, or writable through these routes
+even though the agent's own sandbox is broader.
 """
 from __future__ import annotations
 
@@ -35,24 +41,35 @@ _MAX_UPLOAD = 50 * 1024 * 1024  # raw-body upload cap
 _NAME_RE = re.compile(r"^[^\\/:*?\"<>|\x00-\x1f]{1,120}$")  # single component
 
 
-def _checked(path: str) -> str:
-    """abspath + sandbox check; raises 403 with the sandbox's reason."""
-    p = os.path.abspath(os.path.expanduser(path or ""))
-    reason = check_path(p)
-    if reason:
-        raise HTTPException(status_code=403, detail=reason)
-    return p
-
-
 def register_file_routes(app, check_auth, default_root: str):
+    jail = os.path.realpath(os.path.abspath(default_root))
+    os.makedirs(jail, exist_ok=True)
+
     def _auth(request: Request):
         if not check_auth(request):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
+    def _in_jail(p: str) -> bool:
+        # realpath so a symlink inside the jail can't point the browser out.
+        rp = os.path.realpath(p)
+        return rp == jail or rp.startswith(jail + os.sep)
+
+    def _checked(path: str) -> str:
+        """abspath + jail + sandbox check; raises 403 with the reason."""
+        p = os.path.abspath(os.path.expanduser(path or ""))
+        if not _in_jail(p):
+            raise HTTPException(
+                status_code=403,
+                detail="outside the agent workspace area")
+        reason = check_path(p)
+        if reason:
+            raise HTTPException(status_code=403, detail=reason)
+        return p
+
     @app.get("/v1/files")
     async def list_dir(request: Request, path: str = ""):
         _auth(request)
-        p = _checked(path or default_root)
+        p = _checked(path or jail)
         if not os.path.isdir(p):
             raise HTTPException(status_code=404, detail="Not a directory")
         entries = []
@@ -76,9 +93,10 @@ def register_file_routes(app, check_auth, default_root: str):
         parent = os.path.dirname(p)
         return {
             "path": p,
-            # Only offer a parent the sandbox would actually allow —
-            # the client uses this for its ".." affordance.
-            "parent": parent if (parent != p and not check_path(parent)) else None,
+            # Only offer a parent inside the jail — the client uses this
+            # for its ".." affordance; None means "you're at the top".
+            "parent": parent if (parent != p and _in_jail(parent)
+                                 and not check_path(parent)) else None,
             "entries": entries[:_MAX_LIST],
             "truncated": truncated,
         }

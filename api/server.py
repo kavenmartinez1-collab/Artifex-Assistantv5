@@ -1360,12 +1360,15 @@ def create_app():
     register_session_routes(app, check_auth=_check_auth, session_dir=SESSION_DIR)
 
     # ─── Workspace files ─────────────────────────────────────────────────
-    # Browse/read/download/upload within the agent's exact sandbox reach.
+    # Browse/read/download/upload, JAILED to the agent-runs area — an
+    # artifact space for the phone, not a repo browser.
 
     from core.config import BASE_DIR
     from api.files_api import register_file_routes
-    register_file_routes(app, check_auth=_check_auth,
-                         default_root=os.path.abspath(BASE_DIR))
+    register_file_routes(
+        app, check_auth=_check_auth,
+        default_root=os.path.join(os.path.abspath(BASE_DIR),
+                                  "output", "agent_runs"))
 
     from api.agent_api import register_agent_routes
     register_agent_routes(
