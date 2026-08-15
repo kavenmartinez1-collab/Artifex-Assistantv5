@@ -263,21 +263,22 @@
              calc(var(--sab) + 8px) calc(var(--gut) + var(--sal));
     background: var(--panel); border-top: 1px solid var(--border);
   }
-  #chat-input {
+  /* The agent follow-up composer reuses the chat composer wholesale. */
+  #chat-input, #agent-msg {
     flex: 1; min-width: 0; resize: none; border-radius: 12px;
     border: 1px solid var(--border);
     background: var(--panel2); color: var(--text); padding: 11px 12px;
     /* 16px is the floor: anything smaller and iOS zooms the page on focus. */
     font: 16px/1.35 inherit; max-height: 120px; min-height: var(--tap);
   }
-  #chat-input:focus { outline: none; border-color: var(--accent); }
-  #send-btn {
+  #chat-input:focus, #agent-msg:focus { outline: none; border-color: var(--accent); }
+  #send-btn, #agent-send {
     border: none; border-radius: 12px; background: var(--accent); color: #06121f;
     font-weight: 700; font-size: 15px; padding: 0 16px;
     min-height: var(--tap); min-width: 66px; flex: none;
   }
   #send-btn.stop { background: var(--err); color: #fff; }
-  #send-btn:disabled { opacity: .45; }
+  #send-btn:disabled, #agent-send:disabled { opacity: .45; }
 
   /* ── Agent view ─────────────────────────────────────── */
   #agent-scroll {
@@ -307,12 +308,19 @@
     font-size: 15px; padding: 0 12px; min-height: 48px;
   }
   #agent-start:disabled { opacity: .4; }
+  /* Two stacked rows: status + Stop, then the follow-up composer (which
+     appears as soon as a run exists and stays after it ends — a finished
+     run is revivable in place). One padded container so the home-indicator
+     inset is applied once. */
   #agent-bar {
-    display: flex; align-items: center; gap: 10px; flex: none;
+    display: flex; flex-direction: column; align-items: stretch; gap: 7px;
+    flex: none;
     padding: 8px calc(var(--gut) + var(--sar))
              calc(var(--sab) + 8px) calc(var(--gut) + var(--sal));
     background: var(--panel); border-top: 1px solid var(--border);
   }
+  #agent-bar .ab-row { display: flex; gap: 8px; align-items: center; }
+  #agent-composer { align-items: flex-end; }
   #agent-status {
     flex: 1; min-width: 0; font-size: 12px; color: var(--dim);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -368,6 +376,19 @@
   .ev-msg {
     background: var(--panel); border: 1px solid var(--border);
     border-radius: 10px; padding: 9px 11px; overflow-wrap: anywhere;
+  }
+  /* Follow-up the user sent into the run. Right-aligned and plain text, so
+     it reads the same as a user turn in the chat tab. */
+  .ev-user {
+    margin: 0 0 9px auto; max-width: 88%;
+    background: var(--user); border: 1px solid #2b4a75;
+    border-radius: 12px; padding: 9px 11px;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .ev-user.pending { opacity: .55; border-style: dashed; }
+  .ev-user .q {
+    display: block; margin-top: 4px; font-size: 10.5px;
+    letter-spacing: 1px; color: var(--dim);
   }
   .ev-stream {
     background: var(--panel); border: 1px dashed var(--border);
@@ -497,7 +518,7 @@
     #approval .ap-btns { gap: 6px; }
     #approval .ap-btns button { font-size: 13px; }
     #agent-stop { min-width: 80px; padding: 0 12px; }
-    #send-btn { min-width: 58px; padding: 0 12px; }
+    #send-btn, #agent-send { min-width: 58px; padding: 0 12px; }
   }
   /* ── Landscape / short viewports ────────────────────── */
   @media (max-height: 460px) {
@@ -579,8 +600,15 @@
     </div>
   </div>
   <div id="agent-bar">
-    <span id="agent-status">No run.</span>
-    <button id="agent-stop" class="hidden" onclick="stopAgentRun()">Stop</button>
+    <div class="ab-row">
+      <span id="agent-status">No run.</span>
+      <button id="agent-stop" class="hidden" onclick="stopAgentRun()">Stop</button>
+    </div>
+    <div class="ab-row hidden" id="agent-composer">
+      <textarea id="agent-msg" rows="1" enterkeyhint="send"
+        placeholder="Continue with a follow-up..."></textarea>
+      <button id="agent-send" onclick="sendAgentMessage()">Send</button>
+    </div>
   </div>
 </div>
 
@@ -1395,6 +1423,7 @@ let agentRetryTimer = null;
 let agentRetries = 0;
 let agStream = null;              // live chunk block {wrap, think, tb, txt}
 let agChip = null;                // chip for the action currently in flight
+let agPending = [];               // follow-ups POSTed but not yet echoed back
 
 const feed = () => $("agent-feed");
 
@@ -1437,6 +1466,37 @@ function updateAgentUi() {
   $("agent-start").disabled = live;
   $("agent-stop").classList.toggle("hidden", !live);
   $("tab-agent").classList.toggle("live", live);
+  // The composer appears as soon as a run exists and stays after it ends:
+  // a terminal run is revived in place by the same endpoint.
+  $("agent-composer").classList.toggle("hidden", !agentRunId);
+  $("agent-send").disabled = !agentRunId;
+  $("agent-msg").placeholder = live ? "Steer the run..." : "Continue with a follow-up...";
+}
+
+// ── Follow-up messages ────────────────────────────────────
+// POST is acknowledged immediately but the run only picks the text up at its
+// next round boundary, where it emits a persisted user_message event. Until
+// that echo arrives the bubble is shown dimmed; the echo reconciles it.
+function agentUserBubble(text, pending) {
+  const b = el("div", "ev ev-user" + (pending ? " pending" : ""));
+  b.appendChild(document.createTextNode(text));
+  if (pending) b.appendChild(el("span", "q", "queued..."));
+  return feedAdd(b);
+}
+function confirmPending(text) {
+  // The server truncates event text at 8000 chars, so a very long follow-up
+  // comes back as a prefix of what we sent — match that too.
+  let idx = -1;
+  for (let n = 0; n < agPending.length; n++) {
+    const p = agPending[n];
+    if (p.text === text || (text.length >= 8000 && p.text.indexOf(text) === 0)) { idx = n; break; }
+  }
+  if (idx < 0) return false;
+  const p = agPending.splice(idx, 1)[0];
+  p.el.classList.remove("pending");
+  const q = p.el.querySelector(".q");
+  if (q) q.remove();
+  return true;
 }
 
 // ── Live chunk block (assistant/thinking tokens, live listeners only) ──
@@ -1607,6 +1667,7 @@ function beginRun(runId, since, attaching) {
   agentLastI = since > 0 ? since - 1 : -1;
   agentRetries = 0;
   agChip = null;
+  agPending = [];        // a NEW run drops any follow-ups aimed at the old one
   agentEndChunks();
   rememberRun();
   updateAgentUi();
@@ -1615,6 +1676,96 @@ function beginRun(runId, since, attaching) {
     agentNote("Attached to run " + runId + ".");
   }
   agentAttach(since);
+}
+
+// Send one follow-up. Live run -> queued for the next round boundary.
+// Terminal run -> revived in place, same workspace/history/event indices.
+async function sendAgentText(text, isResend) {
+  const bubble = agentUserBubble(text, true);
+  const entry = { text: text, el: bubble, resent: !!isResend };
+  agPending.push(entry);
+  const drop = () => {
+    const n = agPending.indexOf(entry);
+    if (n >= 0) agPending.splice(n, 1);
+    bubble.remove();
+  };
+  try {
+    const r = await fetch("/v1/agent/runs/" + agentRunId + "/message", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ text: text }),
+    });
+    let data = null;
+    try { data = await r.json(); } catch (e) {}
+    if (r.status === 409 && data && data.detail && data.detail.run_id) {
+      drop();
+      agentNote("Another run is active - attaching to it.", "warn");
+      beginRun(data.detail.run_id, 0, true);
+      return false;
+    }
+    if (r.status === 404) {
+      drop();
+      agentNote("That run no longer exists on the server.", "warn");
+      clearRunRef();
+      return false;
+    }
+    if (!r.ok) {
+      drop();
+      const d = data && data.detail;
+      agentNote("Message failed: " + (typeof d === "string" ? d : "HTTP " + r.status), "bad");
+      return false;
+    }
+    if (data && data.revived) {
+      // Restarted in place: indices continue, so resume from where we left off.
+      agentDone = false;
+      agentSawEnd = false;
+      agentRetries = 0;
+      agentNote("- run revived -", "good");
+      rememberRun();
+      updateAgentUi();
+      agentAttach(agentLastI + 1);
+    }
+    return true;
+  } catch (e) {
+    drop();
+    agentNote("Message failed: " + e.message, "bad");
+    return false;
+  }
+}
+
+function sendAgentMessage() {
+  const box = $("agent-msg");
+  const text = box.value.trim();
+  if (!text || !agentRunId) return;
+  if (!store.k) { toggleDrawer(); return; }
+  box.value = "";
+  box.style.height = "auto";
+  sendAgentText(text, false);
+}
+
+// The run ended before picking a queued follow-up up (the server drops
+// anything queued during the final round). Resend it once, which revives the
+// run; if it is dropped a second time, hand the text back to the composer
+// rather than looping.
+function handleDroppedPendings() {
+  if (!agPending.length) return;
+  const dropped = agPending.splice(0);
+  dropped.forEach(p => p.el.remove());
+  const stale = dropped.filter(p => p.resent);
+  const fresh = dropped.filter(p => !p.resent);
+  if (stale.length) {
+    const box = $("agent-msg");
+    box.value = (box.value ? box.value + "\n" : "") + stale.map(p => p.text).join("\n");
+    agentNote("Follow-up still wasn't picked up - text put back in the composer.", "warn");
+  }
+  if (!fresh.length) return;
+  agentNote("Run ended before your message was picked up - resending to continue it.", "warn");
+  (async () => {
+    for (const p of fresh) {
+      if (!agentRunId) break;
+      await sendAgentText(p.text, true);
+    }
+  })();
 }
 
 async function stopAgentRun() {
@@ -1654,7 +1805,12 @@ async function agentAttach(since) {
     const r = await fetch("/v1/agent/runs/" + runId + "/events?since=" + Math.max(0, since), {
       headers: authHeaders(), signal: ac.signal,
     });
-    if (r.status === 404) { agentNote("Run " + runId + " is gone.", "warn"); finishRun("gone", ""); return; }
+    if (r.status === 404) {
+      agentNote("Run " + runId + " is gone.", "warn");
+      finishRun("gone", "");
+      clearRunRef();
+      return;
+    }
     if (r.status === 401) {
       // Retrying with the same bad key would just spin the backoff.
       agentNote("Invalid API key - check Settings, then reopen this tab.", "bad");
@@ -1705,7 +1861,8 @@ function scheduleReattach() {
     if (!agentRunId || agentDone) return;
     try {
       const r = await fetch("/v1/agent/runs/" + agentRunId, { headers: authHeaders() });
-      if (!r.ok) { finishRun("gone", ""); return; }
+      if (r.status === 404) { finishRun("gone", ""); clearRunRef(); return; }
+      if (!r.ok) { scheduleReattach(); return; }   // 401/5xx: keep the run ref
       const s = await r.json();
       if (isTerminalStatus(s.status)) { renderFinal(s.status, s.summary); return; }
       if (s.pending_approval) showApproval(s.pending_approval, s.pending_approval.action ? "action" : "gate");
@@ -1716,14 +1873,26 @@ function scheduleReattach() {
   }, Math.min(2000 + agentRetries * 500, 8000));
 }
 
+// A terminal run is NOT forgotten: it can be revived in place by a follow-up,
+// so the stored id/index survives a page reload. Storage is cleared only by
+// starting a new run (beginRun overwrites both keys) or by clearRunRef() when
+// the server says the run is gone.
 function finishRun(status, summary) {
   agentDone = true;
   agGenerating = false;
   agentEndChunks();
   hideApproval();
   agentDetach();
-  forgetRun();
   setAgentStatus(status ? "run " + status : "no run");
+  updateAgentUi();
+}
+
+function clearRunRef() {
+  forgetRun();
+  agentRunId = null;
+  agentLastI = -1;
+  agPending.forEach(p => p.el.remove());
+  agPending = [];
   updateAgentUi();
 }
 
@@ -1760,6 +1929,11 @@ function agentEvent(ev) {
       agGenerating = true;
       feedAdd(el("div", "ev ev-round", "ROUND " + (ev.round || "?")));
       setAgentStatus("run " + agentRunId + " - round " + (ev.round || "?"));
+      break;
+    case "user_message":
+      // Echo of a follow-up at the point the run actually picked it up (or
+      // round 0 of a revival). Reconcile the dimmed bubble we already showed.
+      if (!confirmPending(ev.text || "")) agentUserBubble(ev.text || "", false);
       break;
     case "assistant_message": {
       agGenerating = false;
@@ -1829,6 +2003,7 @@ function agentEvent(ev) {
       agentNote("— run " + (ev.status || "finished") + " —", "good");
       agentSawEnd = true;
       finishRun(ev.status || "finished", ev.summary || "");
+      handleDroppedPendings();   // anything queued in the final round was lost
       break;
     default:
       agentNote(k + (ev.reason ? ": " + ev.reason : ""), "");
@@ -1845,24 +2020,30 @@ async function agentBoot() {
   agentBooting = true;
   try {
     const r = await fetch("/v1/agent/runs/" + id, { headers: authHeaders() });
-    if (!r.ok) { forgetRun(); return; }
+    // 404 is the one answer that means "forget it"; 401/5xx keep the ref so a
+    // fixed key or a restarted server can still pick the run back up.
+    if (r.status === 404) { forgetRun(); return; }
+    if (!r.ok) return;
     const s = await r.json();
-    if (isTerminalStatus(s.status)) {
-      forgetRun();
-      return;
-    }
+    const terminal = isTerminalStatus(s.status);
     agentRunId = id;
     agentLastI = lastI;
-    agentDone = false;
+    agentDone = terminal;
     agentRetries = 0;
+    agPending = [];
     $("agent-setup").open = false;
     feed().innerHTML = "";
-    agentNote("Reattached to run " + id + " (" + s.status + ").");
+    // A finished run is kept and shown: the composer below revives it.
+    agentNote(terminal
+      ? "Run " + id + " finished (" + s.status + "). Send a follow-up to continue it."
+      : "Reattached to run " + id + " (" + s.status + ").");
     if (s.goal) agentNote("Goal: " + s.goal);
     if (s.pending_approval) {
       showApproval(s.pending_approval, s.pending_approval.action ? "action" : "gate");
     }
     updateAgentUi();
+    // Drains anything that landed after our last seen index. For a terminal
+    // run that is the missed tail plus an immediate `end`.
     agentAttach(agentLastI + 1);
   } catch (e) {
     /* offline: leave the stored run alone, boot will retry on reconnect */
@@ -1887,6 +2068,13 @@ inputEl.addEventListener("input", function () {
 inputEl.addEventListener("keydown", function (e) {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
+$("agent-msg").addEventListener("input", function () {
+  this.style.height = "auto";
+  this.style.height = Math.min(this.scrollHeight, 120) + "px";
+});
+$("agent-msg").addEventListener("keydown", function (e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendAgentMessage(); }
+});
 $("api-key").addEventListener("change", () => store.save());
 
 // ── On-screen keyboard ───────────────────────────────────
@@ -1904,9 +2092,10 @@ $("api-key").addEventListener("change", () => store.save());
     const focused = a && FIELD.test(a.tagName);
     const gap = window.innerHeight - vv.height - vv.offsetTop;
     const kb = (focused && gap > 60) ? Math.round(gap) : 0;
-    const wasPinned = isPinned(messagesDiv);      // measure before resizing
+    const box = activeTab === "agent" ? $("agent-scroll") : messagesDiv;
+    const wasPinned = isPinned(box);              // measure before resizing
     document.documentElement.style.setProperty("--kb", kb + "px");
-    if (wasPinned) pinTo(messagesDiv);            // never yank a scrolled-up reader
+    if (wasPinned) pinTo(box);                    // never yank a scrolled-up reader
     updateToBottom();
   };
   vv.addEventListener("resize", apply);
