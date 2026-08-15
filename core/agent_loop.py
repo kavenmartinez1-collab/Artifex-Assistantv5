@@ -322,12 +322,32 @@ class AgentRunner:
                 self.emit(AgentEvent("action_proposed", action=action,
                                      decision=decision, round=rnd))
 
+                sandbox_approved = False
                 if not decision.allowed:
-                    self.emit(AgentEvent("blocked", action=action,
-                                         reason=decision.reason, round=rnd))
-                    outputs.append(f"[BLOCKED by policy] {action.display}: {decision.reason}")
-                    deferred_done_ok = False
-                    continue
+                    # Outside-sandbox (scope) blocks become approval prompts
+                    # when a human is supervising — the protection is the
+                    # person in the loop, not the wall. Deny-list hits
+                    # ("fs_sandbox") and unattended full-auto runs stay hard.
+                    promptable = (
+                        decision.matched_rule == "fs_sandbox_scope"
+                        and self.config.autonomy != AutonomyLevel.FULL_AUTO
+                    )
+                    if not promptable:
+                        self.emit(AgentEvent("blocked", action=action,
+                                             reason=decision.reason, round=rnd))
+                        outputs.append(f"[BLOCKED by policy] {action.display}: {decision.reason}")
+                        deferred_done_ok = False
+                        continue
+                    self.emit(AgentEvent("approval_required", action=action,
+                                         decision=decision, round=rnd))
+                    dec = self.request_approval(action, decision, "")
+                    if dec == Decision.STOP:
+                        return self._finish("stopped:user", history)
+                    if dec == Decision.DENY:
+                        outputs.append(f"[skipped by user] {action.display}")
+                        deferred_done_ok = False
+                        continue
+                    sandbox_approved = True
 
                 # Circuit breaker — catch runaway loops before executing.
                 trip = self.breaker.check_and_trip()
@@ -337,7 +357,7 @@ class AgentRunner:
                         return self._finish("stopped:breaker", history)
                     self.breaker.acknowledge()
 
-                if self._needs_approval(action, decision):
+                if not sandbox_approved and self._needs_approval(action, decision):
                     self.emit(AgentEvent("approval_required", action=action,
                                          decision=decision, round=rnd))
                     dec = self.request_approval(action, decision, "")

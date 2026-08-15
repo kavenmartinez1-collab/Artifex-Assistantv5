@@ -257,17 +257,26 @@ def extract_paths_from_content(action_type: str, content: str) -> list[str]:
 # ── Policy hook ──────────────────────────────────────────────────────────────
 
 def _fs_sandbox_hook(action_type: str, content: str, risk: RiskLevel):
-    """Policy hook that checks file paths against the sandbox."""
+    """Policy hook that checks file paths against the sandbox.
+
+    Two distinct rule tags so hosts can treat them differently:
+    - "fs_sandbox"       — deny-list hit (credentials, keys, system files).
+      Absolute; never promptable.
+    - "fs_sandbox_scope" — path is merely outside the allowed roots. A
+      supervised loop (guided/manual) may surface this as an approval
+      prompt instead of a wall; unattended (full-auto) hosts keep it hard.
+    """
     paths = extract_paths_from_content(action_type, content)
     for path in paths:
         reason = check_path(path)
         if reason:
+            scope_only = reason.startswith("outside sandbox:")
             return PolicyDecision(
                 allowed=False,
                 requires_confirmation=False,
                 risk_level=risk,
                 reason=f"filesystem sandbox: {reason}",
-                matched_rule="fs_sandbox",
+                matched_rule="fs_sandbox_scope" if scope_only else "fs_sandbox",
             )
     return None
 
