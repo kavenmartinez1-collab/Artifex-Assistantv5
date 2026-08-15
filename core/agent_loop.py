@@ -89,6 +89,13 @@ class RunConfig:
     # presets own the full sampler chain. None/None keeps engine defaults.
     sampler_preset: Optional[str] = None
     sampling: Optional[dict] = None
+    # Thinking depth for models whose template exposes it (qwen3.8: low /
+    # medium / high / xhigh). None keeps the engine/template default — which
+    # on qwen3.8 is xhigh, measured to deliberate past the entire completion
+    # budget on some prompts and return zero content, so hosts that drive
+    # unattended runs should set "medium" explicitly. Passed to the engine
+    # only when its generate_streaming signature accepts it.
+    reasoning_effort: Optional[str] = None
     always_confirm_types: tuple = ("edit_file", "download")  # GUIDED always asks
     auto_approve_max_risk: str = "LOW"                       # GUIDED auto-runs <= this
     framing: bool = True   # wrap the prompt with the autonomous preamble + GOAL
@@ -116,6 +123,17 @@ class RunResult:
     actions_run: int = 0
     summary: str = ""
     history: list = field(default_factory=list)
+
+
+class GenerationAborted(Exception):
+    """Raised inside the token callback to cut off an in-flight generation.
+
+    Without it a stop request is only honored at the round boundary, so a
+    stop during a full-budget round leaves the run "running" for minutes
+    while the tokens drain (measured 48 s on a 4096-token round). Raising
+    from on_token unwinds the engine's SSE read loop; closing that
+    connection also makes llama-server abort the generation server-side.
+    """
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -220,6 +238,14 @@ class AgentRunner:
             self._set_system_prompt(history)
             active = self._active_messages(history)
             resp = self._generate(active)
+            if self.control.stop_requested:
+                # Mid-generation stop: keep whatever partial text streamed
+                # (the prose branch below would misread it as a completed
+                # answer and report "done" for a run the user killed).
+                if resp:
+                    history.append({"role": "assistant", "content": resp})
+                    self.emit(AgentEvent("assistant_message", text=resp, round=rnd))
+                return self._finish("stopped:user", history)
             if not resp and self._gen_error:
                 # Engine failure, not a model choice — don't report a clean
                 # "done" (empty resp with no actions would read as one).
@@ -453,6 +479,8 @@ class AgentRunner:
         samp = self._resolved_sampling()
         if samp is not None and (has_var_kw or "sampling" in params):
             kwargs["sampling"] = samp
+        if self.config.reasoning_effort and (has_var_kw or "reasoning_effort" in params):
+            kwargs["reasoning_effort"] = self.config.reasoning_effort
         return kwargs
 
     def _generate(self, active) -> str:
@@ -461,10 +489,14 @@ class AgentRunner:
         parts: List[str] = []
 
         def on_resp(t):
+            if self.control.stop_requested:
+                raise GenerationAborted()
             parts.append(t)
             self.emit(AgentEvent("assistant_chunk", text=t, round=self._round))
 
         def on_think(t):
+            if self.control.stop_requested:
+                raise GenerationAborted()
             self.emit(AgentEvent("thinking_chunk", text=t, round=self._round))
 
         # Engines that emit explicit <think> tags (llama.cpp, ollama) start
@@ -479,6 +511,12 @@ class AgentRunner:
                 active, max_tokens=self.config.max_tokens,
                 temperature=self.config.temperature, on_token=tf.feed,
                 **self._engine_gen_kwargs())
+        except GenerationAborted:
+            # User stop, not a failure: return the partial text so the
+            # transcript keeps what was said; the round loop's stop checks
+            # prevent any of its actions from running and end the run.
+            self._safe(tf.flush)
+            return "".join(parts)
         except Exception as e:
             _log.exception("agent_loop generation failed")
             self._gen_error = type(e).__name__
