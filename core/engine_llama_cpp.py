@@ -204,6 +204,11 @@ class LlamaCppEngine(BaseEngine):
         self._active_gpu_index: int | None = None
         self._process = None
         self._loaded = False
+        # True when load() adopted a server some other process launched
+        # (GUI, another API instance, or a machine-level scheduled task
+        # that keeps a model warm).  Adopted servers are not ours to
+        # terminate on unload.
+        self._adopted = False
         self._base_url = f"http://localhost:{self.port}"
         self._last_gen_stats = {}
 
@@ -238,6 +243,21 @@ class LlamaCppEngine(BaseEngine):
                 return data.get("status") == "ok"
         except Exception:
             return False
+
+    def _served_model_path(self) -> str | None:
+        """Model path reported by the server on our port (GET /props).
+
+        Returns None when it can't be determined — endpoint missing,
+        timeout, unexpected shape.  Callers must treat None as "unknown
+        model", not as a match.
+        """
+        try:
+            req = urllib.request.Request(f"{self._base_url}/props")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read())
+            return data.get("model_path") or None
+        except Exception:
+            return None
 
     def _get_kv_quant_bpe(self):
         """(bpe_k, bpe_v) from -ctk/-ctv in extra_flags.  Defaults to f16."""
@@ -340,14 +360,36 @@ class LlamaCppEngine(BaseEngine):
         if self._loaded and self._is_server_healthy():
             return
 
-        # Another process (API server or GUI) may already have a healthy
-        # server on our port — adopt it instead of launching a duplicate.
+        # Another process (API server, GUI, or a machine-level scheduled
+        # task that keeps a model warm) may already have a healthy server
+        # on our port — adopt it instead of launching a duplicate.  Verify
+        # it serves OUR model first: a stale orphan from a different model
+        # config answers /health just as happily, and adopting it blindly
+        # would turn a model switch into a no-op that returns wrong-model
+        # completions.
         if self._is_server_healthy():
-            self._loaded = True
-            _log.info("Adopting existing llama-server on port %d", self.port)
-            if status_callback:
-                status_callback(f"llama-server already running — {self.model_name}")
-            return
+            served = self._served_model_path()
+            ours = os.path.basename(self.model_path).casefold()
+            if served and os.path.basename(served).casefold() == ours:
+                self._loaded = True
+                self._adopted = True
+                _log.info(
+                    "Adopting existing llama-server on port %d (verified: %s)",
+                    self.port, os.path.basename(served),
+                )
+                if status_callback:
+                    status_callback(f"llama-server already running — {self.model_name}")
+                return
+            # Wrong model, or a build too old to report one (served is
+            # None): reclaim the port and launch our own.  This is the
+            # stale-orphan path that adopted-server termination used to
+            # cover from the unload side.
+            _log.warning(
+                "Healthy llama-server on port %d serves %r, not %r — "
+                "terminating it and launching our own",
+                self.port, served, os.path.basename(self.model_path),
+            )
+            self._kill_listener_on_port()
 
         if not os.path.isfile(self.model_path):
             raise FileNotFoundError(f"Model GGUF not found: {self.model_path}")
@@ -522,18 +564,28 @@ class LlamaCppEngine(BaseEngine):
     def _kill_process(self):
         """Stop the llama-server bound to this engine.
 
-        Two paths because load() has two paths: when we spawned the
-        process ourselves we have a Popen handle and terminate via that;
-        when load() adopted an already-running server we have no Popen
-        handle (self._process is None) and must look up the listener by
-        port and terminate the OS process directly.
+        Three paths, mirroring how load() acquired the server:
 
-        Without the second path, unload() silently leaves an adopted
-        server running and the next load() re-adopts the same orphan,
-        which is how a model/ctx-tier "switch" can be a no-op at the
-        server level even though the queue thinks it succeeded.
+        - We spawned it: terminate via our Popen handle.
+        - We adopted it: leave it RUNNING and just drop our reference.
+          Adopted means another process owns it (the GUI, or a scheduled
+          task that keeps a model warm for tailnet clients); the idle
+          unload exists to free VRAM *this engine* allocated, and killing
+          an externally-owned server turns "release to free VRAM" into a
+          machine-wide outage until someone relaunches it.  The stale-
+          orphan hazard that adopted-kill used to cover is now handled at
+          adoption time: load() verifies the served model via /props and
+          reclaims the port on mismatch, so a wrong-model orphan can't be
+          silently re-adopted.
+        - Neither (state lost, e.g. a previous API run crashed after
+          spawning): look up the listener by port and terminate it.
         """
-        if self._process and self._process.poll() is None:
+        if self._adopted:
+            _log.info(
+                "Releasing adopted llama-server on port %d without "
+                "terminating it (externally managed)", self.port,
+            )
+        elif self._process and self._process.poll() is None:
             self._process.terminate()
             try:
                 self._process.wait(timeout=10)
@@ -543,15 +595,17 @@ class LlamaCppEngine(BaseEngine):
         elif self._is_server_healthy():
             self._kill_listener_on_port()
         self._process = None
+        self._adopted = False
 
     def _kill_listener_on_port(self):
         """Find and terminate a llama-server listening on self.port.
 
-        Used by _kill_process() when this engine adopted an existing
-        server — without this, unload would be a no-op for adopted
-        servers.  Scopes the kill to processes whose executable name
-        contains 'llama-server' so an unrelated service that happens to
-        bind the port is left alone.
+        Used when the port must be reclaimed from a server we did not
+        spawn and cannot adopt: a wrong-model orphan found at adoption
+        time, or a leftover from a crashed previous run.  Scopes the
+        kill to processes whose executable name contains 'llama-server'
+        so an unrelated service that happens to bind the port is left
+        alone.
         """
         import psutil
         matches: list[psutil.Process] = []
@@ -584,7 +638,7 @@ class LlamaCppEngine(BaseEngine):
         for proc in matches:
             try:
                 _log.info(
-                    "Terminating adopted llama-server pid=%d on port %d",
+                    "Terminating llama-server pid=%d holding port %d",
                     proc.pid, self.port,
                 )
                 proc.terminate()
