@@ -252,13 +252,21 @@ class AgentRunner:
                                          reason="announced a plan, took no action"))
                     history.append({"role": "user", "content": self._stall_nudge()})
                     continue
-            if done is not None or not actions:
+            if not actions:
                 summary = done if done else resp.strip()
                 self.emit(AgentEvent("done", summary=summary, round=rnd))
                 return self._finish("done", history, summary)
 
+            # NOTE: a response carrying BOTH actions and @done falls through to
+            # the executor below. Returning here (the old behavior) discarded
+            # the actions *and* reported success — a run recorded as
+            # "done: wrote answer.txt" with no answer.txt on disk. Models that
+            # batch their final write with @done in one turn (Qwen3.8 does this
+            # routinely) silently lost that write. The deferred @done is
+            # honored after the actions run, and only if they all succeeded.
             outputs: List[str] = []
             pending_edits: List[str] = []
+            deferred_done_ok = True
             for action in actions:
                 if self.control.stop_requested:
                     return self._finish("stopped:user", history)
@@ -272,6 +280,7 @@ class AgentRunner:
                     self.emit(AgentEvent("blocked", action=action,
                                          reason=decision.reason, round=rnd))
                     outputs.append(f"[BLOCKED by policy] {action.display}: {decision.reason}")
+                    deferred_done_ok = False
                     continue
 
                 # Circuit breaker — catch runaway loops before executing.
@@ -290,6 +299,7 @@ class AgentRunner:
                         return self._finish("stopped:user", history)
                     if dec == Decision.DENY:
                         outputs.append(f"[skipped by user] {action.display}")
+                        deferred_done_ok = False
                         continue
 
                 self.emit(AgentEvent("action_started", action=action, round=rnd))
@@ -310,6 +320,7 @@ class AgentRunner:
                 else:
                     self.breaker.record_failure(action.content)
                     consecutive_failures += 1
+                    deferred_done_ok = False
                 self.gate.record_action(decision.risk_level)
 
                 if self.km:
@@ -344,6 +355,14 @@ class AgentRunner:
                 self.gate.acknowledge_gate(rnd)
 
             history.append({"role": "user", "content": self._feedback(outputs)})
+
+            # @done arrived alongside the actions we just ran. Honor it only if
+            # every action actually succeeded; otherwise drop back into the
+            # loop so the model sees the failure in its feedback and can
+            # recover, instead of us accepting a success claim it can't back up.
+            if done is not None and deferred_done_ok:
+                self.emit(AgentEvent("done", summary=done, round=rnd))
+                return self._finish("done", history, done)
 
         self.emit(AgentEvent("stopped", reason=f"max rounds ({self.config.max_rounds})",
                              round=self._round))
