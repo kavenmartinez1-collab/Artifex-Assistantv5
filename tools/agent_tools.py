@@ -696,6 +696,10 @@ def extract_agent_actions(response):
     if re.search(r'@architecture\(\s*\)', marker_text):
         actions.append(AgentAction("architecture", "", "architecture: project map"))
 
+    # @sysinfo()
+    if re.search(r'@sysinfo\(\s*\)', marker_text):
+        actions.append(AgentAction("sysinfo", "", "sysinfo: machine specs"))
+
     # @read_function("filepath", "function_name")
     read_fn_matches = re.findall(
         r'@read_function\(["\'](.+?)["\']\s*,\s*["\'](.+?)["\']\)',
@@ -2117,6 +2121,84 @@ def agent_auto_exec_enabled() -> bool:
     return bool(AGENT_KEY)
 
 
+def run_sysinfo() -> tuple[bool, str]:
+    """Machine snapshot: OS, CPU, RAM, GPUs, disks. Read-only, no shell.
+
+    Exists because "what are this machine's specs" is a common ask that
+    otherwise costs several risk-budgeted shell rounds and tempts the model
+    into tools the platform may not ship (wmic). Sources: platform/psutil,
+    plus the Windows registry for the CPU name and per-GPU VRAM —
+    HardwareInformation.qwMemorySize is the accurate figure; WMI's
+    AdapterRAM is a 32-bit field that caps at 4 GB.
+    """
+    import platform
+    lines = [f"OS: {platform.system()} {platform.release()} "
+             f"build {platform.version()} ({platform.machine()})"]
+
+    cpu = platform.processor() or "unknown"
+    if IS_WINDOWS:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+                cpu = winreg.QueryValueEx(k, "ProcessorNameString")[0].strip()
+        except OSError:
+            pass
+    try:
+        import psutil
+        lines.append(f"CPU: {cpu} — {psutil.cpu_count(logical=False)} cores / "
+                     f"{psutil.cpu_count()} threads")
+        vm = psutil.virtual_memory()
+        lines.append(f"RAM: {vm.total / 2**30:.1f} GB total, "
+                     f"{vm.available / 2**30:.1f} GB available")
+    except ImportError:
+        lines.append(f"CPU: {cpu}")
+
+    if IS_WINDOWS:
+        try:
+            import winreg
+            base = (r"SYSTEM\CurrentControlSet\Control\Class"
+                    r"\{4d36e968-e325-11ce-bfc1-08002be10318}")
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as cls:
+                for i in range(32):
+                    try:
+                        sub = winreg.EnumKey(cls, i)
+                    except OSError:
+                        break
+                    if not sub.isdigit():
+                        continue
+                    try:
+                        with winreg.OpenKey(cls, sub) as k:
+                            name = winreg.QueryValueEx(k, "DriverDesc")[0]
+                            try:
+                                raw = winreg.QueryValueEx(
+                                    k, "HardwareInformation.qwMemorySize")[0]
+                                vram = int.from_bytes(raw, "little") \
+                                    if isinstance(raw, bytes) else int(raw)
+                                lines.append(f"GPU: {name} — "
+                                             f"{vram / 2**30:.0f} GB VRAM")
+                            except OSError:
+                                lines.append(f"GPU: {name}")
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+
+    try:
+        import psutil
+        for part in psutil.disk_partitions(all=False):
+            try:
+                u = psutil.disk_usage(part.mountpoint)
+            except OSError:
+                continue
+            lines.append(f"Disk {part.mountpoint}: {u.free / 2**30:.1f} GB free "
+                         f"of {u.total / 2**30:.1f} GB")
+    except ImportError:
+        pass
+
+    return True, "\n".join(lines)
+
+
 def run_agent_action(action, confirm_cb=None, policy_check=True):
     """
     Dispatch an AgentAction to the appropriate executor.
@@ -2160,7 +2242,9 @@ def run_agent_action(action, confirm_cb=None, policy_check=True):
             if not confirm_cb(action, decision):
                 return False, "[NOT RUN — confirmation declined]"
 
-    if action.type == "shell":
+    if action.type == "sysinfo":
+        return run_sysinfo()
+    elif action.type == "shell":
         return run_shell_command(action.content, cwd=os.getcwd())
     elif action.type == "python":
         return run_python_snippet(action.content)

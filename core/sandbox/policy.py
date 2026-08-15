@@ -45,6 +45,7 @@ ACTION_RISK: dict[str, RiskLevel] = {
     "find_references":  RiskLevel.SAFE,
     "trace_imports":    RiskLevel.SAFE,
     "architecture":     RiskLevel.SAFE,
+    "sysinfo":          RiskLevel.SAFE,
     "search":           RiskLevel.LOW,
     "web_read":         RiskLevel.LOW,
     "edit_file":        RiskLevel.MEDIUM,

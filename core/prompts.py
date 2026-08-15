@@ -39,6 +39,7 @@ TOOLS:
 - @grep("pattern", "path") — search file contents (regex)
 - @glob("**/*.py") — find files by pattern
 - @trace_imports("path") — show import dependencies
+- @sysinfo() — this machine's specs: OS, CPU, RAM, GPUs, disks (use this, NOT shell commands)
 - @search("query") — web search
 - @web_read(N) or @web_read("url") — read web page or search result
 - @download("url") — download file to cwd
@@ -167,6 +168,7 @@ TOOLS:
 - @grep("pattern", "path") — search file contents (regex)
 - @glob("**/*.py") — find files by pattern
 - @trace_imports("path") — show import dependencies
+- @sysinfo() — this machine's specs: OS, CPU, RAM, GPUs, disks (use this, NOT shell commands)
 - @search("query") — web search
 - @web_read(N) or @web_read("url") — read web page or search result
 - @download("url") — download file to cwd
