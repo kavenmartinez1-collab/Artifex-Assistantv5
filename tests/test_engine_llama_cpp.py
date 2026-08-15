@@ -321,6 +321,104 @@ class TestEnableThinking(unittest.TestCase):
         self.assertNotIn("<think>", result)
 
 
+class TestDryPenaltyLastNCompat(unittest.TestCase):
+    """dry_penalty_last_n=-1 must not reach current llama-server builds.
+
+    -1 is llama.cpp's "scan the whole context" sentinel and is what
+    core.sampling ships as the neutral value, but current builds validate
+    the field as 0 <= n and reject -1 with HTTP 400.  Because the neutral
+    base always sends the key, an unresolved -1 fails *every* request, not
+    just ones using DRY.
+    """
+
+    def _make_engine(self, num_ctx=32768):
+        from core.engine_llama_cpp import LlamaCppEngine
+        engine = LlamaCppEngine("test", {"path": "/fake/model.gguf"})
+        engine._loaded = True
+        engine._base_url = "http://localhost:8081"
+        engine._is_server_healthy = lambda: True
+        engine._num_ctx = num_ctx
+        return engine
+
+    def _mock_resp(self):
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.__iter__ = MagicMock(return_value=iter([
+            b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]))
+        return mock_resp
+
+    def _body(self, mock_urlopen):
+        return json.loads(mock_urlopen.call_args[0][0].data.decode())
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_sentinel_resolved_to_ctx(self, mock_urlopen):
+        engine = self._make_engine(num_ctx=32768)
+        mock_urlopen.return_value = self._mock_resp()
+        engine.generate_streaming(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=10, temperature=0.7,
+            sampling={"dry_penalty_last_n": -1},
+        )
+        self.assertEqual(self._body(mock_urlopen)["dry_penalty_last_n"], 32768)
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_default_sampling_never_sends_negative(self, mock_urlopen):
+        """The shipped neutral base must survive a round trip."""
+        engine = self._make_engine()
+        mock_urlopen.return_value = self._mock_resp()
+        engine.generate_streaming(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=10, temperature=0.7,
+        )
+        self.assertGreaterEqual(self._body(mock_urlopen)["dry_penalty_last_n"], 0)
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_explicit_positive_value_preserved(self, mock_urlopen):
+        """Only the sentinel is rewritten; a real range passes through."""
+        engine = self._make_engine()
+        mock_urlopen.return_value = self._mock_resp()
+        engine.generate_streaming(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=10, temperature=0.7,
+            sampling={"dry_penalty_last_n": 256},
+        )
+        self.assertEqual(self._body(mock_urlopen)["dry_penalty_last_n"], 256)
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_zero_disable_preserved(self, mock_urlopen):
+        """0 means 'disabled' to llama.cpp and must not be rewritten."""
+        engine = self._make_engine()
+        mock_urlopen.return_value = self._mock_resp()
+        engine.generate_streaming(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=10, temperature=0.7,
+            sampling={"dry_penalty_last_n": 0},
+        )
+        self.assertEqual(self._body(mock_urlopen)["dry_penalty_last_n"], 0)
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_creative_preset_keeps_dry_armed(self, mock_urlopen):
+        """The one preset that arms DRY must still get a usable range.
+
+        Guards the tempting-but-wrong fix of flattening the sentinel to 0
+        in core.sampling, which would disarm DRY's range for 'creative'.
+        """
+        from core.sampling import get_preset
+        engine = self._make_engine()
+        mock_urlopen.return_value = self._mock_resp()
+        engine.generate_streaming(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=10, temperature=0.7,
+            sampling=get_preset("creative"),
+        )
+        body = self._body(mock_urlopen)
+        self.assertGreater(body["dry_multiplier"], 0.0)
+        self.assertGreater(body["dry_penalty_last_n"], 0)
+
+
 class TestCountTokens(unittest.TestCase):
     """P1-T8: count_tokens uses llama-server /tokenize when available."""
 

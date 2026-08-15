@@ -702,6 +702,20 @@ class LlamaCppEngine(BaseEngine):
         for key in SAMPLING_PAYLOAD_KEYS:
             if key in samp:
                 payload[key] = samp[key]
+
+        # dry_penalty_last_n = -1 is llama.cpp's "scan the whole context"
+        # sentinel and is what core.sampling ships as the neutral value.
+        # Current llama-server builds validate the field as 0 <= n and reject
+        # -1 outright with HTTP 400, which fails EVERY request — including
+        # ones that never touch DRY, since the neutral base always sends the
+        # key.  Resolve the sentinel to the launch ctx here, at the transport
+        # boundary, rather than in core.sampling: the platform contract keeps
+        # -1 (the WebGPU engine maps it to dryRangeLastN and honours it), and
+        # flattening it to 0 in the shared base would silently disarm DRY's
+        # range for the one preset that arms it — "creative" runs
+        # dry_multiplier 0.8 and inherits this value.
+        if payload.get("dry_penalty_last_n") == -1:
+            payload["dry_penalty_last_n"] = self._num_ctx or 0
         if not enable_thinking:
             # Qwen3.x chat templates gate the think block on an
             # `enable_thinking` template variable — not a `/no_think` text
