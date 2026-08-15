@@ -1284,6 +1284,14 @@ def create_app():
     # The autonomous loop (core.agent_loop) over REST: start goals, stream
     # events, answer approval prompts. Same runner the Qt GUI drives.
 
+    # ─── Chat sessions ───────────────────────────────────────────────────
+    # Server-side conversation store so any device can list and resume
+    # previous chats; the phone client syncs after each exchange.
+
+    from core.config import SESSION_DIR
+    from api.session_api import register_session_routes
+    register_session_routes(app, check_auth=_check_auth, session_dir=SESSION_DIR)
+
     from api.agent_api import register_agent_routes
     register_agent_routes(
         app,
