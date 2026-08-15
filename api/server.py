@@ -52,7 +52,7 @@ if not _api_key:
     _log.warning("ARTIFEX_API_KEY not set — API authentication is DISABLED")
 
 
-def _get_engine(ctx_tier: int | None = None):
+def _get_engine(ctx_tier: int | None = None, exact_ctx: bool = False):
     """Get or create the active engine.
 
     Args:
@@ -60,6 +60,10 @@ def _get_engine(ctx_tier: int | None = None):
             load() so the server starts with a tier sized for the actual
             request rather than the model's max ctx.  Ignored for engines
             that don't expose set_target_tier (Ollama, Transformers).
+        exact_ctx: Require the loaded server's ctx to EQUAL ctx_tier
+            (explicit user reload) instead of merely meeting it — a
+            downsize must relaunch smaller, not re-adopt the bigger
+            still-running server.
     """
     global _engine
     with _engine_lock:
@@ -70,7 +74,7 @@ def _get_engine(ctx_tier: int | None = None):
                 refresh_ollama_models()
             _engine = create_engine()
             if ctx_tier and hasattr(_engine, "set_target_tier"):
-                _engine.set_target_tier(ctx_tier)
+                _engine.set_target_tier(ctx_tier, exact=exact_ctx)
             _engine.load(status_callback=lambda msg: _log.info(msg))
         return _engine
 
@@ -1339,7 +1343,7 @@ def create_app():
             await mq._unload_engine()
             loop = asyncio.get_event_loop()
             eng = await loop.run_in_executor(
-                None, lambda: _get_engine(ctx_tier=target))
+                None, lambda: _get_engine(ctx_tier=target, exact_ctx=True))
             mq._current_ctx_tier = (
                 eng.current_tier() if hasattr(eng, "current_tier") else body.ctx_tier)
             _log.info("Engine reloaded via /v1/engine/reload at ctx=%s",

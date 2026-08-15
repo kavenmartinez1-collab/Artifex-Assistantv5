@@ -200,6 +200,7 @@ class LlamaCppEngine(BaseEngine):
         # When None, _compute_num_ctx falls back to the configured cap or the
         # legacy VRAM-fit heuristic.
         self._target_ctx: int | None = None
+        self._target_exact = False
         self._num_ctx = None
         self._active_gpu_index: int | None = None
         self._process = None
@@ -212,7 +213,7 @@ class LlamaCppEngine(BaseEngine):
         self._base_url = f"http://localhost:{self.port}"
         self._last_gen_stats = {}
 
-    def set_target_tier(self, tier: int) -> None:
+    def set_target_tier(self, tier: int, exact: bool = False) -> None:
         """Set the launch ctx for the next load(), capped at the configured cap.
 
         Called by the request router (api/server.py) before engine.load() so
@@ -220,12 +221,19 @@ class LlamaCppEngine(BaseEngine):
         of the model's max context.  Has no effect on a currently-loaded
         engine; a relaunch (unload + load) is required for the change to
         take effect — the queue handles that on a tier change.
+
+        exact=True (the user's explicit reload-at-N): adoption must match
+        the ctx exactly, not merely meet it. Without this a downsize
+        request re-adopts the bigger still-running server — "bigger is
+        fine" is right for implicit tier picks but wrong when the user is
+        deliberately trading window for prefill speed.
         """
         if not isinstance(tier, int) or tier <= 0:
             return
         if self._configured_num_ctx and tier > self._configured_num_ctx:
             tier = self._configured_num_ctx
         self._target_ctx = tier
+        self._target_exact = bool(exact)
 
     def current_tier(self) -> int:
         """The live engine's loaded ctx, or 0 if unloaded."""
@@ -373,8 +381,14 @@ class LlamaCppEngine(BaseEngine):
         if self._is_server_healthy():
             served, served_ctx = self._served_props()
             ours = os.path.basename(self.model_path).casefold()
-            ctx_ok = not (self._target_ctx and served_ctx
-                          and served_ctx < self._target_ctx)
+            if self._target_ctx and served_ctx and self._target_exact:
+                ctx_ok = served_ctx == self._target_ctx
+            else:
+                ctx_ok = not (self._target_ctx and served_ctx
+                              and served_ctx < self._target_ctx)
+            # One-shot: exact matching must not leak into later implicit
+            # loads, where adopting a bigger server is correct.
+            self._target_exact = False
             if served and os.path.basename(served).casefold() == ours and ctx_ok:
                 self._loaded = True
                 self._adopted = True

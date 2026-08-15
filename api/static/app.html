@@ -784,11 +784,19 @@
     <div class="pt">ENGINE</div>
     <div class="hint" id="engine-info">Tap Refresh to check what is loaded.</div>
     <div class="row" style="margin-top:8px">
+      <select id="engine-ctx" onchange="localStorage.setItem('ax_engine_ctx', this.value)">
+        <option value="16384">ctx 16k — fastest</option>
+        <option value="32768" selected>ctx 32k</option>
+        <option value="49152">ctx 48k</option>
+        <option value="">ctx full (model cap)</option>
+      </select>
+    </div>
+    <div class="row" style="margin-top:8px">
       <button class="btn" onclick="refreshEngine()">Refresh</button>
-      <button class="btn" id="engine-reload-btn" onclick="reloadEngine()">Reload at full ctx</button>
+      <button class="btn" id="engine-reload-btn" onclick="reloadEngine()">Reload</button>
     </div>
     <button class="btn hidden" id="engine-jump" style="margin-top:8px">Go to the live run</button>
-    <div class="hint">A reload relaunches llama-server at the model's full configured context. Takes 30-60 s.</div>
+    <div class="hint">Reload relaunches llama-server at the chosen context. Smaller = faster prefill; bigger = longer conversations. Takes 30-60 s.</div>
   </div>
   <div class="panel">
     <div class="pt">REASONING EFFORT</div>
@@ -941,6 +949,8 @@ const store = {
     $("system-prompt").value = localStorage.getItem("ax_sysprompt") || DEFAULT_SYSTEM_PROMPT;
     setEffort(localStorage.getItem("ax_effort") || "medium");
     setAutonomy(localStorage.getItem("ax_autonomy") || "guided");
+    const ectx = localStorage.getItem("ax_engine_ctx");
+    if (ectx !== null) $("engine-ctx").value = ectx;
     $("hist-budget").value = localStorage.getItem("ax_histbudget") || String(DEFAULT_HISTORY_BUDGET);
     if (!$("hist-budget").value) $("hist-budget").value = String(DEFAULT_HISTORY_BUDGET);
     segSet("agentctx-seg", localStorage.getItem("ax_agentctx") || "16384");
@@ -2220,15 +2230,17 @@ async function reloadEngine() {
   const box = $("engine-info");
   if (btn.disabled) return;
   if (!store.k) { box.textContent = "Add your API key first."; return; }
+  const ctxSel = $("engine-ctx").value;   // "" = the model's full cap
   btn.disabled = true;
   btn.textContent = "reloading...";
-  box.textContent = "Relaunching at full context - this takes 30-60 s.";
+  box.textContent = "Relaunching at " + (ctxSel ? Math.round(ctxSel / 1024) + "k" : "full") +
+    " context - this takes 30-60 s.";
   $("engine-jump").classList.add("hidden");
   try {
     const r = await fetch("/v1/engine/reload", {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: "{}",                       // empty body = the model's full cap
+      body: JSON.stringify(ctxSel ? { ctx_tier: parseInt(ctxSel, 10) } : {}),
     });
     let data = null;
     try { data = await r.json(); } catch (e) {}
@@ -2252,7 +2264,7 @@ async function reloadEngine() {
     box.textContent = "Reload failed: " + e.message;
   } finally {
     btn.disabled = false;
-    btn.textContent = "Reload at full ctx";
+    btn.textContent = "Reload";
   }
 }
 
