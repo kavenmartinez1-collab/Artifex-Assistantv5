@@ -205,9 +205,48 @@ AUTONOMOUS MODE — you are running in a self-driving loop, not a chat.
 - If you are genuinely blocked and need the user, say so plainly and stop."""
 
 
+def _environment_note() -> str:
+    """Runtime facts about the box the agent's commands actually run on.
+
+    The model otherwise guesses from training priors and reaches for tools
+    the platform no longer ships (observed: wmic, removed in current
+    Windows 11 builds, tried repeatedly for a machine-specs goal). All
+    facts are detected at call time — nothing machine-specific is baked in.
+    """
+    import platform
+    import shutil
+
+    lines = [f"ENVIRONMENT: {platform.system()} {platform.release()} "
+             f"(build {platform.version()}), Python {platform.python_version()}."]
+    if platform.system() == "Windows":
+        if shutil.which("bash"):
+            lines.append(
+                "- Shell blocks: bash syntax runs under Git Bash; PowerShell "
+                "syntax runs under PowerShell. Pick one per block, don't mix.")
+        else:
+            lines.append(
+                "- Shell blocks run under PowerShell (simple bash-isms are "
+                "auto-translated). Prefer PowerShell syntax.")
+        if not shutil.which("wmic"):
+            lines.append(
+                "- `wmic` DOES NOT EXIST on this Windows build. For hardware/"
+                "system info use PowerShell CIM: Get-CimInstance Win32_Processor"
+                " / Win32_OperatingSystem / Win32_VideoController / "
+                "Win32_PhysicalMemory / Win32_LogicalDisk — or `systeminfo`.")
+    else:
+        lines.append("- Shell blocks run under the system shell (sh/bash).")
+    return "\n".join(lines)
+
+
+_ENV_NOTE_CACHE: str = ""
+
+
 def build_autonomous_prompt(base_prompt: str, goal: str = "") -> str:
     """Wrap the assistant base prompt with the autonomous loop framing + goal."""
-    out = f"{base_prompt}\n\n{AUTONOMOUS_PREAMBLE}"
+    global _ENV_NOTE_CACHE
+    if not _ENV_NOTE_CACHE:
+        _ENV_NOTE_CACHE = _environment_note()
+    out = f"{base_prompt}\n\n{AUTONOMOUS_PREAMBLE}\n\n{_ENV_NOTE_CACHE}"
     if goal:
         out += f"\n\nGOAL:\n{goal.strip()}"
     return out
