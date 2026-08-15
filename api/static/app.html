@@ -35,7 +35,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="theme-color" content="#0d1117">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -47,26 +47,51 @@
     --err: #f85149; --ok: #3fb950; --warn: #d29922; --think: #a5760a;
     --orange: #db6d28; --code-bg: #0a0d12;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    /* Notch / home-indicator insets — all 0 on anything that isn't an iPhone. */
+    --sat: env(safe-area-inset-top); --sab: env(safe-area-inset-bottom);
+    --sal: env(safe-area-inset-left); --sar: env(safe-area-inset-right);
+    --gut: 10px;   /* horizontal gutter; every px counts at 390 CSS px wide */
+    --tap: 44px;   /* minimum touch target */
+    --kb: 0px;     /* on-screen keyboard height, set from visualViewport */
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-  html, body { margin: 0; padding: 0; height: 100%; overscroll-behavior: none; }
+  html { -webkit-text-size-adjust: 100%; }   /* no landscape text inflation */
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    overscroll-behavior: none;
+    overflow-x: hidden; max-width: 100%;     /* body must never scroll sideways */
+  }
   body {
     background: var(--bg); color: var(--text);
     font: 15px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif;
     display: flex; flex-direction: column;
+    /* dvh, never vh: mobile Safari's vh is the URL-bar-collapsed height, so a
+       vh-sized shell puts the composer behind the browser chrome. --kb then
+       shrinks the shell when the on-screen keyboard opens. */
     height: 100dvh;
+    height: calc(100dvh - var(--kb));
+  }
+  /* Touch ergonomics: kill the 300 ms double-tap zoom delay and give a press
+     state, since a finger has no hover to fall back on. */
+  button, summary, select, input, textarea, label.sw, a { touch-action: manipulation; }
+  button:active, summary:active { opacity: .6; }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
   }
   .hidden { display: none !important; }
 
   /* ── Header ─────────────────────────────────────────── */
   header {
     display: flex; flex-direction: column;
-    padding: calc(env(safe-area-inset-top) + 8px) 0 0;
+    padding-top: calc(var(--sat) + 6px);
     background: var(--panel); border-bottom: 1px solid var(--border);
     flex: none;
   }
-  header .hrow { display: flex; align-items: center; gap: 10px; padding: 0 14px 8px; }
-  header .brand { font-weight: 700; letter-spacing: 2px; font-size: 15px; }
+  header .hrow {
+    display: flex; align-items: center; gap: 8px;
+    padding: 0 calc(var(--gut) + var(--sar)) 4px calc(var(--gut) + var(--sal));
+  }
+  header .brand { font-weight: 700; letter-spacing: 2px; font-size: 15px; flex: none; }
   header .brand span { color: var(--accent); font-weight: 400; }
   #status-dot {
     width: 9px; height: 9px; border-radius: 50%;
@@ -76,17 +101,21 @@
   #status-dot.err { background: var(--err); }
   header .spacer { flex: 1; }
   #model-badge {
-    font-size: 11px; color: var(--dim); max-width: 40vw;
+    font-size: 11px; color: var(--dim); max-width: 32vw;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   #gear-btn {
     background: none; border: 1px solid var(--border); color: var(--text);
-    border-radius: 8px; padding: 6px 10px; font-size: 15px;
+    border-radius: 10px; font-size: 17px; padding: 0; flex: none;
+    min-width: var(--tap); min-height: var(--tap);
   }
-  #tabs { display: flex; padding: 0 8px; gap: 2px; }
+  #tabs {
+    display: flex;
+    padding: 0 calc(var(--gut) + var(--sar)) 0 calc(var(--gut) + var(--sal));
+  }
   #tabs button {
-    background: none; border: none; color: var(--dim);
-    padding: 7px 14px 8px; font-size: 13.5px; font-weight: 600;
+    flex: 1; background: none; border: none; color: var(--dim);
+    min-height: var(--tap); padding: 0 8px; font-size: 14px; font-weight: 600;
     border-bottom: 2px solid transparent; position: relative;
   }
   #tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
@@ -100,23 +129,30 @@
 
   /* ── View shell ─────────────────────────────────────── */
   .view { flex: 1; display: flex; flex-direction: column; min-height: 0; position: relative; }
+  /* Wraps a scroller together with its floating jump-to-bottom button so the
+     button tracks the SCROLLER's bottom edge, not the view's: the approval
+     bar can grow or vanish beneath it without ever being covered. */
+  .scroll-wrap {
+    flex: 1; min-height: 0; display: flex; flex-direction: column; position: relative;
+  }
 
   /* ── Messages ───────────────────────────────────────── */
   #messages {
-    flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
-    padding: 12px 12px 4px;
+    flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
+    -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+    padding: 10px calc(var(--gut) + var(--sar)) 4px calc(var(--gut) + var(--sal));
   }
-  .welcome { text-align: center; color: var(--dim); margin-top: 18vh; }
+  .welcome { text-align: center; color: var(--dim); margin-top: 14vh; margin-top: 14dvh; }
   .welcome .t { font-size: 22px; font-weight: 700; letter-spacing: 3px; color: var(--text); }
   .welcome .t span { color: var(--accent); font-weight: 300; }
   .welcome .s { margin-top: 8px; font-size: 13px; }
-  .msg { margin: 0 0 14px; max-width: 94%; }
+  .msg { margin: 0 0 12px; max-width: 100%; }
   .msg .meta { font-size: 11px; color: var(--dim); margin: 0 4px 3px; }
   .msg .body {
-    padding: 9px 12px; border-radius: 12px; word-wrap: break-word;
+    padding: 10px 12px; border-radius: 12px; word-wrap: break-word;
     overflow-wrap: anywhere; white-space: normal;
   }
-  .msg-user { margin-left: auto; }
+  .msg-user { margin-left: auto; max-width: 88%; }
   .msg-user .meta { text-align: right; }
   .msg-user .body { background: var(--user); border: 1px solid #2b4a75; }
   .msg-assistant .body { background: var(--panel); border: 1px solid var(--border); }
@@ -124,14 +160,19 @@
     border-left: 3px solid var(--think); background: rgba(165,118,10,.07);
     border-radius: 6px; padding: 5px 9px; margin: 0 0 8px; font-size: 13px;
   }
-  details.thinking summary { color: var(--think); cursor: pointer; font-size: 12px; }
+  details.thinking summary {
+    color: var(--think); cursor: pointer; font-size: 12px;
+    min-height: var(--tap); display: flex; align-items: center;
+  }
   details.thinking .tb {
-    color: var(--dim); white-space: pre-wrap; margin-top: 5px;
-    max-height: 150px; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    color: var(--dim); white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 5px;
+    max-height: 24dvh; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
   }
   .tool-status {
     border-left: 3px solid var(--accent); background: rgba(88,166,255,.07);
-    border-radius: 6px; padding: 6px 9px; margin: 8px 0; font-size: 12.5px; color: var(--dim);
+    border-radius: 6px; padding: 6px 9px; margin: 8px 0; font-size: 12.5px;
+    color: var(--dim); overflow-wrap: anywhere;
   }
   .err-text { color: var(--err); }
   .finish-note { font-size: 11.5px; color: var(--warn); margin-top: 6px; }
@@ -145,16 +186,15 @@
     padding: 2px 0 4px; flex: none; display: none;
   }
   .to-bottom {
-    /* clears the composer / agent bar that sits below the scroll area */
-    position: absolute; right: 12px; z-index: 4;
-    bottom: calc(env(safe-area-inset-bottom) + 64px);
-    width: 38px; height: 38px; border-radius: 50%;
+    position: absolute; right: calc(10px + var(--sar)); bottom: 10px; z-index: 4;
+    width: var(--tap); height: var(--tap); border-radius: 50%;
     background: var(--panel2); color: var(--text);
-    border: 1px solid var(--border); font-size: 16px; line-height: 1;
-    box-shadow: 0 3px 10px rgba(0,0,0,.45);
+    border: 1px solid var(--border); font-size: 17px; line-height: 1;
+    box-shadow: 0 3px 12px rgba(0,0,0,.5);
   }
 
   /* ── Markdown ───────────────────────────────────────── */
+  .md { overflow-wrap: anywhere; }   /* raw URLs / paths wrap, never scroll */
   .md > :first-child { margin-top: 0; }
   .md > :last-child { margin-bottom: 0; }
   .md p { margin: 0 0 9px; }
@@ -164,7 +204,7 @@
   .md h1 { font-size: 19px; } .md h2 { font-size: 17px; } .md h3 { font-size: 15.5px; }
   .md h4, .md h5, .md h6 { font-size: 14px; color: var(--dim); }
   .md h1, .md h2 { border-bottom: 1px solid var(--border); padding-bottom: 4px; }
-  .md ul, .md ol { margin: 6px 0 9px; padding-left: 21px; }
+  .md ul, .md ol { margin: 6px 0 9px; padding-left: 19px; }
   .md li { margin: 3px 0; }
   .md li > ul, .md li > ol { margin: 3px 0 2px; }
   .md blockquote {
@@ -174,17 +214,19 @@
   .md blockquote > :last-child { margin-bottom: 0; }
   .md hr { border: none; border-top: 1px solid var(--border); margin: 13px 0; }
   .md a { color: var(--accent); text-decoration: none; border-bottom: 1px solid rgba(88,166,255,.35); }
+  /* A wide table scrolls INSIDE this card; it never widens the page. */
   .md .tw {
-    overflow-x: auto; -webkit-overflow-scrolling: touch;
-    margin: 9px 0; border: 1px solid var(--border); border-radius: 8px;
+    overflow-x: auto; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain;
+    max-width: 100%; margin: 9px 0; border: 1px solid var(--border); border-radius: 8px;
   }
-  .md table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  .md th, .md td { border-bottom: 1px solid var(--border); padding: 6px 10px; text-align: left; white-space: nowrap; }
+  .md table { border-collapse: collapse; min-width: 100%; width: auto; font-size: 13px; }
+  .md th, .md td { border-bottom: 1px solid var(--border); padding: 7px 10px; text-align: left; white-space: nowrap; }
   .md thead th { background: var(--panel2); font-weight: 650; }
   .md tbody tr:last-child td { border-bottom: none; }
   .body pre, .md pre {
     background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
-    padding: 9px; overflow-x: auto; -webkit-overflow-scrolling: touch;
+    padding: 9px; max-width: 100%;
+    overflow-x: auto; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain;
     font-size: 12.5px; margin: 9px 0; font-family: var(--mono); line-height: 1.45;
   }
   .body code, .md code {
@@ -194,93 +236,117 @@
   .body pre code, .md pre code { background: none; padding: 0; font-size: inherit; }
   .cb { margin: 9px 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
   .cb-h {
-    display: flex; align-items: center; gap: 8px;
-    padding: 4px 6px 4px 10px; background: var(--panel2);
+    display: flex; align-items: center; gap: 8px; min-height: 38px;
+    padding: 3px 7px 3px 10px; background: var(--panel2);
     border-bottom: 1px solid var(--border); font-size: 11px; color: var(--dim);
   }
-  .cb-h .lang { letter-spacing: .5px; text-transform: lowercase; }
-  .cb-h button {
-    margin-left: auto; background: none; border: 1px solid var(--border);
-    color: var(--dim); border-radius: 6px; padding: 3px 10px; font-size: 11px;
+  .cb-h .lang {
+    letter-spacing: .5px; text-transform: lowercase;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .cb-h button {
+    position: relative; margin-left: auto; flex: none;
+    background: none; border: 1px solid var(--border);
+    color: var(--dim); border-radius: 7px; padding: 0 12px;
+    min-height: 30px; font-size: 12px;
+  }
+  /* The copy button stays visually small but claims a 44px-tall hit area —
+     it is always visible (no hover affordance on a phone). */
+  .cb-h button:after { content: ""; position: absolute; inset: -7px -6px; }
   .cb-h button.done { color: var(--ok); border-color: rgba(63,185,80,.45); }
   .cb pre { margin: 0; border: none; border-radius: 0; }
 
   /* ── Input bar ──────────────────────────────────────── */
   #input-bar {
-    display: flex; gap: 8px; align-items: flex-end;
-    padding: 8px 10px calc(env(safe-area-inset-bottom) + 8px);
-    background: var(--panel); border-top: 1px solid var(--border); flex: none;
+    display: flex; gap: 8px; align-items: flex-end; flex: none;
+    padding: 8px calc(var(--gut) + var(--sar))
+             calc(var(--sab) + 8px) calc(var(--gut) + var(--sal));
+    background: var(--panel); border-top: 1px solid var(--border);
   }
   #chat-input {
-    flex: 1; resize: none; border-radius: 12px; border: 1px solid var(--border);
-    background: var(--panel2); color: var(--text); padding: 10px 12px;
-    font: 16px/1.4 inherit; max-height: 120px; min-height: 42px;
+    flex: 1; min-width: 0; resize: none; border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--panel2); color: var(--text); padding: 11px 12px;
+    /* 16px is the floor: anything smaller and iOS zooms the page on focus. */
+    font: 16px/1.35 inherit; max-height: 120px; min-height: var(--tap);
   }
   #chat-input:focus { outline: none; border-color: var(--accent); }
   #send-btn {
     border: none; border-radius: 12px; background: var(--accent); color: #06121f;
-    font-weight: 700; font-size: 15px; padding: 0 18px; height: 42px; flex: none;
+    font-weight: 700; font-size: 15px; padding: 0 16px;
+    min-height: var(--tap); min-width: 66px; flex: none;
   }
   #send-btn.stop { background: var(--err); color: #fff; }
   #send-btn:disabled { opacity: .45; }
 
   /* ── Agent view ─────────────────────────────────────── */
   #agent-scroll {
-    flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
-    padding: 12px 12px 6px;
+    flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
+    -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+    padding: 10px calc(var(--gut) + var(--sar)) 6px calc(var(--gut) + var(--sal));
   }
   #agent-setup {
     background: var(--panel); border: 1px solid var(--border);
-    border-radius: 12px; padding: 10px 12px 12px; margin-bottom: 12px;
+    border-radius: 12px; padding: 4px 11px 12px; margin-bottom: 12px;
   }
   #agent-setup > summary {
     list-style: none; cursor: pointer; color: var(--dim);
-    font-size: 11px; letter-spacing: 1.5px; margin: 0 0 9px;
+    font-size: 11px; letter-spacing: 1.5px;
+    min-height: var(--tap); display: flex; align-items: center;
   }
   #agent-setup > summary::-webkit-details-marker { display: none; }
-  #agent-setup[open] > summary { margin-bottom: 10px; }
   #agent-goal {
     width: 100%; background: var(--panel2); border: 1px solid var(--border);
-    color: var(--text); border-radius: 10px; padding: 10px 11px;
-    font: 16px/1.4 inherit; resize: vertical; min-height: 74px;
+    color: var(--text); border-radius: 10px; padding: 11px;
+    font: 16px/1.4 inherit; resize: vertical; min-height: 78px;   /* 16px: no zoom */
   }
   #agent-goal:focus { outline: none; border-color: var(--accent); }
   #agent-start {
     width: 100%; margin-top: 10px; border: none; border-radius: 10px;
     background: var(--accent); color: #06121f; font-weight: 700;
-    font-size: 15px; padding: 11px 0;
+    font-size: 15px; padding: 0 12px; min-height: 48px;
   }
   #agent-start:disabled { opacity: .4; }
   #agent-bar {
     display: flex; align-items: center; gap: 10px; flex: none;
-    padding: 8px 12px calc(env(safe-area-inset-bottom) + 8px);
+    padding: 8px calc(var(--gut) + var(--sar))
+             calc(var(--sab) + 8px) calc(var(--gut) + var(--sal));
     background: var(--panel); border-top: 1px solid var(--border);
   }
   #agent-status {
-    flex: 1; font-size: 12px; color: var(--dim);
+    flex: 1; min-width: 0; font-size: 12px; color: var(--dim);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   #agent-stop {
     border: 1px solid rgba(248,81,73,.5); background: rgba(248,81,73,.12);
-    color: var(--err); border-radius: 10px; padding: 8px 16px;
+    color: var(--err); border-radius: 10px; padding: 0 18px;
     font-size: 14px; font-weight: 600; flex: none;
+    min-height: var(--tap); min-width: 92px;
   }
+  /* Sits ABOVE #agent-bar in the same flex column, so the two can never
+     overlap however tall the pending action is; only the text panes scroll,
+     keeping the three buttons on screen at all times. */
   #approval {
-    flex: none; margin: 0; padding: 11px 12px;
+    flex: none; margin: 0;
+    padding: 10px calc(var(--gut) + var(--sar)) 10px calc(var(--gut) + var(--sal));
     background: rgba(210,153,34,.09); border-top: 2px solid var(--warn);
   }
   #approval .ap-t {
-    font-size: 11px; letter-spacing: 1.5px; color: var(--warn); margin-bottom: 7px;
+    font-size: 11px; letter-spacing: 1.5px; color: var(--warn); margin-bottom: 6px;
   }
   #approval .ap-what {
     font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere;
-    max-height: 100px; overflow-y: auto; margin-bottom: 3px;
+    max-height: 20dvh; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    margin-bottom: 3px;
   }
-  #approval .ap-why { font-size: 12px; color: var(--dim); margin-bottom: 9px; overflow-wrap: anywhere; }
+  #approval .ap-why {
+    font-size: 12px; color: var(--dim); margin-bottom: 9px;
+    overflow-wrap: anywhere; max-height: 12dvh; overflow-y: auto;
+  }
   #approval .ap-btns { display: flex; gap: 8px; }
   #approval .ap-btns button {
-    flex: 1; border-radius: 10px; padding: 10px 0; font-size: 14px;
+    flex: 1; min-width: 0; border-radius: 10px; padding: 0 4px;
+    min-height: 46px; font-size: 14px;
     font-weight: 600; border: 1px solid var(--border); background: var(--panel2);
     color: var(--text);
   }
@@ -317,35 +383,46 @@
   .chip {
     display: flex; gap: 9px; align-items: flex-start;
     background: var(--panel); border: 1px solid var(--border);
-    border-left: 3px solid var(--dim); border-radius: 10px; padding: 8px 10px;
+    border-left: 3px solid var(--dim); border-radius: 10px; padding: 9px 10px;
+    max-width: 100%;
   }
   .chip.r-SAFE, .chip.r-LOW { border-left-color: var(--ok); }
   .chip.r-MEDIUM { border-left-color: var(--warn); }
   .chip.r-HIGH { border-left-color: var(--orange); }
   .chip.r-CRITICAL { border-left-color: var(--err); }
   .chip .cmain { flex: 1; min-width: 0; }
-  .chip .chead { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
+  .chip .chead {
+    display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-bottom: 3px;
+  }
   .chip .ctype {
-    font-size: 10.5px; letter-spacing: 1px; text-transform: uppercase; color: var(--dim);
+    font-size: 10.5px; letter-spacing: 1px; text-transform: uppercase;
+    color: var(--dim); overflow-wrap: anywhere;
   }
   .chip .risk {
     font-size: 9.5px; letter-spacing: 1px; padding: 1px 6px; border-radius: 20px;
-    border: 1px solid var(--border); color: var(--dim);
+    border: 1px solid var(--border); color: var(--dim); flex: none;
   }
   .chip.r-MEDIUM .risk { color: var(--warn); border-color: rgba(210,153,34,.45); }
   .chip.r-HIGH .risk { color: var(--orange); border-color: rgba(219,109,40,.45); }
   .chip.r-CRITICAL .risk { color: var(--err); border-color: rgba(248,81,73,.45); }
   .chip .cdisp { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
   .chip .cwhy { font-size: 11.5px; color: var(--dim); margin-top: 3px; overflow-wrap: anywhere; }
-  .chip .cstate { font-size: 15px; line-height: 1.2; flex: none; color: var(--dim); }
+  .chip .cstate {
+    font-size: 15px; line-height: 1.2; flex: none; color: var(--dim);
+    min-width: 20px; text-align: center;
+  }
   .chip .cstate.run { color: var(--accent); animation: pulse 1.2s infinite; }
   .chip .cstate.ok { color: var(--ok); }
   .chip .cstate.bad { color: var(--err); }
-  .chip details { margin-top: 6px; }
-  .chip details summary { font-size: 11.5px; color: var(--dim); cursor: pointer; }
+  .chip details { margin-top: 4px; }
+  .chip details summary {
+    font-size: 11.5px; color: var(--dim); cursor: pointer;
+    min-height: var(--tap); display: flex; align-items: center;
+  }
   .chip details pre {
-    margin: 6px 0 0; max-height: 260px; overflow: auto; white-space: pre-wrap;
-    overflow-wrap: anywhere; font-size: 12px;
+    margin: 2px 0 0; max-height: 34dvh; overflow: auto;
+    -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+    white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px;
   }
 
   /* ── Settings drawer ────────────────────────────────── */
@@ -355,42 +432,49 @@
   }
   #backdrop.open { opacity: 1; pointer-events: auto; }
   #drawer {
-    position: fixed; top: 0; right: 0; bottom: 0; width: min(340px, 88vw);
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(360px, 90vw);
     background: var(--panel); border-left: 1px solid var(--border); z-index: 9;
     transform: translateX(102%); transition: transform .2s ease-out;
-    overflow-y: auto; -webkit-overflow-scrolling: touch;
-    padding: calc(env(safe-area-inset-top) + 12px) 14px
-             calc(env(safe-area-inset-bottom) + 16px);
+    overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+    padding: calc(var(--sat) + 12px) calc(14px + var(--sar))
+             calc(var(--sab) + 20px) 14px;
   }
   #drawer.open { transform: translateX(0); }
   .panel { margin-bottom: 16px; }
   .panel .pt { font-size: 11px; letter-spacing: 1.5px; color: var(--dim); margin-bottom: 6px; }
   .panel input[type=password], .panel input[type=number], .panel select, .panel textarea {
     width: 100%; background: var(--panel2); border: 1px solid var(--border);
-    color: var(--text); border-radius: 8px; padding: 9px 10px; font: 16px inherit;
+    color: var(--text); border-radius: 8px; padding: 10px; font: 16px inherit;
+    min-height: var(--tap);
   }
-  .panel textarea { font-size: 13px; min-height: 110px; resize: vertical; }
+  /* 16px, not 13px: a smaller font here made iOS zoom the whole page the
+     moment the system-prompt box got focus, and it never zoomed back. */
+  .panel textarea { font-size: 16px; line-height: 1.4; min-height: 120px; resize: vertical; }
   .seg { display: flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
   .seg button {
-    flex: 1; background: var(--panel2); border: none; color: var(--dim);
-    padding: 9px 0; font-size: 13px; border-right: 1px solid var(--border);
+    flex: 1; min-width: 0; background: var(--panel2); border: none; color: var(--dim);
+    min-height: var(--tap); padding: 0 2px; font-size: 13px;
+    border-right: 1px solid var(--border);
   }
   .seg button:last-child { border-right: none; }
   .seg button.on { background: var(--accent); color: #06121f; font-weight: 700; }
   .row { display: flex; gap: 10px; }
-  .row > * { flex: 1; }
-  .hint { font-size: 11.5px; color: var(--dim); margin-top: 5px; }
+  .row > * { flex: 1; min-width: 0; }
+  .hint { font-size: 11.5px; color: var(--dim); margin-top: 5px; overflow-wrap: anywhere; }
   .toggle-row {
-    display: flex; align-items: center; justify-content: space-between;
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
     background: var(--panel2); border: 1px solid var(--border);
-    border-radius: 8px; padding: 10px 12px;
+    border-radius: 8px; padding: 10px 12px; min-height: 52px;
   }
   .btn {
     width: 100%; border: 1px solid var(--border); background: var(--panel2);
     color: var(--text); border-radius: 8px; padding: 10px; font-size: 14px;
+    min-height: 46px;
   }
   .btn.danger { color: var(--err); border-color: rgba(248,81,73,.4); }
   label.sw { position: relative; display: inline-block; width: 44px; height: 26px; flex: none; }
+  /* Pads the switch's hit area out to 44px tall without moving the track. */
+  label.sw:after { content: ""; position: absolute; inset: -9px -6px; }
   label.sw input { display: none; }
   label.sw .sl {
     position: absolute; inset: 0; background: var(--border); border-radius: 13px; transition: .15s;
@@ -401,6 +485,27 @@
   }
   label.sw input:checked + .sl { background: var(--accent); }
   label.sw input:checked + .sl:before { background: #06121f; transform: translateX(18px); }
+
+  /* ── Narrow phones (iPhone SE / mini, 320-375px) ────── */
+  @media (max-width: 375px) {
+    :root { --gut: 8px; }
+    body { font-size: 14.5px; }
+    header .brand { letter-spacing: 1px; font-size: 14px; }
+    #model-badge { max-width: 26vw; }
+    .msg .body { padding: 9px 10px; }
+    .md .tw, .body pre, .md pre { margin-left: -2px; margin-right: -2px; }
+    #approval .ap-btns { gap: 6px; }
+    #approval .ap-btns button { font-size: 13px; }
+    #agent-stop { min-width: 80px; padding: 0 12px; }
+    #send-btn { min-width: 58px; padding: 0 12px; }
+  }
+  /* ── Landscape / short viewports ────────────────────── */
+  @media (max-height: 460px) {
+    .welcome { margin-top: 4dvh; }
+    .welcome .t { font-size: 18px; }
+    details.thinking .tb { max-height: 30dvh; }
+    #approval .ap-what { max-height: 16dvh; }
+  }
 </style>
 </head>
 <body>
@@ -420,26 +525,31 @@
 </header>
 
 <div id="chat-view" class="view">
-  <div id="messages">
-    <div class="welcome">
-      <div class="t">ARTIFEX<span> Assistant</span></div>
-      <div class="s">Local AI on your own hardware, over your own wire.</div>
-      <div class="s" id="welcome-hint">Open &#9881; Settings and paste your API key to begin.</div>
+  <div class="scroll-wrap">
+    <div id="messages">
+      <div class="welcome">
+        <div class="t">ARTIFEX<span> Assistant</span></div>
+        <div class="s">Local AI on your own hardware, over your own wire.</div>
+        <div class="s" id="welcome-hint">Open &#9881; Settings and paste your API key to begin.</div>
+      </div>
     </div>
+    <button id="chat-to-bottom" class="to-bottom hidden" aria-label="Scroll to latest"
+      onclick="scrollChatToBottom()">&#8595;</button>
   </div>
-  <button id="chat-to-bottom" class="to-bottom hidden" onclick="scrollChatToBottom()">&#8595;</button>
   <div id="stats"></div>
   <div id="input-bar">
-    <textarea id="chat-input" placeholder="Message Artifex..." rows="1"></textarea>
+    <textarea id="chat-input" placeholder="Message Artifex..." rows="1"
+      enterkeyhint="send" autocapitalize="sentences" autocorrect="on"></textarea>
     <button id="send-btn" onclick="sendOrStop()">Send</button>
   </div>
 </div>
 
 <div id="agent-view" class="view hidden">
-  <div id="agent-scroll">
+  <div class="scroll-wrap">
+    <div id="agent-scroll">
     <details id="agent-setup" open>
       <summary>NEW RUN</summary>
-      <textarea id="agent-goal" spellcheck="false"
+      <textarea id="agent-goal" spellcheck="false" enterkeyhint="done"
         placeholder="Goal — e.g. list the .py files here and write their names to files.txt"></textarea>
       <div style="margin-top:10px">
         <div class="pt" style="font-size:11px;letter-spacing:1.5px;color:var(--dim);margin-bottom:6px">AUTONOMY</div>
@@ -453,9 +563,11 @@
       <button id="agent-start" onclick="startAgentRun()">Start run</button>
       <div class="hint">Runs in a fresh workspace under output/agent_runs/. One run at a time.</div>
     </details>
-    <div id="agent-feed"></div>
+      <div id="agent-feed"></div>
+    </div>
+    <button id="agent-to-bottom" class="to-bottom hidden" aria-label="Scroll to latest"
+      onclick="scrollAgentToBottom()">&#8595;</button>
   </div>
-  <button id="agent-to-bottom" class="to-bottom hidden" onclick="scrollAgentToBottom()">&#8595;</button>
   <div id="approval" class="hidden">
     <div class="ap-t">APPROVAL REQUIRED</div>
     <div class="ap-what" id="ap-what"></div>
@@ -476,7 +588,8 @@
 <div id="drawer">
   <div class="panel">
     <div class="pt">API KEY</div>
-    <input type="password" id="api-key" placeholder="bearer key" autocomplete="off">
+    <input type="password" id="api-key" placeholder="bearer key" autocomplete="off"
+      autocapitalize="off" autocorrect="off" spellcheck="false">
     <div class="hint">The server's ARTIFEX_API_KEY value. Stored only in this browser.</div>
   </div>
   <div class="panel">
@@ -495,11 +608,13 @@
     <div class="row">
       <div>
         <div class="pt">TEMPERATURE</div>
-        <input type="number" id="temperature" value="0.7" min="0" max="2" step="0.1">
+        <input type="number" id="temperature" value="0.7" min="0" max="2" step="0.1"
+          inputmode="decimal">
       </div>
       <div>
         <div class="pt">MAX TOKENS</div>
-        <input type="number" id="max-tokens" value="12288" min="256" step="256">
+        <input type="number" id="max-tokens" value="12288" min="256" step="256"
+          inputmode="numeric">
       </div>
     </div>
   </div>
@@ -1773,6 +1888,35 @@ inputEl.addEventListener("keydown", function (e) {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
 $("api-key").addEventListener("change", () => store.save());
+
+// ── On-screen keyboard ───────────────────────────────────
+// iOS Safari does not shrink the layout viewport when the keyboard opens, so
+// a 100dvh shell keeps its full height and the composer ends up underneath
+// the keys. visualViewport reports the real visible box; --kb shortens the
+// shell by the difference, but only while a field is focused (offsetTop is
+// also non-zero when the user pinch-zooms, which must not shrink anything).
+(function keyboardInset() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const FIELD = /^(TEXTAREA|INPUT|SELECT)$/;
+  const apply = () => {
+    const a = document.activeElement;
+    const focused = a && FIELD.test(a.tagName);
+    const gap = window.innerHeight - vv.height - vv.offsetTop;
+    const kb = (focused && gap > 60) ? Math.round(gap) : 0;
+    const wasPinned = isPinned(messagesDiv);      // measure before resizing
+    document.documentElement.style.setProperty("--kb", kb + "px");
+    if (wasPinned) pinTo(messagesDiv);            // never yank a scrolled-up reader
+    updateToBottom();
+  };
+  vv.addEventListener("resize", apply);
+  vv.addEventListener("scroll", apply);
+  document.addEventListener("focusin", apply);
+  document.addEventListener("focusout", () => {
+    // Blur first, then re-measure: the keyboard is on its way out.
+    setTimeout(apply, 50);
+  });
+})();
 
 // ── Boot ─────────────────────────────────────────────────
 store.restore();
