@@ -46,6 +46,7 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
   - [API Endpoints](#api-endpoints)
   - [Web Tools in the API](#web-tools-in-the-api)
   - [Authentication](#authentication)
+- [Remote Access (Phone / Tailnet)](#remote-access-phone--tailnet)
 - [Setting Up Ollama Backend](#setting-up-ollama-backend)
 - [Setting Up llama.cpp Backend](#setting-up-llamacpp-backend)
 - [Web Gateway (Secure Web Search)](#web-gateway-secure-web-search)
@@ -487,6 +488,62 @@ curl http://localhost:8000/v1/models \
 ```
 
 If `ARTIFEX_API_KEY` is not set, no authentication is required.
+
+---
+
+## Remote Access (Phone / Tailnet)
+
+The API ships a self-contained phone client at **`/app`** — chat with web
+search, server-synced sessions, a file browser, and full agent runs
+(start goals, watch actions stream, approve/deny risky steps, send
+follow-ups) — everything the desktop drives, from a phone. It's a single
+HTML file with no CDN dependencies, so it works on networks with no
+internet path to the browser.
+
+The server itself is deliberately network-agnostic: it binds
+`127.0.0.1` and knows nothing about how packets reach it. To use it away
+from the machine, put any private transport in front of the loopback
+port. With [Tailscale](https://tailscale.com) that is one command:
+
+```bash
+tailscale serve --bg --tcp=8000 tcp://127.0.0.1:8000
+```
+
+Then from any device on your tailnet:
+
+```
+http://<your-machine's-tailnet-ip>:8000/app
+```
+
+Paste your `ARTIFEX_API_KEY` into the client's settings drawer once; it
+persists in that browser.
+
+Hard-won notes for this setup:
+
+- **Use a raw `--tcp` forward, not `serve --http`.** The HTTPS mode
+  routes by Host header (the bare tailnet IP 404s while the MagicDNS
+  name works — baffling from a phone) and provisions a public
+  certificate, which places your hostname in Certificate Transparency
+  logs. The TCP forward has neither problem.
+- **Keep the API bound to `127.0.0.1`** — don't bind the tailnet IP
+  directly. The llama.cpp engine's adopt-don't-relaunch logic
+  health-checks `localhost`, and other components assume loopback.
+  Terminating tailnet traffic in the forwarder and dialing loopback is
+  the supported shape.
+- **Set `ARTIFEX_API_KEY` before exposing anything.** A tailnet is
+  private, but every device on it can reach the port; the key is what
+  scopes access to you.
+- Agent runs started from the phone honor the same sandbox, risk
+  policy, and approval flow as the desktop — in `guided` autonomy,
+  out-of-sandbox file access becomes an approval prompt on your phone
+  instead of a hard denial.
+- The first authenticated `/health` after a cold start runs a full
+  system scan (seconds); later calls are fast. A 401 from the API means
+  it's healthy and wants the key.
+
+Nothing about this is Tailscale-specific — WireGuard, an SSH tunnel
+(`ssh -L 8000:127.0.0.1:8000 …`), or any VPN that can reach the
+machine's loopback works identically.
 
 ---
 
