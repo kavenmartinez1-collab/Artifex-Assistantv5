@@ -1789,6 +1789,7 @@ async function sendMessage() {
   sendBtn.textContent = "Stop";
   sendBtn.classList.add("stop");
   aborter = new AbortController();
+  acquireWakeLock();  // a locked phone screen kills the fetch mid-stream
 
   const collapseThinking = () => {
     if (thinkingEl && thinkingEl.open) {
@@ -1981,11 +1982,36 @@ async function sendMessage() {
     }
     isStreaming = false;
     aborter = null;
+    releaseWakeLock();
     sendBtn.textContent = "Send";
     sendBtn.classList.remove("stop");
     updateToBottom();
   }
 }
+
+// ── Screen wake lock ─────────────────────────────────────
+// iOS suspends the page's network the moment the screen locks, which
+// aborts a long generation mid-stream (observed: a multi-minute HTML
+// build died with no server error — the phone just went dark). Hold a
+// screen wake lock while streaming; harmless no-op where unsupported.
+let _wakeLock = null;
+async function acquireWakeLock() {
+  try {
+    if (navigator.wakeLock && !_wakeLock) {
+      _wakeLock = await navigator.wakeLock.request("screen");
+      _wakeLock.addEventListener("release", () => { _wakeLock = null; });
+    }
+  } catch (e) { _wakeLock = null; }
+}
+function releaseWakeLock() {
+  try { if (_wakeLock) _wakeLock.release(); } catch (e) {}
+  _wakeLock = null;
+}
+// The lock is auto-released if the user switches tabs; re-acquire when
+// they come back while a stream is still running.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && isStreaming) acquireWakeLock();
+});
 
 // Settings-drawer button. Same semantics as the sidebar's "New chat": the
 // stored session stays on the server, this just starts a fresh one.
