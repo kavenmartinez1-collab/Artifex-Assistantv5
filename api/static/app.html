@@ -101,14 +101,15 @@
   #status-dot.err { background: var(--err); }
   header .spacer { flex: 1; }
   #model-badge {
-    font-size: 11px; color: var(--dim); max-width: 32vw;
+    font-size: 11px; color: var(--dim); max-width: 26vw;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  #gear-btn {
+  #gear-btn, #menu-btn {
     background: none; border: 1px solid var(--border); color: var(--text);
     border-radius: 10px; font-size: 17px; padding: 0; flex: none;
     min-width: var(--tap); min-height: var(--tap);
   }
+  #menu-btn { border-color: transparent; font-size: 19px; }
   #tabs {
     display: flex;
     padding: 0 calc(var(--gut) + var(--sar)) 0 calc(var(--gut) + var(--sal));
@@ -446,12 +447,64 @@
     white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px;
   }
 
+  /* ── Sidebar (chat sessions + agent runs) ───────────── */
+  #sidebar {
+    position: fixed; top: 0; left: 0; bottom: 0;
+    width: min(340px, 85vw); z-index: 9;
+    background: var(--panel); border-right: 1px solid var(--border);
+    transform: translateX(-102%); transition: transform .2s ease-out;
+    display: flex; flex-direction: column;
+    padding: calc(var(--sat) + 10px) 0 calc(var(--sab) + 10px) var(--sal);
+  }
+  #sidebar.open { transform: translateX(0); }
+  #sidebar .sb-head { padding: 0 12px 10px; }
+  #new-chat-btn {
+    width: 100%; min-height: 46px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--panel2);
+    color: var(--text); font-size: 14.5px; font-weight: 600;
+  }
+  #sidebar .sb-body { flex: 1; min-height: 0; overflow-y: auto;
+    -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+  .sb-sec {
+    font-size: 10.5px; letter-spacing: 1.5px; color: var(--dim);
+    padding: 12px 12px 6px;
+  }
+  .sb-empty { font-size: 12.5px; color: var(--dim); padding: 2px 12px 8px; }
+  .sr {
+    display: flex; align-items: center; gap: 6px;
+    min-height: 56px; padding: 6px 6px 6px 12px;
+    border-top: 1px solid var(--border); touch-action: manipulation;
+  }
+  .sr:active { background: var(--panel2); }
+  .sr.on { background: rgba(88,166,255,.10); box-shadow: inset 3px 0 0 var(--accent); }
+  .sr .sr-main { flex: 1; min-width: 0; }
+  .sr .sr-t {
+    font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .sr .sr-m { font-size: 11px; color: var(--dim); margin-top: 2px; }
+  .sr .sr-x {
+    flex: none; min-width: var(--tap); min-height: var(--tap);
+    background: none; border: none; color: var(--dim);
+    font-size: 14px; border-radius: 10px; padding: 0 6px;
+  }
+  .sr .sr-x.armed {
+    color: var(--err); border: 1px solid rgba(248,81,73,.45);
+    font-size: 11.5px; font-weight: 700;
+  }
+  .rr .st {
+    flex: none; font-size: 9.5px; letter-spacing: .5px; padding: 2px 7px;
+    border-radius: 20px; border: 1px solid var(--border); color: var(--dim);
+  }
+  .rr .st.live { color: var(--accent); border-color: rgba(88,166,255,.5); }
+  .rr .st.bad { color: var(--err); border-color: rgba(248,81,73,.45); }
+  .rr .st.ok { color: var(--ok); border-color: rgba(63,185,80,.45); }
+
   /* ── Settings drawer ────────────────────────────────── */
-  #backdrop {
+  #backdrop, #side-backdrop {
     position: fixed; inset: 0; background: rgba(0,0,0,.55);
     opacity: 0; pointer-events: none; transition: opacity .18s; z-index: 8;
   }
-  #backdrop.open { opacity: 1; pointer-events: auto; }
+  #backdrop.open, #side-backdrop.open { opacity: 1; pointer-events: auto; }
   #drawer {
     position: fixed; top: 0; right: 0; bottom: 0; width: min(360px, 90vw);
     background: var(--panel); border-left: 1px solid var(--border); z-index: 9;
@@ -512,7 +565,7 @@
     :root { --gut: 8px; }
     body { font-size: 14.5px; }
     header .brand { letter-spacing: 1px; font-size: 14px; }
-    #model-badge { max-width: 26vw; }
+    #model-badge { max-width: 20vw; }
     .msg .body { padding: 9px 10px; }
     .md .tw, .body pre, .md pre { margin-left: -2px; margin-right: -2px; }
     #approval .ap-btns { gap: 6px; }
@@ -533,6 +586,7 @@
 
 <header>
   <div class="hrow">
+    <button id="menu-btn" aria-label="Chats" onclick="toggleSidebar()">&#9776;</button>
     <div id="status-dot"></div>
     <div class="brand">ARTIFEX<span> V5</span></div>
     <div class="spacer"></div>
@@ -612,6 +666,19 @@
   </div>
 </div>
 
+<div id="side-backdrop" onclick="closeSidebar()"></div>
+<div id="sidebar">
+  <div class="sb-head">
+    <button id="new-chat-btn" onclick="newChat()">+ New chat</button>
+  </div>
+  <div class="sb-body">
+    <div class="sb-sec">CHATS</div>
+    <div id="session-list"><div class="sb-empty">Loading...</div></div>
+    <div class="sb-sec">AGENT RUNS</div>
+    <div id="run-list"><div class="sb-empty">None yet.</div></div>
+  </div>
+</div>
+
 <div id="backdrop" onclick="toggleDrawer()"></div>
 <div id="drawer">
   <div class="panel">
@@ -671,11 +738,19 @@ const messagesDiv = $("messages");
 const inputEl = $("chat-input");
 const sendBtn = $("send-btn");
 
-let conversation = [];         // [{role, content}]
+let conversation = [];         // [{role, content}] — the visible transcript
 let isStreaming = false;
 let aborter = null;
 let gatewayUp = false;
 let activeTab = "chat";
+
+// Server-side chat sessions. The transcript is owned by the API (one JSON
+// per session id); this client generates the id and PUTs the full history
+// after every completed exchange.
+const SESSION_KEY = "ax_session_id";
+const LEGACY_CONV_KEY = "ax_conv";
+let activeSessionId = null;
+let legacyConv = [];           // pre-sessions localStorage history, migrated once
 
 const DEFAULT_SYSTEM_PROMPT =
 `You are Artifex, a local AI assistant running on the user's own hardware.
@@ -696,6 +771,20 @@ You can search the web and read pages using these markers in your response:
 - @web_read(N) - Read the full page of search result N.
 - @web_read("https://example.com") - Read a specific URL directly.
 The system executes the tool and returns results to you automatically; then give a final answer using the retrieved data. Use tools for current events or facts you are unsure of; do NOT use them for general knowledge, math, or coding.`;
+
+// Appended at send time (like TODAY'S DATE) rather than baked into
+// DEFAULT_SYSTEM_PROMPT: users persist edited prompts in localStorage, so a
+// constant change would never reach an existing install. Without this the
+// model truthfully says "I can't access your files" and stops there,
+// instead of pointing at the Agent tab, which can.
+function capabilitiesNote(webOn) {
+  return `
+
+CAPABILITIES IN THIS CHAT:
+- Conversation${webOn ? " and web search (see TOOLS)" : " only. Web search is currently toggled OFF in this app's settings; say so if asked to search"}.
+- You have NO access to the user's files, shell, or system state from this chat, and must never simulate command output or guess file contents.
+- This app's AGENT tab DOES have those tools: it runs commands and reads/writes files on the user's PC, with user approval for risky steps. If the user asks for anything that needs their machine (files, directories, running programs, system info), tell them to switch to the Agent tab and phrase it as a goal.`;
+}
 
 // History caps forwarded to the model each turn (mirrors the Kbot proxy's
 // server-side trim: latest message always survives, older ones drop first).
@@ -721,14 +810,6 @@ const store = {
     localStorage.setItem("ax_sysprompt", $("system-prompt").value);
     localStorage.setItem("ax_autonomy", currentAutonomy());
   },
-  saveConv() {
-    try {
-      let c = conversation;
-      // Cap stored history so localStorage never fills up.
-      while (JSON.stringify(c).length > 400000) c = c.slice(2);
-      localStorage.setItem("ax_conv", JSON.stringify(c));
-    } catch (e) {}
-  },
   restore() {
     $("api-key").value = this.k;
     $("temperature").value = localStorage.getItem("ax_temp") || "0.7";
@@ -737,7 +818,9 @@ const store = {
     $("system-prompt").value = localStorage.getItem("ax_sysprompt") || DEFAULT_SYSTEM_PROMPT;
     setEffort(localStorage.getItem("ax_effort") || "medium");
     setAutonomy(localStorage.getItem("ax_autonomy") || "guided");
-    try { conversation = JSON.parse(localStorage.getItem("ax_conv") || "[]"); } catch (e) {}
+    // ax_conv is legacy: transcripts now live on the server. Anything still
+    // here is migrated into a session on first boot, then the key is dropped.
+    try { legacyConv = JSON.parse(localStorage.getItem(LEGACY_CONV_KEY) || "[]"); } catch (e) {}
   },
 };
 
@@ -810,6 +893,7 @@ async function connect() {
       "Gateway offline (Docker not running on the PC). Toggle stays available; searches will fail until it's up.";
     await loadModels();
     $("welcome-hint") && ($("welcome-hint").textContent = "Type a message below to start.");
+    bootSession();
     if (!agentRunId) agentBoot();
   } catch (e) {
     dot.className = "err";
@@ -1158,9 +1242,288 @@ function appendMessage(role, content) {
   updateToBottom();
   return body;
 }
-function renderHistory() {
-  for (const m of conversation) appendMessage(m.role === "user" ? "user" : "assistant", m.content);
+const WELCOME_HTML =
+  '<div class="welcome"><div class="t">ARTIFEX<span> Assistant</span></div>' +
+  '<div class="s">Type a message below to start.</div></div>';
+
+function renderTranscript() {
+  messagesDiv.innerHTML = conversation.length ? "" : WELCOME_HTML;
+  for (const m of conversation) {
+    appendMessage(m.role === "user" ? "user" : "assistant", m.content);
+  }
+  $("stats").style.display = "none";
   pinTo(messagesDiv);
+  updateToBottom();
+}
+
+// ═════════════════════════════════════════════════════════
+// Chat sessions (server-side) + sidebar
+// ═════════════════════════════════════════════════════════
+function newSessionId() {
+  const a = new Uint8Array(8);          // 16 lowercase hex chars
+  if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(a);
+  else for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 256);
+  let s = "";
+  for (let i = 0; i < a.length; i++) s += (a[i] + 0x100).toString(16).slice(1);
+  return s;
+}
+
+function syncableMessages() {
+  const out = [];
+  for (const m of conversation) {
+    if (!m || m.role === "system") continue;      // system is runtime-only
+    const c = typeof m.content === "string" ? m.content : "";
+    if (!c) continue;                             // never sync empty/thinking
+    out.push({ role: m.role, content: c });
+  }
+  return out;
+}
+
+// Fire-and-forget upsert with a single retry. A sync failure must never
+// interrupt the chat, so nothing here throws or touches the transcript.
+async function syncSession(isRetry) {
+  if (!store.k) return false;
+  const msgs = syncableMessages();
+  if (!msgs.length) return false;
+  if (!activeSessionId) {
+    activeSessionId = newSessionId();
+    localStorage.setItem(SESSION_KEY, activeSessionId);
+  }
+  const id = activeSessionId;
+  try {
+    const r = await fetch("/v1/sessions/" + id, {
+      method: "PUT",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ messages: msgs, model: $("model-select").value || undefined }),
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    if ($("sidebar").classList.contains("open")) refreshSessions();
+    return true;
+  } catch (e) {
+    if (!isRetry) setTimeout(() => syncSession(true), 1500);
+    return false;
+  }
+}
+
+function relTime(ts) {
+  const s = Math.max(0, Date.now() / 1000 - (Number(ts) || 0));
+  if (s < 60) return "now";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  if (s < 172800) return "yesterday";
+  if (s < 604800) return Math.floor(s / 86400) + "d";
+  const d = new Date((Number(ts) || 0) * 1000);
+  return (d.getMonth() + 1) + "/" + d.getDate();
+}
+
+function sessionRow(meta) {
+  const row = el("div", "sr" + (meta.id === activeSessionId ? " on" : ""));
+  const main = el("div", "sr-main");
+  main.appendChild(el("div", "sr-t", meta.title || "Untitled"));
+  const n = meta.message_count || 0;
+  main.appendChild(el("div", "sr-m",
+    relTime(meta.updated) + "  -  " + n + (n === 1 ? " msg" : " msgs")));
+  row.appendChild(main);
+  const x = el("button", "sr-x", "✕");
+  x.type = "button";
+  x.onclick = ev => armDelete(ev, meta.id, x);
+  row.appendChild(x);
+  row.onclick = () => loadSession(meta.id);
+  return row;
+}
+
+async function refreshSessions() {
+  const box = $("session-list");
+  if (!store.k) { box.innerHTML = '<div class="sb-empty">Add your API key first.</div>'; return; }
+  try {
+    const r = await fetch("/v1/sessions", { headers: authHeaders() });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const body = await r.json();
+    const list = body.sessions || [];
+    box.innerHTML = "";
+    if (!list.length) { box.appendChild(el("div", "sb-empty", "No saved chats yet.")); return; }
+    for (const meta of list) box.appendChild(sessionRow(meta));
+  } catch (e) {
+    box.innerHTML = "";
+    box.appendChild(el("div", "sb-empty", "Could not load chats (" + e.message + ")."));
+  }
+}
+
+async function loadSession(id) {
+  if (isStreaming) return;              // never swap the transcript mid-stream
+  closeSidebar();
+  try {
+    const r = await fetch("/v1/sessions/" + id, { headers: authHeaders() });
+    if (r.status === 404) { refreshSessions(); return; }
+    if (!r.ok) return;
+    const s = await r.json();
+    activeSessionId = id;
+    localStorage.setItem(SESSION_KEY, id);
+    conversation = (s.messages || []).filter(m => m && m.role !== "system");
+    renderTranscript();
+    showTab("chat");
+    // Follow the model the session was recorded with, when we still have it.
+    if (s.model) {
+      const sel = $("model-select");
+      for (let i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === s.model) {
+          sel.value = s.model;
+          $("model-badge").textContent = s.model;
+          store.save();
+          break;
+        }
+      }
+    }
+  } catch (e) {}
+}
+
+// Two-tap delete: window.confirm() blocks the whole page on iOS, so the
+// button arms itself for 3 s instead.
+function disarmDelete(btn) {
+  if (btn._t) { clearTimeout(btn._t); btn._t = null; }
+  btn.dataset.armed = "";
+  btn.classList.remove("armed");
+  btn.textContent = "✕";
+}
+function armDelete(ev, id, btn) {
+  if (ev) { ev.stopPropagation(); ev.preventDefault(); }
+  if (btn.dataset.armed === "1") { disarmDelete(btn); deleteSession(id); return; }
+  const armed = $("session-list").querySelectorAll(".sr-x.armed");
+  for (let i = 0; i < armed.length; i++) disarmDelete(armed[i]);
+  btn.dataset.armed = "1";
+  btn.classList.add("armed");
+  btn.textContent = "sure?";
+  btn._t = setTimeout(() => disarmDelete(btn), 3000);
+}
+async function deleteSession(id) {
+  try {
+    const r = await fetch("/v1/sessions/" + id, { method: "DELETE", headers: authHeaders() });
+    if (!r.ok && r.status !== 404) return;
+    if (id === activeSessionId) {
+      activeSessionId = null;
+      localStorage.removeItem(SESSION_KEY);
+      conversation = [];
+      renderTranscript();
+    }
+  } catch (e) { return; }
+  refreshSessions();
+}
+
+function newChat() {
+  if (isStreaming && aborter) aborter.abort();
+  activeSessionId = null;
+  localStorage.removeItem(SESSION_KEY);
+  conversation = [];
+  renderTranscript();
+  closeSidebar();
+}
+
+// ── Agent runs section of the sidebar ────────────────────
+function runRow(snap) {
+  const row = el("div", "sr rr");
+  const main = el("div", "sr-main");
+  main.appendChild(el("div", "sr-t", snap.goal || snap.run_id));
+  main.appendChild(el("div", "sr-m", relTime(snap.created)));
+  row.appendChild(main);
+  const st = String(snap.status || "?");
+  const cls = isTerminalStatus(st)
+    ? (st.indexOf("done") === 0 ? "ok" : "bad")
+    : "live";
+  row.appendChild(el("span", "st " + cls, st.split(":")[0]));
+  row.onclick = () => openRun(snap.run_id);
+  return row;
+}
+
+async function refreshRuns() {
+  const box = $("run-list");
+  if (!store.k) { box.innerHTML = ""; return; }
+  try {
+    const r = await fetch("/v1/agent/runs", { headers: authHeaders() });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const body = await r.json();
+    const runs = (body.runs || []).slice(0, 10);
+    box.innerHTML = "";
+    if (!runs.length) { box.appendChild(el("div", "sb-empty", "No runs yet.")); return; }
+    for (const s of runs) box.appendChild(runRow(s));
+  } catch (e) {
+    box.innerHTML = "";
+    box.appendChild(el("div", "sb-empty", "Could not load runs."));
+  }
+}
+
+function openRun(id) {
+  closeSidebar();
+  showTab("agent");
+  if (agentRunId === id) return;                       // already attached
+  // Same run we were following? Resume from our stored index; otherwise
+  // replay the whole feed from the start.
+  const stored = localStorage.getItem(RUN_KEY);
+  let since = 0;
+  if (stored === id) {
+    const n = parseInt(localStorage.getItem(RUN_I_KEY) || "-1", 10);
+    since = isNaN(n) ? 0 : Math.max(0, n + 1);
+  }
+  feed().innerHTML = "";
+  beginRun(id, since, true);
+}
+
+// ── Sidebar open/close ───────────────────────────────────
+function openSidebar() {
+  // Drop the keyboard first: it would cover the drawer and fight the
+  // visualViewport hook while the transform animates.
+  if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+  if ($("drawer").classList.contains("open")) toggleDrawer();
+  $("sidebar").classList.add("open");
+  $("side-backdrop").classList.add("open");
+  refreshSessions();
+  refreshRuns();
+}
+function closeSidebar() {
+  $("sidebar").classList.remove("open");
+  $("side-backdrop").classList.remove("open");
+}
+function toggleSidebar() {
+  if ($("sidebar").classList.contains("open")) closeSidebar();
+  else openSidebar();
+}
+
+// ── Boot / migration ─────────────────────────────────────
+let bootedSession = false;
+async function bootSession() {
+  if (!store.k || bootedSession) return;
+  bootedSession = true;
+  const id = localStorage.getItem(SESSION_KEY);
+  if (!id) {
+    // First run after the sessions feature landed: push whatever the old
+    // client left in localStorage up as a session so nothing is lost.
+    if (legacyConv.length) {
+      conversation = legacyConv.filter(m => m && m.role !== "system");
+      renderTranscript();
+      if (await syncSession(false)) {
+        legacyConv = [];
+        localStorage.removeItem(LEGACY_CONV_KEY);
+      } else {
+        bootedSession = false;          // offline: try the migration again later
+      }
+    }
+    return;
+  }
+  activeSessionId = id;
+  try {
+    const r = await fetch("/v1/sessions/" + id, { headers: authHeaders() });
+    if (r.status === 404) {             // deleted elsewhere — start clean
+      activeSessionId = null;
+      localStorage.removeItem(SESSION_KEY);
+      return;
+    }
+    if (!r.ok) { bootedSession = false; return; }
+    const s = await r.json();
+    conversation = (s.messages || []).filter(m => m && m.role !== "system");
+    renderTranscript();
+    localStorage.removeItem(LEGACY_CONV_KEY);
+  } catch (e) {
+    bootedSession = false;              // offline: retry on the next connect()
+  }
 }
 
 // ── History trim before send ─────────────────────────────
@@ -1192,6 +1555,9 @@ async function sendMessage() {
   conversation.push({ role: "user", content: text });
   inputEl.value = "";
   inputEl.style.height = "auto";
+  // A brand-new chat is written out at once so it shows up in the sidebar
+  // immediately, rather than only after a long reply finishes.
+  if (!activeSessionId) syncSession(false);
 
   const body = appendMessage("assistant", "");
   const cursor = document.createElement("span");
@@ -1253,6 +1619,7 @@ async function sendMessage() {
     const webOn = $("web-toggle").checked;
     let sys = $("system-prompt").value.trim() || DEFAULT_SYSTEM_PROMPT;
     sys += "\n\nTODAY'S DATE: " + new Date().toDateString();
+    sys += capabilitiesNote(webOn);
     if (webOn) sys += TOOL_PROMPT;
 
     const payload = {
@@ -1377,7 +1744,7 @@ async function sendMessage() {
       body.innerHTML = '<span class="err-text">(empty response)</span>';
     }
     if (segText) conversation.push({ role: "assistant", content: segText });
-    store.saveConv();
+    syncSession(false);            // fire-and-forget; never blocks the UI
     if (usage) {
       const el = ((Date.now() - t0) / 1000);
       $("stats").style.display = "block";
@@ -1394,14 +1761,11 @@ async function sendMessage() {
   }
 }
 
+// Settings-drawer button. Same semantics as the sidebar's "New chat": the
+// stored session stays on the server, this just starts a fresh one.
 function clearChat() {
-  conversation = [];
-  store.saveConv();
-  messagesDiv.innerHTML =
-    '<div class="welcome"><div class="t">ARTIFEX<span> Assistant</span></div>' +
-    '<div class="s">Type a message below to start.</div></div>';
-  $("stats").style.display = "none";
   toggleDrawer();
+  newChat();
 }
 
 // ═════════════════════════════════════════════════════════
@@ -2111,8 +2475,9 @@ $("api-key").addEventListener("change", () => store.save());
 store.restore();
 autonomyHint();
 updateAgentUi();
-if (conversation.length) renderHistory();
-connect();
+activeSessionId = localStorage.getItem(SESSION_KEY) || null;
+connect();          // -> bootSession() restores the transcript from the API
+bootSession();
 agentBoot();
 </script>
 </body>
