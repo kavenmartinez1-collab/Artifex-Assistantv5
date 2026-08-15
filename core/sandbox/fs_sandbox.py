@@ -182,6 +182,37 @@ _PATH_LIKE = re.compile(
     r'[^\s:*?"<>|\x00-\x1f]+'
 )
 
+# Leading escape sequences in shell/python string literals ("hi\n") produce
+# bogus candidates: `printf 'hi\n' > out.txt` extracts "\n'" as a path, which
+# abspath()s to <drive root>\n' and is rejected as "outside sandbox" —
+# blocking the single most common way an agent writes a file. Only candidates
+# BEGINNING with a bare-backslash escape are affected; drive-prefixed and
+# dot-relative candidates are kept verbatim, since stripping escapes out of
+# those breaks the drive prefix and lets real paths whose components start
+# with escape letters (C:\temp\notes.txt) evade the check entirely.
+_LEADING_ESCAPES = re.compile(
+    r'^(?:\\(?:[ntrbfva0]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}))+'
+)
+
+
+def _filter_escape_candidates(candidates: list[str]) -> list[str]:
+    """Drop or trim path candidates that are really string-literal escapes.
+
+    A candidate starting with an escape sequence ("\\n'") is junk unless a
+    genuine path tail follows the escapes ("\\n\\.ssh\\id_rsa" keeps
+    "\\.ssh\\id_rsa" so the deny list still sees it).
+    """
+    kept = []
+    for cand in candidates:
+        if cand.startswith("\\"):
+            remainder = _LEADING_ESCAPES.sub("", cand)
+            if remainder != cand:
+                if remainder.startswith(("\\", "/")):
+                    kept.append(remainder)
+                continue
+        kept.append(cand)
+    return kept
+
 
 def extract_paths_from_content(action_type: str, content: str) -> list[str]:
     """Extract file paths from action content for sandbox checking."""
@@ -213,7 +244,7 @@ def extract_paths_from_content(action_type: str, content: str) -> list[str]:
             paths.append(parts[1].strip())
 
     elif action_type in ("shell", "python"):
-        paths.extend(_PATH_LIKE.findall(content))
+        paths.extend(_filter_escape_candidates(_PATH_LIKE.findall(content)))
 
     elif action_type == "download":
         parts = content.split("|", 1)
