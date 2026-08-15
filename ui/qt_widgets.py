@@ -731,6 +731,17 @@ class ChatView(QScrollArea):
     ChatBubble that can contain mixed text + images + audio/video players.
     """
 
+    # Retained rendered bubbles. The model's own history already decays
+    # (core.inference.auto_compact_if_needed / compress_history), but the
+    # rendered view had no bound at all — every bubble from a session stayed
+    # live, holding its text and any embedded image/audio players. A long
+    # session therefore grew monotonically with nothing to release it.
+    # Oldest bubbles are evicted first, so the view keeps the recent window
+    # and lets older turns fall out. Scroll-back is what is traded away;
+    # the conversation itself is unaffected (self.messages in the window is
+    # the source of truth, and sessions are saved separately).
+    MAX_BUBBLES = int(os.environ.get("ARTIFEX_MAX_CHAT_BUBBLES", "400"))
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWidgetResizable(True)
@@ -755,11 +766,29 @@ class ChatView(QScrollArea):
         idx = self._container_layout.count() - 1
         self._container_layout.insertWidget(idx, bubble)
         self._bubbles.append(bubble)
+        self._trim_bubbles()
 
         if self._auto_scroll:
             self._scroll_to_bottom()
 
         return bubble
+
+    def _trim_bubbles(self):
+        """Evict oldest bubbles once past MAX_BUBBLES.
+
+        Only ever drops from the front, never the bubble just returned by
+        add_bubble: callers hold that reference and stream into it, and
+        touching a deleteLater'd widget raises RuntimeError inside a Qt
+        slot — which PyQt6 escalates to qFatal() and a process abort. A cap
+        below 2 would make that reachable, so the floor is enforced here
+        rather than trusting the env var.
+        """
+        cap = max(2, self.MAX_BUBBLES)
+        while len(self._bubbles) > cap:
+            stale = self._bubbles.pop(0)
+            self._container_layout.removeWidget(stale)
+            stale.setParent(None)
+            stale.deleteLater()
 
     def clear_chat(self):
         """Remove all bubbles."""
