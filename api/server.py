@@ -1359,6 +1359,33 @@ def create_app():
     from api.session_api import register_session_routes
     register_session_routes(app, check_auth=_check_auth, session_dir=SESSION_DIR)
 
+    # ─── Persistent chat jobs ────────────────────────────────────────────
+    # Chat that survives the client (phone locks, tab dies): generation
+    # runs server-side and is reattachable; the finished exchange is
+    # written into the session store even if nobody reattaches.
+
+    def _chat_job_stream(req):
+        # Runs inside the job worker's private event loop. The model-queue
+        # asyncio lock belongs to the main loop, so (like the agent worker)
+        # jobs use _get_engine() directly and run against the active model.
+        from core.config import get_active_backend
+        _get_engine()
+        mq = get_model_queue()
+        model = req.model or mq._current_model or ""
+        return _stream_with_tools(
+            list(req.messages), model,
+            req.max_tokens or 12288,
+            req.temperature if req.temperature is not None else 0.7,
+            {}, bool(req.web_tools), get_active_backend(),
+            enable_thinking=True,
+            reasoning_effort=(req.reasoning_effort or None),
+        )
+
+    from api.chat_jobs import register_chat_job_routes
+    register_chat_job_routes(app, check_auth=_check_auth,
+                             stream_factory=_chat_job_stream,
+                             session_dir=SESSION_DIR)
+
     # ─── Workspace files ─────────────────────────────────────────────────
     # Browse/read/download/upload, JAILED to the agent-runs area — an
     # artifact space for the phone, not a repo browser.

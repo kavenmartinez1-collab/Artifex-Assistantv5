@@ -56,6 +56,45 @@ class SessionUpsert(BaseModel):
     model: Optional[str] = Field(None, max_length=80)
 
 
+def write_session(session_dir: str, session_id: str, messages: list,
+                  title: str | None = None, model: str | None = None) -> bool:
+    """Programmatic upsert for server-side writers (chat jobs).
+
+    Same semantics as PUT /v1/sessions/{id} — strips system messages,
+    derives a title, atomic write — but returns False on any problem
+    instead of raising: a background job must never die on session
+    bookkeeping.
+    """
+    try:
+        if not _ID_RE.match(session_id or ""):
+            return False
+        store = os.path.join(session_dir, "api")
+        os.makedirs(store, exist_ok=True)
+        msgs = [m for m in messages
+                if isinstance(m, dict) and m.get("role") != "system"]
+        if len(msgs) > _MAX_MESSAGES:
+            msgs = msgs[-_MAX_MESSAGES:]
+        data = {
+            "id": session_id,
+            "title": (title or "").strip() or _derive_title(msgs),
+            "model": model,
+            "updated": round(time.time(), 2),
+            "messages": msgs,
+        }
+        raw = json.dumps(data, ensure_ascii=False)
+        if len(raw.encode("utf-8")) > _MAX_BYTES:
+            return False
+        path = os.path.join(store, f"{session_id}.json")
+        with _write_lock:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(raw)
+            os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
 def _derive_title(messages: list) -> str:
     for m in messages:
         if m.get("role") == "user":
