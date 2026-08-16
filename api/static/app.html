@@ -870,7 +870,10 @@ const LEGACY_CONV_KEY = "ax_conv";
 let activeSessionId = null;
 let legacyConv = [];           // pre-sessions localStorage history, migrated once
 
-const DEFAULT_SYSTEM_PROMPT =
+// The old default over-corrected for thinking-runaway by demanding brevity
+// in the ANSWER too — meaty questions got ~500-token replies that read as
+// truncation. Keep reasoning bounded; let the answer match the task.
+const LEGACY_SYSTEM_PROMPT =
 `You are Artifex, a local AI assistant running on the user's own hardware.
 
 CRITICAL RULES:
@@ -879,6 +882,19 @@ CRITICAL RULES:
 - One clear response per question. Do not pad with caveats unless asked.
 - Format responses with markdown when helpful (lists, code blocks, tables).
 - If you don't know something and cannot search for it, say so in one sentence.`;
+
+const DEFAULT_SYSTEM_PROMPT =
+`You are Artifex, a local AI assistant running on the user's own hardware.
+
+RULES:
+- Keep internal reasoning short — but let the ANSWER be as long as the task
+  needs. A quick question deserves a tight answer; a build, explanation, or
+  document deserves a complete one. Never stop early to save space.
+- Lead with the answer, not the reasoning. Skip filler and preamble.
+- When asked to build something (code, HTML, documents), produce the COMPLETE
+  artifact in one response — no placeholders, no "rest left as exercise".
+- Format responses with markdown (lists, code blocks, tables).
+- If you don't know something and cannot search for it, say so briefly.`;
 
 const TOOL_PROMPT =
 `
@@ -946,7 +962,15 @@ const store = {
     $("temperature").value = localStorage.getItem("ax_temp") || "0.7";
     $("max-tokens").value = localStorage.getItem("ax_maxtok") || "12288";
     $("web-toggle").checked = localStorage.getItem("ax_web") === "1";
-    $("system-prompt").value = localStorage.getItem("ax_sysprompt") || DEFAULT_SYSTEM_PROMPT;
+    // Migrate: installs that saved the old default verbatim (the drawer's
+    // save button persists whatever is in the textarea) get the new one;
+    // genuinely customized prompts are left alone.
+    let sp = localStorage.getItem("ax_sysprompt");
+    if (!sp || sp.trim() === LEGACY_SYSTEM_PROMPT.trim()) {
+      sp = DEFAULT_SYSTEM_PROMPT;
+      localStorage.setItem("ax_sysprompt", sp);
+    }
+    $("system-prompt").value = sp;
     setEffort(localStorage.getItem("ax_effort") || "medium");
     setAutonomy(localStorage.getItem("ax_autonomy") || "guided");
     const ectx = localStorage.getItem("ax_engine_ctx");
