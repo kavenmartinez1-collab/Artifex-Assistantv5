@@ -35,7 +35,11 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<!-- maximum-scale=1 suppresses iOS's automatic zoom-in when focusing a
+     field (the "type then pinch back out" annoyance). It does NOT block
+     manual pinch-zoom: iOS 10+ deliberately ignores it for user gestures
+     as an accessibility policy, so only the auto-zoom is affected. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="theme-color" content="#0d1117">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
