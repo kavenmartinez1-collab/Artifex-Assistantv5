@@ -5,7 +5,12 @@
   Talks to the API's own endpoints on the same origin (no CORS, no proxy):
     GET  /health                        status dot + web_gateway availability
     GET  /v1/models                     model picker (local backends only)
-    POST /v1/chat/completions           streaming chat, extended OpenAI SSE
+    POST /v1/chat/jobs                  persistent chat job -> {job_id}
+    GET  /v1/chat/jobs/{id}             snapshot (status + accumulated text)
+    GET  /v1/chat/jobs/{id}/events      SSE: x_snapshot, deltas, x_job_end
+    POST /v1/chat/jobs/{id}/stop        stop delivering
+    POST /v1/chat/completions           context compaction, and the legacy
+                                        direct-streaming fallback
     POST /v1/agent/runs                 start an agent run  -> {run_id, folder}
     GET  /v1/agent/runs/{id}            snapshot (status + pending approval)
     GET  /v1/agent/runs/{id}/events     SSE event feed (?since=<index>)
@@ -1064,7 +1069,7 @@ async function connect() {
       "Gateway offline (Docker not running on the PC). Toggle stays available; searches will fail until it's up.";
     await loadModels();
     $("welcome-hint") && ($("welcome-hint").textContent = "Type a message below to start.");
-    bootSession();
+    bootSession().then(bootChatJob);
     if (!agentRunId) agentBoot();
   } catch (e) {
     dot.className = "err";
@@ -1530,6 +1535,11 @@ async function loadSession(id) {
     const s = await r.json();
     activeSessionId = id;
     localStorage.setItem(SESSION_KEY, id);
+    // Switching conversations detaches from a running job: its answer belongs
+    // to the session it was started in, not to the one being opened here.
+    localStorage.removeItem(CHAT_JOB_KEY);
+    chatJobId = null;
+    pendingTurnEl = null;
     conversation = (s.messages || []).filter(m => m && m.role !== "system");
     renderTranscript();
     showTab("chat");
@@ -1582,6 +1592,11 @@ async function deleteSession(id) {
 
 function newChat() {
   if (isStreaming && aborter) aborter.abort();
+  // Detach from any running job without stopping it: it keeps generating and
+  // still lands in its own session, it just isn't this conversation anymore.
+  localStorage.removeItem(CHAT_JOB_KEY);
+  chatJobId = null;
+  pendingTurnEl = null;
   activeSessionId = null;
   localStorage.removeItem(SESSION_KEY);
   conversation = [];
@@ -1780,10 +1795,42 @@ async function autoCompact(signal, onStatus) {
   }
 }
 
-// ── Chat ─────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════
+// Chat
+//
+// A send is a SERVER-SIDE JOB: the POST returns a job id, generation
+// continues on the PC whether or not this page is open, and the server
+// writes the finished exchange into the session store itself. This page is
+// only a viewer that can detach and reattach at will — send, lock the
+// phone, come back later, the answer is simply there. Direct streaming is
+// kept as a fallback for an API that predates /v1/chat/jobs.
+// ═════════════════════════════════════════════════════════
+const CHAT_JOB_KEY = "ax_chat_job";
+let chatJobId = null;        // job this page is attached to right now
+let pendingTurnEl = null;    // bubble of a turn whose stream died unfinished
+
 function sendOrStop() {
-  if (isStreaming) { if (aborter) aborter.abort(); return; }
+  if (isStreaming) { stopChat(); return; }
   sendMessage();
+}
+
+// Delivery stops at once; the engine drains its current round server-side,
+// so this is treated as ended locally without waiting for confirmation.
+function stopChat() {
+  if (chatJobId) {
+    fetch("/v1/chat/jobs/" + chatJobId + "/stop",
+      { method: "POST", headers: authHeaders() }).catch(() => {});
+    localStorage.removeItem(CHAT_JOB_KEY);
+  }
+  if (aborter) aborter.abort();
+}
+
+function ensureSessionId() {
+  if (!activeSessionId) {
+    activeSessionId = newSessionId();
+    localStorage.setItem(SESSION_KEY, activeSessionId);
+  }
+  return activeSessionId;
 }
 
 async function sendMessage() {
@@ -1791,15 +1838,116 @@ async function sendMessage() {
   if (!text || isStreaming) return;
   if (!store.k) { toggleDrawer(); return; }
 
+  // The session id has to exist BEFORE the job starts: the server persists
+  // the finished exchange into it even if this page never reattaches.
+  ensureSessionId();
   appendMessage("user", text);
   conversation.push({ role: "user", content: text });
   inputEl.value = "";
   inputEl.style.height = "auto";
-  // A brand-new chat is written out at once so it shows up in the sidebar
-  // immediately, rather than only after a long reply finishes.
-  if (!activeSessionId) syncSession(false);
+  // Write the user turn out now, so a reload mid-job shows the question
+  // above the answer that streams back in.
+  syncSession(false);
 
+  await runAssistantTurn({});
+}
+
+// Reattach to a job that is still running on the server.
+function reattachChat(jobId) {
+  if (isStreaming) return;
+  if (pendingTurnEl) { pendingTurnEl.remove(); pendingTurnEl = null; }
+  runAssistantTurn({ attachJob: jobId });
+}
+
+function buildChatPayload() {
+  const webOn = $("web-toggle").checked;
+  let sys = $("system-prompt").value.trim() || DEFAULT_SYSTEM_PROMPT;
+  sys += "\n\nTODAY'S DATE: " + new Date().toDateString();
+  sys += capabilitiesNote(webOn);
+  if (webOn) sys += TOOL_PROMPT;
+  return {
+    model: $("model-select").value || undefined,
+    messages: [{ role: "system", content: sys }].concat(trimmedHistory()),
+    web_tools: webOn,
+    temperature: Math.max(0, Math.min(2, parseFloat($("temperature").value) || 0.7)),
+    max_tokens: Math.max(64, Math.min(32768, parseInt($("max-tokens").value) || 12288)),
+    reasoning_effort: currentEffort(),
+  };
+}
+
+// -> {jobId} | {jobId, attached:true} | {fallback:true}, or throws.
+async function startChatJob(base, signal) {
+  const r = await fetch("/v1/chat/jobs", {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    signal: signal,
+    body: JSON.stringify(Object.assign(
+      { session_id: activeSessionId || undefined }, base)),
+  });
+  // An API that predates persistent jobs — use the old direct stream.
+  if (r.status === 404 || r.status === 405) return { fallback: true };
+  if (r.status === 401) throw new Error("Invalid API key - check Settings");
+  let data = null;
+  try { data = await r.json(); } catch (e) {}
+  if (r.status === 409) {
+    const d = data && data.detail;
+    // One job at a time: watch the one that is already running.
+    if (d && d.job_id) return { jobId: d.job_id, attached: true };
+  }
+  if (!r.ok) throw new Error("Server returned " + r.status);
+  if (!data || !data.job_id) throw new Error("No job id in the response");
+  return { jobId: data.job_id };
+}
+
+// Legacy path: generation lives and dies with this connection.
+async function streamDirect(base, onPayload, signal) {
+  const resp = await fetch("/v1/chat/completions", {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    signal: signal,
+    body: JSON.stringify({
+      model: base.model,
+      messages: base.messages,
+      stream: true,
+      web_tools: base.web_tools,
+      temperature: base.temperature,
+      max_tokens: base.max_tokens,
+      options: { reasoning_effort: base.reasoning_effort },
+    }),
+  });
+  if (resp.status === 401) throw new Error("Invalid API key - check Settings");
+  if (!resp.ok) throw new Error("Server returned " + resp.status);
+  await readSSE(resp, onPayload);
+}
+
+async function readSSE(resp, onPayload) {
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (line.charAt(0) === ":") continue;          // ": ping" keepalive
+      if (!line.startsWith("data:")) continue;
+      const p = line.slice(5).trim();
+      if (!p) continue;
+      if (p === "[DONE]") return;
+      let data;
+      try { data = JSON.parse(p); } catch (e) { continue; }
+      onPayload(data);
+    }
+  }
+}
+
+async function runAssistantTurn(opts) {
+  opts = opts || {};
   const body = appendMessage("assistant", "");
+  const bubble = body.parentNode;
+  pendingTurnEl = bubble;
   const cursor = document.createElement("span");
   cursor.className = "cursor";
   body.appendChild(cursor);
@@ -1811,7 +1959,9 @@ async function sendMessage() {
   let finishReason = "";
   let usage = null;
   let renderTimer = null;
-  const t0 = Date.now();
+  let jobFinished = false;       // the job reached a terminal state
+  let endStatus = "";
+  let t0 = Date.now();           // reset from the snapshot when reattaching
 
   isStreaming = true;
   sendBtn.textContent = "Stop";
@@ -1855,133 +2005,170 @@ async function sendMessage() {
     if (segText) paintAnswer();
   };
   const newSegment = () => { flushRender(); segText = ""; answerEl = null; };
+  const ensureThinking = () => {
+    if (!thinkingEl) {
+      thinkingEl = document.createElement("details");
+      thinkingEl.className = "thinking";
+      thinkingEl.open = true;
+      const s = document.createElement("summary");
+      s.textContent = "Thinking...";
+      thinkingBody = document.createElement("div");
+      thinkingBody.className = "tb";
+      thinkingEl.appendChild(s);
+      thinkingEl.appendChild(thinkingBody);
+      addBlock(thinkingEl);
+    }
+    return thinkingBody;
+  };
+  const addToolStatus = labels => {
+    collapseThinking();
+    newSegment();              // status card lands below the text so far
+    const el = document.createElement("div");
+    el.className = "tool-status";
+    el.innerHTML = "&#x1F50D; " + labels.map(escapeHtml).join("<br>");
+    addBlock(el);
+  };
+  const addError = msg => {
+    flushRender();
+    addBlock(Object.assign(document.createElement("div"),
+      { className: "err-text", textContent: msg }));
+  };
+  const addNote = msg => addBlock(Object.assign(document.createElement("div"),
+    { className: "finish-note", textContent: msg }));
+
+  // Everything the job accumulated before this page attached. Sent as the
+  // first SSE event, so on a fresh send it is empty and this is a no-op.
+  // Round structure is flattened here (all thinking, then all tool labels,
+  // then all text) — live deltas keep their true order after it.
+  const applySnapshot = s => {
+    if (!s) return;
+    if (s.created) t0 = s.created * 1000;
+    if (s.thinking) {
+      ensureThinking();
+      thinkingText = s.thinking;
+      thinkingBody.textContent = s.thinking;
+      thinkingBody.scrollTop = thinkingBody.scrollHeight;
+    }
+    if (s.tool_status && s.tool_status.length) addToolStatus(s.tool_status);
+    if (s.text) {
+      collapseThinking();
+      segText = s.text;
+      sawContent = true;
+      flushRender();                     // paint now, not on the next timer
+    }
+    if (s.usage && Object.keys(s.usage).length) usage = s.usage;
+    if (s.error) addError(s.error);
+    if (s.status && s.status !== "running") {
+      jobFinished = true;
+      endStatus = s.status;
+    }
+  };
+
+  const handlePayload = data => {
+    if (!data) return;
+    if (data.x_snapshot) { applySnapshot(data.x_snapshot); return; }
+    if (data.x_job_end) {
+      const e = data.x_job_end || {};
+      jobFinished = true;
+      endStatus = e.status || "done";
+      if (e.usage && Object.keys(e.usage).length) usage = e.usage;
+      if (e.error) addError(e.error);
+      if (endStatus === "stopped") { flushRender(); addNote("- stopped -"); }
+      return;
+    }
+    // ── Extended events (top-level) ──────────────
+    if (data.error) {
+      addError(typeof data.error === "string" ? data.error
+        : (data.error.message || JSON.stringify(data.error)));
+      return;
+    }
+    if (data.x_tool_status) { addToolStatus(data.x_tool_status); return; }
+    if (data.x_tool_done) {
+      // Tools finished: the model starts a fresh segment. Keep what is
+      // rendered, reset accumulators so the follow-up streams cleanly.
+      newSegment();
+      thinkingEl = null; thinkingBody = null; thinkingText = "";
+      return;
+    }
+    if (data.x_usage) usage = data.x_usage;
+
+    // ── OpenAI-format chunk ──────────────────────
+    const choice = (data.choices || [])[0];
+    if (!choice) return;
+    const delta = choice.delta || {};
+    if (choice.finish_reason) finishReason = choice.finish_reason;
+
+    if (delta.x_thinking) {
+      ensureThinking();
+      // Plain text nodes: no markdown pass, no string rebuild per token.
+      thinkingText += delta.x_thinking;
+      thinkingBody.appendChild(document.createTextNode(delta.x_thinking));
+      thinkingBody.scrollTop = thinkingBody.scrollHeight;
+      if (isPinned(messagesDiv)) pinTo(messagesDiv);
+    }
+    if (delta.content) {
+      collapseThinking();
+      segText += delta.content;
+      sawContent = true;
+      scheduleRender();
+    }
+  };
 
   try {
-    // Slide the window before building the payload: if the conversation has
-    // outgrown its budget, fold the older half into a synopsis first. Status
-    // shows where tool-status lines do; failure falls through to the trim.
-    if (compactCut()) {
-      const statusEl = addBlock(Object.assign(document.createElement("div"),
-        { className: "tool-status", textContent: "Compacting context..." }));
-      const folded = await autoCompact(aborter.signal, null);
-      if (folded) {
-        statusEl.textContent = "— compacted " + folded + " earlier messages —";
+    let jobId = opts.attachJob || null;
+
+    if (!jobId) {
+      // Slide the window before building the payload: if the conversation
+      // has outgrown its budget, fold the older half into a synopsis first.
+      // Status shows where tool-status lines do; failure falls through to
+      // the hard trim.
+      if (compactCut()) {
+        const statusEl = addBlock(Object.assign(document.createElement("div"),
+          { className: "tool-status", textContent: "Compacting context..." }));
+        const folded = await autoCompact(aborter.signal, null);
+        if (folded) {
+          statusEl.textContent = "— compacted " + folded + " earlier messages —";
+        } else {
+          statusEl.remove();
+        }
+      }
+
+      const base = buildChatPayload();
+      const started = await startChatJob(base, aborter.signal);
+      if (started.fallback) {
+        await streamDirect(base, handlePayload, aborter.signal);
+        jobFinished = true;             // nothing to reattach to
       } else {
-        statusEl.remove();
+        jobId = started.jobId;
+        if (started.attached) {
+          addBlock(Object.assign(document.createElement("div"),
+            { className: "tool-status", textContent: "Attached to the reply already in flight." }));
+        }
       }
     }
 
-    const webOn = $("web-toggle").checked;
-    let sys = $("system-prompt").value.trim() || DEFAULT_SYSTEM_PROMPT;
-    sys += "\n\nTODAY'S DATE: " + new Date().toDateString();
-    sys += capabilitiesNote(webOn);
-    if (webOn) sys += TOOL_PROMPT;
-
-    const payload = {
-      model: $("model-select").value || undefined,
-      messages: [{ role: "system", content: sys }, ...trimmedHistory()],
-      stream: true,
-      web_tools: webOn,
-      temperature: parseFloat($("temperature").value) || 0.7,
-      max_tokens: parseInt($("max-tokens").value) || 12288,
-      options: { reasoning_effort: currentEffort() },
-    };
-
-    const resp = await fetch("/v1/chat/completions", {
-      method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify(payload),
-      signal: aborter.signal,
-    });
-    if (resp.status === 401) throw new Error("Invalid API key - check Settings");
-    if (!resp.ok) throw new Error("Server returned " + resp.status);
-
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop();
-
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const payload = line.slice(6).trim();
-        if (!payload || payload === "[DONE]") continue;
-        let data;
-        try { data = JSON.parse(payload); } catch (e) { continue; }
-
-        // ── Extended events (top-level) ──────────────
-        if (data.error) {
-          const msg = typeof data.error === "string" ? data.error :
-                      (data.error.message || JSON.stringify(data.error));
-          flushRender();
-          addBlock(Object.assign(document.createElement("div"),
-            { className: "err-text", textContent: msg }));
-          continue;
-        }
-        if (data.x_tool_status) {
-          collapseThinking();
-          newSegment();          // status card lands below the text so far
-          const el = document.createElement("div");
-          el.className = "tool-status";
-          el.innerHTML = "&#x1F50D; " + data.x_tool_status.map(escapeHtml).join("<br>");
-          addBlock(el);
-          continue;
-        }
-        if (data.x_tool_done) {
-          // Tools finished: the model starts a fresh segment. Keep what is
-          // rendered, reset accumulators so the follow-up streams cleanly.
-          newSegment();
-          thinkingEl = null; thinkingBody = null; thinkingText = "";
-          continue;
-        }
-        if (data.x_usage) usage = data.x_usage;
-
-        // ── OpenAI-format chunk ──────────────────────
-        const choice = (data.choices || [])[0];
-        if (!choice) continue;
-        const delta = choice.delta || {};
-        if (choice.finish_reason) finishReason = choice.finish_reason;
-
-        if (delta.x_thinking) {
-          if (!thinkingEl) {
-            thinkingEl = document.createElement("details");
-            thinkingEl.className = "thinking";
-            thinkingEl.open = true;
-            const s = document.createElement("summary");
-            s.textContent = "Thinking...";
-            thinkingBody = document.createElement("div");
-            thinkingBody.className = "tb";
-            thinkingEl.appendChild(s);
-            thinkingEl.appendChild(thinkingBody);
-            addBlock(thinkingEl);
-          }
-          // Plain text nodes: no markdown pass, no string rebuild per token.
-          thinkingText += delta.x_thinking;
-          thinkingBody.appendChild(document.createTextNode(delta.x_thinking));
-          thinkingBody.scrollTop = thinkingBody.scrollHeight;
-          if (isPinned(messagesDiv)) pinTo(messagesDiv);
-        }
-        if (delta.content) {
-          collapseThinking();
-          segText += delta.content;
-          sawContent = true;
-          scheduleRender();
-        }
-      }
+    if (jobId) {
+      chatJobId = jobId;
+      localStorage.setItem(CHAT_JOB_KEY, jobId);
+      const r = await fetch("/v1/chat/jobs/" + jobId + "/events", {
+        headers: authHeaders(), signal: aborter.signal,
+      });
+      if (r.status === 404) throw new Error("That reply is no longer on the server");
+      if (!r.ok) throw new Error("Server returned " + r.status);
+      // Attaching to an already-finished job yields the snapshot and then
+      // [DONE] with no x_job_end — applySnapshot has set jobFinished.
+      await readSSE(r, handlePayload);
     }
   } catch (err) {
     flushRender();
     if (err.name === "AbortError") {
-      addBlock(Object.assign(document.createElement("div"),
-        { className: "finish-note", textContent: "- stopped -" }));
+      // Only stopChat() aborts, and it already told the server.
+      addNote("- stopped -");
+      jobFinished = true;
     } else {
-      addBlock(Object.assign(document.createElement("div"),
-        { className: "err-text", textContent: "Error: " + err.message }));
+      addError("Error: " + err.message);
+      // A dropped connection is NOT the end of the job: leave the stored id
+      // in place so boot / returning to the tab can reattach to it.
     }
   } finally {
     if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
@@ -1999,6 +2186,9 @@ async function sendMessage() {
       body.innerHTML = '<span class="err-text">(empty response)</span>';
     }
     if (segText) conversation.push({ role: "assistant", content: segText });
+    // The server already wrote a completed exchange into the session; this
+    // PUT is a same-content overwrite, and the only writer for a stopped or
+    // errored job.
     syncSession(false);            // fire-and-forget; never blocks the UI
     if (usage) {
       const el = ((Date.now() - t0) / 1000);
@@ -2008,12 +2198,69 @@ async function sendMessage() {
         " tok - " + (el > 0 ? ((usage.completion_tokens || 0) / el).toFixed(1) : "?") + " tok/s - " +
         el.toFixed(1) + "s";
     }
+    if (jobFinished) localStorage.removeItem(CHAT_JOB_KEY);
+    // Keep the bubble marked stale while the job may still be running, so a
+    // reattach replaces it instead of stacking a second copy underneath.
+    pendingTurnEl = jobFinished ? null : bubble;
+    chatJobId = null;
     isStreaming = false;
     aborter = null;
     releaseWakeLock();
     sendBtn.textContent = "Send";
     sendBtn.classList.remove("stop");
     updateToBottom();
+  }
+}
+
+// ── Reattach ─────────────────────────────────────────────
+// The whole point of server-side jobs: send, lock the phone, reopen later
+// and the answer is simply there.
+async function reloadActiveSession(sessionId) {
+  const id = sessionId || activeSessionId;
+  if (!id) return false;
+  try {
+    const r = await fetch("/v1/sessions/" + id, { headers: authHeaders() });
+    if (!r.ok) return false;
+    const s = await r.json();
+    activeSessionId = id;
+    localStorage.setItem(SESSION_KEY, id);
+    conversation = (s.messages || []).filter(m => m && m.role !== "system");
+    renderTranscript();
+    return true;
+  } catch (e) { return false; }
+}
+
+let chatJobBooting = false;
+async function bootChatJob() {
+  if (isStreaming || chatJobId || chatJobBooting) return;
+  const id = localStorage.getItem(CHAT_JOB_KEY);
+  if (!id || !store.k) return;
+  chatJobBooting = true;
+  try {
+    const r = await fetch("/v1/chat/jobs/" + id, { headers: authHeaders() });
+    if (r.status === 404) { localStorage.removeItem(CHAT_JOB_KEY); return; }
+    if (!r.ok) return;                       // offline / bad key: try again later
+    const s = await r.json();
+    if (s.status === "running") {
+      reattachChat(id);                      // snapshot repaints what we missed
+      return;
+    }
+    // Finished while we were away. A completed job wrote the exchange into
+    // the session itself, so the answer comes back with the transcript.
+    localStorage.removeItem(CHAT_JOB_KEY);
+    if (pendingTurnEl) { pendingTurnEl.remove(); pendingTurnEl = null; }
+    await reloadActiveSession(s.session_id);
+    if (s.status !== "done" && s.text) {
+      // stopped / error: the server did NOT persist it. Keep the partial
+      // answer and write it out ourselves.
+      appendMessage("assistant", s.text);
+      conversation.push({ role: "assistant", content: s.text });
+      syncSession(false);
+    }
+  } catch (e) {
+    /* leave the key in place; the next visibility change retries */
+  } finally {
+    chatJobBooting = false;
   }
 }
 
@@ -2036,9 +2283,12 @@ function releaseWakeLock() {
   _wakeLock = null;
 }
 // The lock is auto-released if the user switches tabs; re-acquire when
-// they come back while a stream is still running.
+// they come back while a stream is still running. If nothing is streaming
+// here but a job was left running on the server, pick it back up.
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && isStreaming) acquireWakeLock();
+  if (document.visibilityState !== "visible") return;
+  if (isStreaming) acquireWakeLock();
+  else bootChatJob();
 });
 
 // Settings-drawer button. Same semantics as the sidebar's "New chat": the
@@ -3032,7 +3282,9 @@ autonomyHint();
 updateAgentUi();
 activeSessionId = localStorage.getItem(SESSION_KEY) || null;
 connect();          // -> bootSession() restores the transcript from the API
-bootSession();
+// Transcript first, then any job still running against it, so the answer
+// lands under the question instead of above it.
+bootSession().then(bootChatJob);
 agentBoot();
 </script>
 </body>
