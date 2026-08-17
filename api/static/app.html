@@ -278,13 +278,41 @@
   .cb-h button.done { color: var(--ok); border-color: rgba(63,185,80,.45); }
   .cb pre { margin: 0; border: none; border-radius: 0; }
 
+  /* ── Image attachments (chat) ───────────────────────── */
+  .bubble-imgs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+  .bubble-img {
+    max-width: min(220px, 100%); max-height: 260px; border-radius: 8px;
+    display: block; border: 1px solid var(--border);
+  }
+  #attach-strip { display: flex; flex-wrap: wrap; gap: 8px; }
+  .attach-thumb {
+    position: relative; width: 58px; height: 58px; flex: none;
+    border-radius: 8px; overflow: hidden; border: 1px solid var(--border);
+  }
+  .attach-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .attach-thumb .rm {
+    position: absolute; top: 2px; right: 2px;
+    width: 22px; height: 22px; padding: 0; border: none; border-radius: 50%;
+    background: rgba(0,0,0,.62); color: #fff; font-size: 12px; line-height: 22px;
+  }
+  /* Small visual, 44px tap target — no hover to fall back on. */
+  .attach-thumb .rm:after { content: ""; position: absolute; inset: -11px; }
+  #attach-err { font-size: 12px; color: var(--err); }
+
   /* ── Input bar ──────────────────────────────────────── */
   #input-bar {
-    display: flex; gap: 8px; align-items: flex-end; flex: none;
+    display: flex; flex-direction: column; gap: 8px; flex: none;
     padding: 8px calc(var(--gut) + var(--sar))
              calc(var(--sab) + 8px) calc(var(--gut) + var(--sal));
     background: var(--panel); border-top: 1px solid var(--border);
   }
+  #input-bar .composer-row { display: flex; gap: 8px; align-items: flex-end; }
+  #attach-btn {
+    flex: none; min-width: var(--tap); min-height: var(--tap);
+    border-radius: 12px; background: var(--panel2); border: 1px solid var(--border);
+    color: var(--text); font-size: 19px; padding: 0;
+  }
+  #attach-btn:disabled { opacity: .45; }
   /* The agent follow-up composer reuses the chat composer wholesale. */
   #chat-input, #agent-msg {
     flex: 1; min-width: 0; resize: none; border-radius: 12px;
@@ -679,9 +707,15 @@
   </div>
   <div id="stats"></div>
   <div id="input-bar">
-    <textarea id="chat-input" placeholder="Message Artifex..." rows="1"
-      enterkeyhint="send" autocapitalize="sentences" autocorrect="on"></textarea>
-    <button id="send-btn" onclick="sendOrStop()">Send</button>
+    <div id="attach-err" class="hidden"></div>
+    <div id="attach-strip" class="hidden"></div>
+    <div class="composer-row">
+      <input type="file" id="chat-image-input" accept="image/*" class="hidden">
+      <button id="attach-btn" aria-label="Attach image" onclick="pickImage()">&#128206;</button>
+      <textarea id="chat-input" placeholder="Message Artifex..." rows="1"
+        enterkeyhint="send" autocapitalize="sentences" autocorrect="on"></textarea>
+      <button id="send-btn" onclick="sendOrStop()">Send</button>
+    </div>
   </div>
 </div>
 
@@ -1436,9 +1470,13 @@ function appendMessage(role, content) {
   const body = document.createElement("div");
   body.className = "body";
   if (content) {
-    body.innerHTML = role === "user"
-      ? renderPlain(content)
-      : '<div class="md">' + renderMarkdown(content) + "</div>";
+    if (Array.isArray(content)) {
+      renderUserParts(body, content);           // multimodal user turn
+    } else if (role === "user") {
+      body.innerHTML = renderPlain(content);
+    } else {
+      body.innerHTML = '<div class="md">' + renderMarkdown(content) + "</div>";
+    }
   }
   bubble.appendChild(meta);
   bubble.appendChild(body);
@@ -1446,6 +1484,31 @@ function appendMessage(role, content) {
   if (pinned || role === "user") pinTo(messagesDiv);
   updateToBottom();
   return body;
+}
+// A multimodal turn: thumbnails first, then the text. `img.src` is a data
+// URL (or the plain-text "[image]" marker for a reloaded session, which has
+// no url and simply renders no thumbnail).
+function renderUserParts(body, parts) {
+  const imgs = contentImages(parts);
+  let text = "";
+  for (const p of parts) { if (p && p.type === "text" && p.text) text = p.text; }
+  if (imgs.length) {
+    const strip = document.createElement("div");
+    strip.className = "bubble-imgs";
+    for (const u of imgs) {
+      const im = document.createElement("img");
+      im.className = "bubble-img";
+      im.loading = "lazy";
+      im.src = u;
+      strip.appendChild(im);
+    }
+    body.appendChild(strip);
+  }
+  if (text) {
+    const t = document.createElement("div");
+    t.innerHTML = renderPlain(text);
+    body.appendChild(t);
+  }
 }
 const WELCOME_HTML =
   '<div class="welcome"><div class="t">ARTIFEX<span> Assistant</span></div>' +
@@ -1477,7 +1540,10 @@ function syncableMessages() {
   const out = [];
   for (const m of conversation) {
     if (!m || m.role === "system") continue;      // system is runtime-only
-    const c = typeof m.content === "string" ? m.content : "";
+    // Array (multimodal) content is flattened to "text [image]" markers so
+    // the persisted session never stores base64 — the real image lives only
+    // in the live conversation and the outgoing request.
+    const c = flattenContent(m.content);
     if (!c) continue;                             // never sync empty/thinking
     out.push({ role: m.role, content: c });
   }
@@ -1570,6 +1636,7 @@ async function loadSession(id) {
     chatJobId = null;
     pendingTurnEl = null;
     conversation = (s.messages || []).filter(m => m && m.role !== "system");
+    clearAttachments();
     renderTranscript();
     showTab("chat");
     // Follow the model the session was recorded with, when we still have it.
@@ -1629,6 +1696,7 @@ function newChat() {
   activeSessionId = null;
   localStorage.removeItem(SESSION_KEY);
   conversation = [];
+  clearAttachments();
   renderTranscript();
   closeSidebar();
 }
@@ -1746,12 +1814,18 @@ async function bootSession() {
 function trimmedHistory() {
   if (conversation.length <= 1) return conversation.slice();
   const budget = historyBudget();
+  const last = conversation.length - 1;
   const kept = [];
   let chars = 0;
-  for (let i = conversation.length - 1; i >= 0; i--) {
-    const c = (conversation[i].content || "").length;
+  for (let i = last; i >= 0; i--) {
+    const raw = conversation[i];
+    // The current turn (last message) keeps its real content — the model
+    // sees the image THIS turn. Every earlier turn is text-coerced, so prior
+    // images become "[image]" and their base64 is never resent.
+    const msg = (i === last) ? raw : { role: raw.role, content: flattenContent(raw.content) };
+    const c = flattenContent(raw.content).length;
     if (kept.length && (chars + c > budget || kept.length >= MAX_HISTORY_MESSAGES)) break;
-    kept.unshift(conversation[i]);
+    kept.unshift(msg);
     chars += c;
   }
   return kept;
@@ -1759,11 +1833,11 @@ function trimmedHistory() {
 
 function convChars() {
   let n = 0;
-  for (const m of conversation) n += ((m && m.content) || "").length;
+  for (const m of conversation) n += flattenContent(m && m.content).length;
   return n;
 }
 function isCompactSummary(m) {
-  return !!m && m.role === "user" && String(m.content || "").indexOf(COMPACT_TAG) === 0;
+  return !!m && m.role === "user" && flattenContent(m.content).indexOf(COMPACT_TAG) === 0;
 }
 
 // How many of the oldest messages to fold away, or 0 for "don't".
@@ -1775,7 +1849,7 @@ function compactCut() {
   if (cut < 2) return 0;
   let headChars = 0, summaryChars = 0;
   for (let i = 0; i < cut; i++) {
-    const c = ((conversation[i] && conversation[i].content) || "").length;
+    const c = flattenContent(conversation[i] && conversation[i].content).length;
     headChars += c;
     if (isCompactSummary(conversation[i])) summaryChars += c;
   }
@@ -1803,7 +1877,7 @@ async function autoCompact(signal, onStatus) {
       body: JSON.stringify({
         model: $("model-select").value || undefined,
         messages: [{ role: "system", content: COMPACT_SYSTEM }]
-          .concat(head.map(m => ({ role: m.role, content: String(m.content || "") })))
+          .concat(head.map(m => ({ role: m.role, content: flattenContent(m.content) })))
           .concat([{ role: "user", content: "Produce the synopsis now." }]),
         stream: false,
         web_tools: false,
@@ -1823,6 +1897,142 @@ async function autoCompact(signal, onStatus) {
     return 0;              // silent fallback to the hard trim
   }
 }
+
+// ═════════════════════════════════════════════════════════
+// Image attachments
+//
+// A user turn with images becomes OpenAI multimodal content: an array of
+// [{type:"text",text}, {type:"image_url",image_url:{url:<data URL>}}...].
+// iPhone photos are HEIC and 3-12 MB, so every pick is drawn to a canvas,
+// scaled so the longest edge is <= 1024 px, and re-encoded as JPEG q0.85 —
+// that converts HEIC->JPEG (which the model wants) and keeps the base64 to
+// a few hundred KB. The full base64 rides ONLY the live conversation and the
+// outgoing request; the session store keeps a "[image]" marker instead (see
+// flattenContent / syncableMessages), so it never approaches its 2 MB cap.
+// ═════════════════════════════════════════════════════════
+const VISION_MODEL = "qwen3.8-27b-vision-vulkan-split";
+const MAX_IMAGES = 4;
+const IMAGE_MAX_EDGE = 1024;
+const IMAGE_QUALITY = 0.85;
+let pendingImages = [];        // downscaled data URLs staged for the next send
+
+function isVisionModel(id) {
+  return String(id || "").toLowerCase().indexOf("vision") >= 0;
+}
+
+// Collapse any message content to plain text: strings pass through; a
+// multimodal array becomes its text part with " [image]" appended per image.
+// Used for history-for-context, budgeting, compaction, and session sync — so
+// prior images degrade to "[image]" text and base64 is never re-sent or
+// persisted. The CURRENT turn keeps its real array (see trimmedHistory).
+function flattenContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  let text = "", imgs = 0;
+  for (const p of content) {
+    if (!p) continue;
+    if (p.type === "text" && p.text) text = p.text;
+    else if (p.type === "image_url") imgs++;
+  }
+  let s = text;
+  for (let i = 0; i < imgs; i++) s += (s ? " " : "") + "[image]";
+  return s;
+}
+function contentHasImage(content) {
+  return Array.isArray(content) && content.some(p => p && p.type === "image_url");
+}
+function contentImages(content) {
+  if (!Array.isArray(content)) return [];
+  const urls = [];
+  for (const p of content) {
+    if (p && p.type === "image_url" && p.image_url && p.image_url.url) urls.push(p.image_url.url);
+  }
+  return urls;
+}
+
+// Draw the picked file to a canvas, downscale, re-encode JPEG. Rejects if the
+// browser can't decode it (e.g. a non-image slipped past accept="image/*").
+function downscaleImage(file) {
+  return new Promise((resolve, reject) => {
+    let url;
+    try { url = URL.createObjectURL(file); }
+    catch (e) { reject(new Error("cannot read file")); return; }
+    const img = new Image();
+    img.onload = () => {
+      try {
+        let w = img.naturalWidth || img.width;
+        let h = img.naturalHeight || img.height;
+        if (!w || !h) throw new Error("empty image");
+        if (w > IMAGE_MAX_EDGE || h > IMAGE_MAX_EDGE) {
+          if (w >= h) { h = Math.round(h * IMAGE_MAX_EDGE / w); w = IMAGE_MAX_EDGE; }
+          else { w = Math.round(w * IMAGE_MAX_EDGE / h); h = IMAGE_MAX_EDGE; }
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = w; canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        const dataUrl = canvas.toDataURL("image/jpeg", IMAGE_QUALITY);
+        URL.revokeObjectURL(url);
+        if (!dataUrl || dataUrl.indexOf("data:image/jpeg") !== 0) throw new Error("encode failed");
+        resolve(dataUrl);
+      } catch (e) { URL.revokeObjectURL(url); reject(e); }
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("could not decode image")); };
+    img.src = url;
+  });
+}
+
+function pickImage() {
+  if (pendingImages.length >= MAX_IMAGES) return;
+  $("chat-image-input").click();
+}
+function attachError(msg) {
+  const e = $("attach-err");
+  e.textContent = msg;
+  e.classList.remove("hidden");
+  clearTimeout(attachError._t);
+  attachError._t = setTimeout(() => e.classList.add("hidden"), 3500);
+}
+function renderAttachStrip() {
+  const strip = $("attach-strip");
+  strip.innerHTML = "";
+  strip.classList.toggle("hidden", pendingImages.length === 0);
+  pendingImages.forEach((url, i) => {
+    const wrap = el("div", "attach-thumb");
+    const im = document.createElement("img");
+    im.src = url;
+    wrap.appendChild(im);
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "rm";
+    rm.textContent = "✕";
+    rm.setAttribute("aria-label", "Remove image");
+    rm.onclick = () => removeAttachment(i);
+    wrap.appendChild(rm);
+    strip.appendChild(wrap);
+  });
+  $("attach-btn").disabled = pendingImages.length >= MAX_IMAGES;
+}
+function removeAttachment(i) {
+  pendingImages.splice(i, 1);
+  renderAttachStrip();
+}
+function clearAttachments() {
+  pendingImages = [];
+  renderAttachStrip();
+}
+$("chat-image-input").addEventListener("change", async function () {
+  const files = Array.from(this.files || []);
+  this.value = "";                         // allow re-picking the same file
+  for (const f of files) {
+    if (pendingImages.length >= MAX_IMAGES) { attachError("Up to " + MAX_IMAGES + " images."); break; }
+    try {
+      pendingImages.push(await downscaleImage(f));
+      renderAttachStrip();
+    } catch (e) {
+      attachError("Could not attach that image.");
+    }
+  }
+});
 
 // ═════════════════════════════════════════════════════════
 // Chat
@@ -1864,18 +2074,31 @@ function ensureSessionId() {
 
 async function sendMessage() {
   const text = inputEl.value.trim();
-  if (!text || isStreaming) return;
+  const imgs = pendingImages.slice();
+  if ((!text && !imgs.length) || isStreaming) return;
   if (!store.k) { toggleDrawer(); return; }
+
+  // A turn with images becomes OpenAI multimodal content; text-only stays a
+  // plain string. An image with no caption gets a default prompt.
+  let content;
+  if (imgs.length) {
+    content = [{ type: "text", text: text || "What's in this image?" }];
+    for (const u of imgs) content.push({ type: "image_url", image_url: { url: u } });
+  } else {
+    content = text;
+  }
 
   // The session id has to exist BEFORE the job starts: the server persists
   // the finished exchange into it even if this page never reattaches.
   ensureSessionId();
-  appendMessage("user", text);
-  conversation.push({ role: "user", content: text });
+  appendMessage("user", content);
+  conversation.push({ role: "user", content: content });
   inputEl.value = "";
   inputEl.style.height = "auto";
+  clearAttachments();
   // Write the user turn out now, so a reload mid-job shows the question
-  // above the answer that streams back in.
+  // above the answer that streams back in. syncableMessages() flattens the
+  // image to a marker, so no base64 reaches the store.
   syncSession(false);
 
   await runAssistantTurn({});
@@ -1894,13 +2117,28 @@ function buildChatPayload() {
   sys += "\n\nTODAY'S DATE: " + new Date().toDateString();
   sys += capabilitiesNote(webOn);
   if (webOn) sys += TOOL_PROMPT;
+  const msgs = trimmedHistory();
+  // Only images CAN survive to the outgoing turn — trimmedHistory keeps the
+  // last message's real array and coerces the rest. So an image here is
+  // always the current turn's.
+  const outgoingHasImage = msgs.length > 0 && contentHasImage(msgs[msgs.length - 1].content);
+  const selected = $("model-select").value || undefined;
+  let model = selected;
+  let visionOverride = false;
+  if (outgoingHasImage && !isVisionModel(selected)) {
+    // Non-vision models can't see images — force the vision model for this
+    // one request without touching the user's dropdown.
+    model = VISION_MODEL;
+    visionOverride = true;
+  }
   return {
-    model: $("model-select").value || undefined,
-    messages: [{ role: "system", content: sys }].concat(trimmedHistory()),
+    model: model,
+    messages: [{ role: "system", content: sys }].concat(msgs),
     web_tools: webOn,
     temperature: Math.max(0, Math.min(2, parseFloat($("temperature").value) || 0.7)),
     max_tokens: Math.max(64, Math.min(32768, parseInt($("max-tokens").value) || 12288)),
     reasoning_effort: currentEffort(),
+    visionOverride: visionOverride,   // internal — not sent in the body
   };
 }
 
@@ -1910,8 +2148,17 @@ async function startChatJob(base, signal) {
     method: "POST",
     headers: authHeaders({ "Content-Type": "application/json" }),
     signal: signal,
-    body: JSON.stringify(Object.assign(
-      { session_id: activeSessionId || undefined }, base)),
+    // Explicit fields, so internal flags (visionOverride) never leak into the
+    // body. `messages` carries the real image array for the current turn.
+    body: JSON.stringify({
+      session_id: activeSessionId || undefined,
+      model: base.model,
+      messages: base.messages,
+      web_tools: base.web_tools,
+      temperature: base.temperature,
+      max_tokens: base.max_tokens,
+      reasoning_effort: base.reasoning_effort,
+    }),
   });
   // An API that predates persistent jobs — use the old direct stream.
   if (r.status === 404 || r.status === 405) return { fallback: true };
@@ -2163,6 +2410,10 @@ async function runAssistantTurn(opts) {
       }
 
       const base = buildChatPayload();
+      if (base.visionOverride) {
+        addBlock(Object.assign(document.createElement("div"),
+          { className: "tool-status", textContent: "— using vision model —" }));
+      }
       const started = await startChatJob(base, aborter.signal);
       if (started.fallback) {
         await streamDirect(base, handlePayload, aborter.signal);
