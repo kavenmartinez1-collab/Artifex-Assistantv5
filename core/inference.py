@@ -286,6 +286,94 @@ def build_active_messages(history, context_window, max_history_tokens=None,
     return compressed, active
 
 
+def context_input_budget(engine_ctx, max_tokens, floor_frac=0.25):
+    """Input-token budget that leaves room to actually GENERATE.
+
+    The old callers capped input at 85% of ctx — but 85% input plus a
+    12k-token completion overflows a 32k tier, and this hybrid model
+    cannot context-shift (DeltaNet recurrence can't evict), so overflow
+    is a hard failure, not a graceful slide.  Budget = ctx minus the
+    completion reservation minus a template/special-token margin.
+
+    floor_frac keeps a degenerate budget (huge max_tokens on a small
+    tier) from starving the prompt entirely — generation room is then
+    implicitly reduced instead.
+    """
+    if engine_ctx <= 0:
+        return 0
+    margin = max(512, engine_ctx // 32)
+    budget = engine_ctx - int(max_tokens or 0) - margin
+    return max(budget, int(engine_ctx * floor_frac))
+
+
+def ensure_context_fit(messages, engine_ctx, max_tokens, context_window=15,
+                       count_fn=None):
+    """Pre-flight context assessment: guarantee messages + generation fit.
+
+    Runs BEFORE a generation round so an oversized tool result or pasted
+    document is caught while we can still act, instead of overflowing the
+    engine mid-prefill.  Escalates: (1) compact old messages into key
+    points, (2) hard-trim to the budget, (3) verify with the engine's
+    REAL tokenizer when available and re-trim scaled by the observed
+    chars/4 underestimate (dense text/code counts ~20-30% high).
+
+    Args:
+        messages: full message list (system prompt first).  Not mutated.
+        engine_ctx: loaded engine context size in tokens.
+        max_tokens: completion budget to reserve.
+        context_window: recent-message window for compaction.
+        count_fn: optional exact counter, e.g. engine.count_tokens
+            (llama-server /tokenize).  One call per invocation, only
+            when the heuristic already passed — cheap.
+
+    Returns:
+        (messages, info) where info = {"budget", "est", "compacted",
+        "trimmed"} — est is the final heuristic token count.
+    """
+    info = {"budget": 0, "est": 0, "compacted": False, "trimmed": False}
+    if engine_ctx <= 0 or not messages:
+        return messages, info
+    budget = context_input_budget(engine_ctx, max_tokens)
+    info["budget"] = budget
+
+    est = _count_tokens(messages)
+    if est > budget and len(messages) > 4:
+        scaled_window = min(max(budget // 500, context_window), 200)
+        compacted = compress_history(messages, scaled_window)
+        if len(compacted) < len(messages):
+            _log.info("Pre-flight compact: %d tok -> %d tok (%d -> %d messages)",
+                      est, _count_tokens(compacted), len(messages), len(compacted))
+            messages = compacted
+            info["compacted"] = True
+        est = _count_tokens(messages)
+
+    if est > budget:
+        messages = trim_messages_to_context(messages, budget)
+        info["trimmed"] = True
+        est = _count_tokens(messages)
+
+    # Exact verification: chars/4 UNDER-counts dense text, so a "fitting"
+    # estimate can still overflow the real tokenizer. One tokenize call;
+    # on overshoot, shrink the heuristic budget by the observed ratio.
+    if count_fn is not None:
+        text = "\n".join(m.get("content", "") for m in messages
+                         if isinstance(m.get("content"), str))
+        try:
+            exact = count_fn(text)
+        except Exception:
+            exact = 0
+        if exact and exact > budget:
+            adj = max(int(budget * max(est, 1) / exact), 256)
+            _log.info("Pre-flight exact count %d > budget %d (heuristic %d) — "
+                      "re-trimming to adjusted budget %d", exact, budget, est, adj)
+            messages = trim_messages_to_context(messages, adj)
+            info["trimmed"] = True
+            est = _count_tokens(messages)
+
+    info["est"] = est
+    return messages, info
+
+
 def auto_compact_if_needed(messages, engine_ctx, context_window, threshold=0.60):
     """Auto-compact conversation when token count approaches engine context.
 

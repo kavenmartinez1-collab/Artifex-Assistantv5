@@ -99,6 +99,12 @@ class RunConfig:
     always_confirm_types: tuple = ("edit_file", "download")  # GUIDED always asks
     auto_approve_max_risk: str = "LOW"                       # GUIDED auto-runs <= this
     framing: bool = True   # wrap the prompt with the autonomous preamble + GOAL
+    # When auto-compaction triggers, ask the MODEL to write the synopsis of
+    # the folded-away portion (best continuity — the compact becomes the
+    # continued context) instead of heuristic key-point extraction. Costs
+    # one bounded generation per compaction; falls back to key points on
+    # any failure.
+    model_compaction: bool = True
 
     @classmethod
     def default(cls, autonomy: AutonomyLevel = AutonomyLevel.GUIDED) -> "RunConfig":
@@ -420,7 +426,8 @@ class AgentRunner:
                     return self._finish("stopped:gate", history)
                 self.gate.acknowledge_gate(rnd)
 
-            history.append({"role": "user", "content": self._feedback(outputs)})
+            history.append({"role": "user",
+                            "content": self._fit_feedback(self._feedback(outputs))})
 
             # @done arrived alongside the actions we just ran. Honor it only if
             # every action actually succeeded; otherwise drop back into the
@@ -472,23 +479,182 @@ class AgentRunner:
         else:
             history.insert(0, {"role": "system", "content": content})
 
-    def _active_messages(self, history):
-        from core.inference import (build_active_messages, auto_compact_if_needed,
-                                    trim_messages_to_context)
-        cw = self.config.context_window
-        ctx = 0
+    def _engine_ctx(self) -> int:
         try:
             if hasattr(self.engine, "get_context_size"):
-                ctx = self.engine.get_context_size() or 0
+                return self.engine.get_context_size() or 0
         except Exception:
-            ctx = 0
+            pass
+        return 0
+
+    def _active_messages(self, history):
+        from core.inference import build_active_messages, ensure_context_fit
+        cw = self.config.context_window
+        ctx = self._engine_ctx()
         if ctx > 0:
-            new_hist, _ = auto_compact_if_needed(history, ctx, cw)
+            new_hist, _ = self._compact_if_needed(history, ctx, cw)
             history[:] = new_hist
         _, active = build_active_messages(history, cw, engine_ctx=ctx)
         if ctx > 0:
-            active = trim_messages_to_context(active, int(ctx * 0.85))
+            # Final pre-flight: the input must fit ctx MINUS the completion
+            # reservation (the old 85%-of-ctx cap left no room to generate
+            # — 85% input + a full completion budget overflowed the tier),
+            # verified against the engine's real tokenizer.
+            active, info = ensure_context_fit(
+                active, ctx, self.config.max_tokens, cw,
+                count_fn=getattr(self.engine, "count_tokens", None))
+            if info["trimmed"]:
+                self.emit(AgentEvent(
+                    "compacted", round=self._round,
+                    reason=f"hard-trimmed to ~{info['est']} tok "
+                           f"(budget {info['budget']} of ctx {ctx})"))
         return active
+
+    def _compact_if_needed(self, history, engine_ctx, context_window,
+                           threshold=0.60):
+        """Auto-compact at threshold of engine ctx — model-written synopsis
+        first (the compact becomes the continued context), key-point
+        extraction as the fallback."""
+        from core.inference import _count_tokens, auto_compact_if_needed
+        if engine_ctx <= 0 or len(history) <= 4:
+            return history, False
+        token_count = _count_tokens(history)
+        if token_count <= int(engine_ctx * threshold):
+            return history, False
+        if self.config.model_compaction:
+            try:
+                compacted = self._model_compact(history, engine_ctx)
+            except Exception as e:
+                _log.warning("model compaction failed (%s) — key-point fallback", e)
+                compacted = None
+            if compacted:
+                new_count = _count_tokens(compacted)
+                _log.info("Model-compacted: %d tok -> %d tok (%d -> %d messages)",
+                          token_count, new_count, len(history), len(compacted))
+                self.emit(AgentEvent(
+                    "compacted", round=self._round,
+                    reason=f"model synopsis: {token_count} -> {new_count} tok"))
+                return compacted, True
+        new_hist, did = auto_compact_if_needed(history, engine_ctx, context_window)
+        if did:
+            self.emit(AgentEvent(
+                "compacted", round=self._round,
+                reason=f"key points: {token_count} -> {_count_tokens(new_hist)} tok"))
+        return new_hist, did
+
+    def _model_compact(self, history, engine_ctx):
+        """Fold the old portion of the session into a model-written synopsis.
+
+        Keeps: system prompt, the pinned first user message (the goal), a
+        token-budgeted tail of recent messages. Everything between is
+        rendered as a transcript and summarized by the model in one
+        bounded generation. Returns the new history, or None to signal
+        the caller to fall back to key-point compaction.
+        """
+        from core.inference import (_count_tokens, context_input_budget,
+                                    strip_think_blocks)
+        convo = history[1:]
+        pinned = convo[0] if convo and convo[0].get("role") == "user" else None
+        compressible = convo[1:] if pinned else convo
+
+        budget = context_input_budget(engine_ctx, self.config.max_tokens)
+        # Recent tail kept verbatim: newest messages up to ~35% of budget.
+        keep_budget = int(budget * 0.35)
+        recent, acc = [], 0
+        for msg in reversed(compressible):
+            t = _count_tokens([msg])
+            if acc + t > keep_budget and recent:
+                break
+            recent.append(msg)
+            acc += t
+        recent.reverse()
+        old = compressible[:len(compressible) - len(recent)]
+        if not old:
+            return None
+
+        transcript = "\n\n".join(
+            f"[{m.get('role', '?')}]\n{m.get('content', '')}" for m in old)
+        # The summarization prompt itself must fit: cap the transcript,
+        # keeping head and tail (the middle of a huge tool dump is the
+        # least load-bearing part).
+        cap_chars = max(int(budget * 0.5) * 4, 2000)
+        if len(transcript) > cap_chars:
+            half = cap_chars // 2
+            transcript = (transcript[:half]
+                          + "\n\n[... middle omitted for length ...]\n\n"
+                          + transcript[-half:])
+
+        prompt = [
+            {"role": "system", "content":
+                "You compress agent session transcripts. Reply with ONLY the "
+                "summary — no preamble, no commentary."},
+            {"role": "user", "content":
+                "Summarize this earlier portion of an autonomous agent session "
+                "so the agent can continue seamlessly from the summary alone. "
+                "Preserve: the goal and constraints, decisions made and why, "
+                "exact file paths / commands / identifiers touched, key tool "
+                "findings (values, line numbers, error messages), current "
+                "state, and what remains to be done. Dense bullet lines.\n\n"
+                + transcript},
+        ]
+
+        import inspect
+        kwargs = {}
+        try:
+            params = inspect.signature(self.engine.generate_streaming).parameters
+            if "enable_thinking" in params or any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                kwargs["enable_thinking"] = False
+        except (TypeError, ValueError):
+            pass
+        parts = []
+
+        def on_tok(t):
+            if self.control.stop_requested:
+                raise GenerationAborted()
+            parts.append(t)
+
+        try:
+            resp = self.engine.generate_streaming(
+                prompt, max_tokens=768, temperature=0.3, on_token=on_tok,
+                **kwargs)
+        except GenerationAborted:
+            return None
+        text = resp if isinstance(resp, str) and resp else "".join(parts)
+        summary = strip_think_blocks(text).strip()
+        if len(summary) < 40:   # empty / degenerate — let key points handle it
+            return None
+
+        result = [history[0]]
+        if pinned:
+            result.append(pinned)
+        result.append({"role": "user", "content":
+                       "[EARLIER SESSION — COMPACTED SUMMARY]\n" + summary})
+        result.extend(recent)
+        return result
+
+    def _fit_feedback(self, feedback):
+        """Pre-append assessment: one round's tool feedback may not eat more
+        than half the input budget — a single huge read/cat must not blow
+        the window. Head+tail are kept; the marker tells the model how to
+        get the rest with a narrower call."""
+        ctx = self._engine_ctx()
+        if ctx <= 0 or not feedback:
+            return feedback
+        from core.inference import context_input_budget
+        cap_chars = (context_input_budget(ctx, self.config.max_tokens) // 2) * 4
+        if len(feedback) <= cap_chars:
+            return feedback
+        head = feedback[:int(cap_chars * 0.8)]
+        tail = feedback[-int(cap_chars * 0.2):]
+        note = (f"\n\n[TOOL OUTPUT TRUNCATED: kept {cap_chars} of "
+                f"{len(feedback)} chars — the full output exceeds the context "
+                f"window. Re-run with a narrower scope (specific file section, "
+                f"grep pattern, line range) if you need the omitted middle.]\n\n")
+        self.emit(AgentEvent(
+            "compacted", round=self._round,
+            reason=f"tool feedback truncated {len(feedback)} -> {cap_chars} chars"))
+        return head + note + tail
 
     def _resolved_sampling(self) -> Optional[dict]:
         """Sampler dict for this run: explicit config.sampling > named preset."""

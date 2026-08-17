@@ -2370,6 +2370,8 @@ class ArtifexMainWindow(QMainWindow):
             self._auto_append(f"  ⚡ circuit breaker: {ev.reason}")
         elif k == "gate_pause":
             self._auto_append(f"  ⏸ human gate: {ev.reason}")
+        elif k == "compacted":
+            self._auto_append(f"  ⤵ context compacted: {ev.reason}")
         elif k == "git":
             self._auto_append(f"    [git] {ev.text}")
         elif k == "error":
