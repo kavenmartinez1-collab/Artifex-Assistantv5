@@ -5,7 +5,10 @@ import * as fs from 'fs';
 export interface ServiceOption {
   key: string;        // CLI flag name (e.g. '--backend')
   label: string;      // UI label
-  type: 'select' | 'text' | 'number' | 'model-select';
+  // 'checkbox' is a boolean flag: when checked the bare CLI flag is passed
+  // (no value) and envVar, if set, is exported as '1'. Value is the string
+  // 'true' or 'false'.
+  type: 'select' | 'text' | 'number' | 'model-select' | 'checkbox';
   default: string;
   choices?: string[]; // for 'select' type
   envVar?: string;    // if set, also passed as environment variable
@@ -105,6 +108,12 @@ export const SERVICE_DEFINITIONS: ServiceDefinition[] = [
       { key: '--model', label: 'Model', type: 'model-select', default: '',
         envVar: 'ARTIFEX_MODEL', dependsOn: '--backend' },
       { key: '--gateway', label: 'Gateway URL', type: 'text', default: 'http://localhost:8080' },
+      // Phone app service (/app + sessions/chat jobs) is OPT-IN: exposing
+      // it by default would hand remote endpoints to anyone on the LAN.
+      // It also requires ARTIFEX_API_KEY to be set. Agent/files/engine-
+      // reload need ARTIFEX_PHONE_FULL_TOOLS=1 set manually on top.
+      { key: '--phone-app', label: 'Phone app (/app)', type: 'checkbox', default: 'false',
+        envVar: 'ARTIFEX_PHONE_APP' },
     ],
   },
   {

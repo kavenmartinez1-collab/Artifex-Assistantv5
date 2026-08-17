@@ -157,6 +157,13 @@ function updateCardConfig(card, service) {
         if (choice === serviceConfigs[service.id][opt.key]) optEl.selected = true;
         input.appendChild(optEl);
       }
+    } else if (opt.type === 'checkbox') {
+      // Boolean flag — stored as 'true'/'false'; main passes the bare
+      // CLI flag only when checked.
+      input = document.createElement('input');
+      input.type = 'checkbox';
+      input.checked = serviceConfigs[service.id][opt.key] === 'true';
+      input.style.cssText = 'width:14px;height:14px;margin:2px 0;accent-color:var(--accent);align-self:flex-start;';
     } else if (opt.type === 'model-select') {
       // Dropdown that filters by the current value of `dependsOn` (e.g. backend).
       // Populated asynchronously after the cache is loaded.
@@ -182,7 +189,9 @@ function updateCardConfig(card, service) {
       const sid = e.target.dataset.serviceId;
       const key = e.target.dataset.optKey;
       if (!serviceConfigs[sid]) serviceConfigs[sid] = {};
-      serviceConfigs[sid][key] = e.target.value;
+      serviceConfigs[sid][key] = e.target.type === 'checkbox'
+        ? String(e.target.checked)
+        : e.target.value;
 
       // If this field is the dependsOn target of any model-select, refresh it
       for (const dep of Object.values(inputsByKey)) {

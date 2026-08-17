@@ -500,6 +500,24 @@ follow-ups) — everything the desktop drives, from a phone. It's a single
 HTML file with no CDN dependencies, so it works on networks with no
 internet path to the browser.
 
+The phone service is **off by default** and layered:
+
+1. **Off** (default) — `main_api.py` serves only the OpenAI-compatible
+   API; `/app`, sessions, chat jobs, and all remote-ops endpoints are
+   not registered.
+2. **Web-only** — start with `--phone-app` (or `ARTIFEX_PHONE_APP=1`).
+   Requires `ARTIFEX_API_KEY` to be set; the server refuses to start the
+   phone service without it. The client gets chat with web search and
+   web read only — no agent, no file access, no engine reload; the
+   Agent/Files tabs hide themselves.
+3. **Full tools** — additionally set `ARTIFEX_PHONE_FULL_TOOLS=1` in the
+   environment. This is a deliberate, manual opt-in: it enables agent
+   runs, the workspace file browser, and engine reload from the phone.
+
+In the control center, the API server card has a **Phone app** checkbox
+(unchecked by default) for step 2; step 3 stays an environment variable
+on purpose.
+
 The server itself is deliberately network-agnostic: it binds
 `127.0.0.1` and knows nothing about how packets reach it. To use it away
 from the machine, put any private transport in front of the loopback

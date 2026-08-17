@@ -838,7 +838,7 @@
   <div class="panel">
     <div class="pt">ENGINE</div>
     <div class="hint" id="engine-info">Tap Refresh to check what is loaded.</div>
-    <div class="row" style="margin-top:8px">
+    <div class="row" id="engine-ctx-row" style="margin-top:8px">
       <select id="engine-ctx" onchange="localStorage.setItem('ax_engine_ctx', this.value)">
         <option value="16384">ctx 16k — fastest</option>
         <option value="32768" selected>ctx 32k</option>
@@ -851,7 +851,7 @@
       <button class="btn" id="engine-reload-btn" onclick="reloadEngine()">Reload</button>
     </div>
     <button class="btn hidden" id="engine-jump" style="margin-top:8px">Go to the live run</button>
-    <div class="hint">Reload relaunches llama-server at the chosen context. Smaller = faster prefill; bigger = longer conversations. Takes 30-60 s.</div>
+    <div class="hint" id="engine-reload-hint">Reload relaunches llama-server at the chosen context. Smaller = faster prefill; bigger = longer conversations. Takes 30-60 s.</div>
   </div>
   <div class="panel">
     <div class="pt">REASONING EFFORT</div>
@@ -915,6 +915,10 @@ let conversation = [];         // [{role, content}] — the visible transcript
 let isStreaming = false;
 let aborter = null;
 let gatewayUp = false;
+// Whether the server exposes the full phone toolset (agent runs, files,
+// engine reload). Servers in the default web-only mode report
+// phone_tools:"web" in /health; older servers omit the field (treat as full).
+let phoneToolsFull = true;
 let activeTab = "chat";
 
 // Server-side chat sessions. The transcript is owned by the API (one JSON
@@ -986,8 +990,9 @@ function capabilitiesNote(webOn) {
 
 CAPABILITIES IN THIS CHAT:
 - Conversation${webOn ? " and web search (see TOOLS)" : " only. Web search is currently toggled OFF in this app's settings; say so if asked to search"}.
-- You have NO access to the user's files, shell, or system state from this chat, and must never simulate command output or guess file contents.
-- This app's AGENT tab DOES have those tools: it runs commands and reads/writes files on the user's PC, with user approval for risky steps. If the user asks for anything that needs their machine (files, directories, running programs, system info), tell them to switch to the Agent tab and phrase it as a goal.`;
+- You have NO access to the user's files, shell, or system state from this chat, and must never simulate command output or guess file contents.` + (phoneToolsFull ? `
+- This app's AGENT tab DOES have those tools: it runs commands and reads/writes files on the user's PC, with user approval for risky steps. If the user asks for anything that needs their machine (files, directories, running programs, system info), tell them to switch to the Agent tab and phrase it as a goal.` : `
+- The server is running in web-only mode: there is no agent or file access from this app at all. If asked for anything that needs the user's machine, say the server operator has not enabled those tools.`);
 }
 
 // Sliding context. The char budget is a user setting; past COMPACT_AT of it
@@ -1091,6 +1096,20 @@ document.querySelectorAll("#agentctx-seg button").forEach(b =>
 $("hist-budget").addEventListener("change", () => store.save());
 
 // ── Tabs ─────────────────────────────────────────────────
+// Web-only servers (phone_tools:"web" in /health) don't register the
+// agent/files endpoints at all — hide the tabs instead of surfacing 404s.
+function applyToolLevel() {
+  $("tab-agent").style.display = phoneToolsFull ? "" : "none";
+  $("tab-files").style.display = phoneToolsFull ? "" : "none";
+  // Engine reload is a full-tools endpoint; Refresh (read-only) stays.
+  $("engine-ctx-row").style.display = phoneToolsFull ? "" : "none";
+  $("engine-reload-btn").style.display = phoneToolsFull ? "" : "none";
+  $("engine-reload-hint").style.display = phoneToolsFull ? "" : "none";
+  if (!phoneToolsFull && (activeTab === "agent" || activeTab === "files")) {
+    showTab("chat");
+  }
+}
+
 function showTab(name) {
   activeTab = name;
   $("chat-view").classList.toggle("hidden", name !== "chat");
@@ -1123,6 +1142,8 @@ async function connect() {
     if (h.status === 401) throw new Error("bad key");
     const health = await h.json();
     gatewayUp = !!health.web_gateway;
+    phoneToolsFull = health.phone_tools ? health.phone_tools === "full" : true;
+    applyToolLevel();
     dot.className = "ok";
     $("conn-info").textContent =
       "backend: " + (health.backend || "?") +
@@ -1133,7 +1154,7 @@ async function connect() {
     await loadModels();
     $("welcome-hint") && ($("welcome-hint").textContent = "Type a message below to start.");
     bootSession().then(bootChatJob);
-    if (!agentRunId) agentBoot();
+    if (phoneToolsFull && !agentRunId) agentBoot();
   } catch (e) {
     dot.className = "err";
     $("conn-info").textContent = "Cannot reach API: " + e.message;

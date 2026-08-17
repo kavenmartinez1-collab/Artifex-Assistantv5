@@ -116,6 +116,16 @@ export class ServiceManager {
       for (const opt of def.options) {
         // Use override if provided, otherwise use default
         const val = configOverrides?.[opt.key] ?? opt.default;
+        if (opt.type === 'checkbox') {
+          // Boolean flag: bare flag + envVar='1' only when checked
+          if (val === 'true' || val === '1') {
+            args.push(opt.key);
+            if (opt.envVar) {
+              extraEnv[opt.envVar] = '1';
+            }
+          }
+          continue;
+        }
         if (val !== undefined && val !== '') {
           args.push(opt.key, val);
           if (opt.envVar) {

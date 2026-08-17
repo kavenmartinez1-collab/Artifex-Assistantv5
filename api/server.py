@@ -52,6 +52,11 @@ if not _api_key:
     _log.warning("ARTIFEX_API_KEY not set — API authentication is DISABLED")
 
 
+def _env_flag(name: str) -> bool:
+    """True when an env var is set to a truthy value (1/true/yes/on)."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _get_engine(ctx_tier: int | None = None, exact_ctx: bool = False):
     """Get or create the active engine.
 
@@ -1269,167 +1274,201 @@ def create_app():
 
     get_model_queue().register_transformers_unload(_unload_transformers_engine)
 
-    # ─── Phone client ────────────────────────────────────────────────────
-    # Single-file web app (api/static/app.html) served on the same origin
-    # as the API so its fetches need no CORS entries.  The page itself is
-    # static and holds no secrets — every API call it makes carries the
-    # bearer key the user pastes into its settings — so this route is
-    # deliberately unauthenticated, like a login page.
+    # ─── Phone app service (OPT-IN) ──────────────────────────────────────
+    # The phone-facing surface — /app page, engine control, chat sessions,
+    # persistent chat jobs, workspace files, agent runs — is DISABLED by
+    # default so a fresh install on a shared LAN never exposes remote ops.
+    # Enable with main_api.py --phone-app (or ARTIFEX_PHONE_APP=1); doing
+    # so REQUIRES ARTIFEX_API_KEY.
+    #
+    # Even when enabled, the default surface is chat with web search and
+    # web read only.  The hands-on-the-machine endpoints — agent runs,
+    # workspace files, engine reload — additionally require the operator
+    # to set ARTIFEX_PHONE_FULL_TOOLS=1 manually for the project.
+    phone_app_on = _env_flag("ARTIFEX_PHONE_APP")
+    phone_full_tools = phone_app_on and _env_flag("ARTIFEX_PHONE_FULL_TOOLS")
+    if phone_app_on and not _api_key:
+        # A tailnet/LAN forward exposes these endpoints to other devices;
+        # never serve them open.
+        raise RuntimeError(
+            "ARTIFEX_PHONE_APP is set but ARTIFEX_API_KEY is not — refusing "
+            "to serve the phone app unauthenticated. Set ARTIFEX_API_KEY or "
+            "drop --phone-app.")
+    if phone_app_on:
+        _log.info("Phone app service ENABLED — tools: %s",
+                  "FULL (agent, files, engine reload)" if phone_full_tools
+                  else "web search/read only (set ARTIFEX_PHONE_FULL_TOOLS=1 "
+                       "to enable agent/files/engine-reload)")
+    else:
+        _log.info("Phone app service disabled (opt in with --phone-app / "
+                  "ARTIFEX_PHONE_APP=1)")
 
-    @app.get("/app", include_in_schema=False)
-    async def phone_app():
-        from fastapi.responses import FileResponse
-        return FileResponse(
-            os.path.join(os.path.dirname(__file__), "static", "app.html"),
-            media_type="text/html",
-        )
+    if phone_app_on:
+        # ─── Phone client ────────────────────────────────────────────────
+        # Single-file web app (api/static/app.html) served on the same
+        # origin as the API so its fetches need no CORS entries.  The page
+        # itself is static and holds no secrets — every API call it makes
+        # carries the bearer key the user pastes into its settings — so
+        # this route is deliberately unauthenticated, like a login page.
 
-    # ─── Agent runs ──────────────────────────────────────────────────────
-    # The autonomous loop (core.agent_loop) over REST: start goals, stream
-    # events, answer approval prompts. Same runner the Qt GUI drives.
+        @app.get("/app", include_in_schema=False)
+        async def phone_app():
+            from fastapi.responses import FileResponse
+            return FileResponse(
+                os.path.join(os.path.dirname(__file__), "static", "app.html"),
+                media_type="text/html",
+            )
 
-    # ─── Engine control ──────────────────────────────────────────────────
-    # Remote ops for the phone: see what's loaded and force a relaunch at a
-    # chosen ctx. Tier upgrades happen automatically per request; this is
-    # the manual lever for "reload it big right now".
+        # ─── Engine control ──────────────────────────────────────────────
+        # Remote ops for the phone: see what's loaded and force a relaunch
+        # at a chosen ctx. Tier upgrades happen automatically per request;
+        # this is the manual lever for "reload it big right now".
 
-    class EngineReloadRequest(BaseModel):
-        ctx_tier: Optional[int] = Field(None, ge=2048, le=262144)
+        class EngineReloadRequest(BaseModel):
+            ctx_tier: Optional[int] = Field(None, ge=2048, le=262144)
 
-    @app.get("/v1/engine")
-    async def engine_state(request: Request):
-        if not _check_auth(request):
-            raise HTTPException(status_code=401, detail="Invalid API key")
-        mq = get_model_queue()
-        eng = _engine  # cached only — never load as a side effect of a GET
-        tier = eng.current_tier() if (eng and hasattr(eng, "current_tier")) else None
-        cap = getattr(eng, "_configured_num_ctx", None) if eng else None
-        return {
-            "model": mq._current_model,
-            "backend": mq._current_backend,
-            "loaded": bool(eng and eng.is_loaded()),
-            "ctx": tier or None,
-            "ctx_cap": cap,
-            "queue_tier": mq._current_ctx_tier,
-        }
+        @app.get("/v1/engine")
+        async def engine_state(request: Request):
+            if not _check_auth(request):
+                raise HTTPException(status_code=401, detail="Invalid API key")
+            mq = get_model_queue()
+            eng = _engine  # cached only — never load as a side effect of a GET
+            tier = eng.current_tier() if (eng and hasattr(eng, "current_tier")) else None
+            cap = getattr(eng, "_configured_num_ctx", None) if eng else None
+            return {
+                "model": mq._current_model,
+                "backend": mq._current_backend,
+                "loaded": bool(eng and eng.is_loaded()),
+                "ctx": tier or None,
+                "ctx_cap": cap,
+                "queue_tier": mq._current_ctx_tier,
+            }
 
-    @app.post("/v1/engine/reload")
-    async def engine_reload(body: EngineReloadRequest, request: Request):
-        """Relaunch llama-server, at body.ctx_tier or the model's full cap."""
-        if not _check_auth(request):
-            raise HTTPException(status_code=401, detail="Invalid API key")
-        from api.agent_api import _runs, _runs_lock
-        with _runs_lock:
-            live = next((r for r in _runs.values() if not r.terminal), None)
-        if live is not None:
-            raise HTTPException(
-                status_code=409,
-                detail={"message": "An agent run is active — stop it first",
-                        "run_id": live.id})
-        mq = get_model_queue()
-        async with mq._lock:
-            if not mq._current_model:
+    if phone_full_tools:
+        @app.post("/v1/engine/reload")
+        async def engine_reload(body: EngineReloadRequest, request: Request):
+            """Relaunch llama-server, at body.ctx_tier or the model's full cap."""
+            if not _check_auth(request):
+                raise HTTPException(status_code=401, detail="Invalid API key")
+            from api.agent_api import _runs, _runs_lock
+            with _runs_lock:
+                live = next((r for r in _runs.values() if not r.terminal), None)
+            if live is not None:
                 raise HTTPException(
                     status_code=409,
-                    detail="Nothing loaded yet — any chat request loads the engine")
-            # Resolve "no tier given" to the model's configured cap BEFORE
-            # unloading: load()'s adoption path only refuses a smaller
-            # still-running server when an explicit target ctx is set —
-            # with None it would happily re-adopt the old small server and
-            # the reload would be a silent no-op.
-            target = body.ctx_tier
-            if target is None and _engine is not None:
-                target = getattr(_engine, "_configured_num_ctx", None)
-            await mq._unload_engine()
-            loop = asyncio.get_event_loop()
-            eng = await loop.run_in_executor(
-                None, lambda: _get_engine(ctx_tier=target, exact_ctx=True))
-            mq._current_ctx_tier = (
-                eng.current_tier() if hasattr(eng, "current_tier") else body.ctx_tier)
-            _log.info("Engine reloaded via /v1/engine/reload at ctx=%s",
-                      mq._current_ctx_tier)
-            return {"ok": True, "model": mq._current_model,
-                    "ctx": mq._current_ctx_tier}
-
-    # ─── Chat sessions ───────────────────────────────────────────────────
-    # Server-side conversation store so any device can list and resume
-    # previous chats; the phone client syncs after each exchange.
-
-    from core.config import SESSION_DIR
-    from api.session_api import register_session_routes
-    register_session_routes(app, check_auth=_check_auth, session_dir=SESSION_DIR)
-
-    # ─── Persistent chat jobs ────────────────────────────────────────────
-    # Chat that survives the client (phone locks, tab dies): generation
-    # runs server-side and is reattachable; the finished exchange is
-    # written into the session store even if nobody reattaches.
-
-    async def _chat_job_prepare(req):
-        # MAIN loop: resolve the model (image requests route to a vision
-        # model), switch the queue, load the engine — so the worker runs
-        # against the RIGHT model. Returns the resolved model id.
-        backend = _infer_backend_from_model(req.model) or get_active_backend()
-        msgs = [m for m in req.messages if isinstance(m, dict)]
-        has_images = _messages_have_images(msgs)
-        model = _resolve_model_for_request(req.model, has_images, backend)
-        ctx_tier = None
-        if backend == "llama_cpp":
-            from core.engine_llama_cpp import pick_ctx_tier
-            from core.request_estimator import estimate_request_requirements
-            from core.config import get_llama_cpp_model_config
-            cfg = get_llama_cpp_model_config(model) or {}
-            est = estimate_request_requirements(
-                msgs, req.max_tokens or 12288,
-                web_tools=bool(req.web_tools), enable_thinking=True,
-                model_config=cfg)
-            ctx_tier = pick_ctx_tier(est.total_context_needed, cfg.get("num_ctx"))
-        mq = get_model_queue()
-        async with mq._lock:
-            await mq.switch_if_needed(model, backend, ctx_tier=ctx_tier)
-            if backend != "ollama":
+                    detail={"message": "An agent run is active — stop it first",
+                            "run_id": live.id})
+            mq = get_model_queue()
+            async with mq._lock:
+                if not mq._current_model:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Nothing loaded yet — any chat request loads the engine")
+                # Resolve "no tier given" to the model's configured cap BEFORE
+                # unloading: load()'s adoption path only refuses a smaller
+                # still-running server when an explicit target ctx is set —
+                # with None it would happily re-adopt the old small server and
+                # the reload would be a silent no-op.
+                target = body.ctx_tier
+                if target is None and _engine is not None:
+                    target = getattr(_engine, "_configured_num_ctx", None)
+                await mq._unload_engine()
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, lambda: _get_engine(ctx_tier=ctx_tier))
-        return model
+                eng = await loop.run_in_executor(
+                    None, lambda: _get_engine(ctx_tier=target, exact_ctx=True))
+                mq._current_ctx_tier = (
+                    eng.current_tier() if hasattr(eng, "current_tier") else body.ctx_tier)
+                _log.info("Engine reloaded via /v1/engine/reload at ctx=%s",
+                          mq._current_ctx_tier)
+                return {"ok": True, "model": mq._current_model,
+                        "ctx": mq._current_ctx_tier}
 
-    def _chat_job_stream(req, model):
-        # Runs in the worker's private loop; the engine is already loaded
-        # for `model` by _chat_job_prepare above.
-        return _stream_with_tools(
-            list(req.messages), model,
-            req.max_tokens or 12288,
-            req.temperature if req.temperature is not None else 0.7,
-            {}, bool(req.web_tools), get_active_backend(),
-            enable_thinking=True,
-            reasoning_effort=(req.reasoning_effort or None),
+    if phone_app_on:
+        # ─── Chat sessions ───────────────────────────────────────────────
+        # Server-side conversation store so any device can list and resume
+        # previous chats; the phone client syncs after each exchange.
+
+        from core.config import SESSION_DIR
+        from api.session_api import register_session_routes
+        register_session_routes(app, check_auth=_check_auth, session_dir=SESSION_DIR)
+
+        # ─── Persistent chat jobs ────────────────────────────────────────
+        # Chat that survives the client (phone locks, tab dies): generation
+        # runs server-side and is reattachable; the finished exchange is
+        # written into the session store even if nobody reattaches.
+
+        async def _chat_job_prepare(req):
+            # MAIN loop: resolve the model (image requests route to a vision
+            # model), switch the queue, load the engine — so the worker runs
+            # against the RIGHT model. Returns the resolved model id.
+            backend = _infer_backend_from_model(req.model) or get_active_backend()
+            msgs = [m for m in req.messages if isinstance(m, dict)]
+            has_images = _messages_have_images(msgs)
+            model = _resolve_model_for_request(req.model, has_images, backend)
+            ctx_tier = None
+            if backend == "llama_cpp":
+                from core.engine_llama_cpp import pick_ctx_tier
+                from core.request_estimator import estimate_request_requirements
+                from core.config import get_llama_cpp_model_config
+                cfg = get_llama_cpp_model_config(model) or {}
+                est = estimate_request_requirements(
+                    msgs, req.max_tokens or 12288,
+                    web_tools=bool(req.web_tools), enable_thinking=True,
+                    model_config=cfg)
+                ctx_tier = pick_ctx_tier(est.total_context_needed, cfg.get("num_ctx"))
+            mq = get_model_queue()
+            async with mq._lock:
+                await mq.switch_if_needed(model, backend, ctx_tier=ctx_tier)
+                if backend != "ollama":
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, lambda: _get_engine(ctx_tier=ctx_tier))
+            return model
+
+        def _chat_job_stream(req, model):
+            # Runs in the worker's private loop; the engine is already loaded
+            # for `model` by _chat_job_prepare above.
+            return _stream_with_tools(
+                list(req.messages), model,
+                req.max_tokens or 12288,
+                req.temperature if req.temperature is not None else 0.7,
+                {}, bool(req.web_tools), get_active_backend(),
+                enable_thinking=True,
+                reasoning_effort=(req.reasoning_effort or None),
+            )
+
+        from api.chat_jobs import register_chat_job_routes
+        register_chat_job_routes(app, check_auth=_check_auth,
+                                 prepare=_chat_job_prepare,
+                                 stream_factory=_chat_job_stream,
+                                 session_dir=SESSION_DIR)
+
+    if phone_full_tools:
+        # ─── Workspace files ─────────────────────────────────────────────
+        # Browse/read/download/upload, JAILED to the agent-runs area — an
+        # artifact space for the phone, not a repo browser.
+
+        from core.config import BASE_DIR
+        from api.files_api import register_file_routes
+        register_file_routes(
+            app, check_auth=_check_auth,
+            default_root=os.path.join(os.path.abspath(BASE_DIR),
+                                      "output", "agent_runs"))
+
+        # ─── Agent runs ──────────────────────────────────────────────────
+        # The autonomous loop (core.agent_loop) over REST: start goals,
+        # stream events, answer approval prompts. Same runner the Qt GUI
+        # drives.
+
+        from api.agent_api import register_agent_routes
+        register_agent_routes(
+            app,
+            check_auth=_check_auth,
+            get_engine=_get_engine,
+            default_workspace_root=os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "output", "agent_runs",
+            ),
         )
-
-    from api.chat_jobs import register_chat_job_routes
-    register_chat_job_routes(app, check_auth=_check_auth,
-                             prepare=_chat_job_prepare,
-                             stream_factory=_chat_job_stream,
-                             session_dir=SESSION_DIR)
-
-    # ─── Workspace files ─────────────────────────────────────────────────
-    # Browse/read/download/upload, JAILED to the agent-runs area — an
-    # artifact space for the phone, not a repo browser.
-
-    from core.config import BASE_DIR
-    from api.files_api import register_file_routes
-    register_file_routes(
-        app, check_auth=_check_auth,
-        default_root=os.path.join(os.path.abspath(BASE_DIR),
-                                  "output", "agent_runs"))
-
-    from api.agent_api import register_agent_routes
-    register_agent_routes(
-        app,
-        check_auth=_check_auth,
-        get_engine=_get_engine,
-        default_workspace_root=os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "output", "agent_runs",
-        ),
-    )
 
     # ─── Health ───────────────────────────────────────────────────────────
 
@@ -1441,6 +1480,10 @@ def create_app():
         # Include web gateway status and backend info
         report["web_gateway"] = gateway_available()
         report["backend"] = get_active_backend()
+        # Phone app capability — the client hides Agent/Files when the
+        # server is serving web search/read only.
+        report["phone_app"] = phone_app_on
+        report["phone_tools"] = "full" if phone_full_tools else "web"
         return report
 
     @app.get("/v1/queue")
