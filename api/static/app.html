@@ -919,6 +919,10 @@ let gatewayUp = false;
 // engine reload). Servers in the default web-only mode report
 // phone_tools:"web" in /health; older servers omit the field (treat as full).
 let phoneToolsFull = true;
+// Loaded engine context size in tokens (0 = unknown). Feeds historyBudget()
+// so client-side compaction fires relative to the REAL tier, before the
+// server's pre-flight trim has to cut anything.
+let engineCtx = 0;
 let activeTab = "chat";
 
 // Server-side chat sessions. The transcript is owned by the API (one JSON
@@ -1008,7 +1012,16 @@ const COMPACT_SYSTEM =
   "all names, paths, numbers, decisions, and open questions. Output only the synopsis.";
 function historyBudget() {
   const n = parseInt($("hist-budget").value, 10);
-  return (isNaN(n) || n < 4000) ? DEFAULT_HISTORY_BUDGET : n;
+  const user = (isNaN(n) || n < 4000) ? DEFAULT_HISTORY_BUDGET : n;
+  if (!engineCtx) return user;
+  // Clamp to what the LOADED tier can hold: ctx minus the completion
+  // reservation minus a template margin, tokens->chars at 4/token with a
+  // 0.85 safety factor (dense text tokenizes above chars/4). Keeps the
+  // synopsis compaction firing BEFORE the server has to hard-trim.
+  const maxTok = parseInt($("max-tokens").value, 10) || 12288;
+  const margin = Math.max(512, engineCtx >> 5);
+  const tokBudget = Math.max(engineCtx - maxTok - margin, engineCtx >> 2);
+  return Math.min(user, Math.floor(tokBudget * 4 * 0.85));
 }
 
 // Re-render cadence while streaming. Every token re-rendered the whole
@@ -1153,6 +1166,11 @@ async function connect() {
       "Gateway offline (Docker not running on the PC). Toggle stays available; searches will fail until it's up.";
     await loadModels();
     $("welcome-hint") && ($("welcome-hint").textContent = "Type a message below to start.");
+    // Engine ctx for context budgeting (best effort, non-blocking)
+    fetch("/v1/engine", { headers: authHeaders() })
+      .then(r => r.ok ? r.json() : null)
+      .then(e => { if (e) engineCtx = e.ctx || e.ctx_cap || e.queue_tier || 0; })
+      .catch(() => {});
     bootSession().then(bootChatJob);
     if (phoneToolsFull && !agentRunId) agentBoot();
   } catch (e) {
@@ -2380,6 +2398,17 @@ async function runAssistantTurn(opts) {
       return;
     }
     if (data.x_tool_status) { addToolStatus(data.x_tool_status); return; }
+    if (data.x_context_fit) {
+      // Server-side pre-flight had to compact/trim to fit the model window
+      // (e.g. a single message bigger than the whole tier).
+      addBlock(Object.assign(document.createElement("div"), {
+        className: "tool-status",
+        textContent: "— context " +
+          (data.x_context_fit.compacted ? "compacted" : "trimmed") +
+          " to fit the model window —",
+      }));
+      return;
+    }
     if (data.x_tool_done) {
       // Tools finished: the model starts a fresh segment. Keep what is
       // rendered, reset accumulators so the follow-up streams cleanly.
@@ -2856,6 +2885,13 @@ async function reloadEngine() {
         const jump = $("engine-jump");
         jump.classList.remove("hidden");
         jump.onclick = () => { toggleDrawer(); openRun(d.run_id); };
+      } else if (d && d.refused) {
+        // VRAM gate said no. The server restored the previous tier
+        // (restored_ctx) when it could.
+        box.textContent = (d.message || "Reload refused.") +
+          (d.restored_ctx
+            ? " Still serving at ctx " + d.restored_ctx + "."
+            : " Nothing is loaded now - a chat request reloads the old size.");
       } else {
         box.textContent = typeof d === "string" ? d : "Nothing is loaded yet.";
       }
@@ -3435,6 +3471,9 @@ function agentEvent(ev) {
         risk: ev.risk || "",
         reason: ev.policy_reason || "",
       }, "action");
+      break;
+    case "compacted":
+      agentNote("Context compacted: " + (ev.reason || "fit to model window"));
       break;
     case "gate_pause":
       agentNote("Human gate: " + (ev.reason || ""), "warn");

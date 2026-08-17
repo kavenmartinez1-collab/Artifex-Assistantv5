@@ -65,6 +65,11 @@ class GPUDevice:
     memory_used_mb: float
     compute_cap: str
     last_refresh: float = field(default_factory=time.time)
+    # "cuda" = enumerated via nvidia-smi (index == CUDA/nvidia-smi index);
+    # "dxgi" = enumerated via DXGI+PDH (non-NVIDIA cards on Windows).
+    source: str = "cuda"
+    vendor_id: int = 0
+    luid: str = ""
 
     @property
     def utilization_pct(self) -> float:
@@ -250,38 +255,70 @@ class GPUPool:
             return None
 
     def _enumerate_devices(self) -> None:
-        """Query all GPUs and populate the device list."""
+        """Query all GPUs and populate the device list.
+
+        NVIDIA devices come from nvidia-smi (keeps their CUDA indices, which
+        launch code pins via CUDA_VISIBLE_DEVICES).  Every OTHER hardware
+        adapter (AMD, Intel) comes from the DXGI+PDH probe and is appended
+        with the next free index — without this, a Vulkan multi-GPU split
+        leaves the non-NVIDIA share of the model completely ungated.
+        """
+        devices = []
+        now = time.time()
+
         output = self._run_nvidia_smi(
             "index,name,memory.total,memory.free,memory.used,compute_cap"
         )
-        if output is None:
-            _log.info("No GPU devices enumerated (nvidia-smi unavailable)")
-            return
+        if output is not None:
+            for line in output.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 6:
+                    _log.warning("Unexpected nvidia-smi line format: %s", line)
+                    continue
+                try:
+                    dev = GPUDevice(
+                        index=int(parts[0]),
+                        name=parts[1],
+                        memory_total_mb=float(parts[2]),
+                        memory_free_mb=float(parts[3]),
+                        memory_used_mb=float(parts[4]),
+                        compute_cap=parts[5],
+                        last_refresh=now,
+                        source="cuda",
+                        vendor_id=0x10DE,
+                    )
+                    devices.append(dev)
+                except (ValueError, IndexError) as e:
+                    _log.warning("Failed to parse GPU line '%s': %s", line, e)
+                    continue
 
-        devices = []
-        now = time.time()
-        for line in output.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 6:
-                _log.warning("Unexpected nvidia-smi line format: %s", line)
-                continue
-            try:
-                dev = GPUDevice(
-                    index=int(parts[0]),
-                    name=parts[1],
-                    memory_total_mb=float(parts[2]),
-                    memory_free_mb=float(parts[3]),
-                    memory_used_mb=float(parts[4]),
-                    compute_cap=parts[5],
+        # DXGI+PDH: all vendors. NVIDIA adapters are skipped whenever
+        # nvidia-smi answered (already covered above, richer data there);
+        # with no nvidia-smi at all, DXGI covers NVIDIA too.
+        try:
+            from core.dxgi_vram import probe_adapters
+            next_index = max((d.index for d in devices), default=-1) + 1
+            for a in probe_adapters():
+                if devices and output is not None and a["vendor_id"] == 0x10DE:
+                    continue
+                devices.append(GPUDevice(
+                    index=next_index,
+                    name=a["description"],
+                    memory_total_mb=a["dedicated_mb"],
+                    memory_free_mb=a["free_mb"],
+                    memory_used_mb=a["usage_mb"],
+                    compute_cap="-",
                     last_refresh=now,
-                )
-                devices.append(dev)
-            except (ValueError, IndexError) as e:
-                _log.warning("Failed to parse GPU line '%s': %s", line, e)
-                continue
+                    source="dxgi",
+                    vendor_id=a["vendor_id"],
+                    luid=a["luid"],
+                ))
+                next_index += 1
+        except Exception as e:
+            _log.debug("DXGI adapter probe unavailable: %s", e)
 
         with self._lock:
             self._devices = devices
@@ -289,19 +326,46 @@ class GPUPool:
         if devices:
             _log.info("Enumerated %d GPU device(s):", len(devices))
             for d in devices:
-                _log.info("  [%d] %s — %0.f MB total, %.0f MB free, compute %s",
+                _log.info("  [%d] %s — %0.f MB total, %.0f MB free (%s)",
                           d.index, d.name, d.memory_total_mb, d.memory_free_mb,
-                          d.compute_cap)
+                          d.source)
         else:
-            _log.warning("nvidia-smi ran but returned no devices")
+            _log.info("No GPU devices enumerated")
 
     def refresh_device(self, device_index: int = 0) -> Optional[GPUDevice]:
         """Refresh dynamic VRAM info for a specific device."""
+        with self._lock:
+            target = next((d for d in self._devices
+                           if d.index == device_index), None)
+        target_source = target.source if target else "cuda"
+        now = time.time()
+
+        if target_source == "dxgi":
+            # LUID-matched refresh via the DXGI+PDH probe.
+            try:
+                from core.dxgi_vram import probe_adapters
+                by_luid = {a["luid"]: a for a in probe_adapters()}
+            except Exception as e:
+                _log.debug("DXGI refresh failed: %s", e)
+                return None
+            with self._lock:
+                for dev in self._devices:
+                    if dev.source != "dxgi":
+                        continue
+                    a = by_luid.get(dev.luid)
+                    if a is not None:
+                        dev.memory_free_mb = a["free_mb"]
+                        dev.memory_used_mb = a["usage_mb"]
+                        dev.last_refresh = now
+                for dev in self._devices:
+                    if dev.index == device_index:
+                        return dev
+            return None
+
         output = self._run_nvidia_smi("index,memory.free,memory.used")
         if output is None:
             return None
 
-        now = time.time()
         with self._lock:
             for line in output.split("\n"):
                 line = line.strip()
@@ -318,7 +382,7 @@ class GPUPool:
                     continue
                 # Update existing device or skip
                 for dev in self._devices:
-                    if dev.index == idx:
+                    if dev.index == idx and dev.source == "cuda":
                         dev.memory_free_mb = free
                         dev.memory_used_mb = used
                         dev.last_refresh = now
@@ -478,8 +542,11 @@ class GPUPool:
             True if VRAM became available within timeout.
             False if timeout was exceeded or nvidia-smi is unavailable.
         """
-        if self._nvidia_smi_available is False:
-            _log.warning("wait_for_vram: nvidia-smi unavailable, assuming VRAM is ready")
+        with self._lock:
+            known = any(d.index == device_index for d in self._devices)
+        if not known:
+            _log.warning("wait_for_vram: device %d not enumerated, "
+                         "assuming VRAM is ready", device_index)
             return True
 
         _log.info("wait_for_vram: need %.0f MB free on GPU %d (timeout=%.1fs, poll=%.1fs)",
@@ -534,6 +601,8 @@ class GPUPool:
         kv_quant: str = "f16",
         extra_flags: Optional[list] = None,
         device_index: int = 0,
+        split_fraction_override: Optional[float] = None,
+        compute_buffer_override_mb: Optional[float] = None,
     ) -> dict:
         """Estimate total VRAM needed to run a model config.
 
@@ -550,6 +619,14 @@ class GPUPool:
             extra_flags: llama-server flags from model config. Scanned for
                          --cpu-moe / --n-cpu-moe to scale model_weight_mb
                          when MoE experts are offloaded to CPU RAM.
+            split_fraction_override: this device's share of a multi-GPU
+                         split, computed by the caller (engine gate). When
+                         given, the -ts inference below is skipped — the
+                         caller knows the share→device mapping; positional
+                         inference here does not.
+            compute_buffer_override_mb: per-device compute buffer estimate
+                         (split configs put the primary graph buffer on the
+                         first device; secondaries carry less).
 
         Returns:
             Dict with component breakdown and total_mb.
@@ -565,7 +642,10 @@ class GPUPool:
         result = {
             "model_weight_mb": 0.0,
             "kv_cache_mb": 0.0,
-            "compute_buffer_mb": COMPUTE_BUFFER_MB,
+            "compute_buffer_mb": (
+                compute_buffer_override_mb
+                if compute_buffer_override_mb is not None
+                else COMPUTE_BUFFER_MB),
             "system_reserve_mb": reserve_mb,
             "total_mb": 0.0,
             "estimation_method": "exact",
@@ -627,7 +707,9 @@ class GPUPool:
         # no single GPU has room for the whole weight.  Shares are relative:
         # llama.cpp normalises the list, so "5,11" and "0.31,0.69" agree.
         split_fraction = 1.0
-        if extra_flags:
+        if split_fraction_override is not None:
+            split_fraction = max(0.0, min(1.0, float(split_fraction_override)))
+        elif extra_flags:
             for i, f in enumerate(extra_flags):
                 if f in ("-ts", "--tensor-split") and i + 1 < len(extra_flags):
                     try:
@@ -730,10 +812,14 @@ class GPUPool:
         # Refresh all devices
         self._enumerate_devices()
 
+        # CUDA devices only, unless none exist: the returned index feeds
+        # CUDA_VISIBLE_DEVICES pinning, and a DXGI index would point a CUDA
+        # build at the wrong (or no) card.  Vulkan split configs don't use
+        # this path — they gate every device via the -ts shares instead.
         with self._lock:
-            candidates = [
-                d for d in self._devices if d.memory_free_mb >= needed_mb
-            ]
+            cuda = [d for d in self._devices if d.source == "cuda"]
+            pool = cuda or list(self._devices)
+            candidates = [d for d in pool if d.memory_free_mb >= needed_mb]
 
         if not candidates:
             _log.warning("find_best_device: no GPU has %.0f MB free", needed_mb)

@@ -976,14 +976,21 @@ def _inject_web_tool_prompt(messages: list):
         messages.insert(0, {"role": "system", "content": _WEB_TOOL_SYSTEM_PROMPT})
 
 
-def _get_context_budget(backend: str) -> int:
-    """Return input token budget for the current engine, or 0 if unknown."""
+def _get_context_budget(backend: str, max_tokens: int = 0) -> int:
+    """Return input token budget for the current engine, or 0 if unknown.
+
+    With max_tokens given, the budget reserves room to actually generate
+    (ctx - completion - margin); the bare form keeps the legacy 85% cap.
+    """
     if backend == "ollama":
         return 0
     try:
         engine = _get_engine()
         ctx = engine.get_context_size()
         if ctx > 0:
+            if max_tokens:
+                from core.inference import context_input_budget
+                return context_input_budget(ctx, max_tokens)
             return int(ctx * 0.85)
     except Exception as e:
         _log.debug("Could not query engine context size: %s", e)
@@ -1020,6 +1027,34 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
     round_count = 0
 
     while True:
+        # ── Pre-context assessment ────────────────────────────────────
+        # Before EVERY round: the prompt plus the completion reservation
+        # must fit the LOADED tier. An oversized paste (round 1) or tool
+        # result (later rounds) gets compacted/trimmed HERE, while we can
+        # still act — this hybrid model cannot context-shift, so overflow
+        # at prefill is a hard failure. Verified against the engine's
+        # real tokenizer (chars/4 under-counts dense text). Multimodal
+        # content arrays are skipped: image tokens are budgeted by the
+        # request estimator and list contents would confuse the trimmer.
+        if backend != "ollama" and all(
+                isinstance(m.get("content"), str) for m in current_messages):
+            try:
+                _pf_engine = _get_engine()
+                _pf_ctx = _pf_engine.get_context_size() or 0
+            except Exception:
+                _pf_ctx = 0
+            if _pf_ctx > 0:
+                from core.inference import ensure_context_fit
+                current_messages, fit = ensure_context_fit(
+                    current_messages, _pf_ctx, max_tokens or 12288,
+                    count_fn=getattr(_pf_engine, "count_tokens", None))
+                if fit["compacted"] or fit["trimmed"]:
+                    _log.info("[%s] Pre-flight fit: compacted=%s trimmed=%s "
+                              "~%d tok (budget %d of ctx %d)",
+                              chat_id, fit["compacted"], fit["trimmed"],
+                              fit["est"], fit["budget"], _pf_ctx)
+                    yield f"data: {json.dumps({'x_context_fit': fit})}\n\n"
+
         # Start generation in a background thread
         q = queue.Queue(maxsize=256)
 
@@ -1109,7 +1144,7 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
         round_count += 1
         if round_count > MAX_TOOL_ROUNDS:
             _log.warning("Max tool rounds (%d) reached — forcing answer", MAX_TOOL_ROUNDS)
-            budget = _get_context_budget(backend)
+            budget = _get_context_budget(backend, max_tokens or 12288)
             if budget > 0:
                 current_messages = trim_messages_to_context(current_messages, budget)
             current_messages.append({
@@ -1182,22 +1217,8 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
             ),
         })
 
-        # Compact then trim to fit context window
-        from core.inference import auto_compact_if_needed
-        budget = _get_context_budget(backend)
-        est_tokens = sum(len(m.get("content", "")) for m in current_messages) // 4
-        _log.info("[%s] Pre-trim: %d messages (~%d tok), ctx_budget=%d",
-                  chat_id, len(current_messages), est_tokens, budget)
-        if budget > 0:
-            current_messages, compacted = auto_compact_if_needed(
-                current_messages, budget, context_window=15
-            )
-            if compacted:
-                _log.info("[%s] Auto-compacted to %d messages", chat_id, len(current_messages))
-            current_messages = trim_messages_to_context(current_messages, budget)
-            new_est = sum(len(m.get("content", "")) for m in current_messages) // 4
-            if new_est < est_tokens:
-                _log.info("[%s] Trimmed: %d messages (~%d tok)", chat_id, len(current_messages), new_est)
+        # Fit-to-context happens at the top of the next loop iteration
+        # (the pre-context assessment), with exact token counts.
         _log.info("[%s] Starting follow-up round %d", chat_id, round_count + 1)
         # Loop continues with new generation round
 
@@ -1370,12 +1391,42 @@ def create_app():
                 # with None it would happily re-adopt the old small server and
                 # the reload would be a silent no-op.
                 target = body.ctx_tier
-                if target is None and _engine is not None:
-                    target = getattr(_engine, "_configured_num_ctx", None)
+                prev_tier = None
+                if _engine is not None:
+                    if target is None:
+                        target = getattr(_engine, "_configured_num_ctx", None)
+                    if hasattr(_engine, "current_tier"):
+                        prev_tier = _engine.current_tier() or None
                 await mq._unload_engine()
                 loop = asyncio.get_event_loop()
-                eng = await loop.run_in_executor(
-                    None, lambda: _get_engine(ctx_tier=target, exact_ctx=True))
+                try:
+                    eng = await loop.run_in_executor(
+                        None, lambda: _get_engine(ctx_tier=target, exact_ctx=True))
+                except RuntimeError as e:
+                    # VRAM gate refused the requested tier. Don't leave the
+                    # user with nothing loaded — put the previous tier back
+                    # and tell them exactly why the reload was refused.
+                    refusal = str(e)
+                    _log.warning("Reload to ctx=%s refused: %s", target, refusal)
+                    restored = None
+                    if prev_tier and prev_tier != target:
+                        try:
+                            eng = await loop.run_in_executor(
+                                None, lambda: _get_engine(
+                                    ctx_tier=prev_tier, exact_ctx=True))
+                            restored = (eng.current_tier()
+                                        if hasattr(eng, "current_tier")
+                                        else prev_tier)
+                            mq._current_ctx_tier = restored
+                        except Exception as e2:
+                            _log.error("Restore of previous ctx=%s also "
+                                       "failed: %s", prev_tier, e2)
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"message": f"Reload refused: {refusal}",
+                                "refused": True,
+                                "requested_ctx": target,
+                                "restored_ctx": restored})
                 mq._current_ctx_tier = (
                     eng.current_tier() if hasattr(eng, "current_tier") else body.ctx_tier)
                 _log.info("Engine reloaded via /v1/engine/reload at ctx=%s",

@@ -196,6 +196,14 @@ class LlamaCppEngine(BaseEngine):
         # PCI index is a display card, e.g. 1080 Ti for screens + 4090 for
         # inference).  Per-model override > env var > auto.
         self._configured_gpu_index = model_config.get("gpu_index")
+        # Optional explicit share→device mapping for -ts splits: a list of
+        # GPU-pool device indices, same order as the -ts shares.  Default
+        # (None) maps biggest share → biggest-VRAM card, which matches how
+        # split ratios are chosen in practice.
+        self._split_gpu_indices = model_config.get("split_gpu_indices")
+        # Per-device VRAM requirements of the last gate pass, for the
+        # launch-retry path: [(pool_device_index, needed_mb)].
+        self._gate_requirements: list = []
         # Tier-driven launch ctx, set by set_target_tier() before load().
         # When None, _compute_num_ctx falls back to the configured cap or the
         # legacy VRAM-fit heuristic.
@@ -316,6 +324,114 @@ class LlamaCppEngine(BaseEngine):
             return 0
         return picked
 
+    def _parse_ts_shares(self) -> list:
+        """Relative device shares from -ts / --tensor-split, or []."""
+        flags = self.extra_flags
+        for i, f in enumerate(flags):
+            if f in ("-ts", "--tensor-split") and i + 1 < len(flags):
+                try:
+                    shares = [float(x)
+                              for x in flags[i + 1].replace("/", ",").split(",")
+                              if x.strip()]
+                except ValueError:
+                    return []
+                return shares if sum(shares) > 0 else []
+        return []
+
+    def _split_assignment(self, pool, shares) -> "list | None":
+        """Map -ts share positions onto GPU-pool devices.
+
+        Returns [(share_pos, pool_device_index, fraction)] covering every
+        share, or None when the pool knows fewer devices than the split
+        has shares (caller falls back to the single-device gate).
+
+        Mapping: config `split_gpu_indices` when given; otherwise greedy —
+        largest share to the largest-total-VRAM device.  llama.cpp's own
+        device order (Vulkan/CUDA enumeration) is not observable from
+        here, but split ratios are in practice written to match card
+        sizes, so capacity-greedy reproduces the real assignment; the
+        config key covers rigs where it doesn't.
+        """
+        total = sum(shares)
+        if total <= 0:
+            return None
+        devices = pool.get_device_status()
+        if len(devices) < len(shares):
+            _log.warning(
+                "Split gate: %d -ts shares but only %d known device(s) — "
+                "falling back to single-device gating", len(shares), len(devices))
+            return None
+
+        if (isinstance(self._split_gpu_indices, (list, tuple))
+                and len(self._split_gpu_indices) == len(shares)):
+            known = {d["index"] for d in devices}
+            if all(idx in known for idx in self._split_gpu_indices):
+                return [(pos, int(idx), shares[pos] / total)
+                        for pos, idx in enumerate(self._split_gpu_indices)]
+            _log.warning("split_gpu_indices %r references unknown devices "
+                         "(known: %s) — using capacity-greedy mapping",
+                         self._split_gpu_indices, sorted(known))
+
+        by_share = sorted(range(len(shares)), key=lambda p: -shares[p])
+        by_capacity = sorted(devices, key=lambda d: -d["memory_total_mb"])
+        assignment = [
+            (pos, by_capacity[rank]["index"], shares[pos] / total)
+            for rank, pos in enumerate(by_share)
+        ]
+        return sorted(assignment)
+
+    def _vram_gate(self, pool, gpu_index: int, wait_timeout: float) -> None:
+        """Verify every device the launch will touch has room; raise if not.
+
+        Split configs (-ts) are gated PER DEVICE: each card only needs its
+        own share of weights and KV, and each card must individually have
+        that much free — the historical single-device gate saw only the
+        share of one (NVIDIA) card and let the other card OOM.  The
+        primary device carries the main compute graph buffer; secondaries
+        carry roughly half that.
+        """
+        from core.gpu_pool import COMPUTE_BUFFER_MB
+        kv_quant_str = self._get_kv_quant_str()
+        requirements = []   # [(device_index, needed_mb)]
+
+        shares = self._parse_ts_shares()
+        assignment = self._split_assignment(pool, shares) if len(shares) >= 2 else None
+        if assignment:
+            for pos, dev_idx, frac in assignment:
+                comp = COMPUTE_BUFFER_MB if pos == 0 else COMPUTE_BUFFER_MB // 2
+                alloc = pool.estimate_allocation_mb(
+                    self.model_path, self._num_ctx, kv_quant=kv_quant_str,
+                    device_index=dev_idx, extra_flags=self.extra_flags,
+                    split_fraction_override=frac,
+                    compute_buffer_override_mb=comp,
+                )
+                requirements.append((dev_idx, (
+                    alloc["model_weight_mb"] + alloc["kv_cache_mb"]
+                    + alloc["compute_buffer_mb"])))
+        else:
+            alloc = pool.estimate_allocation_mb(
+                self.model_path, self._num_ctx, kv_quant=kv_quant_str,
+                device_index=gpu_index, extra_flags=self.extra_flags,
+            )
+            requirements.append((gpu_index, (
+                alloc["model_weight_mb"] + alloc["kv_cache_mb"]
+                + alloc["compute_buffer_mb"])))
+
+        self._gate_requirements = requirements
+        for dev_idx, needed_mb in requirements:
+            _log.info("VRAM gate: need %.0f MB free on GPU %d (ctx=%d)",
+                      needed_mb, dev_idx, self._num_ctx)
+            if not pool.wait_for_vram(needed_mb, device_index=dev_idx,
+                                      timeout=wait_timeout):
+                dev = pool.refresh_device(dev_idx)
+                name = f" ({dev.name})" if dev else ""
+                free = f", {dev.memory_free_mb:.0f} MB free" if dev else ""
+                raise RuntimeError(
+                    f"VRAM gate refused ctx={self._num_ctx}: need "
+                    f"{needed_mb:.0f} MB free on GPU {dev_idx}{name}{free}. "
+                    f"Close GPU-heavy apps or use a smaller context tier."
+                )
+
     def _compute_num_ctx(self) -> int:
         # Tier picker takes priority — set by request router via set_target_tier
         if self._target_ctx:
@@ -429,33 +545,37 @@ class LlamaCppEngine(BaseEngine):
         self._num_ctx = self._compute_num_ctx()
 
         # ── VRAM gate ──
-        from core.gpu_pool import get_pool
+        from core.gpu_pool import get_pool, DEFAULT_VRAM_WAIT_TIMEOUT
         pool = get_pool()
 
         gpu_index = self._resolve_gpu_index(pool)
         self._active_gpu_index = gpu_index
 
-        kv_quant_str = self._get_kv_quant_str()
-        allocation = pool.estimate_allocation_mb(
-            self.model_path, self._num_ctx, kv_quant=kv_quant_str,
-            device_index=gpu_index, extra_flags=self.extra_flags,
-        )
-        needed_mb = (
-            allocation["model_weight_mb"]
-            + allocation["kv_cache_mb"]
-            + allocation["compute_buffer_mb"]
-        )
-        _log.info(
-            "VRAM gate: need %.0f MB free on GPU %d (weight=%.0f + kv=%.0f + compute=%.0f)",
-            needed_mb, gpu_index, allocation["model_weight_mb"],
-            allocation["kv_cache_mb"], allocation["compute_buffer_mb"],
-        )
-        if not pool.wait_for_vram(needed_mb, device_index=gpu_index):
-            raise RuntimeError(
-                f"VRAM not available: need {needed_mb:.0f} MB free on GPU {gpu_index}. "
-                f"Previous process may still be releasing memory. "
-                f"Try again in a few seconds or reduce context size."
-            )
+        # Gate the planned tier on EVERY device the launch touches.  On
+        # refusal, implicit loads walk DOWN the tier ladder until a tier
+        # fits — the conversation-side pre-flight compaction then fits the
+        # session into whatever loads — instead of launching into an OOM.
+        # Explicit user reloads (exact tier) refuse outright so the caller
+        # can restore the previous tier and tell the user.
+        exact_request = self._target_exact
+        gate_timeout = DEFAULT_VRAM_WAIT_TIMEOUT
+        while True:
+            try:
+                self._vram_gate(pool, gpu_index, wait_timeout=gate_timeout)
+                break
+            except RuntimeError as e:
+                lower = max((t for t in CTX_TIERS if t < (self._num_ctx or 0)),
+                            default=None)
+                if exact_request or lower is None:
+                    raise
+                _log.warning("%s — stepping down to ctx=%d", e, lower)
+                if status_callback:
+                    status_callback(
+                        f"VRAM tight: stepping context {self._num_ctx} → {lower}")
+                self._num_ctx = lower
+                # The first pass already waited out any WDDM reclaim lag;
+                # retries only need a quick look.
+                gate_timeout = 5
 
         if status_callback:
             status_callback(
@@ -478,7 +598,10 @@ class LlamaCppEngine(BaseEngine):
         # reorder by compute capability and silently flip the indices.
         launch_env = os.environ.copy()
         launch_env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        launch_env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+        # A -ts split intends MULTIPLE devices — pinning visibility to one
+        # card would break a CUDA-build split (Vulkan ignores the var).
+        if len(self._parse_ts_shares()) < 2:
+            launch_env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
 
         # llama-server.exe depends on ggml-cuda.dll, which in turn depends on
         # cudart64_12.dll / cublas64_12.dll / cublasLt64_12.dll. If the CUDA
@@ -562,7 +685,10 @@ class LlamaCppEngine(BaseEngine):
                         )
                         self._process = None
                         time.sleep(launch_retry_delay)
-                        pool.wait_for_vram(needed_mb, device_index=gpu_index, timeout=10)
+                        for _dev_idx, _need_mb in (self._gate_requirements
+                                                   or [(gpu_index, 0)]):
+                            pool.wait_for_vram(_need_mb, device_index=_dev_idx,
+                                               timeout=10)
                         launch_failed = True
                         break
                     raise RuntimeError(
