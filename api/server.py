@@ -1364,14 +1364,36 @@ def create_app():
     # runs server-side and is reattachable; the finished exchange is
     # written into the session store even if nobody reattaches.
 
-    def _chat_job_stream(req):
-        # Runs inside the job worker's private event loop. The model-queue
-        # asyncio lock belongs to the main loop, so (like the agent worker)
-        # jobs use _get_engine() directly and run against the active model.
-        from core.config import get_active_backend
-        _get_engine()
+    async def _chat_job_prepare(req):
+        # MAIN loop: resolve the model (image requests route to a vision
+        # model), switch the queue, load the engine — so the worker runs
+        # against the RIGHT model. Returns the resolved model id.
+        backend = _infer_backend_from_model(req.model) or get_active_backend()
+        msgs = [m for m in req.messages if isinstance(m, dict)]
+        has_images = _messages_have_images(msgs)
+        model = _resolve_model_for_request(req.model, has_images, backend)
+        ctx_tier = None
+        if backend == "llama_cpp":
+            from core.engine_llama_cpp import pick_ctx_tier
+            from core.request_estimator import estimate_request_requirements
+            from core.config import get_llama_cpp_model_config
+            cfg = get_llama_cpp_model_config(model) or {}
+            est = estimate_request_requirements(
+                msgs, req.max_tokens or 12288,
+                web_tools=bool(req.web_tools), enable_thinking=True,
+                model_config=cfg)
+            ctx_tier = pick_ctx_tier(est.total_context_needed, cfg.get("num_ctx"))
         mq = get_model_queue()
-        model = req.model or mq._current_model or ""
+        async with mq._lock:
+            await mq.switch_if_needed(model, backend, ctx_tier=ctx_tier)
+            if backend != "ollama":
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, lambda: _get_engine(ctx_tier=ctx_tier))
+        return model
+
+    def _chat_job_stream(req, model):
+        # Runs in the worker's private loop; the engine is already loaded
+        # for `model` by _chat_job_prepare above.
         return _stream_with_tools(
             list(req.messages), model,
             req.max_tokens or 12288,
@@ -1383,6 +1405,7 @@ def create_app():
 
     from api.chat_jobs import register_chat_job_routes
     register_chat_job_routes(app, check_auth=_check_auth,
+                             prepare=_chat_job_prepare,
                              stream_factory=_chat_job_stream,
                              session_dir=SESSION_DIR)
 

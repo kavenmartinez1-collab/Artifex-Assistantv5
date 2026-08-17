@@ -75,6 +75,26 @@ class ChatJobRequest(BaseModel):
     reasoning_effort: Optional[str] = None
 
 
+def _flatten_image_content(m: dict) -> dict:
+    """Collapse an OpenAI multimodal message to a text+marker string before
+    it reaches the session store — base64 images belong in the live turn,
+    never persisted (mirrors the client's flattenContent; keeps sessions
+    under the 2 MB cap). Plain-string messages pass through untouched.
+    """
+    c = m.get("content")
+    if not isinstance(c, list):
+        return {"role": m.get("role"), "content": c}
+    parts = []
+    for item in c:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text":
+            parts.append(item.get("text", ""))
+        elif item.get("type") == "image_url":
+            parts.append("[image]")
+    return {"role": m.get("role"), "content": " ".join(p for p in parts if p).strip()}
+
+
 class ChatJob:
     def __init__(self, req: ChatJobRequest):
         self.id = uuid.uuid4().hex[:12]
@@ -149,10 +169,10 @@ class ChatJob:
             }
 
 
-def _worker(job: ChatJob, stream_factory, session_dir: str):
+def _worker(job: ChatJob, stream_factory, model: str, session_dir: str):
     """Consume the chat stream inside a private event loop."""
     async def consume():
-        gen = stream_factory(job.req)
+        gen = stream_factory(job.req, model)
         try:
             async for chunk in gen:
                 if job._stop.is_set():
@@ -189,7 +209,7 @@ def _worker(job: ChatJob, stream_factory, session_dir: str):
     if job.status == "done" and job.req.session_id and job.text:
         try:
             from api.session_api import write_session
-            history = [m for m in job.req.messages
+            history = [_flatten_image_content(m) for m in job.req.messages
                        if isinstance(m, dict) and m.get("role") != "system"]
             history = history + [{"role": "assistant", "content": job.text}]
             ok = write_session(session_dir, job.req.session_id, history,
@@ -206,12 +226,18 @@ def _worker(job: ChatJob, stream_factory, session_dir: str):
             _jobs.pop(j.id, None)
 
 
-def register_chat_job_routes(app, check_auth, stream_factory, session_dir: str):
+def register_chat_job_routes(app, check_auth, prepare, stream_factory, session_dir: str):
     """Wire the chat-job endpoints.
 
-    stream_factory — (ChatJobRequest) -> async generator of SSE chunk
-        strings; the server passes a closure over its _stream_with_tools
-        pipeline so jobs and live streaming share one code path.
+    prepare        — async (ChatJobRequest) -> str, run on the MAIN event
+        loop before the worker spawns: resolves the model (image-bearing
+        requests route to a vision model), switches the model queue, and
+        loads the engine. Returns the resolved model id. This MUST happen
+        on the main loop because the queue's lock is bound to it — the
+        worker's private loop can't take it, which is why a vision job
+        previously ran against whatever model was already loaded.
+    stream_factory — (ChatJobRequest, model) -> async generator of SSE
+        chunk strings; shares the server's _stream_with_tools pipeline.
     """
 
     def _auth(request: Request):
@@ -237,10 +263,21 @@ def register_chat_job_routes(app, check_auth, stream_factory, session_dir: str):
                             "job_id": live.id})
             job = ChatJob(body)
             _jobs[job.id] = job
-        threading.Thread(target=_worker, args=(job, stream_factory, session_dir),
+        # Switch/load the right engine on the MAIN loop before the worker
+        # runs (image requests route to a vision model here). A failure
+        # marks the job errored rather than silently generating on the
+        # wrong model.
+        try:
+            resolved_model = await prepare(body)
+        except Exception as e:
+            _log.exception("Chat job %s prepare failed", job.id)
+            job.finish("error", f"engine prepare failed: {e}"[:500])
+            return {"job_id": job.id, "status": job.status}
+        threading.Thread(target=_worker,
+                         args=(job, stream_factory, resolved_model, session_dir),
                          name=f"chat-job-{job.id}", daemon=True).start()
-        _log.info("Chat job %s started (session=%s, web=%s)",
-                  job.id, body.session_id, bool(body.web_tools))
+        _log.info("Chat job %s started (model=%s, session=%s, web=%s)",
+                  job.id, resolved_model, body.session_id, bool(body.web_tools))
         return {"job_id": job.id, "status": job.status}
 
     @app.get("/v1/chat/jobs/{job_id}")
