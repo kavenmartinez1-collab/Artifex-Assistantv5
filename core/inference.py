@@ -229,13 +229,58 @@ def _extract_key_point(msg):
 _tokenizer = None
 
 
+def _flatten_for_count(content):
+    """Coerce one message's content to countable text.
+
+    Multimodal content is a LIST of parts, not a str.  Feeding that list to
+    "\\n".join() raised TypeError, and len() on it returned the PART COUNT —
+    so a 400 KB image turn counted as ~0 tokens and no trimming ever fired.
+    Text parts contribute their text; each image contributes its own token
+    cost via TOKENS_PER_IMAGE, which the caller adds separately.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    out = []
+    for part in content:
+        if isinstance(part, str):
+            out.append(part)
+        elif isinstance(part, dict) and part.get("type") == "text":
+            out.append(part.get("text", "") or "")
+    return "\n".join(out)
+
+
+def _count_image_parts(messages):
+    """Number of image parts across messages (each costs TOKENS_PER_IMAGE)."""
+    n = 0
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if (isinstance(part, dict)
+                    and part.get("type") in ("image_url", "image", "input_image")):
+                n += 1
+    return n
+
+
 def _count_tokens(messages, tokenizer=None):
-    """Count tokens in messages. Uses actual tokenizer if available, else char/4 fallback."""
+    """Count tokens in messages. Uses actual tokenizer if available, else char/4 fallback.
+
+    Image parts are billed at TOKENS_PER_IMAGE (~1030 measured for a 1024px
+    JPEG through the Qwen3.8 mmproj) rather than ignored, so a multimodal turn
+    is budgeted at something close to its real prefill cost.
+    """
+    from core.request_estimator import TOKENS_PER_IMAGE
+
+    image_tokens = _count_image_parts(messages) * TOKENS_PER_IMAGE
     tok = tokenizer or _tokenizer
     if tok is not None:
-        text = "\n".join(m.get("content", "") for m in messages)
-        return len(tok.encode(text, add_special_tokens=False))
-    return sum(len(m.get("content", "")) for m in messages) // 4
+        text = "\n".join(_flatten_for_count(m.get("content")) for m in messages)
+        return len(tok.encode(text, add_special_tokens=False)) + image_tokens
+    return sum(len(_flatten_for_count(m.get("content")))
+               for m in messages) // 4 + image_tokens
 
 
 def build_active_messages(history, context_window, max_history_tokens=None,

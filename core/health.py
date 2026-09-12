@@ -25,7 +25,7 @@ def _check_cuda():
                 "available": False,
                 "reason": "CUDA not available (CPU-only mode)",
             }
-        return {
+        out = {
             "available": True,
             "gpu_name": gpu_info.name,
             "gpu_count": gpu_info.device_count,
@@ -35,6 +35,27 @@ def _check_cuda():
             "compute_capability": gpu_info.compute_cap_str,
             "gpu_tier": GPU_TIER,
         }
+        # The figures above come from torch's allocator, which only sees THIS
+        # process — llama-server runs out-of-process, so a fully-loaded 8 GB
+        # card still reported vram_free_gb 7.96 while the driver had 0.5 GB
+        # left. Report the driver's own numbers alongside; these are what the
+        # VRAM gate actually gates on, so this is the view that explains a
+        # refused load.
+        try:
+            from core.gpu_pool import get_pool
+            out["devices"] = [
+                {
+                    "index": d["index"],
+                    "name": d["name"],
+                    "total_mb": round(d["memory_total_mb"]),
+                    "free_mb": round(d["memory_free_mb"]),
+                    "used_mb": round(d["memory_used_mb"]),
+                }
+                for d in get_pool().get_device_status()
+            ]
+        except Exception as e:
+            _log.debug("Driver-level VRAM query failed: %s", e)
+        return out
     except Exception as e:
         _log.debug("GPU health check failed: %s", e)
         return {"available": False, "reason": str(e)}

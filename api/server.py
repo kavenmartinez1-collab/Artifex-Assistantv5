@@ -282,12 +282,26 @@ def _convert_messages_for_ollama(messages):
 
 
 def _messages_have_images(messages):
-    """Check if any message contains image content."""
+    """Check if any message contains image content.
+
+    Every item is isinstance-checked: a content list carrying a bare string
+    or None (relays and hand-rolled clients both do it) used to raise
+    AttributeError here, which surfaced as an opaque 500 — or, from the chat
+    job path, as "engine prepare failed: 'str' object has no attribute 'get'".
+    _flatten_image_content and _describe_content_shape already guard this way.
+    """
     for msg in messages:
+        if not isinstance(msg, dict):
+            continue
         content = msg.get("content")
         if isinstance(content, list):
             for item in content:
-                if item.get("type") == "image_url":
+                if not isinstance(item, dict):
+                    continue
+                # "image" is the Anthropic-style part name; "input_image" is
+                # the OpenAI Responses form. Accept both — a missed shape
+                # means the request silently routes to a text-only model.
+                if item.get("type") in ("image_url", "image", "input_image"):
                     return True
     return False
 
@@ -997,6 +1011,49 @@ def _get_context_budget(backend: str, max_tokens: int = 0) -> int:
     return 0
 
 
+def _clamp_max_tokens(messages, max_tokens: int, backend: str,
+                      chat_id: str = "-") -> int:
+    """Cap the completion budget to what the LOADED context can give back.
+
+    The vision entry launches at 16384 ctx (a ~16128-token slot) and every
+    1024px image costs ~1030 tokens, so four photos plus a 12288-token
+    completion request overruns the window.  llama-server truncates rather
+    than erroring, which silently loses the tail of the answer — and the
+    pre-flight trimmer can't help because it skips list-shaped content.
+
+    Returns max_tokens unchanged when it already fits, or when the engine's
+    context size can't be determined (better to let the backend decide than
+    to clamp on a guess).
+    """
+    if backend == "ollama" or not max_tokens:
+        return max_tokens
+    try:
+        ctx = _get_engine().get_context_size() or 0
+    except Exception as e:
+        _log.debug("[%s] max_tokens clamp skipped: %s", chat_id, e)
+        return max_tokens
+    if ctx <= 0:
+        return max_tokens
+
+    from core.inference import _count_tokens
+    prompt_tok = _count_tokens(messages)
+    margin = max(512, ctx // 32)
+    room = ctx - prompt_tok - margin
+    if room >= max_tokens:
+        return max_tokens
+
+    # Never return a budget so small the answer is pointless; if even the
+    # floor doesn't fit, the prompt itself is the problem and the engine's
+    # own truncation is the honest outcome.
+    safe = max(room, 256)
+    _log.warning(
+        "[%s] max_tokens %d -> %d: prompt ~%d tok + margin %d would overrun "
+        "ctx %d (image parts billed at ~1030 tok each)",
+        chat_id, max_tokens, safe, prompt_tok, margin, ctx,
+    )
+    return safe
+
+
 # ── Unified streaming with optional tool execution ──────────────────────
 
 async def _stream_with_tools(messages: list, model: str, max_tokens: int,
@@ -1015,7 +1072,11 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
     last_finish_reason = "stop"  # Updated from engine usage events
 
     current_messages = list(messages)
-    msg_tokens_est = sum(len(m.get("content", "")) for m in current_messages) // 4
+    # Image-aware: len() on a multimodal content LIST returns the part count,
+    # so the old form logged "~884 tok" for a three-photo request. _count_tokens
+    # now flattens text parts and bills images at TOKENS_PER_IMAGE.
+    from core.inference import _count_tokens as _ct
+    msg_tokens_est = _ct(current_messages)
 
     _log.info("[%s] web_tools=%s, backend=%s, %d messages (~%d tok), max_tokens=%s",
               chat_id, use_web_tools, backend, len(current_messages), msg_tokens_est, max_tokens)
@@ -1023,6 +1084,11 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
     if use_web_tools:
         _inject_web_tool_prompt(current_messages)
         _log.info("[%s] Injected web tool system prompt", chat_id)
+
+    # Image turns bypass the pre-flight trimmer below (their content is a list,
+    # not a str), so nothing else keeps prompt + completion inside the window.
+    # Clamp the completion budget to what the LOADED ctx can actually return.
+    max_tokens = _clamp_max_tokens(current_messages, max_tokens, backend, chat_id)
 
     round_count = 0
 
@@ -1778,6 +1844,12 @@ def create_app():
 
             # Transformers / llama_cpp non-streaming
             engine = _get_engine(ctx_tier=ctx_tier)
+            # The same clamp _stream_with_tools applies — this path never
+            # reaches it, so without this a non-streaming image request could
+            # still ask for more completion than the loaded window can return
+            # (four photos already spend ~4100 tok of the 16384 vision ctx).
+            max_tokens = _clamp_max_tokens(messages, max_tokens, backend,
+                                           "nostream")
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,

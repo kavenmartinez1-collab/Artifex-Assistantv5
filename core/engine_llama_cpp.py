@@ -50,6 +50,13 @@ CTX_TIERS = (32_000, 64_000, 128_000, 224_000, 256_000)
 # tool rounds and follow-up turns within a session.
 TIER_HEADROOM_TOK = 8_000
 
+# Absolute floor for VRAM step-down.  Models whose num_ctx sits below the
+# smallest CTX_TIERS rung (the 16384-ctx vision entry) have no lower rung to
+# fall back to, so the gate halves instead — but never past this floor: below
+# ~4K a multimodal turn cannot hold even one image (~1030 tok) plus a prompt
+# and a usable answer, so failing loudly beats loading something useless.
+MIN_CTX = 4_096
+
 # Pressure margin used while a tier is live: if the next request would
 # bring the engine within this many tokens of its tier cap, the request
 # router should grow to the next tier instead of risking mid-stream
@@ -77,9 +84,13 @@ def pick_ctx_tier(needed_tokens: int, max_cap: int | None = None) -> int:
     candidates = CTX_TIERS
     if max_cap and max_cap > 0:
         capped = tuple(t for t in CTX_TIERS if t <= max_cap)
-        # Keep at least one tier — degenerate caps below the smallest tier
-        # are clamped to that tier so callers always get a usable value.
-        candidates = capped or (CTX_TIERS[0],)
+        # A cap BELOW the smallest tier (the 16384-ctx vision entry) has no
+        # representable rung.  Return the cap itself rather than CTX_TIERS[0]:
+        # handing back 32000 for a 16384-ctx model overstates the window to
+        # the queue and the request estimator, and set_ctx_tier() only has to
+        # clamp it straight back down.  That mismatch is what made
+        # /v1/engine report queue_tier=32000 against ctx_cap=16384.
+        candidates = capped or (int(max_cap),)
     for tier in candidates:
         if tier >= target:
             return tier
@@ -566,6 +577,18 @@ class LlamaCppEngine(BaseEngine):
             except RuntimeError as e:
                 lower = max((t for t in CTX_TIERS if t < (self._num_ctx or 0)),
                             default=None)
+                # No lower RUNG is not the same as no lower CTX.  A model
+                # capped below CTX_TIERS[0] — the 16384-ctx vision entry —
+                # used to land here with lower=None and raise on the spot, so
+                # any VRAM shortfall became an instant hard failure with no
+                # fallback, while the message told the user to "use a smaller
+                # context tier" that does not exist.  Halve instead, down to
+                # MIN_CTX.  The vision tier walks 16384 → 8192 → 4096, each
+                # still large enough for a single image plus a real answer.
+                if lower is None:
+                    halved = (self._num_ctx or 0) // 2
+                    if halved >= MIN_CTX:
+                        lower = halved
                 if exact_request or lower is None:
                     raise
                 _log.warning("%s — stepping down to ctx=%d", e, lower)

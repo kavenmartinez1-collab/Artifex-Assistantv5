@@ -1529,8 +1529,11 @@ function appendMessage(role, content) {
 // no url and simply renders no thumbnail).
 function renderUserParts(body, parts) {
   const imgs = contentImages(parts);
+  // FIRST text part, not last: a multi-image turn carries per-image "Image N:"
+  // labels after the caption (they work around llama.cpp dropping adjacent
+  // images), and overwriting would show the last label as the user's message.
   let text = "";
-  for (const p of parts) { if (p && p.type === "text" && p.text) text = p.text; }
+  for (const p of parts) { if (p && p.type === "text" && p.text) { text = p.text; break; } }
   if (imgs.length) {
     const strip = document.createElement("div");
     strip.className = "bubble-imgs";
@@ -1854,14 +1857,25 @@ function trimmedHistory() {
   if (conversation.length <= 1) return conversation.slice();
   const budget = historyBudget();
   const last = conversation.length - 1;
+  // Index of the most recent turn still holding real image data. It is kept
+  // verbatim alongside the current turn so FOLLOW-UP questions about a photo
+  // can still see it. Previously only the last message kept its array, so the
+  // next question sent "[image]" text instead — the request then looked
+  // text-only, routed away from the vision model, and the reply was "I can't
+  // see the images". Bounded to IMAGE_RECALL_TURNS so an old photo doesn't
+  // ride along (and re-pay its ~1030 tok) for the rest of the session.
+  let imgIdx = -1;
+  for (let i = last; i >= 0 && i > last - IMAGE_RECALL_TURNS; i--) {
+    if (contentHasImage(conversation[i] && conversation[i].content)) { imgIdx = i; break; }
+  }
   const kept = [];
   let chars = 0;
   for (let i = last; i >= 0; i--) {
     const raw = conversation[i];
-    // The current turn (last message) keeps its real content — the model
-    // sees the image THIS turn. Every earlier turn is text-coerced, so prior
-    // images become "[image]" and their base64 is never resent.
-    const msg = (i === last) ? raw : { role: raw.role, content: flattenContent(raw.content) };
+    // The current turn and the most recent image turn keep their real content.
+    // Every other turn is text-coerced, so older images become "[image]" and
+    // their base64 is never resent.
+    const msg = (i === last || i === imgIdx) ? raw : { role: raw.role, content: flattenContent(raw.content) };
     const c = flattenContent(raw.content).length;
     if (kept.length && (chars + c > budget || kept.length >= MAX_HISTORY_MESSAGES)) break;
     kept.unshift(msg);
@@ -1951,6 +1965,11 @@ async function autoCompact(signal, onStatus) {
 // ═════════════════════════════════════════════════════════
 const VISION_MODEL = "qwen3.8-27b-vision-vulkan-split";
 const MAX_IMAGES = 4;
+// How far back trimmedHistory() will still resend a turn's real image data so
+// follow-up questions about a photo keep working. 6 covers roughly three
+// question/answer exchanges about the same picture; beyond that the image
+// degrades to a "[image]" marker as before.
+const IMAGE_RECALL_TURNS = 6;
 const IMAGE_MAX_EDGE = 1024;
 const IMAGE_QUALITY = 0.85;
 let pendingImages = [];        // downscaled data URLs staged for the next send
@@ -1970,7 +1989,10 @@ function flattenContent(content) {
   let text = "", imgs = 0;
   for (const p of content) {
     if (!p) continue;
-    if (p.type === "text" && p.text) text = p.text;
+    // FIRST text part wins — see renderUserParts: the per-image "Image N:"
+    // labels trail the caption, and overwriting would persist "Image 4:" as
+    // the whole user turn in the session store.
+    if (p.type === "text" && p.text) { if (!text) text = p.text; }
     else if (p.type === "image_url") imgs++;
   }
   let s = text;
@@ -2122,7 +2144,17 @@ async function sendMessage() {
   let content;
   if (imgs.length) {
     content = [{ type: "text", text: text || "What's in this image?" }];
-    for (const u of imgs) content.push({ type: "image_url", image_url: { url: u } });
+    // llama.cpp b10453 DROPS EVERY SECOND IMAGE in a run of adjacent
+    // image_url parts: measured by prompt_tokens (~1030 tok per 1024px
+    // image), 2 images encoded as 1, and 4 encoded as 2, regardless of part
+    // order or cache_prompt. A text part between each image encodes all of
+    // them (4 images -> 4128 tok), as does one image per message. So label
+    // each image with its own text part — it fixes the drop AND lets the
+    // model refer to them by number.
+    imgs.forEach((u, i) => {
+      if (imgs.length > 1) content.push({ type: "text", text: `Image ${i + 1}:` });
+      content.push({ type: "image_url", image_url: { url: u } });
+    });
   } else {
     content = text;
   }
@@ -2157,10 +2189,11 @@ function buildChatPayload() {
   sys += capabilitiesNote(webOn);
   if (webOn) sys += TOOL_PROMPT;
   const msgs = trimmedHistory();
-  // Only images CAN survive to the outgoing turn — trimmedHistory keeps the
-  // last message's real array and coerces the rest. So an image here is
-  // always the current turn's.
-  const outgoingHasImage = msgs.length > 0 && contentHasImage(msgs[msgs.length - 1].content);
+  // Any kept message may carry real images now: trimmedHistory preserves the
+  // current turn AND the most recent image turn (see IMAGE_RECALL_TURNS), so
+  // checking only the last message would miss a follow-up question about a
+  // photo sent a turn or two ago and hand it to a text-only model.
+  const outgoingHasImage = msgs.some(m => m && contentHasImage(m.content));
   const selected = $("model-select").value || undefined;
   let model = selected;
   let visionOverride = false;
