@@ -31,7 +31,14 @@ OLLAMA_BASE = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rst
 # VRAM goes back to the user for whatever else they want to run on the GPU
 # (other AI workloads, games, browsers, etc.).  Only acts on llama_cpp;
 # Ollama and Transformers each manage their own lifecycles.
-IDLE_SHRINK_SEC = 600
+#
+# Override with ARTIFEX_IDLE_SHRINK_SEC; <= 0 disables the shrink entirely.
+# Raise or disable it when a latency-sensitive client talks to llama-server
+# directly instead of through this wrapper: the queue then sees no traffic
+# and would release a model that is actively mid-session.  That is a real
+# configuration, not a misuse — the per-request wrapper path costs seconds,
+# which some interactive loops cannot spend.
+IDLE_SHRINK_SEC = int(os.environ.get("ARTIFEX_IDLE_SHRINK_SEC", "600"))
 IDLE_SHRINK_CHECK_INTERVAL = 60
 
 
@@ -200,7 +207,15 @@ class ModelQueue:
         own lifecycles and unloading them through this path would interfere
         with their internal state.  Acquires the queue lock so the shrink
         never races with an in-flight switch_if_needed.
+
+        Exits immediately when the shrink is disabled, so a deployment whose
+        traffic bypasses this wrapper doesn't pay for a task that can only
+        ever unload a model that is still in use.
         """
+        if IDLE_SHRINK_SEC <= 0:
+            _log.info("Queue: idle shrink disabled (ARTIFEX_IDLE_SHRINK_SEC<=0)")
+            return
+
         while True:
             try:
                 await asyncio.sleep(IDLE_SHRINK_CHECK_INTERVAL)

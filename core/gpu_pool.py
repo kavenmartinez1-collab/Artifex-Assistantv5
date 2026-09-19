@@ -49,6 +49,15 @@ SYSTEM_RESERVE_MB = 2048        # Static fallback reserve when the live baseline
 VRAM_BASELINE_FLOOR_MB = 1500   # Lower bound for the live baseline, even on a quiet system
 NVIDIA_SMI_TIMEOUT = 5          # seconds
 
+# Reclaim settling (see wait_for_vram_settled): how long to let a freed
+# allocation actually drain before launching into the space it left, how
+# often to look, and how much movement between polls still counts as "done".
+# 30 s is the measured worst case for a ~12 GB Vulkan allocation on this
+# class of card; the common case clears in one poll.
+VRAM_SETTLE_TIMEOUT = 30.0
+VRAM_SETTLE_POLL = 1.5
+VRAM_SETTLE_DELTA_MB = 64
+
 DEFAULT_VRAM_WAIT_TIMEOUT = 30  # seconds
 DEFAULT_VRAM_POLL_INTERVAL = 1.5  # seconds
 
@@ -590,6 +599,87 @@ class GPUPool:
             _log.debug("wait_for_vram: poll %d — %.0f MB free / %.0f MB needed "
                        "(deficit: %.0f MB), waiting %.1fs...",
                        iteration, free_mb, needed_mb, needed_mb - free_mb, poll_interval)
+            time.sleep(poll_interval)
+
+    def wait_for_vram_settled(
+        self,
+        device_indices: Optional[list] = None,
+        timeout: float = VRAM_SETTLE_TIMEOUT,
+        poll_interval: float = VRAM_SETTLE_POLL,
+    ) -> bool:
+        """Block until freed VRAM stops growing on the given devices.
+
+        wait_for_vram answers "are there N free MB?", which a killed
+        server's memory satisfies the instant the process exits.  It does
+        NOT answer "has the driver finished reclaiming?", and on WDDM those
+        are different questions: measured on a model switch, relaunching
+        ~1.5 s after the previous server died left the new one with 400 MB
+        of its weights in shared system memory — decode 12 tok/s instead
+        of 35 — with the same config that runs fully resident after a
+        longer pause.  Free MB read as plentiful the whole time (12119 of
+        12242), so nothing upstream could see the problem.
+
+        "Settled" = two consecutive polls where free VRAM moved less than
+        VRAM_SETTLE_DELTA_MB on every device.  An already-idle box clears
+        that on the first two polls, so a cold load pays one poll interval.
+
+        Returns True once settled, False on timeout (callers proceed
+        anyway — a slow load beats refusing to load).
+        """
+        if device_indices is None:
+            with self._lock:
+                device_indices = [d.index for d in self._devices]
+        if not device_indices:
+            return True
+
+        deadline = time.time() + timeout
+        previous = None
+        stable_rounds = 0
+        iteration = 0
+
+        while True:
+            iteration += 1
+            current = {}
+            for idx in device_indices:
+                dev = self.refresh_device(idx)
+                if dev is not None:
+                    current[idx] = dev.memory_free_mb
+            if not current:
+                return True
+
+            if previous is not None:
+                moved = max(
+                    (abs(current[i] - previous[i])
+                     for i in current if i in previous),
+                    default=0.0,
+                )
+                if moved < VRAM_SETTLE_DELTA_MB:
+                    stable_rounds += 1
+                    if stable_rounds >= 2:
+                        _log.info(
+                            "wait_for_vram_settled: settled after %d poll(s) "
+                            "— free %s MB",
+                            iteration,
+                            ", ".join(f"GPU{i}={current[i]:.0f}"
+                                      for i in sorted(current)),
+                        )
+                        return True
+                else:
+                    if stable_rounds:
+                        stable_rounds = 0
+                    _log.info(
+                        "wait_for_vram_settled: still reclaiming (moved "
+                        "%.0f MB since last poll), waiting %.1fs...",
+                        moved, poll_interval)
+
+            if time.time() >= deadline:
+                _log.warning(
+                    "wait_for_vram_settled: TIMEOUT after %d polls — VRAM is "
+                    "still moving; launching anyway, but part of the model may "
+                    "land in shared system memory", iteration)
+                return False
+
+            previous = current
             time.sleep(poll_interval)
 
     # ── VRAM Estimation ────────────────────────────────────────────────

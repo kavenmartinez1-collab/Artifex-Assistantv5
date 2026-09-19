@@ -65,11 +65,15 @@ class TestPickCtxTier:
         # 100K need would normally pick 128K, but capped at 64K → 64K
         assert pick_ctx_tier(100_000, max_cap=64_000) == 64_000
 
-    def test_cap_below_smallest_tier_returns_smallest(self):
+    def test_cap_below_smallest_tier_returns_the_cap(self):
+        # A cap below the smallest tier has no representable rung, so the
+        # picker returns the CAP, not CTX_TIERS[0].  This test used to
+        # assert 32_000 and was left stale when that changed: handing back
+        # a tier above the cap overstated the window to the queue and the
+        # request estimator (the /v1/engine queue_tier=32000 vs
+        # ctx_cap=16384 mismatch).
         from core.engine_llama_cpp import pick_ctx_tier
-        # Degenerate cap below the smallest tier — picker still returns
-        # something usable (the smallest tier) rather than failing.
-        assert pick_ctx_tier(10_000, max_cap=20_000) == 32_000
+        assert pick_ctx_tier(10_000, max_cap=20_000) == 20_000
 
     def test_zero_or_negative_input_clamped(self):
         from core.engine_llama_cpp import pick_ctx_tier

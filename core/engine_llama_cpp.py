@@ -57,6 +57,14 @@ TIER_HEADROOM_TOK = 8_000
 # and a usable answer, so failing loudly beats loading something useless.
 MIN_CTX = 4_096
 
+# Slack allowed when checking that weights+KV actually became resident
+# after a load (see _check_resident_after_load).  Absorbs probe noise and
+# the weight estimate's own error — file size counts tensors llama.cpp may
+# discard, e.g. an MTP/nextn block with spec decoding off (~300 MB on a
+# 27B).  An observed real spill overshot by 465 MB, so a genuine one
+# still clears this floor while the normal case stays quiet.
+SPILL_TOLERANCE_MB = 256
+
 # Pressure margin used while a tier is live: if the next request would
 # bring the engine within this many tokens of its tier cap, the request
 # router should grow to the next tier instead of risking mid-stream
@@ -215,6 +223,10 @@ class LlamaCppEngine(BaseEngine):
         # Per-device VRAM requirements of the last gate pass, for the
         # launch-retry path: [(pool_device_index, needed_mb)].
         self._gate_requirements: list = []
+        # Same pass, for the post-load spill check: weights+KV that must be
+        # resident per device, and each device's usage before we launched.
+        self._resident_floors: dict = {}
+        self._pre_launch_used_mb: dict = {}
         # Tier-driven launch ctx, set by set_target_tier() before load().
         # When None, _compute_num_ctx falls back to the configured cap or the
         # legacy VRAM-fit heuristic.
@@ -400,35 +412,62 @@ class LlamaCppEngine(BaseEngine):
         share of one (NVIDIA) card and let the other card OOM.  The
         primary device carries the main compute graph buffer; secondaries
         carry roughly half that.
+
+        That halving is known to UNDER-reserve: measured on a 2-way
+        Vulkan split of a 27B, graph+staging is ~550 MB on the primary
+        and ~880 MB on the layer-heavy secondary (a 5,11 split puts 69%
+        of the layers there), against the 500 MB allowed here.  It is
+        left under-reserved on purpose — raising it to the measured value
+        refuses configs that demonstrably run, because the other terms
+        err the same way: weight is taken from FILE size, and a GGUF
+        carrying an MTP/nextn block that llama.cpp discards when spec
+        decoding is off ("unused tensor blk.N.nextn.* -- ignoring")
+        overstates resident weight by ~300 MB.  The two errors are the
+        same size as the margin being tested, so tightening one alone
+        just trades false accepts for false refusals.
+
+        Do not read this gate as a spill guard.  Over-committing a card
+        does not OOM on WDDM — the driver demotes the overflow to shared
+        system memory, the model loads and answers, and only decode
+        speed collapses (measured 35 → 8 tok/s).  The check that catches
+        that is _check_resident_after_load, which compares real
+        residency against this estimate once the server is up.
         """
         from core.gpu_pool import COMPUTE_BUFFER_MB
         kv_quant_str = self._get_kv_quant_str()
         requirements = []   # [(device_index, needed_mb)]
+        # Weight+KV per device, and what other processes already held when
+        # we looked: the two numbers _check_resident_after_load needs to
+        # tell "loaded" from "loaded, minus what WDDM paged out".
+        floors = {}
+        baseline = {}
 
         shares = self._parse_ts_shares()
         assignment = self._split_assignment(pool, shares) if len(shares) >= 2 else None
         if assignment:
-            for pos, dev_idx, frac in assignment:
-                comp = COMPUTE_BUFFER_MB if pos == 0 else COMPUTE_BUFFER_MB // 2
-                alloc = pool.estimate_allocation_mb(
-                    self.model_path, self._num_ctx, kv_quant=kv_quant_str,
-                    device_index=dev_idx, extra_flags=self.extra_flags,
-                    split_fraction_override=frac,
-                    compute_buffer_override_mb=comp,
-                )
-                requirements.append((dev_idx, (
-                    alloc["model_weight_mb"] + alloc["kv_cache_mb"]
-                    + alloc["compute_buffer_mb"])))
+            plan = [(dev_idx, frac,
+                     COMPUTE_BUFFER_MB if pos == 0 else COMPUTE_BUFFER_MB // 2)
+                    for pos, dev_idx, frac in assignment]
         else:
+            plan = [(gpu_index, None, None)]
+
+        for dev_idx, frac, comp in plan:
             alloc = pool.estimate_allocation_mb(
                 self.model_path, self._num_ctx, kv_quant=kv_quant_str,
-                device_index=gpu_index, extra_flags=self.extra_flags,
+                device_index=dev_idx, extra_flags=self.extra_flags,
+                split_fraction_override=frac,
+                compute_buffer_override_mb=comp,
             )
-            requirements.append((gpu_index, (
+            requirements.append((dev_idx, (
                 alloc["model_weight_mb"] + alloc["kv_cache_mb"]
                 + alloc["compute_buffer_mb"])))
+            floors[dev_idx] = alloc["model_weight_mb"] + alloc["kv_cache_mb"]
+            dev = pool.refresh_device(dev_idx)
+            baseline[dev_idx] = dev.memory_used_mb if dev else None
 
         self._gate_requirements = requirements
+        self._resident_floors = floors
+        self._pre_launch_used_mb = baseline
         for dev_idx, needed_mb in requirements:
             _log.info("VRAM gate: need %.0f MB free on GPU %d (ctx=%d)",
                       needed_mb, dev_idx, self._num_ctx)
@@ -442,6 +481,53 @@ class LlamaCppEngine(BaseEngine):
                     f"{needed_mb:.0f} MB free on GPU {dev_idx}{name}{free}. "
                     f"Close GPU-heavy apps or use a smaller context tier."
                 )
+
+    def _check_resident_after_load(self, pool) -> None:
+        """Warn when part of the model landed in shared system memory.
+
+        WDDM does not refuse an over-committed GPU allocation the way a
+        CUDA malloc does: it demotes the overflow to shared system memory.
+        llama-server then loads, reports healthy, and answers correctly —
+        while every token that touches a demoted page pays a PCIe round
+        trip.  Nothing in the launch path can see this.  Residency can:
+        weights and KV are allocations that MUST be resident to run at
+        speed, so a device holding less than that floor is holding the
+        remainder in host RAM.
+
+        The signature is inverted residency — MORE context allocated,
+        LESS VRAM resident.  Measured on a 2-way Vulkan split of a 27B
+        (5,11 across an 8 GB and a 12 GB card): at 32k ctx the 12 GB card
+        holds 11951 MB and decodes 35 tok/s; at 64k ctx it holds 11007 MB
+        — 900 MB LESS while needing 400 MB more — and decodes 8 tok/s.
+
+        Warn only.  The tier step-down in load() acts on a refusal from
+        the gate, which is arithmetic done before launch; this runs after,
+        on a coarse signal, and auto-reloading here would silently throw
+        away the context tier the caller just asked for.
+        """
+        floors = getattr(self, "_resident_floors", None)
+        if not floors:
+            return
+        pre = getattr(self, "_pre_launch_used_mb", {}) or {}
+        for dev_idx, floor_mb in floors.items():
+            base_mb = pre.get(dev_idx)
+            dev = pool.refresh_device(dev_idx)
+            if dev is None or base_mb is None:
+                continue
+            # What THIS server added, net of whatever else was already on
+            # the card (desktop compositor, browser, another model).
+            resident_mb = dev.memory_used_mb - base_mb
+            if resident_mb >= floor_mb - SPILL_TOLERANCE_MB:
+                continue
+            _log.warning(
+                "VRAM SPILL on GPU %d (%s): weights+KV need %.0f MB resident "
+                "but only %.0f MB of dedicated VRAM was added by this launch "
+                "— roughly %.0f MB is in shared system memory and decode will "
+                "be PCIe-bound. Drop the context tier (ctx=%d) or shift -ts "
+                "share away from this card.",
+                dev_idx, dev.name, floor_mb, resident_mb,
+                floor_mb - resident_mb, self._num_ctx,
+            )
 
     def _compute_num_ctx(self) -> int:
         # Tier picker takes priority — set by request router via set_target_tier
@@ -561,6 +647,15 @@ class LlamaCppEngine(BaseEngine):
 
         gpu_index = self._resolve_gpu_index(pool)
         self._active_gpu_index = gpu_index
+
+        # Let any just-freed VRAM finish draining before we allocate into
+        # it.  A model switch kills the previous server moments before this
+        # point, and launching into a half-reclaimed card puts part of the
+        # new model in shared system memory — the load succeeds, the model
+        # answers, and decode runs ~3x slow.  Free MB alone cannot see that
+        # (it reads plentiful immediately), so this waits on the derivative
+        # instead.  Costs one poll on an idle box.
+        pool.wait_for_vram_settled()
 
         # Gate the planned tier on EVERY device the launch touches.  On
         # refusal, implicit loads walk DOWN the tier ladder until a tier
@@ -725,6 +820,7 @@ class LlamaCppEngine(BaseEngine):
                         "llama-server ready: %s (port %d, ctx %d, ngl %d)",
                         self.model_name, self.port, self._num_ctx, self.num_gpu_layers,
                     )
+                    self._check_resident_after_load(pool)
                     if status_callback:
                         status_callback(
                             f"llama-server ready — {self.model_name} (ctx={self._num_ctx})"
