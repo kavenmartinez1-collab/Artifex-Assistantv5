@@ -332,7 +332,65 @@ class TestFormatRetry:
         result = runner.run("goal", [])
         assert result.status == "stopped:no_action"
         assert [e.reason for e in events if e.kind == "format_retry"] == [
-            "empty response", "empty response"]
+            "empty response — retrying without thinking"] * 2
+
+    def test_empty_round_retries_with_thinking_off(self):
+        # A thinking model can spend the whole completion budget inside its
+        # reasoning block and return zero content tokens. A prose nudge
+        # cannot fix that — the model is cut off before it ever reads one —
+        # so the retry has to take thinking away and hand the budget to
+        # content instead.
+        seen = []
+
+        class ThinkyEngine:
+            def get_context_size(self):
+                return 8192
+
+            def generate_streaming(self, messages, max_tokens=0,
+                                   temperature=0.0, on_token=None,
+                                   enable_thinking=True, **kw):
+                seen.append(enable_thinking)
+                r = "" if len(seen) == 1 else '@done("recovered")'
+                if on_token:
+                    on_token(r)
+                return r
+
+        runner = AgentRunner(
+            ThinkyEngine(), build_system_prompt=lambda: "sys",
+            config=RunConfig(autonomy=AutonomyLevel.FULL_AUTO,
+                             enable_thinking=True),
+        )
+        result = runner.run("goal", [])
+        assert result.status == "done"
+        assert seen == [True, False]      # thinking dropped for the retry
+
+    def test_thinking_restored_after_recovery_round(self, monkeypatch):
+        # The override is consumed by one generation, not latched forever.
+        monkeypatch.setattr("core.agent_loop.run_agent_action",
+                            lambda a, **kw: (True, "ok"))
+        seen = []
+
+        class ThinkyEngine:
+            def get_context_size(self):
+                return 8192
+
+            def generate_streaming(self, messages, max_tokens=0,
+                                   temperature=0.0, on_token=None,
+                                   enable_thinking=True, **kw):
+                seen.append(enable_thinking)
+                r = ["", '@glob("*.py")', '@done("done")'][len(seen) - 1]
+                if on_token:
+                    on_token(r)
+                return r
+
+        runner = AgentRunner(
+            ThinkyEngine(), build_system_prompt=lambda: "sys",
+            config=RunConfig(autonomy=AutonomyLevel.FULL_AUTO,
+                             enable_thinking=True),
+        )
+        runner.run("goal", [])
+        assert seen[:2] == [True, False]
+        assert seen[2] is True           # back on for the following round
 
     def test_prose_answer_still_finishes(self):
         engine = FakeEngine(["The answer is 42. Nothing to run."])

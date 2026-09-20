@@ -230,6 +230,9 @@ class AgentRunner:
         self._t0 = 0.0
         self._gen_error = ""
         self.goal = ""
+        # Set when a round returns zero content: the NEXT generation runs
+        # with thinking off. See _generate().
+        self._no_think_next = False
 
     # ── public ──────────────────────────────────────────────────────────────
 
@@ -293,10 +296,17 @@ class AgentRunner:
                 malformed = self._looks_like_failed_tool_attempt(resp)
                 if format_retries < 2 and (blank or malformed):
                     format_retries += 1
+                    if blank:
+                        # A prose nudge cannot fix a token-budget problem —
+                        # the model never reaches the end of its own think
+                        # block, so it never reads the nudge at all. Take
+                        # thinking away for the retry instead; the whole
+                        # completion budget then goes to content.
+                        self._no_think_next = True
                     self.emit(AgentEvent(
                         "format_retry", round=rnd,
-                        reason="empty response" if blank
-                               else "malformed tool invocation"))
+                        reason="empty response — retrying without thinking"
+                               if blank else "malformed tool invocation"))
                     history.append({"role": "user", "content":
                                     self._empty_nudge() if blank
                                     else self._format_nudge()})
@@ -684,12 +694,15 @@ class AgentRunner:
             return get_preset(self.config.sampler_preset)
         return None
 
-    def _engine_gen_kwargs(self) -> dict:
+    def _engine_gen_kwargs(self, enable_thinking: Optional[bool] = None) -> dict:
         """Optional generate_streaming kwargs the engine's signature accepts.
 
         Engines predate the sampling/enable_thinking wiring (and tests use
         minimal fakes), so only pass what the callee can take instead of
         blowing up with TypeError on older signatures.
+
+        enable_thinking overrides the configured value for one call (the
+        empty-round recovery turns it off); None keeps the config.
         """
         import inspect
         try:
@@ -698,9 +711,11 @@ class AgentRunner:
             return {}
         has_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD
                          for p in params.values())
+        if enable_thinking is None:
+            enable_thinking = self.config.enable_thinking
         kwargs = {}
         if has_var_kw or "enable_thinking" in params:
-            kwargs["enable_thinking"] = self.config.enable_thinking
+            kwargs["enable_thinking"] = enable_thinking
         samp = self._resolved_sampling()
         if samp is not None and (has_var_kw or "sampling" in params):
             kwargs["sampling"] = samp
@@ -724,18 +739,24 @@ class AgentRunner:
                 raise GenerationAborted()
             self.emit(AgentEvent("thinking_chunk", text=t, round=self._round))
 
+        # One round of recovery after an empty response: thinking off, so
+        # the whole completion budget is available for content. Consumed
+        # here so it applies to exactly this generation.
+        think_on = self.config.enable_thinking and not self._no_think_next
+        self._no_think_next = False
+
         # Engines that emit explicit <think> tags (llama.cpp, ollama) start
         # the stream OUTSIDE a think block; transformers pre-fills <think>.
         # With thinking disabled there is no leading think block either way.
         starts_in_think = (bool(getattr(self.engine, "stream_starts_in_think", True))
-                           and self.config.enable_thinking)
+                           and think_on)
         tf = ThinkFilter(on_response=on_resp, on_thinking=on_think,
                          starts_in_think=starts_in_think)
         try:
             resp = self.engine.generate_streaming(
                 active, max_tokens=self.config.max_tokens,
                 temperature=self.config.temperature, on_token=tf.feed,
-                **self._engine_gen_kwargs())
+                **self._engine_gen_kwargs(think_on))
         except GenerationAborted:
             # User stop, not a failure: return the partial text so the
             # transcript keeps what was said; the round loop's stop checks
@@ -819,16 +840,19 @@ class AgentRunner:
         """The round produced zero content tokens.
 
         On a thinking model that means the completion budget was spent
-        inside the reasoning block and the turn ended before any answer —
-        measured at 295 s for one wasted round on qwen3.8-27B. Telling it
-        to think short is the only lever available from inside the loop.
+        inside the reasoning block and the turn ended mid-thought, before
+        any answer — measured at exactly max_tokens generated with zero
+        content tokens, three rounds running, on qwen3.8-27B.
+
+        The caller has already switched thinking OFF for the retry; this
+        text just tells the model why its context looks the way it does.
         """
         return (
             "[EMPTY RESPONSE — automated] Your last turn produced no output "
-            "at all: the entire token budget went into thinking. Think "
-            "BRIEFLY, then act in this same turn — emit the tool call or the "
-            "answer first and keep deliberation short. If the GOAL is "
-            'already complete, emit @done("summary").'
+            "at all: the entire token budget was spent thinking and the turn "
+            "was cut off mid-thought. Thinking is DISABLED for this turn — "
+            "do not deliberate. Emit the tool call or the answer immediately. "
+            'If the GOAL is already complete, emit @done("summary").'
         )
 
     @staticmethod
