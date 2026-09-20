@@ -11,6 +11,10 @@ import pytest
 
 from core.engine_llama_cpp import LlamaCppEngine, CTX_TIERS
 
+# Stand-in model: roughly the 27B Q4_K_S that every split number here was
+# measured against, so the fixtures stay inside the real cards' totals.
+FAKE_WEIGHT_MB = 15400
+
 
 class FakePool:
     """GPU pool double: fixed devices, deterministic free VRAM."""
@@ -50,13 +54,13 @@ class FakePool:
                                extra_flags=None, device_index=0,
                                split_fraction_override=None,
                                compute_buffer_override_mb=None):
-        # Weight model: 16000 MB total; KV: 1 MB per 64 tokens.
+        # Weight model: FAKE_WEIGHT_MB total; KV: 1 MB per 64 tokens.
         frac = (split_fraction_override
                 if split_fraction_override is not None else 1.0)
         comp = (compute_buffer_override_mb
                 if compute_buffer_override_mb is not None else 1000)
         return {
-            "model_weight_mb": 16000 * frac,
+            "model_weight_mb": FAKE_WEIGHT_MB * frac,
             "kv_cache_mb": (num_ctx / 64) * frac,
             "compute_buffer_mb": comp,
             "system_reserve_mb": 2048,
@@ -122,12 +126,66 @@ class TestSplitAssignment:
 
 class TestVramGate:
     def test_split_passes_when_both_fit(self):
-        # small card needs 16000*5/16 + kv + 1000 ≈ 6300; big needs ≈ 11800
+        # small card needs 15400*5/16 + kv + 750 ≈ 5900; big needs ≈ 12000
         pool = FakePool([(0, "small", 8151, 7100), (1, "big", 12242, 12200)])
         e = _engine(["-ts", "5,11"])
         e._num_ctx = 64000
         e._vram_gate(pool, 0, wait_timeout=1)   # must not raise
         assert len(e._gate_requirements) == 2
+
+    def test_split_charges_every_device_half_a_buffer_plus_headroom(self):
+        # The policy, pinned: on a split no device holds all the layers, so
+        # none is charged the full single-device compute buffer — and each
+        # must keep SPLIT_PREFILL_HEADROOM_MB free on top for prefill's
+        # batch-sized buffers.  Same number on both cards: 500 + 250.
+        from core.gpu_pool import COMPUTE_BUFFER_MB, SPLIT_PREFILL_HEADROOM_MB
+        per_device = COMPUTE_BUFFER_MB // 2 + SPLIT_PREFILL_HEADROOM_MB
+        pool = FakePool([(0, "small", 8151, 7100), (1, "big", 12242, 12200)])
+        e = _engine(["-ts", "5,11"])
+        e._num_ctx = 64000
+        e._vram_gate(pool, 0, wait_timeout=1)
+        need = dict(e._gate_requirements)
+        for dev_idx, share in ((0, 5 / 16), (1, 11 / 16)):
+            assert need[dev_idx] == pytest.approx(
+                (FAKE_WEIGHT_MB + 64000 / 64) * share + per_device)
+
+    def test_split_primary_not_charged_full_single_device_buffer(self):
+        # Regression: charging the primary the whole COMPUTE_BUFFER_MB put a
+        # measured-good config 71 MB over an 8 GB card and stepped every load
+        # down a tier.  This card fits half a buffer plus headroom (5875) but
+        # not the old flat 1000 (6125).
+        pool = FakePool([(0, "small", 8151, 6000), (1, "big", 12242, 12200)])
+        e = _engine(["-ts", "5,11"])
+        e._num_ctx = 64000
+        e._vram_gate(pool, 0, wait_timeout=1)   # must not raise
+
+    def test_split_refused_when_only_the_prefill_headroom_is_missing(self):
+        # Fits weights+KV+graph with 100 MB to spare — which is exactly the
+        # state that loads fully resident and then prefills out of shared
+        # system memory.  Refuse it so the caller can step down instead.
+        from core.gpu_pool import SPLIT_PREFILL_HEADROOM_MB
+        fits_without_headroom = (FAKE_WEIGHT_MB + 64000 / 64) * 11 / 16 + 500
+        pool = FakePool([
+            (0, "small", 8151, 7100),
+            (1, "big", 12242, fits_without_headroom + 100),
+        ])
+        e = _engine(["-ts", "5,11"])
+        e._num_ctx = 64000
+        with pytest.raises(RuntimeError) as exc:
+            e._vram_gate(pool, 0, wait_timeout=1)
+        assert "GPU 1" in str(exc.value)
+        assert SPLIT_PREFILL_HEADROOM_MB > 100   # the refusal is the headroom
+
+    def test_single_device_gets_no_headroom(self):
+        # The headroom is a split-only policy: it was measured on a -ts
+        # split, and adding it to single-device configs would silently
+        # tighten every other entry in the config.
+        pool = FakePool([(0, "only", 24000, 20000)])
+        e = _engine(["-fa", "on"])
+        e._num_ctx = 32000
+        e._vram_gate(pool, 0, wait_timeout=1)
+        assert e._gate_requirements[0][1] == pytest.approx(
+            FAKE_WEIGHT_MB + 32000 / 64 + 1000)
 
     def test_gate_records_resident_floor_and_baseline(self):
         # The floor is weights+KV WITHOUT the compute buffer: those are the
@@ -141,7 +199,7 @@ class TestVramGate:
         e._num_ctx = 64000
         e._vram_gate(pool, 0, wait_timeout=1)
         assert e._resident_floors[1] == pytest.approx(
-            16000 * 11 / 16 + (64000 / 64) * 11 / 16)
+            FAKE_WEIGHT_MB * 11 / 16 + (64000 / 64) * 11 / 16)
         assert e._pre_launch_used_mb[1] == 12242 - 12200
 
     def test_split_refused_when_big_card_busy(self):

@@ -741,7 +741,11 @@
           <button data-v="16384" class="on">16k</button>
           <button data-v="32768">32k</button>
           <button data-v="49152">48k</button>
+          <button data-v="65536">64k</button>
         </div>
+        <div class="hint">How much of the run's history it keeps. The window
+          itself is whatever ctx the engine is loaded at - change that under
+          Settings &rarr; Engine.</div>
       </div>
       <button id="agent-start" onclick="startAgentRun()">Start run</button>
       <div class="hint">Runs in a fresh workspace under output/agent_runs/. One run at a time.</div>
@@ -843,6 +847,7 @@
         <option value="16384">ctx 16k — fastest</option>
         <option value="32768" selected>ctx 32k</option>
         <option value="49152">ctx 48k</option>
+        <option value="65536">ctx 64k</option>
         <option value="">ctx full (model cap)</option>
       </select>
     </div>
@@ -1093,6 +1098,72 @@ function currentAutonomy() { return segValue("autonomy-seg", "guided"); }
 function setAutonomy(v) { segSet("autonomy-seg", v); autonomyHint(); }
 function currentAgentCtx() { return segValue("agentctx-seg", "16384"); }
 
+// ── Context rungs ────────────────────────────────────────
+// Launch contexts offered for the engine, and history windows offered for an
+// agent run.  Both lists are filtered to the SELECTED model's cap
+// (x_context_length, which for llama_cpp is the config's num_ctx) instead of
+// being a fixed ladder: a fixed one ends up simultaneously too big for a 16k
+// vision entry and too small for a split whose cap was tuned to measured
+// hardware.  The cap is appended as the top rung whenever it is not already
+// a standard one, so a 73728-ctx model can actually be asked for 73728.
+const CTX_RUNGS = [16384, 32768, 49152, 65536, 98304, 131072, 196608, 262144];
+const AGENT_SEG_MAX = 5;        // buttons a phone-width segmented control fits
+const modelCtxCaps = {};
+function ctxLabel(v) { return Math.round(v / 1024) + "k"; }
+function ctxRungsFor(cap) {
+  const rungs = CTX_RUNGS.filter(v => !cap || v <= cap);
+  if (cap && (!rungs.length || rungs[rungs.length - 1] < cap)) rungs.push(cap);
+  return rungs;
+}
+// Keep the small rungs AND the ceiling when there are more rungs than
+// buttons fit — dropping the low end would cost the cheap fast options.
+function agentRungsFor(rungs) {
+  return rungs.length <= AGENT_SEG_MAX
+    ? rungs
+    : rungs.slice(0, AGENT_SEG_MAX - 1).concat([rungs[rungs.length - 1]]);
+}
+function selectedCtxCap() {
+  return modelCtxCaps[$("model-select").value] || 0;
+}
+function applyCtxCap(cap) {
+  const rungs = ctxRungsFor(cap);
+  const has = v => rungs.some(r => String(r) === v);
+
+  const sel = $("engine-ctx");
+  const savedEngine = localStorage.getItem("ax_engine_ctx");
+  // "" is a real stored value (full cap), so test for null, not falsiness.
+  const wantEngine = (savedEngine !== null && (savedEngine === "" || has(savedEngine)))
+    ? savedEngine
+    : String(has("32768") ? 32768 : rungs[rungs.length - 1]);
+  sel.innerHTML = "";
+  rungs.forEach((v, i) => {
+    const o = document.createElement("option");
+    o.value = String(v);
+    o.textContent = "ctx " + ctxLabel(v) + (i === 0 && rungs.length > 1 ? " — fastest" : "");
+    sel.appendChild(o);
+  });
+  const full = document.createElement("option");
+  full.value = "";
+  full.textContent = "ctx full (model cap)";
+  sel.appendChild(full);
+  sel.value = wantEngine;
+
+  const agentRungs = agentRungsFor(rungs);
+  const savedAgent = localStorage.getItem("ax_agentctx");
+  const wantAgent = agentRungs.some(v => String(v) === savedAgent)
+    ? savedAgent
+    : String(agentRungs.includes(16384) ? 16384 : agentRungs[0]);
+  const seg = $("agentctx-seg");
+  seg.innerHTML = "";
+  for (const v of agentRungs) {
+    const b = document.createElement("button");
+    b.dataset.v = String(v);
+    b.textContent = ctxLabel(v);
+    if (String(v) === wantAgent) b.classList.add("on");
+    seg.appendChild(b);
+  }
+}
+
 const AUTONOMY_HINTS = {
   guided: "Auto-runs low-risk reads; asks before writes and anything MEDIUM+.",
   full_auto: "Runs everything policy allows without asking. Only CRITICAL stops for you.",
@@ -1104,8 +1175,14 @@ document.querySelectorAll("#effort-seg button").forEach(b =>
   b.addEventListener("click", () => { setEffort(b.dataset.v); store.save(); }));
 document.querySelectorAll("#autonomy-seg button").forEach(b =>
   b.addEventListener("click", () => { setAutonomy(b.dataset.v); store.save(); }));
-document.querySelectorAll("#agentctx-seg button").forEach(b =>
-  b.addEventListener("click", () => { segSet("agentctx-seg", b.dataset.v); store.save(); }));
+// Delegated: applyCtxCap() replaces these buttons whenever the model's cap
+// changes, so a per-button listener would die with the first rebuild.
+$("agentctx-seg").addEventListener("click", e => {
+  const b = e.target.closest("button");
+  if (!b || !b.dataset.v) return;
+  segSet("agentctx-seg", b.dataset.v);
+  store.save();
+});
 $("hist-budget").addEventListener("change", () => store.save());
 
 // ── Tabs ─────────────────────────────────────────────────
@@ -1195,13 +1272,16 @@ async function loadModels() {
     o.textContent = (m.x_active ? "* " : "") + m.id + " (" + m.x_backend + ")";
     if (m.id === saved) chosen = m.id;
     if (!chosen && m.x_active) chosen = m.id;
+    modelCtxCaps[m.id] = m.x_context_length || 0;
     sel.appendChild(o);
   }
   if (chosen) sel.value = chosen;
   $("model-badge").textContent = sel.value;
+  applyCtxCap(selectedCtxCap());
 }
 $("model-select").addEventListener("change", () => {
   $("model-badge").textContent = $("model-select").value;
+  applyCtxCap(selectedCtxCap());
   store.save();
 });
 
@@ -2882,6 +2962,15 @@ async function refreshEngine() {
     // ctx can be null while the engine is mid-relaunch; fall back to the
     // queue's tier, and say "?" rather than inventing a number.
     const ctx = e.ctx || e.queue_tier || null;
+    // Adopt the live window: historyBudget() clamps against engineCtx, and
+    // leaving it at whatever boot saw means a reload to a bigger tier keeps
+    // trimming the conversation to the old one until the page is reloaded.
+    if (ctx) engineCtx = ctx;
+    // The model list is the primary source of caps (it covers every entry,
+    // loaded or not); fall back to the live engine's only when the selected
+    // model isn't in it — otherwise selecting model A while B is loaded
+    // would rebuild A's rungs from B's cap.
+    if (!selectedCtxCap() && e.ctx_cap) applyCtxCap(e.ctx_cap);
     const bits = [e.model || "(unknown model)"];
     if (e.backend) bits.push(e.backend);
     bits.push("ctx " + (ctx ? ctx : "?") + (e.ctx_cap ? " / cap " + e.ctx_cap : ""));

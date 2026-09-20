@@ -75,6 +75,22 @@ class TestPickCtxTier:
         from core.engine_llama_cpp import pick_ctx_tier
         assert pick_ctx_tier(10_000, max_cap=20_000) == 20_000
 
+    def test_cap_between_rungs_is_itself_the_top_rung(self):
+        # A cap tuned to measured hardware (73728: the largest window the
+        # 27B split prefills at full speed) is a legal launch ctx, so a need
+        # that outgrows the 64000 rung gets the cap — not the rung below it,
+        # which would strand the last 9728 tokens behind a manual reload.
+        from core.engine_llama_cpp import pick_ctx_tier
+        assert pick_ctx_tier(70_000, max_cap=73_728) == 73_728
+        assert pick_ctx_tier(200_000, max_cap=131_072) == 131_072
+
+    def test_cap_between_rungs_still_picks_small_tiers_for_small_needs(self):
+        # The extra rung is a ceiling, not a floor: a short request under
+        # such a cap must still launch at the cheap tier.
+        from core.engine_llama_cpp import pick_ctx_tier
+        assert pick_ctx_tier(10_000, max_cap=73_728) == 32_000
+        assert pick_ctx_tier(40_000, max_cap=73_728) == 64_000
+
     def test_zero_or_negative_input_clamped(self):
         from core.engine_llama_cpp import pick_ctx_tier
         assert pick_ctx_tier(0) == 32_000

@@ -92,6 +92,15 @@ def pick_ctx_tier(needed_tokens: int, max_cap: int | None = None) -> int:
     candidates = CTX_TIERS
     if max_cap and max_cap > 0:
         capped = tuple(t for t in CTX_TIERS if t <= max_cap)
+        # The cap is always a legal launch ctx — it is exactly what the
+        # config asked for — so it belongs on the ladder as its top rung
+        # whenever it is not already a standard one.  Without this, a cap
+        # tuned to measured hardware rather than to a round number is
+        # unreachable by any implicit load: a 73728-ctx entry topped out at
+        # the 64000 rung and the last 9728 tokens of a window that had been
+        # benchmarked at full speed could only be had by a manual reload.
+        if capped and capped[-1] < max_cap:
+            capped += (int(max_cap),)
         # A cap BELOW the smallest tier (the 16384-ctx vision entry) has no
         # representable rung.  Return the cap itself rather than CTX_TIERS[0]:
         # handing back 32000 for a 16384-ctx model overstates the window to
@@ -409,22 +418,36 @@ class LlamaCppEngine(BaseEngine):
         Split configs (-ts) are gated PER DEVICE: each card only needs its
         own share of weights and KV, and each card must individually have
         that much free — the historical single-device gate saw only the
-        share of one (NVIDIA) card and let the other card OOM.  The
-        primary device carries the main compute graph buffer; secondaries
-        carry roughly half that.
+        share of one (NVIDIA) card and let the other card OOM.
 
-        That halving is known to UNDER-reserve: measured on a 2-way
-        Vulkan split of a 27B, graph+staging is ~550 MB on the primary
-        and ~880 MB on the layer-heavy secondary (a 5,11 split puts 69%
-        of the layers there), against the 500 MB allowed here.  It is
-        left under-reserved on purpose — raising it to the measured value
-        refuses configs that demonstrably run, because the other terms
-        err the same way: weight is taken from FILE size, and a GGUF
-        carrying an MTP/nextn block that llama.cpp discards when spec
-        decoding is off ("unused tensor blk.N.nextn.* -- ignoring")
-        overstates resident weight by ~300 MB.  The two errors are the
-        same size as the margin being tested, so tightening one alone
-        just trades false accepts for false refusals.
+        On a split, EVERY device is charged half the single-device compute
+        buffer, primary included.  COMPUTE_BUFFER_MB is calibrated for one
+        card holding all the layers; when the model is split no card does,
+        so charging the primary the full amount is simply the wrong shape.
+        It cost a real feature: at -ts 5.8,10.2 the primary's share of a
+        27B plus a flat 1000 MB landed 71 MB over the 8 GB card's free
+        VRAM, so every load of that config was refused and silently
+        stepped down a tier — while the configuration it refused had been
+        measured running at 270 tok/s prefill with ~300 MB to spare.
+
+        Half is still an under-reserve on the layer-heavy side: measured
+        on a 2-way Vulkan split of a 27B, graph+staging is ~550 MB on the
+        primary and ~880 MB on the secondary that a 5,11 split gives 69%
+        of the layers.  It is left under-reserved on purpose — raising it
+        to the measured value refuses configs that demonstrably run,
+        because the other terms err the same way: weight is taken from
+        FILE size, and a GGUF carrying an MTP/nextn block that llama.cpp
+        discards when spec decoding is off ("unused tensor
+        blk.N.nextn.* -- ignoring") overstates resident weight by ~300 MB.
+        The two errors are the same size as the margin being tested, so
+        tightening one alone just trades false accepts for false refusals.
+
+        What a split does get on top is SPLIT_PREFILL_HEADROOM_MB of free
+        space that must survive the load — prefill's batch-sized buffers
+        are allocated above the loaded footprint, and a card with no room
+        left for them runs its prefill out of shared system memory while
+        decode still looks fine.  Net against the old policy: the primary
+        goes 1000 → 750 and secondaries 500 → 750.
 
         Do not read this gate as a spill guard.  Over-committing a card
         does not OOM on WDDM — the driver demotes the overflow to shared
@@ -433,7 +456,7 @@ class LlamaCppEngine(BaseEngine):
         that is _check_resident_after_load, which compares real
         residency against this estimate once the server is up.
         """
-        from core.gpu_pool import COMPUTE_BUFFER_MB
+        from core.gpu_pool import COMPUTE_BUFFER_MB, SPLIT_PREFILL_HEADROOM_MB
         kv_quant_str = self._get_kv_quant_str()
         requirements = []   # [(device_index, needed_mb)]
         # Weight+KV per device, and what other processes already held when
@@ -445,11 +468,12 @@ class LlamaCppEngine(BaseEngine):
         shares = self._parse_ts_shares()
         assignment = self._split_assignment(pool, shares) if len(shares) >= 2 else None
         if assignment:
-            plan = [(dev_idx, frac,
-                     COMPUTE_BUFFER_MB if pos == 0 else COMPUTE_BUFFER_MB // 2)
-                    for pos, dev_idx, frac in assignment]
+            plan = [(dev_idx, frac, COMPUTE_BUFFER_MB // 2)
+                    for _pos, dev_idx, frac in assignment]
+            headroom_mb = SPLIT_PREFILL_HEADROOM_MB
         else:
             plan = [(gpu_index, None, None)]
+            headroom_mb = 0
 
         for dev_idx, frac, comp in plan:
             alloc = pool.estimate_allocation_mb(
@@ -460,7 +484,7 @@ class LlamaCppEngine(BaseEngine):
             )
             requirements.append((dev_idx, (
                 alloc["model_weight_mb"] + alloc["kv_cache_mb"]
-                + alloc["compute_buffer_mb"])))
+                + alloc["compute_buffer_mb"] + headroom_mb)))
             floors[dev_idx] = alloc["model_weight_mb"] + alloc["kv_cache_mb"]
             dev = pool.refresh_device(dev_idx)
             baseline[dev_idx] = dev.memory_used_mb if dev else None

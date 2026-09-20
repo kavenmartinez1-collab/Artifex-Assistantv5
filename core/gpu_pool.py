@@ -46,6 +46,16 @@ KV_QUANT_BPE = {
 MODEL_OVERHEAD_FACTOR = 1.0     # GGUF file size ≈ GPU weight (embeddings/vocab offloaded to CPU)
 COMPUTE_BUFFER_MB = 1000        # Flat estimate for llama.cpp compute buffers
 SYSTEM_RESERVE_MB = 2048        # Static fallback reserve when the live baseline can't be measured
+
+# Free VRAM a device must still have AFTER everything is loaded, on a -ts
+# split.  Prefill's compute buffers are batch-sized — far larger than the
+# batch-1 buffers decode uses — so they are allocated on top of the loaded
+# footprint and need room above it.  Measured on the 27B Vulkan split: a
+# config leaving 299/250 MB free per card prefilled at 270 tok/s, while one
+# leaving 213/74 MB collapsed to 66 tok/s from the very first chunk despite
+# being FULLY resident (decode stayed healthy at 30 tok/s — this failure
+# mode is prefill-only, and a residency check cannot see it).
+SPLIT_PREFILL_HEADROOM_MB = 250
 VRAM_BASELINE_FLOOR_MB = 1500   # Lower bound for the live baseline, even on a quiet system
 NVIDIA_SMI_TIMEOUT = 5          # seconds
 
