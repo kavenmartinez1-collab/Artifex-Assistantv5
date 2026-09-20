@@ -289,11 +289,17 @@ class AgentRunner:
                 # malformed" (e.g. Qwen3.6 <tool_call> repetition collapse,
                 # empty fences). The latter gets corrective feedback and
                 # another round instead of being misread as a final answer.
-                if format_retries < 2 and self._looks_like_failed_tool_attempt(resp):
+                blank = not resp.strip()
+                malformed = self._looks_like_failed_tool_attempt(resp)
+                if format_retries < 2 and (blank or malformed):
                     format_retries += 1
-                    self.emit(AgentEvent("format_retry", round=rnd,
-                                         reason="malformed tool invocation"))
-                    history.append({"role": "user", "content": self._format_nudge()})
+                    self.emit(AgentEvent(
+                        "format_retry", round=rnd,
+                        reason="empty response" if blank
+                               else "malformed tool invocation"))
+                    history.append({"role": "user", "content":
+                                    self._empty_nudge() if blank
+                                    else self._format_nudge()})
                     continue
                 if format_retries < 2 and self._looks_like_stalled_plan(resp):
                     # "Step 1: find the definition." <end of turn> — a chat
@@ -304,6 +310,19 @@ class AgentRunner:
                                          reason="announced a plan, took no action"))
                     history.append({"role": "user", "content": self._stall_nudge()})
                     continue
+                if blank or malformed:
+                    # Nudges spent and STILL nothing executable. That is a
+                    # FAILED run, not a finished one — falling through to the
+                    # prose branch below reported status "done" with a
+                    # malformed <tool_call> as the summary, for a goal whose
+                    # tools never ran once (observed 2026-09-20: three rounds
+                    # of <function=glob> parsed as prose, run recorded "done",
+                    # workspace empty).
+                    self.emit(AgentEvent(
+                        "stopped", round=rnd,
+                        reason="model returned no text" if blank
+                               else "no parseable tool call after retries"))
+                    return self._finish("stopped:no_action", history)
             if not actions:
                 summary = done if done else resp.strip()
                 self.emit(AgentEvent("done", summary=summary, round=rnd))
@@ -793,6 +812,23 @@ class AgentRunner:
             "step NOW in this turn using a live @tool(...) marker or a "
             "```bash```/```python``` block, or emit @done(\"summary\") if the "
             "GOAL is already complete."
+        )
+
+    @staticmethod
+    def _empty_nudge() -> str:
+        """The round produced zero content tokens.
+
+        On a thinking model that means the completion budget was spent
+        inside the reasoning block and the turn ended before any answer —
+        measured at 295 s for one wasted round on qwen3.8-27B. Telling it
+        to think short is the only lever available from inside the loop.
+        """
+        return (
+            "[EMPTY RESPONSE — automated] Your last turn produced no output "
+            "at all: the entire token budget went into thinking. Think "
+            "BRIEFLY, then act in this same turn — emit the tool call or the "
+            "answer first and keep deliberation short. If the GOAL is "
+            'already complete, emit @done("summary").'
         )
 
     @staticmethod

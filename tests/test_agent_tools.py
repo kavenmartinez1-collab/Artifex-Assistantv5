@@ -191,6 +191,62 @@ class TestMarkerNormalization:
                     '"arguments": {"target": "moon"}}</tool_call>')
         assert extract_agent_actions(response) == []
 
+    # ── native XML dialect (<function=name>) ──────────────────────────────
+    # Qwen3.8-27B under --jinja emits this instead of @markers. Every case
+    # below was parsed as prose before 2026-09-20, so the agent loop saw
+    # zero actions and reported the run "done" without running anything.
+
+    def test_xml_tool_call_bare_body(self):
+        response = ("Let me check the workspace.\n\n<tool_call>\n"
+                    "<function=bash>\nls -la\n</function>\n</tool_call>")
+        actions = extract_agent_actions(response)
+        assert [a.type for a in actions] == ["shell"]
+        assert actions[0].content == "ls -la"
+
+    def test_xml_tool_call_bare_body_glob(self):
+        response = "<tool_call>\n<function=glob>\n**/*\n</function>\n</tool_call>"
+        actions = extract_agent_actions(response)
+        assert [a.type for a in actions] == ["glob"]
+        assert actions[0].content == "**/*"
+
+    def test_xml_tool_call_with_parameters(self):
+        response = ("<tool_call>\n<function=grep>\n"
+                    "<parameter=pattern>TODO</parameter>\n"
+                    "<parameter=path>core</parameter>\n"
+                    "</function>\n</tool_call>")
+        actions = extract_agent_actions(response)
+        assert [a.type for a in actions] == ["grep"]
+        assert actions[0].content == "TODO|core|"
+
+    def test_xml_tool_call_writes_file(self):
+        response = ("<tool_call>\n<function=write_file>\n"
+                    "<parameter=path>pagoda.html</parameter>\n"
+                    "<parameter=content><!doctype html>\n<canvas></canvas>"
+                    "</parameter>\n</function>\n</tool_call>")
+        actions = extract_agent_actions(response)
+        assert [a.type for a in actions] == ["edit_file"]
+        path, old, new = actions[0].content.split("\x00")
+        assert (path, old) == ("pagoda.html", "")      # empty OLD = create
+        assert new == "<!doctype html>\n<canvas></canvas>"
+
+    def test_xml_tool_call_empty_body_yields_nothing(self):
+        # No argument at all — must NOT invent one; the loop nudges instead.
+        response = "<tool_call>\n<function=bash>\n</function>\n</tool_call>"
+        assert extract_agent_actions(response) == []
+
+    def test_xml_two_arg_tool_refuses_bare_body(self):
+        # A bare body cannot carry both path and content — guessing would
+        # write the file to a path named after its own contents.
+        response = ("<tool_call>\n<function=write_file>\n"
+                    "some file text\n</function>\n</tool_call>")
+        assert extract_agent_actions(response) == []
+
+    def test_plain_html_fence_stays_inert(self):
+        # The failure that started this: a finished file shown in a plain
+        # ```html``` fence is NOT a tool call and must never look like one.
+        response = "Here it is:\n\n```html\n<canvas id=\"c\"></canvas>\n```\n"
+        assert extract_agent_actions(response) == []
+
 
 class TestEmptyOldEdit:
     def test_empty_old_gets_clear_error(self, tmp_path):

@@ -300,6 +300,40 @@ class TestFormatRetry:
         assert result.summary == "all set"
         assert any(e.kind == "format_retry" for e in events)
 
+    def test_xml_tool_call_dialect_executes(self):
+        # Qwen3.8-27B under --jinja emits its native XML dialect instead of
+        # @markers. It used to parse as prose, so the run ended "done"
+        # having executed nothing.
+        responses = [
+            "Let me look.\n\n<tool_call>\n<function=glob>\n**/*\n</function>\n</tool_call>",
+            '@done("found them")',
+        ]
+        engine = FakeEngine(responses)
+        events = []
+        runner = AgentRunner(
+            engine, build_system_prompt=lambda: "sys", emit=events.append,
+            config=RunConfig(autonomy=AutonomyLevel.FULL_AUTO),
+        )
+        result = runner.run("goal", [])
+        assert result.status == "done"
+        assert result.actions_run == 1
+        started = [e for e in events if e.kind == "action_started"]
+        assert started and started[0].action.type == "glob"
+
+    def test_empty_response_is_not_done(self):
+        # A round that returns zero content tokens (thinking ate the whole
+        # budget) is a failure, not a completed goal. Two nudges, then stop.
+        engine = FakeEngine(["", "   ", ""])
+        events = []
+        runner = AgentRunner(
+            engine, build_system_prompt=lambda: "sys", emit=events.append,
+            config=RunConfig(autonomy=AutonomyLevel.FULL_AUTO),
+        )
+        result = runner.run("goal", [])
+        assert result.status == "stopped:no_action"
+        assert [e.reason for e in events if e.kind == "format_retry"] == [
+            "empty response", "empty response"]
+
     def test_prose_answer_still_finishes(self):
         engine = FakeEngine(["The answer is 42. Nothing to run."])
         runner = AgentRunner(
@@ -317,8 +351,11 @@ class TestFormatRetry:
             config=RunConfig(autonomy=AutonomyLevel.FULL_AUTO),
         )
         result = runner.run("goal", [])
-        # two retries then the third garbage round ends the run
-        assert result.status == "done"
+        # Two retries, then the third garbage round ends the run — as a
+        # FAILURE. It used to end as "done" carrying the garbage as its
+        # summary, which told the user a goal had been completed by a run
+        # that never executed a single tool.
+        assert result.status == "stopped:no_action"
         assert result.rounds == 3
 
     def test_malformed_edit_block_gets_retry(self):

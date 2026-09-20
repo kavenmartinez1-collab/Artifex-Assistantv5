@@ -348,6 +348,23 @@ _HYBRID_TOOL_CALL_RE = re.compile(
 # Fully-native JSON tool calls: <tool_call>{"name": ..., "arguments": ...}</tool_call>
 _JSON_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
+# Native XML tool calls — the dialect Qwen3.x emits under --jinja once its
+# template's tool section is live:
+#   <tool_call>
+#   <function=grep>
+#   <parameter=pattern>TODO</parameter>
+#   <parameter=path>.</parameter>
+#   </function>
+#   </tool_call>
+# and the degenerate no-<parameter> form observed on Qwen3.8-27B (2026-09-20),
+# where the single argument sits raw in the function body:
+#   <tool_call>\n<function=glob>\n**/*\n</function>\n</tool_call>
+# Unparsed, both read as prose — the run ends "done" having executed nothing.
+_XML_TOOL_CALL_RE = re.compile(
+    r"<function\s*=\s*([A-Za-z_]\w*)\s*>(.*?)</function\s*>", re.DOTALL)
+_XML_PARAM_RE = re.compile(
+    r"<parameter\s*=\s*([A-Za-z_]\w*)\s*>(.*?)</parameter\s*>", re.DOTALL)
+
 # Argument-name aliases seen in the wild for the JSON form.
 _JSON_ARG_ALIASES = {
     "path": ("path", "file", "filepath", "file_path", "filename"),
@@ -357,6 +374,21 @@ _JSON_ARG_ALIASES = {
     "url": ("url", "link", "href"),
     "command": ("command", "cmd", "shell"),
     "code": ("code", "script", "source"),
+    "content": ("content", "text", "new_str", "new_string", "new", "body", "data"),
+    "old": ("old_str", "old_string", "old", "search"),
+}
+
+# Which argument a bare-body XML call is filling in, per tool. Tools needing
+# two arguments (write_file: path AND content) are deliberately absent — a
+# single raw body cannot carry both, and guessing would write the content to
+# a file named after the content.
+_PRIMARY_ARG = {
+    "read_file": "path", "trace_imports": "path",
+    "glob": "pattern", "grep": "pattern",
+    "search": "query", "web_read": "url", "download": "url",
+    "find_symbol": "name", "find_references": "name",
+    "shell": "command", "bash": "command", "run_shell": "command",
+    "execute": "command", "python": "code", "run_python": "code",
 }
 
 
@@ -399,13 +431,89 @@ def _strip_inline_code(text):
     return "".join(out)
 
 
+def _action_from_call(name, args):
+    """Build an AgentAction from one parsed native tool call, or None.
+
+    Shared by every native dialect (JSON payload, XML <function=...>) so a
+    tool reachable through one is reachable through all of them. Only tools
+    with an existing executor are mapped; unknown names return None —
+    better a stall the loop can nudge than a hallucinated capability.
+    """
+    if name == "read_file":
+        path = _json_arg(args, "path")
+        if path:
+            return AgentAction("read_file", f"{path}|1", f'read_file: "{path}"')
+    elif name == "read_function":
+        path, fn = _json_arg(args, "path"), _json_arg(args, "name")
+        if path and fn:
+            return AgentAction("read_function", f"{path}|{fn}",
+                               f'read_function: "{fn}" in {os.path.basename(path)}')
+    elif name == "glob":
+        pattern = _json_arg(args, "pattern")
+        if pattern:
+            return AgentAction("glob", pattern, f'glob: "{pattern}"')
+    elif name == "grep":
+        pattern, path = _json_arg(args, "pattern"), _json_arg(args, "path") or "."
+        if pattern:
+            return AgentAction("grep", f"{pattern}|{path}|",
+                               f'grep: "{pattern}" in {path}')
+    elif name == "search":
+        query = _json_arg(args, "query")
+        if query:
+            return AgentAction("search", query, f'search: "{query}"')
+    elif name == "web_read":
+        ref = _json_arg(args, "url")
+        if ref:
+            return AgentAction("web_read", ref, f"web_read: {ref}")
+    elif name == "download":
+        url = _json_arg(args, "url")
+        if url:
+            fname = url.split("/")[-1].split("?")[0] or "file"
+            return AgentAction("download", url, f'download: "{fname}"')
+    elif name == "find_symbol":
+        sym = _json_arg(args, "name")
+        if sym:
+            return AgentAction("find_symbol", sym, f'find_symbol: "{sym}"')
+    elif name == "find_references":
+        sym = _json_arg(args, "name")
+        if sym:
+            return AgentAction("find_references", sym, f'find_references: "{sym}"')
+    elif name == "trace_imports":
+        path = _json_arg(args, "path")
+        if path:
+            return AgentAction("trace_imports", path, f'trace_imports: "{path}"')
+    elif name == "architecture":
+        return AgentAction("architecture", "", "architecture: project map")
+    elif name == "sysinfo":
+        return AgentAction("sysinfo", "", "sysinfo: machine specs")
+    elif name in ("shell", "bash", "run_shell", "execute"):
+        cmd = _json_arg(args, "command")
+        if cmd:
+            return AgentAction("shell", cmd, cmd[:80])
+    elif name in ("python", "run_python"):
+        code = _json_arg(args, "code")
+        if code:
+            first = code.strip().split("\n")[0]
+            return AgentAction("python", code, first[:80])
+    elif name in ("edit_file", "write_file", "create_file", "save_file"):
+        # run_edit_file's create form: an empty OLD against a path that does
+        # not exist writes the file. This is the ONLY native call that makes
+        # "save the finished file" a single action — without it the model has
+        # to smuggle the whole payload through a python string literal.
+        path, content = _json_arg(args, "path"), _json_arg(args, "content")
+        if path and content is not None:
+            old = _json_arg(args, "old") or ""
+            verb = "edit_file" if old else "write_file"
+            return AgentAction("edit_file", f"{path}\x00{old}\x00{content}",
+                               f'{verb}: "{path}"')
+    return None
+
+
 def _extract_json_tool_calls(response):
     """Parse native <tool_call>{JSON}</tool_call> calls into AgentActions.
 
     Qwen3.x models running under llama-server --jinja are trained on this
     format and occasionally fall back to it despite the @marker prompt.
-    Only tools with an existing executor are mapped; unknown names are
-    ignored (better a stall than a hallucinated capability).
     """
     actions = []
     for m in _JSON_TOOL_CALL_RE.finditer(response):
@@ -424,60 +532,34 @@ def _extract_json_tool_calls(response):
                 args = {}
         if not isinstance(args, dict):
             args = {}
+        action = _action_from_call(name, args)
+        if action:
+            actions.append(action)
+    return actions
 
-        if name == "read_file":
-            path = _json_arg(args, "path")
-            if path:
-                actions.append(AgentAction("read_file", f"{path}|1",
-                                           f'read_file: "{path}"'))
-        elif name == "read_function":
-            path, fn = _json_arg(args, "path"), _json_arg(args, "name")
-            if path and fn:
-                actions.append(AgentAction("read_function", f"{path}|{fn}",
-                                           f'read_function: "{fn}" in {os.path.basename(path)}'))
-        elif name == "glob":
-            pattern = _json_arg(args, "pattern")
-            if pattern:
-                actions.append(AgentAction("glob", pattern, f'glob: "{pattern}"'))
-        elif name == "grep":
-            pattern, path = _json_arg(args, "pattern"), _json_arg(args, "path") or "."
-            if pattern:
-                actions.append(AgentAction("grep", f"{pattern}|{path}|",
-                                           f'grep: "{pattern}" in {path}'))
-        elif name == "search":
-            query = _json_arg(args, "query")
-            if query:
-                actions.append(AgentAction("search", query, f'search: "{query}"'))
-        elif name == "web_read":
-            ref = _json_arg(args, "url")
-            if ref:
-                actions.append(AgentAction("web_read", ref, f"web_read: {ref}"))
-        elif name == "find_symbol":
-            sym = _json_arg(args, "name")
-            if sym:
-                actions.append(AgentAction("find_symbol", sym,
-                                           f'find_symbol: "{sym}"'))
-        elif name == "find_references":
-            sym = _json_arg(args, "name")
-            if sym:
-                actions.append(AgentAction("find_references", sym,
-                                           f'find_references: "{sym}"'))
-        elif name == "trace_imports":
-            path = _json_arg(args, "path")
-            if path:
-                actions.append(AgentAction("trace_imports", path,
-                                           f'trace_imports: "{path}"'))
-        elif name == "architecture":
-            actions.append(AgentAction("architecture", "", "architecture: project map"))
-        elif name in ("shell", "bash", "run_shell", "execute"):
-            cmd = _json_arg(args, "command")
-            if cmd:
-                actions.append(AgentAction("shell", cmd, cmd[:80]))
-        elif name in ("python", "run_python"):
-            code = _json_arg(args, "code")
-            if code:
-                first = code.strip().split("\n")[0]
-                actions.append(AgentAction("python", code, first[:80]))
+
+def _extract_xml_tool_calls(response):
+    """Parse native <function=name>...</function> calls into AgentActions.
+
+    Handles both the documented <parameter=key>value</parameter> form and
+    the bare-body form, where the function body IS the single argument.
+    The bare body is only honored for tools whose one required argument is
+    unambiguous (_PRIMARY_ARG) — a two-argument tool with no parameter tags
+    is left unparsed so the loop nudges instead of guessing.
+    """
+    actions = []
+    for m in _XML_TOOL_CALL_RE.finditer(response):
+        name = m.group(1).lower().strip()
+        body = m.group(2)
+        args = {k.lower(): v.strip("\r\n") for k, v in _XML_PARAM_RE.findall(body)}
+        if not args:
+            raw = _XML_PARAM_RE.sub("", body).strip()
+            key = _PRIMARY_ARG.get(name)
+            if raw and key:
+                args = {key: raw}
+        action = _action_from_call(name, args)
+        if action:
+            actions.append(action)
     return actions
 
 
@@ -738,6 +820,9 @@ def extract_agent_actions(response):
 
     # --- Native JSON tool calls: <tool_call>{"name": ...}</tool_call> ---
     actions.extend(_extract_json_tool_calls(response))
+
+    # --- Native XML tool calls: <function=name>...</function> ---
+    actions.extend(_extract_xml_tool_calls(response))
 
     return actions
 
