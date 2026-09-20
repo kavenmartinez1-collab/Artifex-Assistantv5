@@ -879,6 +879,10 @@
           inputmode="numeric">
       </div>
     </div>
+    <div class="hint">Tokens the model may WRITE per turn - separate from
+      context, which is what it can READ. Thinking is spent from this budget
+      first, so too low a cap means a run that deliberates and returns
+      nothing. Agent runs use this too.</div>
   </div>
   <div class="panel">
     <div class="pt">HISTORY BUDGET</div>
@@ -3254,13 +3258,25 @@ async function startAgentRun() {
     const r = await fetch("/v1/agent/runs", {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({
+      // context_window OMITTED on the full rung: the server then hands the
+      // run the engine's whole loaded window. Sending a number would pin it
+      // to a tier the engine may not be on.
+      // max_tokens is the per-ROUND completion budget, and it is independent
+      // of context_window: a run at the engine's full 72k still only gets to
+      // WRITE this many tokens per turn. A thinking model spends that budget
+      // on its think block first, so a cap set for chat-sized replies can be
+      // consumed entirely by reasoning, leaving zero content. Send the user's
+      // setting instead of letting the server fall back to its default.
+      body: JSON.stringify(Object.assign({
         goal: goal,
         autonomy: currentAutonomy(),
         reasoning_effort: currentEffort(),
-        context_window: parseInt(currentAgentCtx(), 10) || 16384,
         temperature: Math.max(0, Math.min(2, parseFloat($("temperature").value) || 0.7)),
-      }),
+        max_tokens: Math.max(256, Math.min(32768,
+          parseInt($("max-tokens").value, 10) || 12288)),
+      }, currentAgentCtx()
+           ? { context_window: parseInt(currentAgentCtx(), 10) }
+           : {})),
     });
     let data = null;
     try { data = await r.json(); } catch (e) {}

@@ -392,6 +392,37 @@ class TestFormatRetry:
         assert seen[:2] == [True, False]
         assert seen[2] is True           # back on for the following round
 
+    def test_empty_round_no_think_can_be_disabled(self):
+        # Opting out: a blank round still gets its nudge and still fails
+        # honestly, but thinking is never traded away to recover.
+        seen = []
+
+        class ThinkyEngine:
+            def get_context_size(self):
+                return 8192
+
+            def generate_streaming(self, messages, max_tokens=0,
+                                   temperature=0.0, on_token=None,
+                                   enable_thinking=True, **kw):
+                seen.append(enable_thinking)
+                if on_token:
+                    on_token("")
+                return ""
+
+        events = []
+        runner = AgentRunner(
+            ThinkyEngine(), build_system_prompt=lambda: "sys",
+            emit=events.append,
+            config=RunConfig(autonomy=AutonomyLevel.FULL_AUTO,
+                             enable_thinking=True,
+                             empty_round_no_think=False),
+        )
+        result = runner.run("goal", [])
+        assert result.status == "stopped:no_action"
+        assert seen == [True, True, True]          # thinking never dropped
+        assert [e.reason for e in events if e.kind == "format_retry"] == [
+            "empty response"] * 2
+
     def test_prose_answer_still_finishes(self):
         engine = FakeEngine(["The answer is 42. Nothing to run."])
         runner = AgentRunner(

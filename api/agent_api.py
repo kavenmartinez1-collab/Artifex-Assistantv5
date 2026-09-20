@@ -75,8 +75,28 @@ class AgentRunRequest(BaseModel):
     folder: Optional[str] = Field(None, description="Workspace directory; created if missing. Default: output/agent_runs/<run_id>")
     autonomy: Optional[str] = Field("guided", description="manual | guided | full_auto")
     max_rounds: Optional[int] = Field(None, ge=1, le=100)
-    max_tokens: Optional[int] = Field(4096, ge=256, le=32768)
-    context_window: Optional[int] = Field(16384, ge=2048)
+    max_tokens: Optional[int] = Field(
+        12288, ge=256, le=32768,
+        description=(
+            "Completion budget per ROUND — what the model may WRITE, "
+            "independent of context_window (what it may READ). On a "
+            "reasoning model the think block is spent from this first, so a "
+            "chat-sized cap is consumed entirely by deliberation and the "
+            "round returns no content at all: 4096 was measured producing "
+            "three empty rounds in a row on qwen3.8-27B at medium effort. "
+            "Raise it rather than lowering effort when runs come back blank."
+        ),
+    )
+    context_window: Optional[int] = Field(
+        None, ge=2048,
+        description=(
+            "History window in tokens. Omit for the engine's FULL loaded "
+            "context (the default since 2026-09-20 — it used to be a flat "
+            "16384, which left most of a 72k split unused). Clamped to the "
+            "loaded window; falls back to 16384 if the engine can't report "
+            "its size."
+        ),
+    )
     temperature: Optional[float] = Field(0.7, ge=0.0, le=2.0)
     reasoning_effort: Optional[str] = Field(
         "medium",
@@ -339,8 +359,10 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
             config = RunConfig.default(autonomy)
             if body.max_rounds:
                 config.max_rounds = body.max_rounds
-            config.max_tokens = body.max_tokens or 4096
-            config.context_window = body.context_window or 16384
+            config.max_tokens = body.max_tokens or 12288
+            # Provisional: the worker replaces this with the engine's loaded
+            # window (or the clamped request) before the loop starts.
+            config.context_window = body.context_window or _CTX_FALLBACK
             config.temperature = body.temperature if body.temperature is not None else 0.7
             config.reasoning_effort = effort or "medium"
 

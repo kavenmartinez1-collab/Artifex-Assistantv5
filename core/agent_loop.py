@@ -96,6 +96,14 @@ class RunConfig:
     # unattended runs should set "medium" explicitly. Passed to the engine
     # only when its generate_streaming signature accepts it.
     reasoning_effort: Optional[str] = None
+    # Last-resort recovery: when a round returns ZERO content (the think
+    # block consumed the whole completion budget and the turn was cut off
+    # mid-thought), retry that one round with thinking off so the budget
+    # goes to content. Never fires while max_tokens is large enough to
+    # finish a thought — the real fix for blank rounds is a bigger
+    # completion budget, not less reasoning. Set False to let such a round
+    # fail instead of trading away the think block.
+    empty_round_no_think: bool = True
     always_confirm_types: tuple = ("edit_file", "download")  # GUIDED always asks
     auto_approve_max_risk: str = "LOW"                       # GUIDED auto-runs <= this
     framing: bool = True   # wrap the prompt with the autonomous preamble + GOAL
@@ -296,7 +304,7 @@ class AgentRunner:
                 malformed = self._looks_like_failed_tool_attempt(resp)
                 if format_retries < 2 and (blank or malformed):
                     format_retries += 1
-                    if blank:
+                    if blank and self.config.empty_round_no_think:
                         # A prose nudge cannot fix a token-budget problem —
                         # the model never reaches the end of its own think
                         # block, so it never reads the nudge at all. Take
@@ -305,7 +313,8 @@ class AgentRunner:
                         self._no_think_next = True
                     self.emit(AgentEvent(
                         "format_retry", round=rnd,
-                        reason="empty response — retrying without thinking"
+                        reason=("empty response — retrying without thinking"
+                                if self._no_think_next else "empty response")
                                if blank else "malformed tool invocation"))
                     history.append({"role": "user", "content":
                                     self._empty_nudge() if blank
