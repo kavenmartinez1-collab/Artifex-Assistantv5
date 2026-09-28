@@ -38,6 +38,14 @@ Design notes:
   timeout: an unanswered prompt holds the run in "awaiting_approval"
   indefinitely, which is visible in the run list and resumable from the
   phone whenever the user comes back.
+
+- The run names its model. Starting (or reviving) a run switches the model
+  queue to it BEFORE the worker loads the engine — the same path chat takes —
+  so an agent started with the vision entry selected runs on the vision
+  entry, not on whatever the API happened to launch with. While a run is
+  live the queue reports busy (live_run_busy_reason): the idle shrink leaves
+  the engine loaded and a chat naming another model is refused, instead of
+  llama-server being unloaded under the run.
 """
 from __future__ import annotations
 
@@ -72,6 +80,13 @@ _runs_lock = threading.Lock()
 class AgentRunRequest(BaseModel):
     goal: str = Field(..., min_length=1,
                       json_schema_extra={"example": "List the .py files here and write their names to files.txt"})
+    model: Optional[str] = Field(
+        None,
+        description=(
+            "Model to run on (a /v1/models id). The queue switches to it "
+            "before the run starts. Omit for the currently active model."
+        ),
+    )
     folder: Optional[str] = Field(None, description="Workspace directory; created if missing. Default: output/agent_runs/<run_id>")
     autonomy: Optional[str] = Field("guided", description="manual | guided | full_auto")
     max_rounds: Optional[int] = Field(None, ge=1, le=100)
@@ -138,11 +153,19 @@ def _serialize_event(ev: AgentEvent) -> dict:
 
 class AgentRun:
     def __init__(self, goal: str, folder: str, config: RunConfig,
-                 requested_ctx: int | None = None):
+                 requested_ctx: int | None = None, model: str | None = None):
         self.id = uuid.uuid4().hex[:12]
         self.goal = goal
         self.folder = folder
         self.config = config
+        # The model the queue was switched to for this run; a revival
+        # switches back to it, so a chat on another model in between doesn't
+        # silently move the run.
+        self.model = model
+        # "MODEL: ..." line for the system prompt, and whether the engine can
+        # see images. Filled in by the worker once the engine is loaded.
+        self.model_info = ""
+        self.vision: Optional[bool] = None
         # What the CALLER asked for: None = "the engine's full window".
         # Settled against the loaded engine in the worker, because resolving
         # it here would force a cold model load (30-60 s) inside the POST
@@ -256,6 +279,8 @@ class AgentRun:
                 # loaded window. None until the worker has resolved it.
                 "context_window": self.config.context_window,
                 "max_tokens": self.config.max_tokens,
+                "model": self.model,
+                "vision": self.vision,
             }
 
 
@@ -288,6 +313,53 @@ def _resolve_context_window(engine, requested: int | None) -> int:
     return min(requested, loaded)
 
 
+def live_run_busy_reason() -> str | None:
+    """Busy check for the model queue: why the engine must stay put, or None."""
+    with _runs_lock:
+        live = next((r for r in _runs.values() if not r.terminal), None)
+    if live is None:
+        return None
+    return f"agent run {live.id} is using the model"
+
+
+def _engine_vision(engine) -> Optional[bool]:
+    """True/False from the llama-server the engine talks to; None = can't tell.
+
+    Asks the server (GET /props modalities.vision) rather than trusting the
+    config name: the flag reflects the --mmproj the process was actually
+    launched with, which is what decides whether an image gets seen.
+    """
+    base = getattr(engine, "_base_url", None)
+    if not base:
+        return None
+    from tools.image_tools import check_vision_server
+    ok, msg = check_vision_server(base)
+    if ok:
+        return True
+    return False if "without vision" in msg else None
+
+
+def _model_info_text(model: str | None, ctx: int, vision: Optional[bool]) -> str:
+    """The MODEL section of the agent's system prompt.
+
+    Without it the model has no idea what it is running as, and answers
+    "which model are you / can you see images" with a guess — and it cannot
+    tell whether @view_image will work before trying it.
+    """
+    name = model or "(unknown)"
+    if vision is True:
+        seeing = ("Vision: YES. You can look at images with @view_image and "
+                  "@describe_images.")
+    elif vision is False:
+        seeing = ("Vision: NO. This model cannot see images, so @view_image and "
+                  "@describe_images will fail. If the user asks about images, "
+                  "tell them to pick a vision model (an entry with 'vision' in "
+                  "its name) in the model menu and start a new run.")
+    else:
+        seeing = "Vision: unknown."
+    return f"You are running as the model {name}, context window {ctx} tokens.\n{seeing}"
+
+
 def _worker(run: AgentRun, get_engine, goal: str | None = None):
     goal = run.goal if goal is None else goal
     old_cwd = os.getcwd()
@@ -301,6 +373,14 @@ def _worker(run: AgentRun, get_engine, goal: str | None = None):
                       resolved_ctx)
         run.config.context_window = resolved_ctx
 
+        if not run.model:
+            from core.config import get_active_model_name
+            run.model = get_active_model_name()
+        run.vision = _engine_vision(engine)
+        run.model_info = _model_info_text(run.model, resolved_ctx, run.vision)
+        seeing = {True: "can see images", False: "text only"}.get(run.vision, "vision unknown")
+        run.emit(AgentEvent("model", text=f"Model: {run.model} ({seeing}, ctx {resolved_ctx})"))
+
         def build_system_prompt() -> str:
             # Same prompt stack the Qt GUI uses — the full tool catalog
             # (@read_file/@glob/@sysinfo/edit blocks/...) plus the sensed
@@ -313,6 +393,7 @@ def _worker(run: AgentRun, get_engine, goal: str | None = None):
                     get_assistant_tools_prompt(),
                     os.getcwd(),
                     workspace_text=run.folder,
+                    model_text=run.model_info,
                 )
             except Exception:
                 _log.exception("full prompt build failed; using minimal prompt")
@@ -359,18 +440,48 @@ def _prune_finished():
 
 # ── Route registration ───────────────────────────────────────────────────
 
-def register_agent_routes(app, check_auth, get_engine, default_workspace_root: str):
+def register_agent_routes(app, check_auth, get_engine, default_workspace_root: str,
+                          prepare_model=None):
     """Wire the agent endpoints onto `app`.
 
     check_auth              — (Request) -> bool, the server's bearer check.
     get_engine              — () -> BaseEngine, loads/adopts the active engine.
     default_workspace_root  — directory under which per-run folders are made
                               when the request names none (gitignored output/).
+    prepare_model           — async (requested: str | None) -> str. Resolves the
+                              run's model and switches the model queue to it
+                              (unloading a different model; the worker's
+                              get_engine() then loads the right one). None =
+                              run on whatever get_engine() returns.
     """
 
     def _auth(request: Request):
         if not check_auth(request):
             raise HTTPException(status_code=401, detail="Invalid API key")
+
+    def _live_conflict():
+        with _runs_lock:
+            live = next((r for r in _runs.values() if not r.terminal), None)
+        if live is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "A run is already active", "run_id": live.id},
+            )
+
+    async def _prepare(requested: str | None) -> str | None:
+        if prepare_model is None:
+            return requested
+        from core.model_queue import ModelBusyError
+        try:
+            return await prepare_model(requested)
+        except HTTPException:
+            raise
+        except ModelBusyError as e:
+            raise HTTPException(status_code=409, detail={"message": str(e)})
+        except Exception as e:
+            _log.exception("Agent model prepare failed for %r", requested)
+            raise HTTPException(status_code=503,
+                                detail=f"Could not switch to model {requested!r}: {e}")
 
     def _get_run(run_id: str) -> AgentRun:
         with _runs_lock:
@@ -391,6 +502,12 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
         effort = (body.reasoning_effort or "").strip().lower()
         if effort and effort not in ("low", "medium", "high", "xhigh"):
             raise HTTPException(status_code=422, detail="bad reasoning_effort")
+
+        # Check for a live run BEFORE switching: switching would unload the
+        # model under it. The lock can't be held across the await, so the
+        # registration below re-checks.
+        _live_conflict()
+        model = await _prepare(body.model)
 
         with _runs_lock:
             live = next((r for r in _runs.values() if not r.terminal), None)
@@ -422,10 +539,10 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
                             status_code=422,
                             detail=f"folder is not usable: {folder} ({e})")
                 run = AgentRun(body.goal, folder, config,
-                               requested_ctx=body.context_window)
+                               requested_ctx=body.context_window, model=model)
             else:
                 run = AgentRun(body.goal, "", config,
-                               requested_ctx=body.context_window)
+                               requested_ctx=body.context_window, model=model)
                 run.folder = os.path.join(default_workspace_root, run.id)
                 os.makedirs(run.folder, exist_ok=True)
 
@@ -437,13 +554,14 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
             name=f"agent-run-{run.id}", daemon=True,
         )
         run.thread.start()
-        _log.info("Agent run %s started: autonomy=%s folder=%s ctx=%s goal=%r",
-                  run.id, autonomy.value, run.folder,
+        _log.info("Agent run %s started: model=%s autonomy=%s folder=%s ctx=%s goal=%r",
+                  run.id, model, autonomy.value, run.folder,
                   body.context_window or "full", body.goal[:120])
         # context_window here is still provisional — the worker settles it
         # against the loaded engine. Clients wanting the real figure read it
         # from the snapshot (GET /v1/agent/runs/{id}) once status is running.
         return {"run_id": run.id, "folder": run.folder, "status": run.status,
+                "model": model,
                 "requested_context_window": body.context_window}
 
     @app.get("/v1/agent/runs")
@@ -494,6 +612,16 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
                 run.control.inject_message(text)
                 return {"queued": True, "run_id": run.id, "status": run.status}
 
+        # Reviving: put the run's own model back first — a chat on another
+        # model may have swapped it out since the run finished.
+        _live_conflict()
+        model = await _prepare(run.model)
+
+        with _runs_lock:
+            if not run.terminal:
+                # Another request revived it while we were switching.
+                run.control.inject_message(text)
+                return {"queued": True, "run_id": run.id, "status": run.status}
             live = next((r for r in _runs.values() if not r.terminal), None)
             if live is not None:
                 raise HTTPException(
@@ -506,6 +634,7 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
             run.summary = ""
             run.finished_at = None
             run.status = "starting"
+            run.model = model or run.model
 
         run.emit(AgentEvent("user_message", text=text, round=0))
         run.thread = threading.Thread(

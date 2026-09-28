@@ -42,6 +42,15 @@ IDLE_SHRINK_SEC = int(os.environ.get("ARTIFEX_IDLE_SHRINK_SEC", "600"))
 IDLE_SHRINK_CHECK_INTERVAL = 60
 
 
+class ModelBusyError(RuntimeError):
+    """A switch would unload a model that long-running work is still using.
+
+    Agent runs call the engine directly for minutes at a time, outside the
+    queue's per-request lock. Without this refusal a chat message naming a
+    different model unloads llama-server under the run mid-generation.
+    """
+
+
 class ModelQueue:
     """Serialized model-aware request queue for all backends.
 
@@ -64,6 +73,10 @@ class ModelQueue:
         self._last_request_at: float | None = None
         self._idle_shrink_task: asyncio.Task | None = None
         self._engine_unload_fn = None  # registered by api layer
+        # () -> str | None callbacks: a reason string while something outside
+        # the lock (an agent run) is using the loaded engine. See
+        # register_busy_check.
+        self._busy_checks: list = []
         self._stats = {
             "total_requests": 0,
             "model_switches": 0,
@@ -81,6 +94,27 @@ class ModelQueue:
         to import api.server directly.
         """
         self._engine_unload_fn = fn
+
+    def register_busy_check(self, fn):
+        """Register () -> str | None; a string means "the engine is in use".
+
+        While any check reports busy, the idle shrink leaves the engine
+        loaded (and restarts its countdown), and switch_if_needed refuses to
+        swap the model or relaunch it. Agent runs need this: they generate
+        for minutes at a time without ever passing through this queue.
+        """
+        self._busy_checks.append(fn)
+
+    def busy_reason(self) -> str | None:
+        for fn in self._busy_checks:
+            try:
+                reason = fn()
+            except Exception as e:
+                _log.warning("busy check failed (treated as idle): %s", e)
+                continue
+            if reason:
+                return reason
+        return None
 
     @property
     def current_model(self) -> str | None:
@@ -101,6 +135,7 @@ class ModelQueue:
 
     async def switch_if_needed(
         self, model: str, backend: str, ctx_tier: int | None = None,
+        ignore_busy: bool = False,
     ):
         """Switch model/backend/ctx_tier if the request needs a different config.
 
@@ -113,6 +148,13 @@ class ModelQueue:
                 -c flag.  A tier change within the same model triggers a
                 relaunch because llama-server's launch ctx is fixed once the
                 process starts.  Ignored for other backends.
+            ignore_busy: skip the busy check. Only for the caller that IS the
+                busy work (an agent run selecting its own model).
+
+        Raises:
+            ModelBusyError: a model switch was needed while a busy check
+                reports the engine in use. A same-model tier relaunch is
+                skipped instead — the request runs on the current window.
         """
         needs_switch = (
             self._current_model != model
@@ -130,6 +172,19 @@ class ModelQueue:
             and self._current_ctx_tier is not None
             and ctx_tier > self._current_ctx_tier
         )
+
+        if (needs_switch or needs_tier_relaunch) and not ignore_busy:
+            busy = self.busy_reason()
+            if busy and needs_switch and self._current_model is not None:
+                raise ModelBusyError(
+                    f"{busy} on {self._current_model} — can't switch to "
+                    f"{model} until it finishes or is stopped.")
+            if busy and needs_tier_relaunch:
+                _log.info("Queue: %s — skipping ctx relaunch %d → %d; "
+                          "request runs on the current window",
+                          busy, self._current_ctx_tier, ctx_tier)
+                needs_tier_relaunch = False
+                ctx_tier = self._current_ctx_tier
 
         if needs_switch or needs_tier_relaunch:
             if needs_tier_relaunch:
@@ -220,6 +275,12 @@ class ModelQueue:
             try:
                 await asyncio.sleep(IDLE_SHRINK_CHECK_INTERVAL)
                 async with self._lock:
+                    if self._last_request_at is not None and self.busy_reason():
+                        # In use outside the queue: count it as activity, so
+                        # the countdown starts when the work ends, not when
+                        # the last chat request happened to arrive.
+                        self._last_request_at = time.time()
+                        continue
                     if (
                         self._current_backend == "llama_cpp"
                         and self._last_request_at is not None

@@ -112,7 +112,10 @@
   #model-badge {
     font-size: 11px; color: var(--dim); max-width: 26vw;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    cursor: pointer;
   }
+  #model-badge.mismatch { color: var(--warn); }
+  #model-badge.idle { opacity: .6; }
   #gear-btn, #menu-btn {
     background: none; border: 1px solid var(--border); color: var(--text);
     border-radius: 10px; font-size: 17px; padding: 0; flex: none;
@@ -683,7 +686,7 @@
     <div id="status-dot"></div>
     <div class="brand">ARTIFEX<span> V5</span></div>
     <div class="spacer"></div>
-    <div id="model-badge"></div>
+    <div id="model-badge" onclick="toggleDrawer()"></div>
     <button id="gear-btn" onclick="toggleDrawer()">&#9881;</button>
   </div>
   <div id="tabs">
@@ -1301,13 +1304,54 @@ async function loadModels() {
     sel.appendChild(o);
   }
   if (chosen) sel.value = chosen;
-  $("model-badge").textContent = sel.value;
   applyCtxCap(selectedCtxCap());
+  refreshModelBadge();
 }
 $("model-select").addEventListener("change", () => {
-  $("model-badge").textContent = $("model-select").value;
   applyCtxCap(selectedCtxCap());
   store.save();
+  refreshModelBadge();
+});
+
+// The badge shows what the PC has LOADED, not just the dropdown. Picking a
+// model loads nothing by itself - the next chat message or agent run does -
+// so a badge that echoed the dropdown claimed "vision" while the text model
+// was still the one answering. Tapping it opens Settings (Engine panel).
+async function refreshModelBadge() {
+  const sel = $("model-select").value;
+  const b = $("model-badge");
+  let e = null;
+  if (store.k) {
+    try {
+      const r = await fetch("/v1/engine", { headers: authHeaders() });
+      if (r.ok) e = await r.json();
+    } catch (err) {}
+  }
+  const loaded = e && e.loaded ? e.model : null;
+  b.classList.remove("mismatch", "idle");
+  if (!e) {
+    b.textContent = sel;
+    b.title = sel;
+  } else if (!loaded) {
+    b.textContent = sel + " (not loaded)";
+    b.classList.add("idle");
+    b.title = "Nothing is loaded on the PC. The next chat message or agent run loads " + sel + ".";
+  } else if (loaded !== sel) {
+    b.textContent = "loaded: " + loaded;
+    b.classList.add("mismatch");
+    b.title = "You picked " + sel + " but " + loaded + " is loaded. The next chat " +
+      "message or agent run switches to " + sel +
+      (e.busy ? " (not while " + e.busy + ")" : "") + ".";
+  } else {
+    b.textContent = sel;
+    b.title = sel + " is loaded" + (e.busy ? " - " + e.busy : "") + ".";
+  }
+}
+// The engine can change without this page doing anything (idle unload after
+// 10 min, another device, an agent run): re-check while the page is visible.
+setInterval(() => { if (!document.hidden) refreshModelBadge(); }, 60000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshModelBadge();
 });
 
 // ═════════════════════════════════════════════════════════
@@ -1792,8 +1836,8 @@ async function loadSession(id) {
       for (let i = 0; i < sel.options.length; i++) {
         if (sel.options[i].value === s.model) {
           sel.value = s.model;
-          $("model-badge").textContent = s.model;
           store.save();
+          refreshModelBadge();
           break;
         }
       }
@@ -2672,6 +2716,7 @@ async function runAssistantTurn(opts) {
     pendingTurnEl = jobFinished ? null : bubble;
     chatJobId = null;
     isStreaming = false;
+    refreshModelBadge();          // this reply may have switched the model
     aborter = null;
     releaseWakeLock();
     sendBtn.textContent = "Send";
@@ -3000,7 +3045,9 @@ async function refreshEngine() {
     if (e.backend) bits.push(e.backend);
     bits.push("ctx " + (ctx ? ctx : "?") + (e.ctx_cap ? " / cap " + e.ctx_cap : ""));
     if (!e.loaded) bits.push("not loaded");
+    if (e.busy) bits.push(e.busy);
     box.textContent = bits.join("  -  ");
+    refreshModelBadge();
   } catch (err) {
     box.textContent = "Engine state unavailable: " + err.message;
   }
@@ -3288,8 +3335,12 @@ async function startAgentRun() {
       // on its think block first, so a cap set for chat-sized replies can be
       // consumed entirely by reasoning, leaving zero content. Send the user's
       // setting instead of letting the server fall back to its default.
+      // model: the run switches the PC to the model picked in the header
+      // before it starts, the same way a chat message does. Without it the
+      // run silently took whatever happened to be loaded.
       body: JSON.stringify(Object.assign({
         goal: goal,
+        model: $("model-select").value || undefined,
         autonomy: currentAutonomy(),
         reasoning_effort: currentEffort(),
         temperature: Math.max(0, Math.min(2, parseFloat($("temperature").value) || 0.7)),
@@ -3309,7 +3360,8 @@ async function startAgentRun() {
     if (r.status === 401) { agentNote("Invalid API key - check Settings.", "bad"); setAgentStatus("no run"); updateAgentUi(); return; }
     if (!r.ok) {
       const d = data && data.detail;
-      agentNote("Could not start: " + (typeof d === "string" ? d : "HTTP " + r.status), "bad");
+      agentNote("Could not start: " + (typeof d === "string" ? d
+        : (d && d.message) || "HTTP " + r.status), "bad");
       setAgentStatus("no run");
       updateAgentUi();
       return;
@@ -3377,7 +3429,8 @@ async function sendAgentText(text, isResend) {
     if (!r.ok) {
       drop();
       const d = data && data.detail;
-      agentNote("Message failed: " + (typeof d === "string" ? d : "HTTP " + r.status), "bad");
+      agentNote("Message failed: " + (typeof d === "string" ? d
+        : (d && d.message) || "HTTP " + r.status), "bad");
       return false;
     }
     if (data && data.revived) {
@@ -3550,6 +3603,7 @@ function finishRun(status, summary) {
   agentDetach();
   setAgentStatus(status ? "run " + status : "no run");
   updateAgentUi();
+  refreshModelBadge();
 }
 
 function clearRunRef() {
@@ -3633,6 +3687,12 @@ function agentEvent(ev) {
       break;
     case "compacted":
       agentNote("Context compacted: " + (ev.reason || "fit to model window"));
+      break;
+    case "model":
+      // Which model the run actually loaded, and whether it can see images.
+      agentNote(ev.text || "model loaded",
+        /text only/.test(ev.text || "") ? "warn" : "");
+      refreshModelBadge();
       break;
     case "gate_pause":
       agentNote("Human gate: " + (ev.reason || ""), "warn");

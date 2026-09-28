@@ -29,7 +29,7 @@ from core.config import (
 )
 from core.engine_factory import create_engine
 from core.inference import strip_think_blocks, ThinkFilter, trim_messages_to_context
-from core.model_queue import get_model_queue
+from core.model_queue import get_model_queue, ModelBusyError
 from core.health import run_health_check, format_health_report
 from core.logging_config import get_logger
 from api.web_tools import (
@@ -1514,6 +1514,9 @@ def create_app():
                 "ctx": tier or None,
                 "ctx_cap": cap,
                 "queue_tier": mq._current_ctx_tier,
+                # Why the model can't be switched right now (an agent run),
+                # or None. The phone shows it next to the model badge.
+                "busy": mq.busy_reason(),
             }
 
     if phone_full_tools:
@@ -1661,16 +1664,62 @@ def create_app():
         # stream events, answer approval prompts. Same runner the Qt GUI
         # drives.
 
-        from api.agent_api import register_agent_routes
+        from api.agent_api import register_agent_routes, live_run_busy_reason
+
+        async def _agent_prepare_model(requested):
+            # Same resolution + queue switch chat uses, so a run started with
+            # the vision entry selected runs ON the vision entry. Only the
+            # switch happens here (unloading a different model is quick);
+            # the worker's _agent_get_engine() does the 30-60 s load so the
+            # POST still returns a run id at once.
+            backend = _infer_backend_from_model(requested) or get_active_backend()
+            model = _resolve_model_for_request(requested, False, backend)
+            mq = get_model_queue()
+            async with mq._lock:
+                same = mq._current_model == model and mq._current_backend == backend
+                if not same:
+                    from api.chat_jobs import _jobs, _jobs_lock
+                    with _jobs_lock:
+                        chat_live = any(not j.terminal for j in _jobs.values())
+                    if chat_live:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={"message": (
+                                f"A chat reply is still generating on "
+                                f"{mq._current_model} - wait for it (or stop "
+                                f"it) before starting a run on {model}.")})
+                # Same model: keep its current tier (no relaunch). New model:
+                # record its configured cap, which is what the worker's load
+                # launches at; _agent_get_engine corrects it after the VRAM
+                # gate has had its say.
+                tier = mq._current_ctx_tier if same else None
+                if not same and backend == "llama_cpp":
+                    from core.config import get_llama_cpp_model_config
+                    tier = (get_llama_cpp_model_config(model) or {}).get("num_ctx")
+                await mq.switch_if_needed(model, backend, ctx_tier=tier,
+                                          ignore_busy=True)
+            return model
+
+        def _agent_get_engine():
+            eng = _get_engine()
+            loaded = eng.current_tier() if hasattr(eng, "current_tier") else 0
+            if loaded:
+                get_model_queue()._current_ctx_tier = loaded
+            return eng
+
         register_agent_routes(
             app,
             check_auth=_check_auth,
-            get_engine=_get_engine,
+            get_engine=_agent_get_engine,
             default_workspace_root=os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 "output", "agent_runs",
             ),
+            prepare_model=_agent_prepare_model,
         )
+        # A live run keeps the engine loaded (idle shrink) and refuses chat
+        # requests that would swap the model out from under it.
+        get_model_queue().register_busy_check(live_run_busy_reason)
 
     # ─── Health ───────────────────────────────────────────────────────────
 
@@ -1901,7 +1950,10 @@ def create_app():
         # ── Non-streaming path (both backends via model queue) ────────
         mq = get_model_queue()
         async with mq._lock:
-            await mq.switch_if_needed(model, backend, ctx_tier=ctx_tier)
+            try:
+                await mq.switch_if_needed(model, backend, ctx_tier=ctx_tier)
+            except ModelBusyError as e:
+                raise HTTPException(status_code=409, detail=str(e))
 
             if backend == "ollama":
                 try:

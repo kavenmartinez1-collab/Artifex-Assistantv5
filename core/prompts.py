@@ -44,7 +44,7 @@ TOOLS:
 - @web_read(N) or @web_read("url") — read web page or search result
 - @download("url") — download file to cwd
 - @view_image("path") or @view_image("path", "question") — look at ONE image
-  and get a text description back (needs a vision model loaded)
+  and get a text description back (works only when MODEL says Vision: YES)
 - @describe_images("folder", "list.md") — go through EVERY image in a folder
   (and subfolders) and append "- name — what it shows" to list.md. Optional
   3rd argument replaces the per-image question. It stops after ~15 minutes and
@@ -117,12 +117,17 @@ SESSION MAP (files explored — use line numbers to drill in with @read_function
 
 
 def build_assistant_prompt(system_info, cwd, workspace_text="", knowledge_text="",
-                           session_map_text="", rag_context="", agent_context=""):
+                           session_map_text="", rag_context="", agent_context="",
+                           model_text=""):
     """Build the ASSISTANT agent system prompt with environment context.
 
     `agent_context` is the normalized harness context absorbed from the
     workspace's .artifex bundle (see core/harness.py). When present it is
     injected as an authoritative AGENT CONTEXT section ahead of ENVIRONMENT.
+
+    `model_text` says which model the loop is running on and whether it can
+    see images; callers that know (the API's agent runs) pass it, so the
+    model neither guesses its own identity nor calls image tools blind.
     """
     agent_block = ""
     if agent_context and agent_context.strip():
@@ -131,6 +136,8 @@ def build_assistant_prompt(system_info, cwd, workspace_text="", knowledge_text="
             "authoritative project instructions and memory left by a prior agent:\n"
             f"{agent_context.strip()}\n\n"
         )
+    if model_text and model_text.strip():
+        agent_block += f"MODEL:\n{model_text.strip()}\n\n"
     prompt = ASSISTANT_AGENT_PROMPT_TEMPLATE.format(
         system_info=system_info,
         cwd=cwd,
