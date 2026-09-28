@@ -282,6 +282,16 @@ def extract_paths_from_content(action_type: str, content: str) -> list[str]:
         if len(parts) > 1:
             paths.append(parts[1].strip())
 
+    elif action_type == "view_image":
+        path = content.split("|", 1)[0].strip()
+        if path:
+            paths.append(path)
+
+    elif action_type == "describe_images":
+        # "folder|catalog|prompt" — the prompt is free text, not a path.
+        parts = content.split("|", 2)
+        paths.extend(p.strip() for p in parts[:2] if p.strip())
+
     return paths
 
 

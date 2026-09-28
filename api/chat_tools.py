@@ -160,7 +160,8 @@ def tool_status_labels(actions: list) -> list[str]:
         "download": "Downloading", "glob": "Finding", "grep": "Searching",
         "edit_file": "Editing", "find_symbol": "Finding", "sysinfo": "Checking",
         "find_references": "Finding", "trace_imports": "Tracing",
-        "architecture": "Mapping",
+        "architecture": "Mapping", "view_image": "Looking at",
+        "describe_images": "Describing images in",
     }
     out = []
     for a in actions:

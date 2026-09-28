@@ -43,6 +43,13 @@ TOOLS:
 - @search("query") — web search
 - @web_read(N) or @web_read("url") — read web page or search result
 - @download("url") — download file to cwd
+- @view_image("path") or @view_image("path", "question") — look at ONE image
+  and get a text description back (needs a vision model loaded)
+- @describe_images("folder", "list.md") — go through EVERY image in a folder
+  (and subfolders) and append "- name — what it shows" to list.md. Optional
+  3rd argument replaces the per-image question. It stops after ~15 minutes and
+  skips images already in list.md, so call it again until it says 0 remaining.
+  Use this, NOT a loop of @view_image, for more than a handful of images.
 - ```bash``` — shell commands (auto-routes to correct shell)
 - ```python``` — Python code (ONLY for computation and generated files)
 - ```edit``` block — write a file: surgical replacement, or a NEW file when

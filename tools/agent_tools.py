@@ -335,6 +335,7 @@ def _python_parses(code):
 _MARKER_TOOL_NAMES = (
     "search|read_file|read_function|find_symbol|find_references"
     "|grep|glob|web_read|download|trace_imports|architecture"
+    "|view_image|describe_images"
 )
 
 # Hybrid syntax some chat-template-trained models (Qwen3.x under --jinja)
@@ -389,6 +390,7 @@ _PRIMARY_ARG = {
     "find_symbol": "name", "find_references": "name",
     "shell": "command", "bash": "command", "run_shell": "command",
     "execute": "command", "python": "code", "run_python": "code",
+    "view_image": "path", "describe_images": "path",
 }
 
 
@@ -486,6 +488,20 @@ def _action_from_call(name, args):
         return AgentAction("architecture", "", "architecture: project map")
     elif name == "sysinfo":
         return AgentAction("sysinfo", "", "sysinfo: machine specs")
+    elif name == "view_image":
+        path = _json_arg(args, "path")
+        if path:
+            question = args.get("question") or args.get("prompt") or ""
+            content = f"{path}|{question}" if question else path
+            return AgentAction("view_image", content, f'view_image: "{path}"')
+    elif name == "describe_images":
+        folder = args.get("folder") or args.get("directory") or _json_arg(args, "path")
+        if folder:
+            out = args.get("output") or args.get("catalog") or args.get("out") or ""
+            prompt = args.get("prompt") or args.get("instructions") or ""
+            content = "|".join([str(folder), str(out), str(prompt)]).rstrip("|")
+            return AgentAction("describe_images", content,
+                               f'describe_images: "{folder}"')
     elif name in ("shell", "bash", "run_shell", "execute"):
         cmd = _json_arg(args, "command")
         if cmd:
@@ -592,7 +608,8 @@ def extract_agent_actions(response):
     # Some models (especially Ollama) mistakenly wrap these in code blocks.
     _TOOL_MARKER_RE = re.compile(
         r'^\s*@(?:search|read_file|read_function|find_symbol|find_references'
-        r'|grep|glob|web_read|download|trace_imports|architecture)\s*\(',
+        r'|grep|glob|web_read|download|trace_imports|architecture'
+        r'|view_image|describe_images)\s*\(',
     )
 
     # --- Shell code blocks (treat entire block as one command for powershell) ---
@@ -781,6 +798,22 @@ def extract_agent_actions(response):
     # @sysinfo()
     if re.search(r'@sysinfo\(\s*\)', marker_text):
         actions.append(AgentAction("sysinfo", "", "sysinfo: machine specs"))
+
+    # @view_image("path") or @view_image("path", "question")
+    for path, question in re.findall(
+            r'@view_image\(["\'](.+?)["\']\s*(?:,\s*["\'](.+?)["\'])?\s*\)',
+            marker_text):
+        content = f"{path}|{question}" if question else path
+        actions.append(AgentAction("view_image", content, f'view_image: "{path}"'))
+
+    # @describe_images("folder") / ("folder", "catalog.md") / (..., "prompt")
+    for folder, out, prompt in re.findall(
+            r'@describe_images\(["\'](.+?)["\']\s*(?:,\s*["\'](.*?)["\'])?'
+            r'\s*(?:,\s*["\'](.+?)["\'])?\s*\)',
+            marker_text):
+        content = "|".join([folder, out, prompt]).rstrip("|")
+        actions.append(AgentAction("describe_images", content,
+                                   f'describe_images: "{folder}"'))
 
     # @read_function("filepath", "function_name")
     read_fn_matches = re.findall(
@@ -2359,6 +2392,20 @@ def rebase_action_paths(action_type, content, cwd):
         # Whole content is a filepath.
         return _rebase_one(content, cwd)
 
+    if action_type == "view_image":
+        # "path|question" — only field 0 is a path.
+        path, sep, rest = content.partition("|")
+        return f"{_rebase_one(path, cwd)}{sep}{rest}"
+
+    if action_type == "describe_images":
+        # "folder|catalog|prompt" — folder and catalog are paths; an empty
+        # catalog means "inside the folder" and must stay empty.
+        parts = content.split("|", 2)
+        parts[0] = _rebase_one(parts[0], cwd)
+        if len(parts) > 1 and parts[1].strip():
+            parts[1] = _rebase_one(parts[1], cwd)
+        return "|".join(parts)
+
     # find_symbol   — "name" or "name|kind"; field 1 is a KIND
     #                 (function/class/method), NOT a path.
     # find_references — a bare symbol name.
@@ -2448,6 +2495,12 @@ def run_agent_action(action, confirm_cb=None, policy_check=True, cwd=None):
         return run_edit_file(content)
     elif action.type == "read_function":
         return run_read_function(content)
+    elif action.type == "view_image":
+        from tools.image_tools import run_view_image
+        return run_view_image(content)
+    elif action.type == "describe_images":
+        from tools.image_tools import run_describe_images
+        return run_describe_images(content)
     elif action.type in ("find_symbol", "find_references", "trace_imports", "architecture"):
         from tools.codebase_tools import (
             run_find_symbol, run_find_references, run_trace_imports, run_architecture,

@@ -46,9 +46,11 @@ ACTION_RISK: dict[str, RiskLevel] = {
     "trace_imports":    RiskLevel.SAFE,
     "architecture":     RiskLevel.SAFE,
     "sysinfo":          RiskLevel.SAFE,
+    "view_image":       RiskLevel.SAFE,
     "search":           RiskLevel.LOW,
     "web_read":         RiskLevel.LOW,
     "edit_file":        RiskLevel.MEDIUM,
+    "describe_images":  RiskLevel.MEDIUM,   # appends to a catalog file
     "python":           RiskLevel.MEDIUM,
     "download":         RiskLevel.HIGH,
     "shell":            RiskLevel.HIGH,
