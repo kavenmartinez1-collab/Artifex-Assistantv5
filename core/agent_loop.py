@@ -113,6 +113,16 @@ class RunConfig:
     # one bounded generation per compaction; falls back to key points on
     # any failure.
     model_compaction: bool = True
+    # Fraction of the REAL input budget (ctx minus the completion
+    # reservation, not raw ctx) at which history gets folded into a
+    # synopsis. This used to be a flat 0.60 of raw ctx, which on the
+    # 73728-ctx split fired at ~44k — the run compacted away two thirds of
+    # a window that had been tuned, measured and paid for in VRAM. At 0.85
+    # of the budget the fold happens just before the pre-flight trimmer
+    # would have to start cutting, which is the last moment it is still
+    # lossless-ish. Raise toward 1.0 only if you would rather be
+    # hard-trimmed than summarized.
+    compact_threshold: float = 0.85
 
     @classmethod
     def default(cls, autonomy: AutonomyLevel = AutonomyLevel.GUIDED) -> "RunConfig":
@@ -532,7 +542,11 @@ class AgentRunner:
         if ctx > 0:
             new_hist, _ = self._compact_if_needed(history, ctx, cw)
             history[:] = new_hist
-        _, active = build_active_messages(history, cw, engine_ctx=ctx)
+        # max_tokens turns the input cap into ctx-minus-completion instead of
+        # a flat 70% of ctx; without it the agent can never use the top 30%
+        # of the loaded window.
+        _, active = build_active_messages(history, cw, engine_ctx=ctx,
+                                          max_tokens=self.config.max_tokens)
         if ctx > 0:
             # Final pre-flight: the input must fit ctx MINUS the completion
             # reservation (the old 85%-of-ctx cap left no room to generate
@@ -548,17 +562,49 @@ class AgentRunner:
                            f"(budget {info['budget']} of ctx {ctx})"))
         return active
 
+    def _compact_trigger(self, engine_ctx: int) -> int:
+        """Token count at which history gets folded into a synopsis.
+
+        Measured against the REAL input budget (ctx minus the completion
+        reservation minus the template margin), not raw ctx: reserving room
+        to generate is already accounted for there, so a fraction of raw ctx
+        double-counts it and fires far too early.
+        """
+        from core.inference import context_input_budget
+        budget = context_input_budget(engine_ctx, self.config.max_tokens)
+        frac = self.config.compact_threshold
+        if not (0.0 < frac <= 1.0):
+            frac = 0.85
+        return int(budget * frac)
+
     def _compact_if_needed(self, history, engine_ctx, context_window,
-                           threshold=0.60):
-        """Auto-compact at threshold of engine ctx — model-written synopsis
-        first (the compact becomes the continued context), key-point
-        extraction as the fallback."""
+                           threshold=None):
+        """Auto-compact once history reaches compact_threshold of the real
+        input budget — model-written synopsis first (the compact becomes the
+        continued context), key-point extraction as the fallback.
+
+        `threshold` overrides RunConfig.compact_threshold for one call; it is
+        a fraction of the input BUDGET, not of raw ctx (it was the latter
+        before 2026-09-20 — see RunConfig.compact_threshold)."""
         from core.inference import _count_tokens, auto_compact_if_needed
         if engine_ctx <= 0 or len(history) <= 4:
             return history, False
         token_count = _count_tokens(history)
-        if token_count <= int(engine_ctx * threshold):
+        if threshold is None:
+            trigger = self._compact_trigger(engine_ctx)
+        else:
+            from core.inference import context_input_budget
+            trigger = int(context_input_budget(
+                engine_ctx, self.config.max_tokens) * threshold)
+        if token_count <= trigger:
             return history, False
+        # auto_compact_if_needed() has its OWN trigger — a fraction of raw
+        # ctx — and re-checks it. With ours now derived from the input
+        # budget the two can disagree, and a history that passed our check
+        # but sits under the fallback's 0.60*ctx would compact to nothing
+        # at all when the model synopsis fails. Hand it the same absolute
+        # trigger, expressed in the fraction-of-raw-ctx it speaks.
+        fallback_frac = min(1.0, max(trigger / engine_ctx, 0.01))
         if self.config.model_compaction:
             try:
                 compacted = self._model_compact(history, engine_ctx)
@@ -573,7 +619,9 @@ class AgentRunner:
                     "compacted", round=self._round,
                     reason=f"model synopsis: {token_count} -> {new_count} tok"))
                 return compacted, True
-        new_hist, did = auto_compact_if_needed(history, engine_ctx, context_window)
+        new_hist, did = auto_compact_if_needed(history, engine_ctx,
+                                               context_window,
+                                               threshold=fallback_frac)
         if did:
             self.emit(AgentEvent(
                 "compacted", round=self._round,

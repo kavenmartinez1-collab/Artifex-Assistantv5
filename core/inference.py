@@ -284,7 +284,7 @@ def _count_tokens(messages, tokenizer=None):
 
 
 def build_active_messages(history, context_window, max_history_tokens=None,
-                          engine_ctx=0):
+                          engine_ctx=0, max_tokens=None):
     """Build the active message list for the next generation call.
 
     Uses max_total_input_tokens as a HARD CAP on everything sent to the model.
@@ -296,6 +296,15 @@ def build_active_messages(history, context_window, max_history_tokens=None,
         engine_ctx: engine's reported context size in tokens (e.g. 131072).
             When > 0, scales budget and window to use the engine's real
             capacity instead of the profile caps.
+        max_tokens: completion budget for the round this is being built for.
+            When given (with engine_ctx > 0) the input cap becomes the REAL
+            budget — ctx minus the completion reservation minus a
+            template margin — instead of a flat 70% of ctx. The flat 70%
+            left 30% of a measured, hard-won window permanently unusable:
+            on the 73728-ctx split that is 22k tokens the agent could never
+            reach no matter what context_window it was handed. Leave it
+            None to keep the historical 0.70 behaviour for callers that
+            have no completion budget to hand (the Qt GUI, the CLI).
 
     Returns:
         (updated_history, active_messages)
@@ -306,8 +315,16 @@ def build_active_messages(history, context_window, max_history_tokens=None,
     system_tokens = _count_tokens([history[0]])
 
     if engine_ctx > 0:
-        total_cap = int(engine_ctx * 0.70)
+        if max_tokens:
+            total_cap = context_input_budget(engine_ctx, max_tokens)
+        else:
+            total_cap = int(engine_ctx * 0.70)
         history_budget = max_history_tokens or max(total_cap - system_tokens, 200)
+        # NOTE: context_window arrives as a TOKEN count from some callers and
+        # a MESSAGE count from others; here it is only ever a message count.
+        # The min/max collapses a token-valued argument to the 200-message
+        # ceiling, which is the intended behaviour — the real token bound is
+        # history_budget below.
         context_window = min(max(history_budget // 500, context_window), 200)
     else:
         total_cap = profile.max_total_input_tokens
@@ -322,6 +339,20 @@ def build_active_messages(history, context_window, max_history_tokens=None,
         return list(history), active
 
     compressed = compress_history(history, context_window)
+
+    if max_tokens:
+        # Fill the budget. The halving ladder below lands on whatever
+        # power-of-two slice happens to fit, which throws away everything
+        # between that slice and the budget: measured on a 240-message
+        # history at ctx 73728, raising the cap from 51.6k to 67.3k bought
+        # exactly ZERO extra history, because both budgets cleared the same
+        # 100-message rung. Walking back message by message spends what the
+        # cap actually grants. Only on the max_tokens path — the ladder is
+        # mirrored by webgpu/src/chat/context.ts and pinned by golden
+        # fixtures, and that port has no completion budget to reason about.
+        active = _fill_to_budget(compressed, history_budget)
+        return compressed, active
+
     for shrink in (context_window // 2, context_window // 4, 2):
         active = [compressed[0]] + compressed[1:][-max(shrink, 2):]
         if _count_tokens(active[1:]) <= history_budget:
@@ -329,6 +360,50 @@ def build_active_messages(history, context_window, max_history_tokens=None,
 
     active = [compressed[0]] + compressed[1:][-2:]
     return compressed, active
+
+
+def _fill_to_budget(compressed, history_budget):
+    """Newest-first fill of `history_budget` tokens from a compressed history.
+
+    compress_history() puts the system prompt at [0] and — when it fired —
+    the pinned goal and the key-point summary immediately after. Those lead
+    messages are what make the tail intelligible, so they are taken first and
+    kept even if they alone blow the budget (the pre-flight trimmer is the
+    backstop for that case). Everything after them is added newest-first
+    until the next message would not fit.
+
+    Always returns at least the lead plus the two most recent messages, so a
+    single enormous tool result can never reduce the active set to nothing.
+    """
+    system = compressed[:1]
+    rest = compressed[1:]
+    if not rest:
+        return list(compressed)
+
+    # Lead = pinned goal (first user message) + key-point summary, whichever
+    # of them compress_history actually emitted.
+    lead_n = 0
+    if rest and rest[0].get("role") == "user":
+        lead_n = 1
+        if (len(rest) > 1 and rest[1].get("role") == "user"
+                and str(rest[1].get("content", "")).startswith(
+                    "[EARLIER CONVERSATION")):
+            lead_n = 2
+    lead, tail = rest[:lead_n], rest[lead_n:]
+
+    used = _count_tokens(lead)
+    kept = []
+    for msg in reversed(tail):
+        cost = _count_tokens([msg])
+        if used + cost > history_budget and kept:
+            break
+        kept.append(msg)
+        used += cost
+    kept.reverse()
+
+    if len(kept) < 2:
+        kept = tail[-2:] if len(tail) >= 2 else list(tail)
+    return system + lead + kept
 
 
 def context_input_budget(engine_ctx, max_tokens, floor_frac=0.25):

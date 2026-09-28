@@ -980,18 +980,27 @@ def run_shell_command(command, timeout=300, cwd=None):
         return False, f"Execution error: {e}"
 
 
-def run_python_snippet(code, timeout=30):
+def run_python_snippet(code, timeout=30, cwd=None):
     """
     Execute a Python code snippet using the venv's interpreter.
     Single-line: python -c. Multi-line: temp file.
     Returns (success, output) tuple.
 
     Timeout is capped at MAX_PYTHON_TIMEOUT from the sandbox.
+
+    cwd sets the working directory for the child, so relative paths in the
+    snippet resolve where the caller means them to. None inherits this
+    process's cwd, which is what the agent loop wants (it chdirs into the
+    run's workspace); callers with no cwd of their own — the chat tools —
+    pass one explicitly.
     """
     timeout = min(timeout, MAX_PYTHON_TIMEOUT)
     blocked = _check_dangerous(code)
     if blocked:
         return False, blocked
+
+    if cwd and not os.path.isdir(cwd):
+        return False, f"Working directory does not exist: {cwd}"
 
     try:
         lines = code.strip().split("\n")
@@ -1000,7 +1009,7 @@ def run_python_snippet(code, timeout=30):
             result = subprocess.run(
                 [_PYTHON_BIN, "-c", code],
                 capture_output=True, text=True, timeout=timeout,
-                env=_get_clean_env(),
+                env=_get_clean_env(), cwd=cwd,
                 encoding="utf-8", errors="replace",
             )
         else:
@@ -1013,7 +1022,7 @@ def run_python_snippet(code, timeout=30):
                 result = subprocess.run(
                     [_PYTHON_BIN, tmp_path],
                     capture_output=True, text=True, timeout=timeout,
-                    env=_get_clean_env(),
+                    env=_get_clean_env(), cwd=cwd,
                     encoding="utf-8", errors="replace",
                 )
             finally:
@@ -2284,7 +2293,82 @@ def run_sysinfo() -> tuple[bool, str]:
     return True, "\n".join(lines)
 
 
-def run_agent_action(action, confirm_cb=None, policy_check=True):
+def _rebase_one(path, cwd):
+    """Join a RELATIVE path onto cwd; leave absolute paths and URLs alone."""
+    path = path.strip()
+    if not path:
+        return path
+    if path.startswith(("http://", "https://", "ftp://")):
+        return path
+    if os.path.isabs(path):
+        return path
+    # A bare drive-relative path ("C:foo") is absolute enough for our
+    # purposes and joining it would produce nonsense.
+    if len(path) >= 2 and path[1] == ":":
+        return path
+    return os.path.normpath(os.path.join(cwd, path))
+
+
+def rebase_action_paths(action_type, content, cwd):
+    """Rewrite the path field(s) of an action's content to sit under `cwd`.
+
+    Mirrors the content formats that core.sandbox.fs_sandbox's
+    extract_paths_from_content() knows how to read — keep the two in step.
+    Shell and python are NOT rebased: their content is a program, not a
+    path, and the child process gets `cwd` directly.
+    """
+    if not cwd or not content:
+        return content
+
+    if action_type == "read_file":
+        # "path" or "path|chunk" — chunk suffix is optional, path may
+        # itself contain no "|", so split off only a trailing numeric part.
+        head, sep, tail = content.rpartition("|")
+        if sep and tail.strip().isdigit():
+            return f"{_rebase_one(head, cwd)}|{tail.strip()}"
+        return _rebase_one(content, cwd)
+
+    if action_type == "read_function":
+        path, sep, rest = content.partition("|")
+        return f"{_rebase_one(path, cwd)}{sep}{rest}"
+
+    if action_type == "edit_file":
+        path, sep, rest = content.partition("\x00")
+        return f"{_rebase_one(path, cwd)}{sep}{rest}"
+
+    if action_type in ("glob", "grep"):
+        # "pattern|dir[|flags]" — field 0 is the PATTERN, field 1 the root.
+        # Both tools fall back to os.getcwd() when field 1 is absent, so an
+        # omitted root has to be FILLED IN, not just left alone — otherwise
+        # the commonest form, @glob("*.py"), silently searches the API's
+        # process directory instead of the caller's workspace.
+        parts = content.split("|")
+        if len(parts) > 1 and parts[1].strip():
+            parts[1] = _rebase_one(parts[1], cwd)
+        elif len(parts) > 1:
+            parts[1] = cwd
+        else:
+            parts.append(cwd)
+        return "|".join(parts)
+
+    # download's second field is a FILENAME, not a path — run_download()
+    # basename()s it to strip traversal, so an absolute path would be
+    # reduced back to its leaf. Left alone deliberately.
+
+    if action_type == "trace_imports":
+        # Whole content is a filepath.
+        return _rebase_one(content, cwd)
+
+    # find_symbol   — "name" or "name|kind"; field 1 is a KIND
+    #                 (function/class/method), NOT a path.
+    # find_references — a bare symbol name.
+    # architecture  — content ignored entirely; the index picks its own root.
+    # sysinfo/search/web_read — no paths.
+    # Rebasing any of these would corrupt the argument.
+    return content
+
+
+def run_agent_action(action, confirm_cb=None, policy_check=True, cwd=None):
     """
     Dispatch an AgentAction to the appropriate executor.
     Returns (success, output) tuple.
@@ -2308,6 +2392,12 @@ def run_agent_action(action, confirm_cb=None, policy_check=True):
             check_policy and obtained approval for this exact action
             (the AgentRunner loop) — re-checking would double-count the
             audit-log and circuit-breaker hooks.
+        cwd: working directory for shell/python children, and the base that
+            relative paths in file tools resolve against. None = this
+            process's cwd, which is what the agent loop relies on (it
+            chdirs into the run's workspace for the run's duration).
+            Surfaces with no cwd of their own — chat — pass one, because
+            the alternative is building in the repo root.
     """
     if policy_check:
         from core.sandbox import check_policy
@@ -2327,28 +2417,37 @@ def run_agent_action(action, confirm_cb=None, policy_check=True):
             if not confirm_cb(action, decision):
                 return False, "[NOT RUN — confirmation declined]"
 
+    content = action.content
+    if cwd:
+        # The file tools resolve relative paths against the PROCESS cwd. The
+        # agent loop makes that right by chdir'ing into the run's workspace;
+        # chat cannot, because chdir is process-global and a chat turn can
+        # overlap an agent run that owns it. Rebasing the path out of the
+        # action content gets the same result without touching global state.
+        content = rebase_action_paths(action.type, content, cwd)
+
     if action.type == "sysinfo":
         return run_sysinfo()
     elif action.type == "shell":
-        return run_shell_command(action.content, cwd=os.getcwd())
+        return run_shell_command(content, cwd=cwd or os.getcwd())
     elif action.type == "python":
-        return run_python_snippet(action.content)
+        return run_python_snippet(content, cwd=cwd)
     elif action.type == "search":
-        return run_web_search(action.content)
+        return run_web_search(content)
     elif action.type == "read_file":
-        return run_read_file(action.content)
+        return run_read_file(content)
     elif action.type == "web_read":
-        return run_web_read(action.content)
+        return run_web_read(content)
     elif action.type == "download":
-        return run_download(action.content)
+        return run_download(content)
     elif action.type == "glob":
-        return run_glob(action.content)
+        return run_glob(content)
     elif action.type == "grep":
-        return run_grep(action.content)
+        return run_grep(content)
     elif action.type == "edit_file":
-        return run_edit_file(action.content)
+        return run_edit_file(content)
     elif action.type == "read_function":
-        return run_read_function(action.content)
+        return run_read_function(content)
     elif action.type in ("find_symbol", "find_references", "trace_imports", "architecture"):
         from tools.codebase_tools import (
             run_find_symbol, run_find_references, run_trace_imports, run_architecture,
@@ -2359,7 +2458,7 @@ def run_agent_action(action, confirm_cb=None, policy_check=True):
             "trace_imports": run_trace_imports,
             "architecture": run_architecture,
         }
-        return dispatch[action.type](action.content)
+        return dispatch[action.type](content)
     else:
         return False, f"Unknown action type: {action.type}"
 

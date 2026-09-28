@@ -975,19 +975,57 @@ _WEB_TOOL_SYSTEM_PROMPT = (
 )
 
 
-def _inject_web_tool_prompt(messages: list):
-    """Prepend web tool instructions to the conversation's system prompt.
+def _inject_tool_prompt(messages: list, tool_prompt: str):
+    """Append tool instructions to the conversation's system prompt.
 
-    If the first message is a system message, appends the tool instructions
-    to it. Otherwise inserts a new system message at the front.
+    If the first message is a system message, appends to it (copied, not
+    mutated — the caller's list may be shared). Otherwise inserts a new
+    system message at the front.
     """
     if messages and messages[0].get("role") == "system":
         messages[0] = dict(messages[0])
-        messages[0]["content"] = (
-            messages[0]["content"] + "\n\n" + _WEB_TOOL_SYSTEM_PROMPT
-        )
+        messages[0]["content"] = messages[0]["content"] + "\n\n" + tool_prompt
     else:
-        messages.insert(0, {"role": "system", "content": _WEB_TOOL_SYSTEM_PROMPT})
+        messages.insert(0, {"role": "system", "content": tool_prompt})
+
+
+_VISION_SYSTEM_PROMPT = (
+    "VISION: You are a multimodal model and you CAN see images. Images the "
+    "user attaches to their messages are decoded and given to you directly "
+    "as visual input — look at them and describe, read, or analyze what they "
+    "actually show (text, objects, people, charts, screenshots, code). Never "
+    "claim you cannot see or view images, and never ask the user to describe "
+    "or transcribe an image you already have. Any \"no file access\" rule "
+    "above means files on the user's PC, not images attached here. A plain "
+    "\"[image]\" text marker is an older attachment that is no longer "
+    "available to you; if asked about one, say so and ask for it again."
+)
+
+
+def _inject_vision_prompt(messages: list) -> list:
+    """Tell the model it can see, when the request actually carries images.
+
+    Without this the phone's CAPABILITIES block ("Conversation only", "NO
+    access to the user's files") led the vision model to answer "I can't see
+    images" about a photo it had been handed. Server-side so every client
+    gets it. Returns a new list; a system message whose content is not a str
+    is left alone rather than guessed at.
+    """
+    if not _messages_have_images(messages):
+        return messages
+    messages = list(messages)
+    first = messages[0] if messages else None
+    if not isinstance(first, dict) or (
+            first.get("role") == "system"
+            and not isinstance(first.get("content"), str)):
+        return messages
+    _inject_tool_prompt(messages, _VISION_SYSTEM_PROMPT)
+    return messages
+
+
+def _inject_web_tool_prompt(messages: list):
+    """Back-compat shim for the web-only tool prompt."""
+    _inject_tool_prompt(messages, _WEB_TOOL_SYSTEM_PROMPT)
 
 
 def _get_context_budget(backend: str, max_tokens: int = 0) -> int:
@@ -1061,15 +1099,34 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                              use_web_tools: bool, backend: str,
                              grammar=None, response_format=None,
                              enable_thinking=True,
-                             reasoning_effort=None):
+                             reasoning_effort=None,
+                             workspace: str = ""):
     """Full streaming generator with optional tool execution loop.
 
     Yields SSE events. Handles both Ollama and Transformers backends.
+
+    `use_web_tools` accepts the legacy bool OR a tool_mode string
+    ("off"/"web"/"full"); see api/chat_tools.py for what "full" adds.
+    `workspace` is the directory full-mode tools resolve against.
     """
+    from api import chat_tools
+
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     search_cache = []  # Request-scoped cache for @web_read(N)
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
     last_finish_reason = "stop"  # Updated from engine usage events
+
+    mode = (use_web_tools if isinstance(use_web_tools, str)
+            else chat_tools.normalize_mode(None, bool(use_web_tools)))
+    full_mode = mode == chat_tools.MODE_FULL
+    # The engine-level flag just means "this turn may call tools at all";
+    # only claude_cli acts on it (--allowedTools), the rest ignore it.
+    use_web_tools = mode != chat_tools.MODE_OFF
+    ws = ""
+    if full_mode:
+        ws, ws_err = chat_tools.resolve_workspace(workspace)
+        if ws_err:
+            _log.warning("[%s] %s", chat_id, ws_err)
 
     current_messages = list(messages)
     # Image-aware: len() on a multimodal content LIST returns the part count,
@@ -1078,11 +1135,17 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
     from core.inference import _count_tokens as _ct
     msg_tokens_est = _ct(current_messages)
 
-    _log.info("[%s] web_tools=%s, backend=%s, %d messages (~%d tok), max_tokens=%s",
-              chat_id, use_web_tools, backend, len(current_messages), msg_tokens_est, max_tokens)
+    _log.info("[%s] tool_mode=%s, backend=%s, %d messages (~%d tok), max_tokens=%s%s",
+              chat_id, mode, backend, len(current_messages), msg_tokens_est,
+              max_tokens, f", workspace={ws}" if full_mode else "")
 
-    if use_web_tools:
-        _inject_web_tool_prompt(current_messages)
+    if full_mode:
+        _inject_tool_prompt(current_messages,
+                            chat_tools.full_tool_system_prompt(ws))
+        _log.info("[%s] Injected FULL tool system prompt (workspace=%s)",
+                  chat_id, ws)
+    elif use_web_tools:
+        _inject_tool_prompt(current_messages, _WEB_TOOL_SYSTEM_PROMPT)
         _log.info("[%s] Injected web tool system prompt", chat_id)
 
     # Image turns bypass the pre-flight trimmer below (their content is a list,
@@ -1187,38 +1250,54 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
 
         # ── Tool execution check ──────────────────────────────────────
         if not use_web_tools:
-            _log.info("[%s] web_tools disabled — returning final response", chat_id)
+            _log.info("[%s] tools disabled — returning final response", chat_id)
             break
 
-        tools = extract_web_tools(full_response)
-        has_gw = gateway_available() if tools else False
-        _log.info("[%s] Tool extraction: found %d tool calls, gateway_up=%s",
-                  chat_id, len(tools), has_gw)
-        if tools:
+        if full_mode:
+            tools = chat_tools.extract_chat_tools(full_response)
+            _log.info("[%s] Tool extraction (full): %d action(s)",
+                      chat_id, len(tools))
             for t in tools:
-                _log.info("[%s]   → %s: %s", chat_id, t.get("type"), t.get("query") or t.get("ref"))
+                _log.info("[%s]   -> %s: %s", chat_id, t.type,
+                          str(getattr(t, "display", ""))[:120])
+            if not tools:
+                break
+            # Unlike the web path there is no gateway to be down: these
+            # tools are local. A failing one reports its own failure back
+            # to the model, which is how an agent run behaves too.
+        else:
+            tools = extract_web_tools(full_response)
+            has_gw = gateway_available() if tools else False
+            _log.info("[%s] Tool extraction: found %d tool calls, gateway_up=%s",
+                      chat_id, len(tools), has_gw)
+            if tools:
+                for t in tools:
+                    _log.info("[%s]   → %s: %s", chat_id, t.get("type"), t.get("query") or t.get("ref"))
 
-        if not tools or not has_gw:
-            if tools and not has_gw:
-                _log.warning("[%s] Model emitted tool calls but web gateway unavailable — "
-                             "returning raw response", chat_id)
-            elif not tools and use_web_tools:
-                _log.info("[%s] Model did NOT emit any @search/@web_read calls despite "
-                          "web_tools=true — check system prompt compliance", chat_id)
-            break
+            if not tools or not has_gw:
+                if tools and not has_gw:
+                    _log.warning("[%s] Model emitted tool calls but web gateway unavailable — "
+                                 "returning raw response", chat_id)
+                elif not tools and use_web_tools:
+                    _log.info("[%s] Model did NOT emit any @search/@web_read calls despite "
+                              "web_tools=true — check system prompt compliance", chat_id)
+                break
 
         round_count += 1
-        if round_count > MAX_TOOL_ROUNDS:
-            _log.warning("Max tool rounds (%d) reached — forcing answer", MAX_TOOL_ROUNDS)
+        round_cap = (chat_tools.MAX_TOOL_ROUNDS if full_mode
+                     else MAX_TOOL_ROUNDS)
+        if round_count > round_cap:
+            _log.warning("Max tool rounds (%d) reached — forcing answer", round_cap)
             budget = _get_context_budget(backend, max_tokens or 12288)
             if budget > 0:
                 current_messages = trim_messages_to_context(current_messages, budget)
             current_messages.append({
                 "role": "system",
                 "content": (
-                    "You have used all available research rounds. STOP making tool calls. "
-                    "Answer the user's question NOW using the information you have already "
-                    "gathered. Do NOT output any @search() or @web_read() calls."
+                    "You have used all available tool rounds. STOP calling tools. "
+                    "Answer the user's question NOW using what you have already "
+                    "gathered, and say plainly what you did not get to. Do NOT "
+                    "output any @markers or ```bash```/```python``` blocks."
                 ),
             })
             # One final generation pass with tools disabled
@@ -1255,14 +1334,20 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
         _log.info("[%s] Tool round %d: executing %d tools", chat_id, round_count, len(tools))
 
         # Notify client that tools are executing
-        labels = tool_status_labels(tools)
+        labels = (chat_tools.tool_status_labels(tools) if full_mode
+                  else tool_status_labels(tools))
         yield f"data: {json.dumps({'x_tool_status': labels})}\n\n"
 
         # Execute tools (blocking, but SSE connection stays open)
         try:
-            tool_output = await loop.run_in_executor(
-                None, lambda: execute_web_tools(tools, search_cache)
-            )
+            if full_mode:
+                tool_output = await loop.run_in_executor(
+                    None, lambda: chat_tools.execute_chat_tools(tools, ws)
+                )
+            else:
+                tool_output = await loop.run_in_executor(
+                    None, lambda: execute_web_tools(tools, search_cache)
+                )
             _log.info("[%s] Tool results: %d chars, preview='%s'",
                       chat_id, len(tool_output), tool_output[:200])
         except Exception as e:
@@ -1545,7 +1630,7 @@ def create_app():
             # Runs in the worker's private loop; the engine is already loaded
             # for `model` by _chat_job_prepare above.
             return _stream_with_tools(
-                list(req.messages), model,
+                _inject_vision_prompt(list(req.messages)), model,
                 req.max_tokens or 12288,
                 req.temperature if req.temperature is not None else 0.7,
                 {}, bool(req.web_tools), get_active_backend(),
@@ -1733,6 +1818,7 @@ def create_app():
         # opaque 404s. See _resolve_model_for_request for full behaviour.
         has_images = _messages_have_images(messages)
         model = _resolve_model_for_request(body.model, has_images, backend)
+        messages = _inject_vision_prompt(messages)
 
         # ── Request resource estimation (pre-routing diagnostics) ─────
         from core.request_estimator import estimate_request_requirements

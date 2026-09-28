@@ -137,11 +137,17 @@ def _serialize_event(ev: AgentEvent) -> dict:
 
 
 class AgentRun:
-    def __init__(self, goal: str, folder: str, config: RunConfig):
+    def __init__(self, goal: str, folder: str, config: RunConfig,
+                 requested_ctx: int | None = None):
         self.id = uuid.uuid4().hex[:12]
         self.goal = goal
         self.folder = folder
         self.config = config
+        # What the CALLER asked for: None = "the engine's full window".
+        # Settled against the loaded engine in the worker, because resolving
+        # it here would force a cold model load (30-60 s) inside the POST
+        # handler that is supposed to return a run id immediately.
+        self.requested_ctx = requested_ctx
         self.status = "starting"          # running | awaiting_approval | done | stopped:* | error:*
         self.summary = ""
         self.created = time.time()
@@ -246,16 +252,54 @@ class AgentRun:
                 "finished_at": self.finished_at,
                 "event_count": len(self.events),
                 "pending_approval": self.pending_approval,
+                # What the run actually got, once the engine reported its
+                # loaded window. None until the worker has resolved it.
+                "context_window": self.config.context_window,
+                "max_tokens": self.config.max_tokens,
             }
 
 
 # ── Worker ───────────────────────────────────────────────────────────────
+
+# Used when the request names no context_window AND the engine cannot report
+# its loaded size. Matches the old hard-coded request default.
+_CTX_FALLBACK = 16384
+
+
+def _resolve_context_window(engine, requested: int | None) -> int:
+    """Settle the run's history window against the engine's loaded context.
+
+    Omitted (None) means "all of it" — the point of the 72k split is that the
+    window is usable, and a flat default silently threw two thirds of it
+    away. An explicit request is honoured but clamped: asking for more than
+    is loaded just means the pre-flight trimmer does the clamping later,
+    noisily and per round.
+    """
+    try:
+        loaded = engine.get_context_size() or 0
+    except Exception as e:
+        _log.warning("engine did not report a context size (%s)", e)
+        loaded = 0
+
+    if loaded <= 0:
+        return requested or _CTX_FALLBACK
+    if requested is None:
+        return loaded
+    return min(requested, loaded)
+
 
 def _worker(run: AgentRun, get_engine, goal: str | None = None):
     goal = run.goal if goal is None else goal
     old_cwd = os.getcwd()
     try:
         engine = get_engine()
+        resolved_ctx = _resolve_context_window(engine, run.requested_ctx)
+        if resolved_ctx != run.config.context_window:
+            _log.info("Agent run %s context window: requested=%s -> %d "
+                      "(engine loaded ctx)", run.id,
+                      run.requested_ctx if run.requested_ctx else "full",
+                      resolved_ctx)
+        run.config.context_window = resolved_ctx
 
         def build_system_prompt() -> str:
             # Same prompt stack the Qt GUI uses — the full tool catalog
@@ -377,9 +421,11 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
                         raise HTTPException(
                             status_code=422,
                             detail=f"folder is not usable: {folder} ({e})")
-                run = AgentRun(body.goal, folder, config)
+                run = AgentRun(body.goal, folder, config,
+                               requested_ctx=body.context_window)
             else:
-                run = AgentRun(body.goal, "", config)
+                run = AgentRun(body.goal, "", config,
+                               requested_ctx=body.context_window)
                 run.folder = os.path.join(default_workspace_root, run.id)
                 os.makedirs(run.folder, exist_ok=True)
 
@@ -391,9 +437,14 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
             name=f"agent-run-{run.id}", daemon=True,
         )
         run.thread.start()
-        _log.info("Agent run %s started: autonomy=%s folder=%s goal=%r",
-                  run.id, autonomy.value, run.folder, body.goal[:120])
-        return {"run_id": run.id, "folder": run.folder, "status": run.status}
+        _log.info("Agent run %s started: autonomy=%s folder=%s ctx=%s goal=%r",
+                  run.id, autonomy.value, run.folder,
+                  body.context_window or "full", body.goal[:120])
+        # context_window here is still provisional — the worker settles it
+        # against the loaded engine. Clients wanting the real figure read it
+        # from the snapshot (GET /v1/agent/runs/{id}) once status is running.
+        return {"run_id": run.id, "folder": run.folder, "status": run.status,
+                "requested_context_window": body.context_window}
 
     @app.get("/v1/agent/runs")
     async def list_runs(request: Request):

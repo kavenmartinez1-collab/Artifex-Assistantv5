@@ -1003,7 +1003,8 @@ function capabilitiesNote(webOn) {
 
 CAPABILITIES IN THIS CHAT:
 - Conversation${webOn ? " and web search (see TOOLS)" : " only. Web search is currently toggled OFF in this app's settings; say so if asked to search"}.
-- You have NO access to the user's files, shell, or system state from this chat, and must never simulate command output or guess file contents.` + (phoneToolsFull ? `
+- You have NO access to the user's files, shell, or system state from this chat, and must never simulate command output or guess file contents.
+- Images are the exception: the user can attach photos/screenshots with the paperclip button, and attached images are sent to a vision model that sees them directly. If asked whether you can read images, say yes and ask them to attach one.` + (phoneToolsFull ? `
 - This app's AGENT tab DOES have those tools: it runs commands and reads/writes files on the user's PC, with user approval for risky steps. If the user asks for anything that needs their machine (files, directories, running programs, system info), tell them to switch to the Agent tab and phrase it as a goal.` : `
 - The server is running in web-only mode: there is no agent or file access from this app at all. If asked for anything that needs the user's machine, say the server operator has not enabled those tools.`);
 }
@@ -1076,7 +1077,13 @@ const store = {
     if (ectx !== null) $("engine-ctx").value = ectx;
     $("hist-budget").value = localStorage.getItem("ax_histbudget") || String(DEFAULT_HISTORY_BUDGET);
     if (!$("hist-budget").value) $("hist-budget").value = String(DEFAULT_HISTORY_BUDGET);
-    segSet("agentctx-seg", localStorage.getItem("ax_agentctx") || "16384");
+    // "" is a real stored value (the full-window rung), so test for null
+    // rather than falsiness — `|| "16384"` would turn every saved "full"
+    // back into 16k on the next boot. applyCtxCap() rebuilds this segment
+    // once /v1/models reports the selected model's cap and re-applies the
+    // saved value there; this is just the pre-models default.
+    const actx = localStorage.getItem("ax_agentctx");
+    segSet("agentctx-seg", actx === null ? "" : actx);
     // ax_conv is legacy: transcripts now live on the server. Anything still
     // here is migrated into a session on first boot, then the key is dropped.
     try { legacyConv = JSON.parse(localStorage.getItem(LEGACY_CONV_KEY) || "[]"); } catch (e) {}
@@ -1100,7 +1107,10 @@ function currentEffort() { return segValue("effort-seg", "medium"); }
 function setEffort(v) { segSet("effort-seg", v); }
 function currentAutonomy() { return segValue("autonomy-seg", "guided"); }
 function setAutonomy(v) { segSet("autonomy-seg", v); autonomyHint(); }
-function currentAgentCtx() { return segValue("agentctx-seg", "16384"); }
+// "" = the top rung: send no context_window at all and let the server hand
+// the run the engine's whole loaded window. Tracking the engine beats
+// pinning a number the engine may since have been reloaded away from.
+function currentAgentCtx() { return segValue("agentctx-seg", ""); }
 
 // ── Context rungs ────────────────────────────────────────
 // Launch contexts offered for the engine, and history windows offered for an
@@ -1152,20 +1162,29 @@ function applyCtxCap(cap) {
   sel.appendChild(full);
   sel.value = wantEngine;
 
+  // The top rung carries value "" — "the engine's full loaded window" —
+  // rather than the cap as a number. The cap is what the MODEL can do; the
+  // engine may be loaded at a lower tier (the VRAM gate steps down when a
+  // GPU is busy), and a pinned number would then be silently clamped
+  // server-side. "" always means all of whatever is actually loaded.
   const agentRungs = agentRungsFor(rungs);
+  const agentVals = agentRungs.map((v, i) =>
+    i === agentRungs.length - 1 ? "" : String(v));
   const savedAgent = localStorage.getItem("ax_agentctx");
-  const wantAgent = agentRungs.some(v => String(v) === savedAgent)
+  // Full is the default now. It used to be 16384, which on this box asked a
+  // 72k split for less than a quarter of its window on every single run.
+  const wantAgent = (savedAgent !== null && agentVals.includes(savedAgent))
     ? savedAgent
-    : String(agentRungs.includes(16384) ? 16384 : agentRungs[0]);
+    : "";
   const seg = $("agentctx-seg");
   seg.innerHTML = "";
-  for (const v of agentRungs) {
+  agentRungs.forEach((v, i) => {
     const b = document.createElement("button");
-    b.dataset.v = String(v);
-    b.textContent = ctxLabel(v);
-    if (String(v) === wantAgent) b.classList.add("on");
+    b.dataset.v = agentVals[i];
+    b.textContent = ctxLabel(v) + (agentVals[i] === "" ? " full" : "");
+    if (agentVals[i] === wantAgent) b.classList.add("on");
     seg.appendChild(b);
-  }
+  });
 }
 
 const AUTONOMY_HINTS = {
@@ -1183,7 +1202,9 @@ document.querySelectorAll("#autonomy-seg button").forEach(b =>
 // changes, so a per-button listener would die with the first rebuild.
 $("agentctx-seg").addEventListener("click", e => {
   const b = e.target.closest("button");
-  if (!b || !b.dataset.v) return;
+  // The full rung's value is the empty string, so test for the ATTRIBUTE,
+  // not its truthiness — `!b.dataset.v` would swallow every click on it.
+  if (!b || b.dataset.v === undefined) return;
   segSet("agentctx-seg", b.dataset.v);
   store.save();
 });

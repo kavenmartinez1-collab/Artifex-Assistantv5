@@ -8,8 +8,19 @@ Hooks into the policy engine so file-touching actions (read_file, edit_file,
 shell, python, download, glob, grep) are path-checked before execution.
 
 Configured via:
-  ARTIFEX_SANDBOX_ROOTS  — colon-separated additional allowed roots
+  ARTIFEX_SANDBOX_ROOTS  — colon-separated additional allowed roots, or the
+                           single value "*" for OPEN mode: every resolvable
+                           path is in scope. Open mode is for a single-user
+                           box where the assistant is meant to work across
+                           the whole machine (read any repo, build anywhere);
+                           the deny list below still applies.
   ARTIFEX_SANDBOX_DENY   — colon-separated deny patterns (checked first)
+
+Open mode widens SCOPE only. The sensitive-path deny list below is not
+configurable off: ssh/gpg keys, cloud credentials, .env files and the
+Windows SAM stay unreadable however wide the roots are. "Let it read the
+whole machine" and "let it read the key material on the machine" are
+different requests, and only the first one has a good answer.
 """
 
 import logging
@@ -88,6 +99,19 @@ def is_path_denied(path: str) -> str | None:
 
 # ── Allowed root directories ─────────────────────────────────────────────────
 
+OPEN_ROOTS_SENTINEL = "*"
+
+
+def is_open_scope() -> bool:
+    """True when ARTIFEX_SANDBOX_ROOTS is the open-mode sentinel.
+
+    Read live rather than cached at import: the API process sets this from
+    the launcher's environment, and tests flip it per-case.
+    """
+    return os.environ.get(
+        "ARTIFEX_SANDBOX_ROOTS", "").strip() == OPEN_ROOTS_SENTINEL
+
+
 def _get_allowed_roots() -> list[str]:
     """Build the list of allowed root directories."""
     roots = []
@@ -98,7 +122,7 @@ def _get_allowed_roots() -> list[str]:
     roots.append(os.path.abspath(tempfile.gettempdir()))
 
     extra = os.environ.get("ARTIFEX_SANDBOX_ROOTS", "")
-    if extra:
+    if extra and extra.strip() != OPEN_ROOTS_SENTINEL:
         for part in extra.split(os.pathsep):
             part = part.strip()
             if part and os.path.isabs(part):
@@ -140,10 +164,17 @@ def is_path_within_sandbox(path: str) -> bool:
     Resolves symlinks before the check so a link inside the sandbox pointing
     outside is caught. Uses an exact-or-child check rather than a raw prefix
     match so /x/projEVIL doesn't slip past a /x/proj root.
+
+    In open scope (ARTIFEX_SANDBOX_ROOTS="*") every resolvable path is in
+    scope. A path that will not resolve at all is still rejected — that is a
+    malformed path, not a permission question.
     """
     abs_path = _resolve_path(path)
     if abs_path is None:
         return False
+
+    if is_open_scope():
+        return True
 
     for root in _get_allowed_roots():
         resolved_root = os.path.realpath(root)
@@ -284,4 +315,16 @@ def _fs_sandbox_hook(action_type: str, content: str, risk: RiskLevel):
 def install():
     """Register the filesystem sandbox hook with the policy engine."""
     register_policy_hook(_fs_sandbox_hook)
-    _log.debug("Filesystem sandbox installed")
+    if is_open_scope():
+        # WARNING, not debug: "the agent can touch the whole filesystem" is
+        # not something anyone should have to infer from an env var they
+        # cannot see. One line, at startup, in the log everyone greps first.
+        _log.warning(
+            "Filesystem sandbox: OPEN SCOPE (ARTIFEX_SANDBOX_ROOTS=%s) — "
+            "every path on this machine is in scope for agent and chat "
+            "tools. The sensitive-path deny list (ssh/gpg keys, cloud "
+            "credentials, .env, SAM) is still enforced.",
+            OPEN_ROOTS_SENTINEL)
+    else:
+        _log.debug("Filesystem sandbox installed (roots: %s)",
+                   ", ".join(_get_allowed_roots()))
