@@ -101,6 +101,25 @@ _CRITICAL_SHELL_PATTERNS: list[re.Pattern] = [
     re.compile(r"\bwget\b.*\|\s*(bash|sh)\b", re.IGNORECASE),
     re.compile(r"\breg\s+(delete|add)\b", re.IGNORECASE),
     re.compile(r"\bnet\s+user\b", re.IGNORECASE),
+    # Windows equivalents. Shell actions on Windows run in PowerShell (or cmd
+    # via `cmd /c`), and the Unix-only patterns above let the commands a
+    # Windows model actually writes through as merely HIGH.
+    # PowerShell accepts any unambiguous parameter prefix: -r = -Recurse,
+    # -fo = -Force (-f alone is ambiguous with -Filter, so it never runs).
+    # (?<!-) keeps the `ri` alias from matching flags like `grep -ri`.
+    re.compile(r"(?<!-)\b(remove-item|ri|rmdir|rd|del|erase)\b.*\s-r[a-z]*\b", re.IGNORECASE),
+    re.compile(r"(?<!-)\b(remove-item|ri|del|erase)\b.*\s-fo[a-z]*\b", re.IGNORECASE),
+    re.compile(r"(?<!-)\b(rmdir|rd|del|erase)\b.*\s/[sfq]\b", re.IGNORECASE),
+    re.compile(r"\b(format-volume|clear-disk|initialize-disk|diskpart)\b", re.IGNORECASE),
+    re.compile(r"\b(stop|restart)-computer\b", re.IGNORECASE),
+    re.compile(r"\b(remove-item|remove-itemproperty|set-itemproperty|new-itemproperty)\b.*\bhk(lm|cu|cr|u|cc):", re.IGNORECASE),
+    re.compile(r"\b(iwr|irm|invoke-webrequest|invoke-restmethod|downloadstring)\b.*\|\s*(iex|invoke-expression)\b", re.IGNORECASE),
+    re.compile(r"\b(iex|invoke-expression)\b.*\b(iwr|irm|invoke-webrequest|invoke-restmethod|downloadstring)\b", re.IGNORECASE),
+    re.compile(r"\bset-mppreference\b.*\s-disable", re.IGNORECASE),
+    # Destructive git spellings the --force / --hard patterns above miss.
+    re.compile(r"\bgit\s+push\b.*\s-f\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+push\b.*\s\+\S", re.IGNORECASE),
+    re.compile(r"\bgit\s+clean\b.*\s-[a-z]*f", re.IGNORECASE),
 ]
 
 _MEDIUM_SHELL_PATTERNS: list[re.Pattern] = [
@@ -120,15 +139,28 @@ _SAFE_SHELL_PATTERNS: list[re.Pattern] = [
     re.compile(r"^\s*(node|npm|pip)\s+--version"),
 ]
 
+# The SAFE patterns only look at how a command starts, so anything that can
+# run or write something else disqualifies it: `ls && python x.py`,
+# `echo x > file`, `cat $(...)`, `find . -delete`. Plain pipes are allowed
+# when every stage is itself safe (`git log | head`).
+_SAFE_DISQUALIFIERS = re.compile(
+    r"[;&`>\n]|\|\||\$\(|\s-(exec|execdir|ok|delete)\b", re.IGNORECASE)
+
+
+def _is_safe_shell(command: str) -> bool:
+    if _SAFE_DISQUALIFIERS.search(command):
+        return False
+    return all(any(pat.search(stage) for pat in _SAFE_SHELL_PATTERNS)
+               for stage in command.split("|"))
+
 
 def classify_shell_risk(command: str) -> RiskLevel:
     """Classify a shell command into a risk level based on content analysis."""
     for pat in _CRITICAL_SHELL_PATTERNS:
         if pat.search(command):
             return RiskLevel.CRITICAL
-    for pat in _SAFE_SHELL_PATTERNS:
-        if pat.search(command):
-            return RiskLevel.SAFE
+    if _is_safe_shell(command):
+        return RiskLevel.SAFE
     for pat in _MEDIUM_SHELL_PATTERNS:
         if pat.search(command):
             return RiskLevel.MEDIUM
