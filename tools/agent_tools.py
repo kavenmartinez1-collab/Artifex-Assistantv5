@@ -261,8 +261,52 @@ def get_tool_output_limit(tool_type=None):
         return int(base * _TOOL_LIMIT_RATIOS[tool_type])
     return base
 
-# Cache the last search results so @web_read(N) can reference them.
+# Cache search results so @web_read(N) can reference them.
 _last_search_results = []
+
+# 2026-09-30: number search results across searches instead of restarting at
+# [1] every time. Each @search() used to overwrite the cache, so two searches in
+# one round made @web_read(N) resolve against whichever list ran LAST — agent run
+# b23bad6e17c1 asked for result 4 of its first search (abliterlitics.dev) and
+# fetched drugs.com, result 4 of the second (an off-topic eye-drop list). Results
+# now get fresh numbers ([1]-[8], then [9]-[16], ...) so N is never ambiguous,
+# whatever order searches and reads run in.
+# Revert: ARTIFEX_WEB_READ_PER_SEARCH_NUMBERING=1 (old overwrite-per-search cache).
+_SEARCH_RESULTS_KEEP = 256  # oldest numbers expire past this; read by URL instead
+_search_result_base = 0     # number of _last_search_results[0], minus 1
+
+
+def _per_search_numbering():
+    return os.getenv("ARTIFEX_WEB_READ_PER_SEARCH_NUMBERING", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _remember_search_results(results):
+    """Cache results for @web_read(N); return the number the first one gets."""
+    global _last_search_results, _search_result_base
+    if _per_search_numbering():
+        _last_search_results = list(results)
+        _search_result_base = 0
+        return 1
+    first = _search_result_base + len(_last_search_results) + 1
+    _last_search_results.extend(results)
+    excess = len(_last_search_results) - _SEARCH_RESULTS_KEEP
+    if excess > 0:
+        del _last_search_results[:excess]
+        _search_result_base += excess
+    return first
+
+
+def _lookup_search_result(n):
+    """Return (result, None) for result number n, or (None, error message)."""
+    if not _last_search_results:
+        return None, "No search results cached. Run @search(\"query\") first."
+    idx = n - 1 - _search_result_base
+    if 0 <= idx < len(_last_search_results):
+        return _last_search_results[idx], None
+    if 0 < n <= _search_result_base:
+        return None, f"Result {n} has expired. Pass its URL to @web_read instead."
+    last = _search_result_base + len(_last_search_results)
+    return None, f"Invalid result number {n}. Valid results are {_search_result_base + 1}-{last}."
 
 
 def _extract_fenced_blocks(text, languages, validate=None):
@@ -1149,12 +1193,12 @@ def run_web_search(query, max_results=8):
         ok, data = _gateway_post("/search", {"query": query, "max_results": max_results})
         if ok and data.get("results"):
             gw_results = data["results"]
-            _last_search_results = [
+            first = _remember_search_results([
                 {"title": r.get("title", ""), "url": r.get("url", ""), "body": r.get("snippet", "")}
                 for r in gw_results
-            ]
+            ])
             lines = []
-            for i, r in enumerate(gw_results, 1):
+            for i, r in enumerate(gw_results, first):
                 lines.append(f"[{i}] {r.get('title', 'No title')}")
                 lines.append(f"    {r.get('url', '')}")
                 snippet = r.get("snippet", "")
@@ -1178,20 +1222,21 @@ def run_web_search(query, max_results=8):
 
     # --- Layer 3: Both failed ---
     if not results:
-        _last_search_results = []
+        if _per_search_numbering():
+            _last_search_results = []
         return True, (
             "No results found. DuckDuckGo may be rate-limiting requests.\n"
             "Try again in a minute, or try a different/simpler query."
         )
 
     # --- Format results (same as before) ---
-    _last_search_results = [
+    first = _remember_search_results([
         {"title": r.get("title", ""), "url": r.get("href", ""), "body": r.get("body", "")}
         for r in results
-    ]
+    ])
 
     lines = []
-    for i, r in enumerate(results, 1):
+    for i, r in enumerate(results, first):
         lines.append(f"[{i}] {r.get('title', 'No title')}")
         lines.append(f"    {r.get('href', '')}")
         body = r.get("body", "")
@@ -1670,26 +1715,23 @@ def run_web_read(ref):
     """
     Fetch a web page and extract its main text content.
 
-    ref: a URL string, or a number N referencing the Nth result from the last @search().
+    ref: a URL string, or a result number N as printed by @search() (numbering
+         continues across searches, so N is unique).
     Returns (success, output) tuple.
 
     When the web gateway is available, content is fetched and sanitized through
     the gateway (trafilatura extraction, prompt injection detection).
     Falls back to direct fetch for non-Docker use.
     """
-    global _last_search_results
-
     # Resolve reference — number means search result index
     url = None
     title = None
     if ref.isdigit():
-        idx = int(ref) - 1
-        if idx < 0 or idx >= len(_last_search_results):
-            if not _last_search_results:
-                return False, "No search results cached. Run @search(\"query\") first."
-            return False, f"Invalid result number {ref}. Last search had {len(_last_search_results)} results."
-        url = _last_search_results[idx]["url"]
-        title = _last_search_results[idx]["title"]
+        hit, err = _lookup_search_result(int(ref))
+        if err:
+            return False, err
+        url = hit["url"]
+        title = hit["title"]
     else:
         url = ref.strip()
 

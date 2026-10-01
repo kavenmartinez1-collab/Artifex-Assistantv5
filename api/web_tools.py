@@ -145,12 +145,17 @@ def gateway_post(endpoint: str, payload: dict) -> tuple[bool, dict | str]:
 
 # ── Tool execution ───────────────────────────────────────────────────────────
 
+def _per_search_numbering() -> bool:
+    return os.getenv("ARTIFEX_WEB_READ_PER_SEARCH_NUMBERING", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def execute_web_tools(tools: list[dict], search_cache: list[dict]) -> str:
     """Execute a list of web tool calls and return combined results.
 
     Args:
         tools: List of tool dicts from extract_web_tools()
-        search_cache: Mutable list that stores the last search results
+        search_cache: Mutable list of this request's search results, numbered
+                      continuously across searches,
                       for @web_read(N) index lookups. Modified in-place.
     """
     results = []
@@ -162,11 +167,19 @@ def execute_web_tools(tools: list[dict], search_cache: list[dict]) -> str:
             if ok:
                 sr = data.get("results", [])
                 _log.info("Search returned %d results for '%s'", len(sr), tool["query"])
-                # Update search cache for @web_read(N) references
-                search_cache.clear()
+                # Update search cache for @web_read(N) references.
+                # 2026-09-30: append and keep numbering ([9]-[16] for the
+                # second search) instead of clearing — a clear made N resolve
+                # against whichever search ran last, so two searches in one
+                # round fetched the wrong page (see tools/agent_tools.py,
+                # _remember_search_results). Revert:
+                # ARTIFEX_WEB_READ_PER_SEARCH_NUMBERING=1.
+                if _per_search_numbering():
+                    search_cache.clear()
+                first = len(search_cache) + 1
                 search_cache.extend(sr)
                 lines = []
-                for i, r in enumerate(sr, 1):
+                for i, r in enumerate(sr, first):
                     lines.append(f"[{i}] {r.get('title', 'No title')}")
                     lines.append(f"    {r.get('url', '')}")
                     snippet = r.get("snippet", "")
@@ -191,7 +204,7 @@ def execute_web_tools(tools: list[dict], search_cache: list[dict]) -> str:
                     if not search_cache:
                         result = "No search results cached. Use @search(\"query\") first."
                     else:
-                        result = f"Invalid result number {ref}. Last search had {len(search_cache)} results."
+                        result = f"Invalid result number {ref}. Valid results are 1-{len(search_cache)}."
                     results.append(f"[Web page content]\n{result}")
                     continue
                 url = search_cache[idx].get("url", "")
