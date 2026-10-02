@@ -765,6 +765,7 @@ The engine starts `llama-server` on the configured port, waits for it to become 
 | `num_gpu_layers` | GPU layers to offload (99 = all) |
 | `num_ctx` | Context window size (auto-sized from VRAM if omitted) |
 | `health_timeout` | Seconds to wait for `/health` to return OK after spawn (default 120; raise for large quants on slow disks) |
+| `reasoning_effort` | Default thinking budget for requests that don't set one: `low` / `medium` / `high` / `xhigh`, or `none` to leave the chat template's own default (Qwen3.8's is `xhigh`). Overrides `ARTIFEX_REASONING_EFFORT`. |
 | `extra_flags` | Additional CLI flags passed to llama-server (see table below) |
 
 #### Extra flags reference
@@ -1622,6 +1623,7 @@ See [LEARNING.md](LEARNING.md) for a deep-dive walkthrough of the architecture, 
 | `ARTIFEX_EGRESS_ALLOW` | *(none)* | Comma-separated allowed domains (for `allowlist` mode). |
 | `ARTIFEX_EGRESS_DENY` | *(none)* | Comma-separated blocked domains (for `denylist` mode). |
 | `ARTIFEX_HEALTH_TIMEOUT` | `120` | Seconds to wait for llama-server health check. |
+| `ARTIFEX_REASONING_EFFORT` | `medium` | Reasoning effort for llama.cpp thinking requests that don't choose one (Qwen3.8's template would otherwise use `xhigh`). `none` sends nothing. A model entry's `reasoning_effort` key and a per-request `options.reasoning_effort` take precedence. |
 | `ARTIFEX_MAX_CMD_TIMEOUT` | `300` | Max seconds for agent shell command execution. |
 | `ARTIFEX_GATE_INTERVAL` | `5` | Pause for human review every N agent rounds (0 = disabled). |
 | `ARTIFEX_GATE_MAX_ACTIONS` | `25` | Max total actions per session before mandatory pause. |

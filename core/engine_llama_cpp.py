@@ -27,6 +27,15 @@ DEFAULT_HEALTH_TIMEOUT = 120
 HEALTH_TIMEOUT = int(os.environ.get("ARTIFEX_HEALTH_TIMEOUT", DEFAULT_HEALTH_TIMEOUT))
 HEALTH_POLL_INTERVAL = 0.5
 
+# Reasoning effort sent with thinking requests whose caller didn't choose one.
+# Qwen3.8's template defaults to "xhigh"; on real Artifex coding tasks (bench,
+# 2026-10-01) medium solved 6 of 6 in 2-5K tokens, while xhigh solved 0 of 2
+# runs of the same bug report after ~20 min each, reasoning its way to a
+# confident wrong fix.  Templates that don't read the variable ignore it.
+# Override with ARTIFEX_REASONING_EFFORT ("none" sends nothing, leaving the
+# template's own default) or a model entry's "reasoning_effort" key.
+DEFAULT_REASONING_EFFORT = "medium"
+
 _KV_QUANT_BPE = {
     "f16": 2.0, "f32": 4.0,
     "q8_0": 1.0625, "q4_0": 0.5625, "q4_1": 0.625,
@@ -229,6 +238,8 @@ class LlamaCppEngine(BaseEngine):
         # (None) maps biggest share → biggest-VRAM card, which matches how
         # split ratios are chosen in practice.
         self._split_gpu_indices = model_config.get("split_gpu_indices")
+        # Per-model default reasoning effort; see DEFAULT_REASONING_EFFORT.
+        self._configured_reasoning_effort = model_config.get("reasoning_effort")
         # Per-device VRAM requirements of the last gate pass, for the
         # launch-retry path: [(pool_device_index, needed_mb)].
         self._gate_requirements: list = []
@@ -320,6 +331,19 @@ class LlamaCppEngine(BaseEngine):
             elif flag == "-ctv" and i + 1 < len(flags):
                 bpe_v = _KV_QUANT_BPE.get(flags[i + 1], 2.0)
         return bpe_k, bpe_v
+
+    def _default_reasoning_effort(self):
+        """Effort for thinking requests that don't set one, or None.
+
+        Model entry "reasoning_effort" > $ARTIFEX_REASONING_EFFORT >
+        DEFAULT_REASONING_EFFORT.  "none" (or empty) sends nothing, which
+        leaves the chat template's own default in charge.
+        """
+        value = self._configured_reasoning_effort
+        if value is None:
+            value = os.environ.get("ARTIFEX_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
+        value = (value or "").strip().lower()
+        return None if value in ("", "none") else value
 
     def _get_kv_quant_str(self) -> str:
         """KV quant type name from -ctk in extra_flags. Defaults to 'f16'."""
@@ -1035,7 +1059,8 @@ class LlamaCppEngine(BaseEngine):
         reasoning_effort ("low"/"medium"/"high"/"xhigh") rides along in
         chat_template_kwargs for templates that read it.  It only applies
         when thinking is on — with enable_thinking=False there is no think
-        block to budget.
+        block to budget.  When the caller passes none, the model's default
+        applies (_default_reasoning_effort: "medium" unless configured).
         """
         from core.sampling import DEFAULT_SAMPLING, SAMPLING_PAYLOAD_KEYS
 
@@ -1079,13 +1104,14 @@ class LlamaCppEngine(BaseEngine):
             # leaking raw <think>...</think> into the response.
             payload["chat_template_kwargs"] = {"enable_thinking": False}
             payload["reasoning_format"] = "none"
-        elif reasoning_effort:
+        elif reasoning_effort or self._default_reasoning_effort():
             # Qwen3.8's template defaults reasoning effort to "xhigh", which
             # can deliberate unboundedly on hard structured tasks (measured:
             # 16K reasoning tokens with no answer emitted).  Callers bound it
-            # per request with options.reasoning_effort.
+            # per request with options.reasoning_effort; everyone else gets
+            # the model's default rather than the template's.
             payload["chat_template_kwargs"] = {
-                "reasoning_effort": reasoning_effort,
+                "reasoning_effort": reasoning_effort or self._default_reasoning_effort(),
             }
         if max_tokens and max_tokens > 0:
             payload["max_tokens"] = max_tokens

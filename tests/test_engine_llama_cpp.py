@@ -208,9 +208,10 @@ class TestEnableThinking(unittest.TestCase):
         call_args = mock_urlopen.call_args
         req = call_args[0][0]
         body = json.loads(req.data.decode())
-        # Thinking enabled: no chat_template_kwargs, no reasoning_format override.
+        # Thinking enabled: no enable_thinking injection and no reasoning_format
+        # override; only the default reasoning effort rides along.
         self.assertEqual(body["messages"][0]["content"], "Be helpful.")
-        self.assertNotIn("chat_template_kwargs", body)
+        self.assertNotIn("enable_thinking", body.get("chat_template_kwargs", {}))
         self.assertNotIn("reasoning_format", body)
 
     @patch("core.engine_llama_cpp.urllib.request.urlopen")
@@ -241,10 +242,8 @@ class TestEnableThinking(unittest.TestCase):
         # Thinking is still on — no reasoning_format override.
         self.assertNotIn("reasoning_format", body)
 
-    @patch("core.engine_llama_cpp.urllib.request.urlopen")
-    def test_reasoning_effort_omitted_by_default(self, mock_urlopen):
-        """No reasoning_effort argument leaves the payload untouched."""
-        engine = self._make_engine()
+    def _stream_body(self, engine, **kwargs):
+        """Run generate_streaming against a mocked server; return the request body."""
         mock_resp = MagicMock()
         mock_resp.__enter__ = MagicMock(return_value=mock_resp)
         mock_resp.__exit__ = MagicMock(return_value=False)
@@ -252,18 +251,37 @@ class TestEnableThinking(unittest.TestCase):
             b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n',
             b'data: [DONE]\n',
         ]))
-        mock_urlopen.return_value = mock_resp
+        with patch("core.engine_llama_cpp.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+            engine.generate_streaming([{"role": "user", "content": "hi"}],
+                                      max_tokens=100, temperature=0.7, **kwargs)
+        return json.loads(mock_urlopen.call_args[0][0].data.decode())
 
-        engine.generate_streaming(
-            [{"role": "user", "content": "hi"}],
-            max_tokens=100, temperature=0.7,
-            enable_thinking=True,
-        )
+    def test_default_reasoning_effort_is_medium(self):
+        """Without a caller choice, thinking requests are bounded at medium
+        instead of the template's xhigh."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ARTIFEX_REASONING_EFFORT", None)
+            body = self._stream_body(self._make_engine(), enable_thinking=True)
+        self.assertEqual(body["chat_template_kwargs"], {"reasoning_effort": "medium"})
 
-        call_args = mock_urlopen.call_args
-        req = call_args[0][0]
-        body = json.loads(req.data.decode())
+    def test_reasoning_effort_env_override_and_none(self):
+        """$ARTIFEX_REASONING_EFFORT replaces the default; "none" sends nothing."""
+        with patch.dict(os.environ, {"ARTIFEX_REASONING_EFFORT": "low"}):
+            body = self._stream_body(self._make_engine(), enable_thinking=True)
+        self.assertEqual(body["chat_template_kwargs"], {"reasoning_effort": "low"})
+        with patch.dict(os.environ, {"ARTIFEX_REASONING_EFFORT": "none"}):
+            body = self._stream_body(self._make_engine(), enable_thinking=True)
         self.assertNotIn("chat_template_kwargs", body)
+
+    def test_reasoning_effort_model_config_and_request_precedence(self):
+        """A model entry's reasoning_effort beats the env; an explicit request beats both."""
+        engine = self._make_engine()
+        engine._configured_reasoning_effort = "xhigh"
+        with patch.dict(os.environ, {"ARTIFEX_REASONING_EFFORT": "low"}):
+            body = self._stream_body(engine, enable_thinking=True)
+            self.assertEqual(body["chat_template_kwargs"], {"reasoning_effort": "xhigh"})
+            body = self._stream_body(engine, enable_thinking=True, reasoning_effort="medium")
+            self.assertEqual(body["chat_template_kwargs"], {"reasoning_effort": "medium"})
 
     @patch("core.engine_llama_cpp.urllib.request.urlopen")
     def test_reasoning_effort_does_not_clobber_disabled_thinking(self, mock_urlopen):
