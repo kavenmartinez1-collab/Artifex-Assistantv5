@@ -82,6 +82,9 @@ Modelfile
 Modelfile.*
 !Modelfile.example
 llama_cpp_config.json
+llama_cpp_config.json.bak*
+llama_cpp_config.*.json
+!llama_cpp_config.example.json
 claude_cli_config.json
 
 # ── Debug output and session notes (personal, not project code) ───

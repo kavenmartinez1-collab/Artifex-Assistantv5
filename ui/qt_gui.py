@@ -452,6 +452,13 @@ class ArtifexMainWindow(QMainWindow):
         )
         bg_layout.addWidget(self._model_help_btn)
 
+        self._models_btn = QPushButton("Models...")
+        self._models_btn.setProperty("class", "secondary")
+        self._models_btn.setToolTip(
+            "Every model this PC can reach: ready, found but not configured, or broken"
+        )
+        bg_layout.addWidget(self._models_btn)
+
         layout.addWidget(backend_group)
 
         # Optimizations
@@ -892,6 +899,7 @@ class ArtifexMainWindow(QMainWindow):
         self._model_combo.currentTextChanged.connect(self._on_model_changed)
         self._ctx_btn.clicked.connect(self._on_ctx_toggle)
         self._model_help_btn.clicked.connect(self._on_help_choose_model)
+        self._models_btn.clicked.connect(self._on_models_dialog)
 
         # Optimizations
         self._torch_compile_cb.toggled.connect(
@@ -1017,6 +1025,19 @@ class ArtifexMainWindow(QMainWindow):
         layout.addWidget(buttons)
 
         dlg.exec()
+
+    def _on_models_dialog(self):
+        from ui.qt_models_dialog import ModelsDialog
+
+        dlg = ModelsDialog(self)
+        dlg.exec()
+        if dlg.changed:  # a new config entry: show it in the model dropdown
+            current = self._model_combo.currentText()
+            self._model_combo.blockSignals(True)
+            self._model_combo.clear()
+            self._model_combo.addItems(get_model_names())
+            self._model_combo.setCurrentText(current)
+            self._model_combo.blockSignals(False)
 
     # ═══════════════════════════════════════════════════════════════════
     # MODE SWITCHING

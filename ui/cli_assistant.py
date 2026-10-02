@@ -315,6 +315,68 @@ class _ConsoleHost:
         return Decision.APPROVE if ans in ("y", "yes") else Decision.DENY
 
 
+_last_inventory: list = []   # the numbered list the last /models printed
+
+
+def _models_command(args: str):
+    """/models: list every reachable model. /models add <#> [name] [ctx]: add one."""
+    from core import model_inventory as mi
+    global _last_inventory
+    parts = args.split()
+    if not parts:
+        inv = mi.scan()
+        order = {"broken": 0, "unconfigured": 1, "ready": 2}
+        _last_inventory = sorted(inv["models"], key=lambda m: order.get(m["status"], 3))
+        colors = {"ready": Fore.GREEN, "unconfigured": Fore.YELLOW, "broken": Fore.RED}
+        c = inv["counts"]
+        print(f"{Fore.CYAN}  {c['ready']} ready, {c['unconfigured']} not configured, {c['broken']} broken"
+              f"{Style.RESET_ALL}")
+        for i, m in enumerate(_last_inventory, 1):
+            name = m.get("id") or os.path.basename(m.get("path") or "")
+            ctx = m.get("num_ctx") or m.get("native_ctx")
+            extra = "  ".join(x for x in (
+                m.get("family") or "", f"ctx {ctx // 1024}k" if ctx else "",
+                f"{m['size_bytes'] / 1e9:.1f} GB" if m.get("size_bytes") else "",
+                "vision" if m.get("vision") else "") if x)
+            print(f"  {i:2}. {colors.get(m['status'], '')}{m['status']:12}{Style.RESET_ALL} "
+                  f"{name}  [{m.get('backend')}]  {extra}")
+            for note in (m.get("problems") or []) + (m.get("warnings") or []):
+                print(f"      {Fore.YELLOW}{note}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}  Add one: /models add <#> [name] [ctx]{Style.RESET_ALL}\n")
+        return
+    if parts[0] != "add" or len(parts) < 2 or not parts[1].isdigit():
+        print(f"{Fore.YELLOW}  Usage: /models   or   /models add <#> [name] [ctx]{Style.RESET_ALL}\n")
+        return
+    n = int(parts[1])
+    if not (1 <= n <= len(_last_inventory)) or _last_inventory[n - 1]["status"] != "unconfigured":
+        print(f"{Fore.YELLOW}  #{n} is not an unconfigured model in the last /models list.{Style.RESET_ALL}\n")
+        return
+    try:
+        prop = mi.propose_entry(_last_inventory[n - 1]["path"])
+    except ValueError as e:
+        print(f"{Fore.YELLOW}  {e}{Style.RESET_ALL}\n")
+        return
+    name = parts[2] if len(parts) > 2 else prop["name"]
+    if len(parts) > 3 and parts[3].isdigit():
+        prop["entry"]["num_ctx"] = int(parts[3])
+    print(f"{Fore.CYAN}  New entry '{name}': num_ctx {prop['entry']['num_ctx']} ({prop['ctx_reason']})")
+    for note in prop["notes"]:
+        print(f"    - {note}")
+    for w in prop["warnings"]:
+        print(f"    {Fore.YELLOW}! {w}{Fore.CYAN}")
+    print(f"    flags: {' '.join(prop['entry']['extra_flags'])}{Style.RESET_ALL}")
+    if input(f"{Fore.YELLOW}  Add it to llama_cpp_config.json? [y/N]: {Fore.WHITE}").strip().lower() not in ("y", "yes"):
+        print(f"{Fore.CYAN}  Not added.{Style.RESET_ALL}\n")
+        return
+    try:
+        backup = mi.add_entry(name, prop["entry"])
+    except ValueError as e:
+        print(f"{Fore.YELLOW}  Not added: {e}{Style.RESET_ALL}\n")
+        return
+    print(f"{Fore.CYAN}  Added '{name}'." + (f" Backup: {backup}" if backup else "") + f"{Style.RESET_ALL}\n")
+    _last_inventory = []
+
+
 def run_assistant():
     """Main ASSISTANT agent CLI loop."""
     install_all_hooks()
@@ -339,6 +401,7 @@ def run_assistant():
     print(f"  Session:  /save [name], /load [name|#], /sessions, /export [path]")
     print(f"  Pipeline: /mode <mode>, /attach <file>, /output <dir>")
     print(f"  System:   /backend transformers|ollama|llama_cpp, /ctx <num>, /health, /compile, /turboquant")
+    print(f"  Models:   /models (inventory), /models add <#> [name] [ctx]  (add an unconfigured GGUF)")
     print(f"  Type 'exit' to quit.{Style.RESET_ALL}\n")
 
     # Knowledge manager + workspace setup
@@ -616,6 +679,11 @@ def run_assistant():
                     print(f"    output={p.max_output_tokens} history={p.max_history_tokens} "
                           f"knowledge={p.knowledge_token_budget} tools={p.tool_output_limit}")
                     print(f"  Usage: /context [{profiles}]{Style.RESET_ALL}\n")
+                continue
+
+            # /models — the model inventory, and adding an unconfigured GGUF
+            if user_input.lower().startswith("/models"):
+                _models_command(user_input[7:].strip())
                 continue
 
             # /ctx command — per-model Ollama context window

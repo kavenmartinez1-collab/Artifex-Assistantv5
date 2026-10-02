@@ -1647,6 +1647,13 @@ def create_app():
                                  stream_factory=_chat_job_stream,
                                  session_dir=SESSION_DIR)
 
+    # ─── Model inventory ─────────────────────────────────────────────────
+    # Every reachable model with a ready / unconfigured / broken status.
+    # Reading is open to any authenticated client; writing a new config
+    # entry ("Add with defaults") is a phone full-tools action.
+    from api.inventory_api import register_inventory_routes
+    register_inventory_routes(app, check_auth=_check_auth, allow_write=phone_full_tools)
+
     if phone_full_tools:
         # ─── Workspace files ─────────────────────────────────────────────
         # Browse/read/download/upload, JAILED to the agent-runs area — an

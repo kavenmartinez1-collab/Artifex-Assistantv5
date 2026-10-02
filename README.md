@@ -278,6 +278,7 @@ https://github.com/user-attachments/assets/911f3f29-d70f-402c-960c-1c68f7d2de22
 | `/backend transformers` | Switch to HuggingFace Transformers backend |
 | `/backend ollama` | Switch to Ollama backend |
 | `/backend` | Show current backend and model |
+| `/models` | Model inventory: ready / not configured / broken. `/models add <#> [name] [ctx]` adds an unconfigured GGUF after confirmation |
 | `/context STANDARD` | Switch to standard context profile (lower VRAM) |
 | `/context HIGH` | Switch to high context profile (more tokens, needs 24GB+) |
 | `/workspace <path>` | Set working directory for knowledge base |
@@ -386,6 +387,7 @@ python main_api.py --backend transformers --model qwen3.6-27b --gateway http://l
 |--------|----------|-------------|
 | GET | `/health` | System diagnostics (GPU, VRAM, models, backend, web gateway status) |
 | GET | `/v1/models` | List available models |
+| GET | `/v1/inventory` | Every reachable model with its status (ready / unconfigured / broken) and GGUF metadata |
 | POST | `/v1/chat/completions` | Chat completion (streaming or non-streaming, with optional web tools) |
 | POST | `/v1/images/generations` | Image generation (returns file_id for download) |
 | POST | `/v1/images/edits` | Image editing — img2img, inpaint, upscale |
@@ -796,6 +798,31 @@ The engine starts `llama-server` on the configured port, waits for it to become 
 | 8K + spec-dec | Q4_K_M (16.8 GB) | q8_0 | 8192 | Qwen3.5-4B | ~22 GB |
 
 > **Warning:** Unsloth Dynamic quants (UD-Q4_K_XL, 17.6 GB) are 0.8 GB larger than plain Q4_K_M. Combined with Windows WDDM overhead (~0.4 GB), this causes VRAM spill on 24 GB cards at 256K context. Use plain Q4_K_M for VRAM-tight configs.
+
+#### Model inventory (`/models`, Models... button, phone MODELS panel)
+
+Artifex can list every model it can reach, not just the configured ones. The scan reads each GGUF's header (architecture, native context, MTP layers, sliding window, quant mix) and sorts every model into one of three groups:
+
+| Status | Meaning |
+|--------|---------|
+| ready | Configured, and its model file, `llama-server` and vision projector all exist |
+| not configured | A GGUF found in a model folder with no `llama_cpp_config.json` entry |
+| broken | Configured, but something it needs is missing (the problems are listed) |
+
+The scan looks in the repo's `models/` folder, in the folders of configured entries, and in any extra folders listed under a top-level `"model_dirs": [...]` key. Transformers and Ollama models from discovery are listed too.
+
+**Add with defaults** proposes a config entry for an unconfigured GGUF:
+- Machine flags (`-sm`, `-ts`, `--device`, KV types, `-ub`, `-lm`, ...) are copied from a working entry. Set `"template_entry": "<name>"` to choose which one; otherwise the first entry whose files exist is used.
+- Chat and reasoning flags come from the model family: Qwen hybrid models get MTP drafting when the GGUF has a draft layer, and sliding-window models get `--swa-full`.
+- A projector (`mmproj*.gguf`) in the same folder is wired with `--mmproj`.
+- The context is estimated from the GPUs' total VRAM, the weights and the KV bytes per token.
+
+The proposal, with its reasons and warnings, is always shown first, and the name and context can be edited. Nothing is written until you confirm. A confirmed add backs up the file to `llama_cpp_config.json.bak-<timestamp>` before writing.
+
+- CLI: `/models` lists the inventory, numbered. `/models add <#> [name] [ctx]` proposes an entry and asks y/N.
+- GUI: the **Models...** button.
+- Phone: the **MODELS** panel on the Engine tab. Adding is available only with full phone tools.
+- API: `GET /v1/inventory`, `GET /v1/inventory/proposal?path=...`, and `POST /v1/inventory/add {path, name?, num_ctx?}`. The add route is registered only with full phone tools.
 
 #### Connection resilience
 

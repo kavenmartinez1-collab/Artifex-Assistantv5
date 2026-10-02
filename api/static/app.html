@@ -631,6 +631,18 @@
   .row { display: flex; gap: 10px; }
   .row > * { flex: 1; min-width: 0; }
   .hint { font-size: 11.5px; color: var(--dim); margin-top: 5px; overflow-wrap: anywhere; }
+  /* Model inventory (Settings > MODELS) */
+  .inv-item { border-top: 1px solid var(--border); padding: 9px 0; }
+  .inv-h { display: flex; align-items: center; gap: 8px; }
+  .inv-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .inv-name { flex: 1; font-size: 13px; overflow-wrap: anywhere; }
+  .inv-st { font-size: 10.5px; letter-spacing: 1px; color: var(--dim); text-transform: uppercase; }
+  .inv-note { color: var(--warn); }
+  .inv-prop { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px; margin-top: 8px; }
+  .inv-prop input { width: 100%; }
+  .inv-flags { font-family: var(--mono); font-size: 10.5px; color: var(--dim);
+    overflow-wrap: anywhere; margin-top: 6px; }
   .toggle-row {
     display: flex; align-items: center; justify-content: space-between; gap: 10px;
     background: var(--panel2); border: 1px solid var(--border);
@@ -860,6 +872,12 @@
     </div>
     <button class="btn hidden" id="engine-jump" style="margin-top:8px">Go to the live run</button>
     <div class="hint" id="engine-reload-hint">Reload relaunches llama-server at the chosen context. Smaller = faster prefill; bigger = longer conversations. Takes 30-60 s.</div>
+  </div>
+  <div class="panel">
+    <div class="pt">MODELS</div>
+    <div class="hint" id="inv-summary">Every model the PC can reach: ready, found but not configured, or broken.</div>
+    <button class="btn" style="margin-top:8px" onclick="refreshInventory()">Scan</button>
+    <div id="inv-list"></div>
   </div>
   <div class="panel">
     <div class="pt">REASONING EFFORT</div>
@@ -3100,6 +3118,115 @@ async function reloadEngine() {
   } finally {
     btn.disabled = false;
     btn.textContent = "Reload";
+  }
+}
+
+// ── Model inventory ──────────────────────────────────────
+// GET /v1/inventory lists every model the PC can reach: configured and
+// ready, found in a model folder but not configured, or configured but
+// broken (a file is missing). "Add with defaults" previews the entry the
+// server would write (GET /v1/inventory/proposal), then writes it on
+// confirm (POST /v1/inventory/add, full phone tools only).
+const INV_DOT = { ready: "var(--ok)", unconfigured: "var(--warn)", broken: "var(--err)" };
+const INV_ORDER = { broken: 0, unconfigured: 1, ready: 2 };
+
+async function refreshInventory() {
+  const sum = $("inv-summary"), list = $("inv-list");
+  if (!store.k) { sum.textContent = "Add your API key first."; return; }
+  sum.textContent = "scanning...";
+  try {
+    const r = await fetch("/v1/inventory", { headers: authHeaders() });
+    if (!r.ok) throw new Error(await errText(r));
+    const inv = await r.json();
+    const c = inv.counts || {};
+    sum.textContent = (c.ready || 0) + " ready  -  " + (c.unconfigured || 0) + " not configured  -  " +
+      (c.broken || 0) + " broken";
+    list.innerHTML = "";
+    inv.models.sort((a, b) => (INV_ORDER[a.status] ?? 3) - (INV_ORDER[b.status] ?? 3));
+    for (const m of inv.models) list.appendChild(inventoryRow(m));
+  } catch (e) {
+    sum.textContent = "Inventory unavailable: " + e.message;
+  }
+}
+
+function inventoryRow(m) {
+  const row = document.createElement("div");
+  row.className = "inv-item";
+  const name = m.id || (m.path || "").split(/[\\/]/).pop();
+  const bits = [m.backend];
+  if (m.family) bits.push(m.family);
+  if (m.num_ctx) bits.push("ctx " + Math.round(m.num_ctx / 1024) + "k");
+  else if (m.native_ctx) bits.push("native " + Math.round(m.native_ctx / 1024) + "k");
+  if (m.size_bytes) bits.push((m.size_bytes / 1e9).toFixed(1) + " GB");
+  if (m.vision) bits.push("vision");
+  if (m.mtp) bits.push("MTP");
+  const notes = (m.problems || []).concat(m.warnings || []);
+  row.innerHTML =
+    '<div class="inv-h"><span class="inv-dot" style="background:' + (INV_DOT[m.status] || "var(--dim)") +
+    '"></span><span class="inv-name">' + escapeHtml(name) + '</span><span class="inv-st">' +
+    escapeHtml(m.status === "unconfigured" ? "not configured" : m.status) + "</span></div>" +
+    '<div class="hint">' + escapeHtml(bits.join("  -  ")) + "</div>" +
+    notes.map(n => '<div class="hint inv-note">' + escapeHtml(n) + "</div>").join("");
+  if (m.status === "unconfigured" && m.readable && phoneToolsFull) {
+    const b = document.createElement("button");
+    b.className = "btn";
+    b.style.marginTop = "6px";
+    b.textContent = "Add with defaults...";
+    b.onclick = () => previewAdd(m.path, row, b);
+    row.appendChild(b);
+  }
+  return row;
+}
+
+async function previewAdd(path, row, btn) {
+  btn.disabled = true;
+  btn.textContent = "preparing...";
+  try {
+    const r = await fetch("/v1/inventory/proposal?path=" + encodeURIComponent(path), { headers: authHeaders() });
+    if (!r.ok) throw new Error(await errText(r));
+    const p = await r.json();
+    btn.remove();
+    const box = document.createElement("div");
+    box.className = "inv-prop";
+    box.innerHTML =
+      '<div class="pt">NEW ENTRY</div>' +
+      '<div class="hint">Name</div><input class="inv-n" value="' + escapeHtml(p.name) + '">' +
+      '<div class="hint">Context (num_ctx) - ' + escapeHtml(p.ctx_reason || "") + '</div>' +
+      '<input class="inv-c" type="number" inputmode="numeric" min="2048" step="1024" value="' +
+      (p.entry.num_ctx || "") + '">' +
+      (p.notes || []).map(n => '<div class="hint">' + escapeHtml(n) + "</div>").join("") +
+      (p.warnings || []).map(n => '<div class="hint inv-note">' + escapeHtml(n) + "</div>").join("") +
+      '<div class="inv-flags">' + escapeHtml((p.entry.extra_flags || []).join(" ")) + "</div>" +
+      '<div class="row" style="margin-top:8px"><button class="btn inv-ok">Add</button>' +
+      '<button class="btn inv-cancel">Cancel</button></div><div class="hint inv-msg"></div>';
+    row.appendChild(box);
+    box.querySelector(".inv-cancel").onclick = () => refreshInventory();
+    box.querySelector(".inv-ok").onclick = async () => {
+      const ok = box.querySelector(".inv-ok"), msg = box.querySelector(".inv-msg");
+      ok.disabled = true;
+      msg.textContent = "writing the config...";
+      try {
+        const a = await fetch("/v1/inventory/add", {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ path: path, name: box.querySelector(".inv-n").value.trim(),
+                                 num_ctx: parseInt(box.querySelector(".inv-c").value, 10) || null }),
+        });
+        if (!a.ok) throw new Error(await errText(a));
+        const d = await a.json();
+        msg.textContent = "Added '" + d.name + "'. It is in the model list now.";
+        await loadModels();
+        setTimeout(refreshInventory, 1500);
+      } catch (e) {
+        msg.textContent = "Not added: " + e.message;
+        ok.disabled = false;
+      }
+    };
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = "Add with defaults...";
+    row.appendChild(Object.assign(document.createElement("div"),
+      { className: "hint inv-note", textContent: "Could not prepare the entry: " + e.message }));
   }
 }
 
