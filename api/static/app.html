@@ -1144,6 +1144,7 @@ function currentAgentCtx() { return segValue("agentctx-seg", ""); }
 const CTX_RUNGS = [16384, 32768, 49152, 65536, 98304, 131072, 196608, 262144];
 const AGENT_SEG_MAX = 5;        // buttons a phone-width segmented control fits
 const modelCtxCaps = {};
+const modelVision = {};   // id -> true when /v1/models lists "vision" (llama.cpp: --mmproj)
 function ctxLabel(v) { return Math.round(v / 1024) + "k"; }
 function ctxRungsFor(cap) {
   const rungs = CTX_RUNGS.filter(v => !cap || v <= cap);
@@ -1319,6 +1320,7 @@ async function loadModels() {
     if (m.id === saved) chosen = m.id;
     if (!chosen && m.x_active) chosen = m.id;
     modelCtxCaps[m.id] = m.x_context_length || 0;
+    modelVision[m.id] = (m.x_capabilities || []).includes("vision");
     sel.appendChild(o);
   }
   if (chosen) sel.value = chosen;
@@ -2130,7 +2132,14 @@ async function autoCompact(signal, onStatus) {
 // outgoing request; the session store keeps a "[image]" marker instead (see
 // flattenContent / syncableMessages), so it never approaches its 2 MB cap.
 // ═════════════════════════════════════════════════════════
-const VISION_MODEL = "qwen3.8-27b-vision-vulkan-split";
+// The model a photo is rerouted to when the selected one can't see. Taken
+// from /v1/models, never hardcoded: a renamed config entry used to leave this
+// pointing at a model that no longer existed (400 "not in llama.cpp config").
+// Prefer an entry named *vision* (projector on the GPU), else any vision model.
+function visionFallbackModel() {
+  const ids = Object.keys(modelVision).filter(id => modelVision[id]);
+  return ids.find(id => id.toLowerCase().indexOf("vision") >= 0) || ids[0] || undefined;
+}
 const MAX_IMAGES = 4;
 // How far back trimmedHistory() will still resend a turn's real image data so
 // follow-up questions about a photo keep working. 6 covers roughly three
@@ -2142,6 +2151,9 @@ const IMAGE_QUALITY = 0.85;
 let pendingImages = [];        // downscaled data URLs staged for the next send
 
 function isVisionModel(id) {
+  // A model with a projector (e.g. the uncensored entry) keeps the photo
+  // itself; the name is only a guess for models /v1/models did not list.
+  if (id && id in modelVision) return modelVision[id];
   return String(id || "").toLowerCase().indexOf("vision") >= 0;
 }
 
@@ -2367,7 +2379,7 @@ function buildChatPayload() {
   if (outgoingHasImage && !isVisionModel(selected)) {
     // Non-vision models can't see images — force the vision model for this
     // one request without touching the user's dropdown.
-    model = VISION_MODEL;
+    model = visionFallbackModel() || selected;
     visionOverride = true;
   }
   return {
