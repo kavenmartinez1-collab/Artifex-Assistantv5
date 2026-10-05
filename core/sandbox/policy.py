@@ -146,12 +146,19 @@ _PS_SAFE_HEAD = re.compile(
     r"|sort|measure|ft|fl|fw|group|compare|rvpa|\?)(?=\s|$)",
     re.IGNORECASE)
 
+# Loops whose body is a { script block }: as safe as the block, which
+# inner_regions_safe() checks. The member-name form (`% Delete`, which calls
+# .Delete() on every item) has no block and never matches.
+_PS_LOOP_HEAD = re.compile(
+    r"^\s*(?:(?:foreach-object|%|foreach)\s*\{|foreach\s*\()", re.IGNORECASE)
+
 _SAFE_SHELL_PATTERNS: list[re.Pattern] = [
     re.compile(r"^\s*(ls|dir|pwd|cd|echo|cat|head|tail|type|wc|find|which|where)\b"),
     re.compile(r"^\s*(git\s+(status|log|diff|show|branch\s*$))\b"),
     re.compile(r"^\s*python\s+--version"),
     re.compile(r"^\s*(node|npm|pip)\s+--version"),
     _PS_SAFE_HEAD,
+    _PS_LOOP_HEAD,
 ]
 
 # Read-verb cmdlets that still are not safe to auto-run.
@@ -163,9 +170,16 @@ _UNSAFE_READ_CMDLETS = re.compile(r"^\s*get-credential\b", re.IGNORECASE)
 # `[IO.File]::Delete(...)`, `(gi x).Delete()`. Chains (`;`, `&&`, `|`,
 # newlines) are split by split_shell_segments and every piece is judged on
 # its own, so `ls && python x.py` is unsafe because `python x.py` is.
+# A lone `&` is PowerShell's call operator (`& $cmd`, `& "app.exe"`) or
+# bash's background operator: either way it runs something, so it
+# disqualifies; `&&` only chains and is split like `;`.
 _SAFE_DISQUALIFIERS = re.compile(
-    r"[`>]|\$\(|::|\.[A-Za-z_]\w*\s*\(|\s-(exec|execdir|ok|delete)\b",
+    r"[`>]|\$\(|::|\.[A-Za-z_]\w*\s*\(|\s-(exec|execdir|ok|delete)\b"
+    r"|(?<!&)&(?!&)",
     re.IGNORECASE)
+# Dot-sourcing (`. .\x.ps1`, `. $script`) at the start of a PowerShell
+# statement runs a script in the current scope.
+_PS_DOT_SOURCE = re.compile(r"(?:^|[{(;|])\s*\.\s+\S", re.MULTILINE)
 
 # Words that run or change things when they appear inside a script block or
 # subexpression of an otherwise-safe command (`gci | ? { rm $_ }`).
@@ -312,6 +326,8 @@ def _is_safe_shell(command: str) -> bool:
     powershell = looks_powershell(command)
     if powershell:
         command = _PROPERTY_SUBEXPR_RE.sub("$v", command)
+        if _PS_DOT_SOURCE.search(command):
+            return False
     if _SAFE_DISQUALIFIERS.search(command):
         return False
     segments = split_shell_segments(command)

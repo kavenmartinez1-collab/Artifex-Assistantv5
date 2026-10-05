@@ -148,6 +148,13 @@ class TestPowerShellRisk:
         'Write-Output "Count: $($files.Count)"\n'
         "$files.Name",
         "$items = Get-ChildItem\n$items[0].FullName",
+        # Loops the model wrote in live runs 2b80cb558cad / fc88ee82e088.
+        '$files = Get-ChildItem -Path ".\\scripts" -Filter "*.ps1" -File\n'
+        'Write-Output "Count: $($files.Count)"\n'
+        "foreach ($f in $files) { Write-Output $f.Name }",
+        "$files = Get-ChildItem -Path '.\\scripts' -Filter '*.ps1' -File\n"
+        'Write-Output ("Count: {0}" -f $files.Count)\n'
+        "$files | ForEach-Object { Write-Output $_.Name }",
         # ...and the second live run's variant: a bare string as output.
         "$files = Get-ChildItem -Path '.\\scripts' -Filter '*.ps1' -File\n"
         '"Count: $($files.Count)"\n'
@@ -181,6 +188,16 @@ class TestPowerShellRisk:
         # PowerShell output idioms must not be trusted there.
         'ls && "./evil.sh"',
         "ls\n$CMD",
+        # The call operator and dot-sourcing run things.
+        "$cmd = 'notepad'\n& $cmd",
+        '& "C:\\tools\\app.exe"',
+        "Get-ChildItem | ForEach-Object { & $_ }",
+        "$x = Get-Item a.ps1\n. $x",
+        "Get-ChildItem | ForEach-Object { . $_ }",
+        "Get-ChildItem | % Delete",
+        "foreach ($f in Get-ChildItem) { Remove-Item $f }",
+        "Get-ChildItem | ForEach-Object { $_ | Remove-Item }",
+        "Start-Sleep 30 &",
     ])
     def test_not_safe(self, cmd):
         assert classify_shell_risk(cmd) != RiskLevel.SAFE, cmd
