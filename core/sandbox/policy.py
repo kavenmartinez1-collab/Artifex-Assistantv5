@@ -257,7 +257,19 @@ _LITERAL_RE = re.compile(r"""^\s*(?:-?\d+(?:\.\d+)?|'[^']*'|"[^"$]*"|\$(?:true|f
                          re.IGNORECASE)
 
 
+# A line that only outputs a variable or its properties: `$files.Name`,
+# `$items[0].FullName`. No parentheses allowed, so no method calls.
+_VAR_EXPR_RE = re.compile(r"^\s*\$[A-Za-z_][\w:]*(?:\.[A-Za-z_]\w*|\[[^\]()]*\])*\s*$")
+# `"Count: $($files.Count)"` — a subexpression that only READS a variable
+# or property. Neutralized before the `$(` disqualifier sees it; anything
+# else inside `$(...)` (a command, a method call) still disqualifies.
+_PROPERTY_SUBEXPR_RE = re.compile(
+    r"\$\(\s*\$[A-Za-z_][\w:]*(?:\.[A-Za-z_]\w*|\[\d+\])*\s*\)")
+
+
 def _is_safe_segment(segment: str) -> bool:
+    if _VAR_EXPR_RE.match(segment):
+        return True
     m = _PS_ASSIGN_RE.match(segment)
     if m:
         segment = segment[m.end():]
@@ -271,6 +283,7 @@ def _is_safe_segment(segment: str) -> bool:
 
 
 def _is_safe_shell(command: str) -> bool:
+    command = _PROPERTY_SUBEXPR_RE.sub("$v", command)
     if _SAFE_DISQUALIFIERS.search(command):
         return False
     segments = split_shell_segments(command)

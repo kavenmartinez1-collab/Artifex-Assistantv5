@@ -143,6 +143,11 @@ class TestPowerShellRisk:
         "Get-Date\nGet-Location",
         "$files = Get-ChildItem .\\scripts\n$n = 3\nWrite-Output $files.Count $n",
         "$ErrorActionPreference = 'Stop'\nGet-Item x",
+        # The exact script Qwen3.8 wrote in the first live run after the fix.
+        '$files = Get-ChildItem -Path ".\\scripts" -Filter "*.ps1" -File\n'
+        'Write-Output "Count: $($files.Count)"\n'
+        "$files.Name",
+        "$items[0].FullName",
     ])
     def test_safe(self, cmd):
         assert classify_shell_risk(cmd) == RiskLevel.SAFE, cmd
@@ -164,6 +169,9 @@ class TestPowerShellRisk:
         "$x = Remove-Item y",
         "$x = python evil.py",
         "$x = \"$(rm y)\"",
+        'Write-Output "$($f.Delete())"',
+        'Write-Output "$(Remove-Item y)"',
+        "$f.Delete()",
     ])
     def test_not_safe(self, cmd):
         assert classify_shell_risk(cmd) != RiskLevel.SAFE, cmd
