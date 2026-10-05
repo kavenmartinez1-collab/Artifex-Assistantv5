@@ -257,7 +257,9 @@ def _environment_note() -> str:
         if shutil.which("bash"):
             lines.append(
                 "- Shell blocks: bash syntax runs under Git Bash; PowerShell "
-                "syntax runs under PowerShell. Pick one per block, don't mix.")
+                "syntax runs under PowerShell. Pick one per block, don't mix. "
+                "PowerShell is the native shell here — prefer it and label "
+                "the block ```powershell```.")
         else:
             lines.append(
                 "- Shell blocks run under PowerShell (simple bash-isms are "
@@ -270,6 +272,78 @@ def _environment_note() -> str:
                 "Win32_PhysicalMemory / Win32_LogicalDisk — or `systeminfo`.")
     else:
         lines.append("- Shell blocks run under the system shell (sh/bash).")
+    lines.append(shell_execution_note())
+    return "\n".join(lines)
+
+
+def shell_execution_note() -> str:
+    """How the agent's shell actually behaves — the constraints to plan around.
+
+    Without this the model plans as if it were sitting at a terminal: it
+    tried to "type /rc into the running claude" by piping text into a hidden
+    child process (agent run 6024eea3124b), which no harness can make work.
+    It reasoned correctly that its blocks were one-shot, but nothing told it
+    what it COULD do instead. Facts are detected at call time.
+    """
+    import platform
+    import shutil
+
+    try:
+        from core.sandbox.proc_sandbox import MAX_COMMAND_TIMEOUT
+        timeout = min(300, MAX_COMMAND_TIMEOUT)
+    except Exception:
+        timeout = 300
+    windows = platform.system() == "Windows"
+
+    lines = [
+        "HOW YOUR SHELL WORKS — plan around these facts:",
+        "- Each shell block runs as ONE script in a brand-new, hidden, "
+        "non-interactive process that exits when the script ends. Variables, "
+        "functions, `cd` and loaded types last only for that block — keep "
+        "everything that belongs together in the same block. The next block "
+        "starts fresh in the workspace folder.",
+        "- Your actions run in the order you write them, one after another — "
+        "an ```edit``` block that creates a script can be followed by the "
+        "block that runs it.",
+        "- Nobody can type into your commands: there is no keyboard, no "
+        "terminal (TTY) and stdin is closed. Anything that waits for input "
+        "fails at once. Use non-interactive flags (-Confirm:$false, -Force, "
+        "--yes, a CLI's batch/print mode). Interactive programs (REPLs, TUIs, "
+        "chat CLIs) cannot be driven by piping text into them, and nothing "
+        "you start can be typed into later.",
+        f"- Each block is killed after {timeout} seconds. A program that "
+        "must keep running has to be started detached so it outlives the "
+        "block.",
+        "- Success is judged by the LAST command's exit status — read the "
+        "whole output, an earlier line may have failed.",
+        "- Before using an unfamiliar program, check how it is really invoked "
+        "(`<program> --help`, Get-Help, Get-Command) instead of guessing "
+        "flags or subcommands from memory.",
+    ]
+    if windows:
+        lines.append(
+            "- You run inside the user's logged-in desktop session. "
+            "`Start-Process <program>` opens a normal, VISIBLE window the "
+            "user sees, independent of your hidden process — use it for GUI "
+            "apps, for anything that must keep running, and for opening a "
+            "real terminal: Start-Process powershell -ArgumentList "
+            "'-NoExit','-Command','<command>'. Don't add -NoNewWindow or "
+            "-Wait to those; that ties them back to your process and its "
+            "timeout.")
+        if shutil.which("pwsh"):
+            lines.append("- PowerShell here is PowerShell 7 (pwsh).")
+        else:
+            lines.append(
+                "- PowerShell here is Windows PowerShell 5.1: no `&&` / `||` "
+                "(use `;` or `if ($?) { ... }`), no ternary `? :`, no `??`.")
+        try:
+            import ctypes
+            if not ctypes.windll.shell32.IsUserAnAdmin():
+                lines.append(
+                    "- You are NOT running as administrator. Commands that need "
+                    "elevation fail; say so rather than retrying them.")
+        except Exception:
+            pass
     return "\n".join(lines)
 
 

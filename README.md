@@ -557,6 +557,18 @@ Hard-won notes for this setup:
   policy, and approval flow as the desktop — in `guided` autonomy,
   out-of-sandbox file access becomes an approval prompt on your phone
   instead of a hard denial.
+- Read-only shell commands (`ls`, `git status`, and PowerShell reads like
+  `Get-*`, `Test-Path`, `Select-String`) run without a prompt in `guided`;
+  every piece of a chained command must be read-only for that to apply.
+  **Always** on an approval prompt approves the action and stops asking
+  for the same kind of action for the rest of that run: commands with the
+  same prefix (`git commit`, `Set-Volume`), or edits to the same file.
+  Wrappers and destructive commands (`powershell`, `python`,
+  `Start-Process`, `Remove-*`, `rm`) and multi-line scripts are only
+  remembered exactly. CRITICAL actions always ask. The rules live in
+  memory with the run and are never written to disk.
+- A shell block runs as one script in a fresh, hidden, non-interactive
+  process (stdin closed). Actions run in the order the model wrote them.
 - The first authenticated `/health` after a cold start runs a full
   system scan (seconds); later calls are fast. A 401 from the API means
   it's healthy and wants the key.

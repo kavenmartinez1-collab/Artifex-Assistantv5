@@ -29,6 +29,7 @@ from typing import Callable, List, Optional
 
 from core.prompts import build_autonomous_prompt
 from core.sandbox import check_policy, RiskLevel
+from core.sandbox.approvals import ApprovalMemory
 from core.sandbox.circuit_breaker import CircuitBreaker
 from core.sandbox.human_gate import GateState
 from tools.agent_tools import (
@@ -55,6 +56,10 @@ AUTONOMY_LEVELS = (AutonomyLevel.MANUAL, AutonomyLevel.GUIDED, AutonomyLevel.FUL
 
 class Decision(str, Enum):
     APPROVE = "approve"   # run this action / continue past the pause
+    # Run it, and don't ask again this run for actions the same rule covers
+    # (core.sandbox.approvals). Hosts that never offer it lose nothing:
+    # anywhere it isn't understood it is simply an APPROVE.
+    APPROVE_ALWAYS = "approve_always"
     DENY = "deny"         # skip this action, keep going
     STOP = "stop"         # abort the whole run
 
@@ -223,7 +228,10 @@ class AgentRunner:
     emit                — (AgentEvent) -> None: display sink.
     request_approval    — (action, decision, reason) -> Decision: blocking. For
         per-action prompts action/decision are set; for breaker/gate pauses they
-        are None and `reason` explains. Return APPROVE/DENY/STOP.
+        are None and `reason` explains. Return APPROVE/APPROVE_ALWAYS/DENY/STOP.
+    approvals           — ApprovalMemory holding the "always" rules. Pass the
+        same one across revivals of a run so they survive follow-ups; default
+        is a fresh, empty one per runner.
     """
 
     def __init__(self, engine, *, build_system_prompt: Callable[[], str],
@@ -232,7 +240,8 @@ class AgentRunner:
                  km=None, session_map=None, config: Optional[RunConfig] = None,
                  control: Optional[RunControl] = None,
                  gate: Optional[GateState] = None,
-                 breaker: Optional[CircuitBreaker] = None):
+                 breaker: Optional[CircuitBreaker] = None,
+                 approvals: Optional[ApprovalMemory] = None):
         self.engine = engine
         self.build_system_prompt = build_system_prompt
         self.emit = emit or (lambda e: None)
@@ -243,6 +252,7 @@ class AgentRunner:
         self.control = control or RunControl()
         self.gate = gate if gate is not None else GateState()
         self.breaker = breaker if breaker is not None else CircuitBreaker()
+        self.approvals = approvals if approvals is not None else ApprovalMemory()
         self._round = 0
         self._actions_run = 0
         self._t0 = 0.0
@@ -377,6 +387,13 @@ class AgentRunner:
                                      decision=decision, round=rnd))
 
                 sandbox_approved = False
+                # A person said yes to this action (now, or with "always"
+                # earlier in the run). Such actions don't spend the human
+                # gate's risk budget: the budget exists to make someone look
+                # after N risky UNSUPERVISED actions, and in Guided mode it
+                # used to trip after four commands the user had approved one
+                # by one (run 6024eea3124b: "risk budget exhausted 16/15").
+                human_ok = False
                 if not decision.allowed:
                     # Outside-sandbox (scope) blocks become approval prompts
                     # when a human is supervising — the protection is the
@@ -401,7 +418,9 @@ class AgentRunner:
                         outputs.append(f"[skipped by user] {action.display}")
                         deferred_done_ok = False
                         continue
-                    sandbox_approved = True
+                    # "Always" on an out-of-scope prompt approves this one
+                    # only: scope widening is not something to remember.
+                    sandbox_approved = human_ok = True
 
                 # Circuit breaker — catch runaway loops before executing.
                 trip = self.breaker.check_and_trip()
@@ -412,15 +431,29 @@ class AgentRunner:
                     self.breaker.acknowledge()
 
                 if not sandbox_approved and self._needs_approval(action, decision):
-                    self.emit(AgentEvent("approval_required", action=action,
-                                         decision=decision, round=rnd))
-                    dec = self.request_approval(action, decision, "")
-                    if dec == Decision.STOP:
-                        return self._finish("stopped:user", history)
-                    if dec == Decision.DENY:
-                        outputs.append(f"[skipped by user] {action.display}")
-                        deferred_done_ok = False
-                        continue
+                    remembered = self.approvals.covers(action, decision)
+                    if remembered:
+                        self.emit(AgentEvent(
+                            "auto_approved", action=action, decision=decision,
+                            reason=f"you approved {remembered} earlier in this run",
+                            round=rnd))
+                    else:
+                        self.emit(AgentEvent("approval_required", action=action,
+                                             decision=decision, round=rnd))
+                        dec = self.request_approval(action, decision, "")
+                        if dec == Decision.STOP:
+                            return self._finish("stopped:user", history)
+                        if dec == Decision.DENY:
+                            outputs.append(f"[skipped by user] {action.display}")
+                            deferred_done_ok = False
+                            continue
+                        if dec == Decision.APPROVE_ALWAYS:
+                            rules = self.approvals.remember(action)
+                            self.emit(AgentEvent(
+                                "approval_remembered", action=action, round=rnd,
+                                text="Won't ask again this run for: "
+                                     + "; ".join(rules)))
+                    human_ok = True
 
                 self.emit(AgentEvent("action_started", action=action, round=rnd))
                 try:
@@ -441,7 +474,8 @@ class AgentRunner:
                     self.breaker.record_failure(action.content)
                     consecutive_failures += 1
                     deferred_done_ok = False
-                self.gate.record_action(decision.risk_level)
+                self.gate.record_action(
+                    RiskLevel.SAFE if human_ok else decision.risk_level)
 
                 if self.km:
                     self._safe(lambda: self.km.process_tool_result(

@@ -171,6 +171,28 @@ def _is_bash_syntax(command):
     return False
 
 
+# Syntax only PowerShell writes. Checked BEFORE the bash heuristics: a
+# PowerShell script whose first line happens to be `echo ...`, or that
+# mentions `2>&1`, is still PowerShell, and Git Bash would choke on its
+# `$var = ...` lines. (Shell blocks now run whole, so one bash-looking line
+# no longer gets to decide for a whole script by accident.)
+_PS_SYNTAX_RE = re.compile(
+    r"\b(?:Get|Set|New|Remove|Add|Start|Stop|Test|Invoke|Select|Where|ForEach"
+    r"|Out|Write|Format|Measure|Sort|Resolve|Join|Split|Import|Export"
+    r"|ConvertTo|ConvertFrom|Copy|Move|Rename|Clear|Wait|Restart|Register"
+    r"|Unregister|Enable|Disable|Install|Uninstall|Update|Expand|Compress"
+    r"|Read|Show|Push|Pop|Group|Compare|Tee)-[A-Z][A-Za-z]+\b"
+    r"|\[[A-Za-z_][\w.]*\]::"            # [Type]::Member
+    r"|@[\"']\s*$"                        # here-string opener
+    r"|^\s*\$[A-Za-z_][\w:]*\s*[+\-]?=(?!=)"  # $var = ...
+    r"|-ComObject\b|\$env:|\$_\b|\$PSScriptRoot\b",
+    re.MULTILINE)
+
+
+def _looks_powershell(command):
+    return bool(_PS_SYNTAX_RE.search(command))
+
+
 def _bash_to_powershell(command):
     """Quick-translate the most common bash patterns to PowerShell."""
     cmd = command
@@ -322,6 +344,9 @@ def _extract_fenced_blocks(text, languages, validate=None):
     is tried in order and the first whose content validates wins; if none
     validates, the first fence is used (legacy behavior, so genuinely
     broken code still surfaces its own error).
+
+    Returns (offset, content) pairs; offset is where the fence starts, so
+    callers can run actions in the order they were written.
     """
     blocks = []
     pos = 0
@@ -361,7 +386,7 @@ def _extract_fenced_blocks(text, languages, validate=None):
         if close is None:
             close = candidates[0]
 
-        blocks.append(text[content_start:close])
+        blocks.append((fence_start, text[content_start:close]))
         pos = close + 3
     return blocks
 
@@ -457,14 +482,21 @@ def _strip_inline_code(text):
     documentation, not a call. Fenced ``` blocks are preserved untouched
     (shell/python/edit extraction and the marker-recovery path depend on
     their contents).
+
+    Length-preserving (blanked spans become spaces) so match offsets in the
+    result are offsets in the original response — actions are ordered by
+    where they were written.
     """
+    def _blank(m, keep):
+        return keep + " " * (len(m.group(0)) - 2 * len(keep)) + keep
+
     out = []
     pos = 0
     while True:
         fence = text.find("```", pos)
         segment = text[pos: fence if fence != -1 else len(text)]
-        segment = re.sub(r"`[^`\n]*`", "``", segment)
-        segment = re.sub(r"\*\*@[^*\n]{0,200}\*\*", "**", segment)
+        segment = re.sub(r"`[^`\n]*`", lambda m: _blank(m, "`"), segment)
+        segment = re.sub(r"\*\*@[^*\n]{0,200}\*\*", lambda m: _blank(m, "**"), segment)
         out.append(segment)
         if fence == -1:
             break
@@ -574,6 +606,7 @@ def _extract_json_tool_calls(response):
 
     Qwen3.x models running under llama-server --jinja are trained on this
     format and occasionally fall back to it despite the @marker prompt.
+    Returns (offset, action) pairs.
     """
     actions = []
     for m in _JSON_TOOL_CALL_RE.finditer(response):
@@ -594,7 +627,7 @@ def _extract_json_tool_calls(response):
             args = {}
         action = _action_from_call(name, args)
         if action:
-            actions.append(action)
+            actions.append((m.start(), action))
     return actions
 
 
@@ -606,6 +639,7 @@ def _extract_xml_tool_calls(response):
     The bare body is only honored for tools whose one required argument is
     unambiguous (_PRIMARY_ARG) — a two-argument tool with no parameter tags
     is left unparsed so the loop nudges instead of guessing.
+    Returns (offset, action) pairs.
     """
     actions = []
     for m in _XML_TOOL_CALL_RE.finditer(response):
@@ -619,7 +653,7 @@ def _extract_xml_tool_calls(response):
                 args = {key: raw}
         action = _action_from_call(name, args)
         if action:
-            actions.append(action)
+            actions.append((m.start(), action))
     return actions
 
 
@@ -637,16 +671,25 @@ def extract_agent_actions(response):
     Markers inside `inline code` spans are documentation, not calls, and are
     ignored (fenced blocks keep their existing semantics).
 
+    Actions come back in the order they were WRITTEN. They used to come back
+    grouped by kind — every shell block, then python, ..., then edits — so a
+    reply that wrote a script with an ```edit``` block and then ran it ran
+    the script first, against a file that did not exist yet (agent run
+    6024eea3124b, round 2).
+
     Returns list of AgentAction tuples.
     """
-    actions = []
+    found = []   # (offset in response, AgentAction)
 
     # Marker regexes run against a normalized copy: inline code spans blanked
     # (backticked mentions stay inert) and native tool-call wrappers folded
     # back into @marker form. Fenced-block extraction uses the raw response.
+    # Every substitution keeps the length, so offsets line up with response.
     marker_text = _strip_inline_code(response)
-    marker_text = _HYBRID_TOOL_CALL_RE.sub(r"@\1(", marker_text)
-    marker_text = marker_text.replace("</tool_call>", "")
+    marker_text = _HYBRID_TOOL_CALL_RE.sub(
+        lambda m: " " * (len(m.group(0)) - len(m.group(1)) - 2) + "@" + m.group(1) + "(",
+        marker_text)
+    marker_text = marker_text.replace("</tool_call>", " " * len("</tool_call>"))
 
     # Tool marker pattern — lines that are @tool(...) calls, not shell commands.
     # Some models (especially Ollama) mistakenly wrap these in code blocks.
@@ -656,55 +699,35 @@ def extract_agent_actions(response):
         r'|view_image|describe_images)\s*\(',
     )
 
-    # --- Shell code blocks (treat entire block as one command for powershell) ---
+    # --- Shell code blocks: the WHOLE block is one script ---
+    # It used to be split into one process per line unless it contained a
+    # `|` or `\`, so `$wsh = New-Object ...` and `$wsh.SendKeys(...)` ran in
+    # separate PowerShells (the variable was gone by line 2) and an Add-Type
+    # here-string ran as five broken one-liners. A block now runs the way it
+    # reads — like a .ps1 or .sh file — and its variables, here-strings,
+    # loops and heredocs all hold together.
     shell_blocks = _extract_fenced_blocks(
-        response, {"bash", "sh", "shell", "console", "cmd", "powershell", "zsh"},
+        response, {"bash", "sh", "shell", "console", "cmd", "powershell", "ps1",
+                   "pwsh", "zsh"},
     )
-    for block in shell_blocks:
-        block = block.strip()
-        if not block:
+    for start, block in shell_blocks:
+        lines = [l for l in block.strip().split("\n") if not _TOOL_MARKER_RE.match(l)]
+        # Copy-paste prompt prefixes ("$ ls", "> dir"). A PowerShell variable
+        # is `$name` — never `$ name` — so this cannot eat one.
+        lines = [re.sub(r"^\s*[$>]\s+", "", l) for l in lines]
+        if not any(_is_likely_command(l.strip()) for l in lines):
             continue
-
-        lines = block.split("\n")
-
-        # Filter out lines that are tool markers (not shell commands)
-        lines = [l for l in lines if not _TOOL_MARKER_RE.match(l)]
-        if not lines:
-            continue
-
-        # Heredocs must survive as ONE command — line-splitting executes the
-        # document BODY as commands (observed: python source fed line-by-line
-        # into PowerShell). The whole block goes to bash, which understands it.
-        if re.search(r"<<-?\s*['\"]?[A-Za-z_]\w*", lines[0]) or any(
-                re.search(r"\bcat\b.*<<-?\s*['\"]?[A-Za-z_]\w*", l) for l in lines):
-            heredoc_block = "\n".join(lines).strip()
-            if heredoc_block:
-                display = lines[0].strip()[:80]
-                actions.append(AgentAction("shell", heredoc_block, display))
-            continue
-
-        # If it's a multi-line pipeline (PowerShell piped command), keep as one
-        # Detect by checking if it's a single logical command with line continuations
-        # or pipes, or if it has multiple independent commands
-        joined = " ".join(l.rstrip("\\").strip() for l in lines)
-
-        # Check if it looks like one piped/continued command
-        if len(lines) > 1 and ("|" in block or "\\" in block):
-            # Multi-line piped command — keep as single command
-            if _is_likely_command(joined):
-                display = joined[:80] + ("..." if len(joined) > 80 else "")
-                actions.append(AgentAction("shell", joined, display))
-        else:
-            # Multiple separate commands
-            for line in lines:
-                line = re.sub(r"^[$#>]\s+", "", line.strip())
-                if _is_likely_command(line):
-                    actions.append(AgentAction("shell", line, line))
+        script = "\n".join(lines).strip()
+        cmd_lines = [l.strip() for l in lines if _is_likely_command(l.strip())]
+        display = cmd_lines[0][:80]
+        if len(cmd_lines) > 1:
+            display += f"  (+{len(cmd_lines) - 1} more lines)"
+        found.append((start, AgentAction("shell", script, display)))
 
     # --- Python code blocks (AST-validated close: content may embed ```) ---
     python_blocks = _extract_fenced_blocks(response, {"python", "py"},
                                            validate=_python_parses)
-    for block in python_blocks:
+    for start, block in python_blocks:
         code = block.strip()
         if not code:
             continue
@@ -713,53 +736,44 @@ def extract_agent_actions(response):
             display = code[:80]
         else:
             display = f"{lines[0]}  ({len(lines)} lines)"
-        actions.append(AgentAction("python", code, display))
+        found.append((start, AgentAction("python", code, display)))
 
     # --- Web search markers ---
-    search_matches = re.findall(r'@search\(["\'](.+?)["\']\)', marker_text)
-    for query in search_matches:
-        actions.append(AgentAction("search", query, f'search: "{query}"'))
+    for m in re.finditer(r'@search\(["\'](.+?)["\']\)', marker_text):
+        query = m.group(1)
+        found.append((m.start(), AgentAction("search", query, f'search: "{query}"')))
 
     # --- File read markers: @read_file("path") or @read_file("path", chunk=N) ---
-    read_file_matches = re.findall(
-        r'@read_file\(["\'](.+?)["\']\s*(?:,\s*chunk\s*=\s*(\d+))?\)',
-        marker_text,
-    )
-    for filepath, chunk in read_file_matches:
+    for m in re.finditer(
+            r'@read_file\(["\'](.+?)["\']\s*(?:,\s*chunk\s*=\s*(\d+))?\)',
+            marker_text):
+        filepath, chunk = m.group(1), m.group(2) or ""
         chunk_num = chunk if chunk else "1"
         content = f"{filepath}|{chunk_num}"
         display = f'read_file: "{filepath}"'
         if chunk:
             display += f" (chunk {chunk})"
-        actions.append(AgentAction("read_file", content, display))
+        found.append((m.start(), AgentAction("read_file", content, display)))
 
     # --- Web read markers: @web_read("url") or @web_read(N) ---
-    web_read_matches = re.findall(
-        r'@web_read\((?:["\'](.+?)["\']|(\d+))\)',
-        marker_text,
-    )
-    for url, num in web_read_matches:
-        ref = url if url else num
-        display = f"web_read: {ref}"
-        actions.append(AgentAction("web_read", ref, display))
+    for m in re.finditer(r'@web_read\((?:["\'](.+?)["\']|(\d+))\)', marker_text):
+        ref = m.group(1) if m.group(1) else m.group(2)
+        found.append((m.start(), AgentAction("web_read", ref, f"web_read: {ref}")))
 
     # --- Download markers: @download("url") or @download("url", "filename") ---
-    download_matches = re.findall(
-        r'@download\(["\'](.+?)["\']\s*(?:,\s*["\'](.+?)["\'])?\)',
-        marker_text,
-    )
-    for dl_url, dl_name in download_matches:
+    for m in re.finditer(
+            r'@download\(["\'](.+?)["\']\s*(?:,\s*["\'](.+?)["\'])?\)',
+            marker_text):
+        dl_url, dl_name = m.group(1), m.group(2) or ""
         content = f"{dl_url}|{dl_name}" if dl_name else dl_url
         fname = dl_name or dl_url.split("/")[-1].split("?")[0] or "file"
-        display = f'download: "{fname}"'
-        actions.append(AgentAction("download", content, display))
+        found.append((m.start(), AgentAction("download", content, f'download: "{fname}"')))
 
     # --- Glob markers: @glob("pattern") or @glob("pattern", "base_dir") or @glob("pattern", "+all") ---
-    glob_matches = re.findall(
-        r'@glob\(["\'](.+?)["\']\s*(?:,\s*["\'](.+?)["\'])?\s*(?:,\s*["\'](.+?)["\'])?\)',
-        marker_text,
-    )
-    for pattern, arg2, arg3 in glob_matches:
+    for m in re.finditer(
+            r'@glob\(["\'](.+?)["\']\s*(?:,\s*["\'](.+?)["\'])?\s*(?:,\s*["\'](.+?)["\'])?\)',
+            marker_text):
+        pattern, arg2, arg3 = m.group(1), m.group(2) or "", m.group(3) or ""
         # arg2 can be a base_dir or "+all" flag; arg3 is optional "+all" if arg2 was a dir
         if arg2.strip().lower() == "+all":
             content = f"{pattern}||+all"
@@ -773,17 +787,15 @@ def extract_agent_actions(response):
         else:
             content = pattern
             display = f'glob: "{pattern}"'
-        actions.append(AgentAction("glob", content, display))
+        found.append((m.start(), AgentAction("glob", content, display)))
 
     # --- Grep markers: @grep("pattern", "path") or @grep("pattern", "path", "flags") ---
-    grep_matches = re.findall(
-        r'@grep\(["\'](.+?)["\']\s*,\s*["\'](.+?)["\']\s*(?:,\s*["\']([^"\']*)["\'])?\)',
-        marker_text,
-    )
-    for pattern, path, flags in grep_matches:
+    for m in re.finditer(
+            r'@grep\(["\'](.+?)["\']\s*,\s*["\'](.+?)["\']\s*(?:,\s*["\']([^"\']*)["\'])?\)',
+            marker_text):
+        pattern, path, flags = m.group(1), m.group(2), m.group(3) or ""
         content = f"{pattern}|{path}|{flags}"
-        display = f'grep: "{pattern}" in {path}'
-        actions.append(AgentAction("grep", content, display))
+        found.append((m.start(), AgentAction("grep", content, f'grep: "{pattern}" in {path}')))
 
     # --- Edit file blocks: ```edit ... ``` ---
     # Format:
@@ -793,7 +805,7 @@ def extract_agent_actions(response):
     #   NEW:
     #   replacement text
     edit_blocks = _extract_fenced_blocks(response, {"edit"})
-    for block in edit_blocks:
+    for start, block in edit_blocks:
         file_m = re.search(r"^FILE:[ \t]*(.+)$", block, re.MULTILINE)
         # \n? before NEW: — an empty OLD (create-file form) is written as
         # "OLD:\nNEW:" with no blank line between them.
@@ -811,70 +823,72 @@ def extract_agent_actions(response):
         content = "\x00".join([path, old_str, new_str])
         preview = old_str.strip()[:50].replace("\n", "↵")
         display = f'edit: {path} ("{preview}...")'
-        actions.append(AgentAction("edit_file", content, display))
+        found.append((start, AgentAction("edit_file", content, display)))
 
     # --- Codebase intelligence markers ---
 
     # @find_symbol("name") or @find_symbol("name", "class")
-    sym_matches = re.findall(
-        r'@find_symbol\(["\'](.+?)["\']\s*(?:,\s*["\'](\w+)["\'])?\)',
-        marker_text,
-    )
-    for name, kind in sym_matches:
+    for m in re.finditer(r'@find_symbol\(["\'](.+?)["\']\s*(?:,\s*["\'](\w+)["\'])?\)',
+                         marker_text):
+        name, kind = m.group(1), m.group(2) or ""
         content = f"{name}|{kind}" if kind else name
         display = f'find_symbol: "{name}"' + (f" ({kind})" if kind else "")
-        actions.append(AgentAction("find_symbol", content, display))
+        found.append((m.start(), AgentAction("find_symbol", content, display)))
 
     # @find_references("symbol")
-    ref_matches = re.findall(r'@find_references\(["\'](.+?)["\']\)', marker_text)
-    for name in ref_matches:
-        actions.append(AgentAction("find_references", name, f'find_references: "{name}"'))
+    for m in re.finditer(r'@find_references\(["\'](.+?)["\']\)', marker_text):
+        name = m.group(1)
+        found.append((m.start(), AgentAction("find_references", name,
+                                             f'find_references: "{name}"')))
 
     # @trace_imports("filepath")
-    imp_matches = re.findall(r'@trace_imports\(["\'](.+?)["\']\)', marker_text)
-    for path in imp_matches:
-        actions.append(AgentAction("trace_imports", path, f'trace_imports: "{path}"'))
+    for m in re.finditer(r'@trace_imports\(["\'](.+?)["\']\)', marker_text):
+        path = m.group(1)
+        found.append((m.start(), AgentAction("trace_imports", path,
+                                             f'trace_imports: "{path}"')))
 
     # @architecture()
-    if re.search(r'@architecture\(\s*\)', marker_text):
-        actions.append(AgentAction("architecture", "", "architecture: project map"))
+    m = re.search(r'@architecture\(\s*\)', marker_text)
+    if m:
+        found.append((m.start(), AgentAction("architecture", "", "architecture: project map")))
 
     # @sysinfo()
-    if re.search(r'@sysinfo\(\s*\)', marker_text):
-        actions.append(AgentAction("sysinfo", "", "sysinfo: machine specs"))
+    m = re.search(r'@sysinfo\(\s*\)', marker_text)
+    if m:
+        found.append((m.start(), AgentAction("sysinfo", "", "sysinfo: machine specs")))
 
     # @view_image("path") or @view_image("path", "question")
-    for path, question in re.findall(
+    for m in re.finditer(
             r'@view_image\(["\'](.+?)["\']\s*(?:,\s*["\'](.+?)["\'])?\s*\)',
             marker_text):
+        path, question = m.group(1), m.group(2) or ""
         content = f"{path}|{question}" if question else path
-        actions.append(AgentAction("view_image", content, f'view_image: "{path}"'))
+        found.append((m.start(), AgentAction("view_image", content, f'view_image: "{path}"')))
 
     # @describe_images("folder") / ("folder", "catalog.md") / (..., "prompt")
-    for folder, out, prompt in re.findall(
+    for m in re.finditer(
             r'@describe_images\(["\'](.+?)["\']\s*(?:,\s*["\'](.*?)["\'])?'
             r'\s*(?:,\s*["\'](.+?)["\'])?\s*\)',
             marker_text):
+        folder, out, prompt = m.group(1), m.group(2) or "", m.group(3) or ""
         content = "|".join([folder, out, prompt]).rstrip("|")
-        actions.append(AgentAction("describe_images", content,
-                                   f'describe_images: "{folder}"'))
+        found.append((m.start(), AgentAction("describe_images", content,
+                                             f'describe_images: "{folder}"')))
 
     # @read_function("filepath", "function_name")
-    read_fn_matches = re.findall(
-        r'@read_function\(["\'](.+?)["\']\s*,\s*["\'](.+?)["\']\)',
-        marker_text,
-    )
-    for fpath, fname in read_fn_matches:
+    for m in re.finditer(
+            r'@read_function\(["\'](.+?)["\']\s*,\s*["\'](.+?)["\']\)',
+            marker_text):
+        fpath, fname = m.group(1), m.group(2)
         content = f"{fpath}|{fname}"
         display = f'read_function: "{fname}" in {os.path.basename(fpath)}'
-        actions.append(AgentAction("read_function", content, display))
+        found.append((m.start(), AgentAction("read_function", content, display)))
 
     # --- Gemma 4 tool call format: <|tool_call>call:func{k:v,...}<tool_call|> ---
-    gemma_tool_calls = re.findall(
-        r'<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>',
-        marker_text, re.DOTALL,
-    )
-    for func_name, args_str in gemma_tool_calls:
+    for m in re.finditer(
+            r'<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>',
+            marker_text, re.DOTALL):
+        func_name, args_str = m.group(1), m.group(2)
         # Parse Gemma 4 arguments: key:<|"|>value<|"|> or key:plain_value
         args = {}
         for key, quoted_val, plain_val in re.findall(
@@ -884,24 +898,24 @@ def extract_agent_actions(response):
 
         # Map to existing action types where possible
         if func_name == "search" and "query" in args:
-            actions.append(AgentAction("search", args["query"],
-                                       f'search: "{args["query"]}"'))
+            action = AgentAction("search", args["query"], f'search: "{args["query"]}"')
         elif func_name == "read_file" and "path" in args:
-            actions.append(AgentAction("read_file", args["path"],
-                                       f'read_file: "{args["path"]}"'))
+            action = AgentAction("read_file", args["path"], f'read_file: "{args["path"]}"')
         else:
             # Generic tool call — display as-is
             display = f'{func_name}({", ".join(f"{k}={v}" for k, v in args.items())})'
-            actions.append(AgentAction("shell", f"# Gemma tool: {display}",
-                                       f"tool: {display}"))
+            action = AgentAction("shell", f"# Gemma tool: {display}", f"tool: {display}")
+        found.append((m.start(), action))
 
     # --- Native JSON tool calls: <tool_call>{"name": ...}</tool_call> ---
-    actions.extend(_extract_json_tool_calls(response))
+    found.extend(_extract_json_tool_calls(response))
 
     # --- Native XML tool calls: <function=name>...</function> ---
-    actions.extend(_extract_xml_tool_calls(response))
+    found.extend(_extract_xml_tool_calls(response))
 
-    return actions
+    # Stable sort: actions at the same offset keep their extraction order.
+    found.sort(key=lambda pa: pa[0])
+    return [action for _, action in found]
 
 
 def _check_dangerous(command):
@@ -990,16 +1004,22 @@ def run_shell_command(command, timeout=300, cwd=None):
     if blocked:
         return False, blocked
 
+    # stdin=DEVNULL everywhere: nothing the agent runs can be typed into —
+    # there is no keyboard on the other end. Without it a command that
+    # prompts (Read-Host, a y/N confirm, an interactive CLI) sat blocked until
+    # the timeout; now the prompt reads EOF and fails at once with an error
+    # the model can act on.
+    ps_file = None
     try:
         if IS_WINDOWS:
-            use_bash = _is_bash_syntax(command)
+            use_bash = (not _looks_powershell(command)) and _is_bash_syntax(command)
 
             if use_bash and _GIT_BASH:
                 # Route bash-style commands through Git Bash
                 result = subprocess.run(
                     [_GIT_BASH, "-c", command],
                     capture_output=True, text=True, timeout=timeout,
-                    cwd=cwd, env=_get_clean_env(),
+                    cwd=cwd, env=_get_clean_env(), stdin=subprocess.DEVNULL,
                     encoding="utf-8", errors="replace",
                 )
             else:
@@ -1014,17 +1034,36 @@ def run_shell_command(command, timeout=300, cwd=None):
                     # python3/pip3 don't exist in a Windows venv Scripts dir —
                     # python3 resolves to the Microsoft Store alias stub.
                     # Shim both onto the venv interpreter.
+                    # $ProgressPreference: progress bars have no console to
+                    # draw on and only add noise to captured output.
+                    # The prelude shares line 1 with the script, so error
+                    # positions ("At line:4") match the lines the model wrote.
                     ps_prelude = (
                         "$PSDefaultParameterValues['Out-File:Encoding']='utf8'; "
                         "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+                        "$ProgressPreference='SilentlyContinue'; "
                         "function python3 { & python @args }; "
                         "function pip3 { & pip @args }; "
                     )
+                    script = ps_prelude + ps_cmd
+                    # The whole multi-line script goes in as ONE -Command
+                    # argument (newlines, quotes and here-strings survive;
+                    # -EncodedCommand would be tidier but turns stderr into
+                    # CLIXML). Past the ~32k Windows command-line limit it
+                    # runs from a temp .ps1 instead.
+                    if len(script) < 24000:
+                        ps_args = [ps_bin, "-NoProfile", "-NonInteractive",
+                                   "-Command", script]
+                    else:
+                        fd, ps_file = tempfile.mkstemp(suffix=".ps1", prefix="artifex_")
+                        with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
+                            f.write(script)
+                        ps_args = [ps_bin, "-NoProfile", "-NonInteractive",
+                                   "-ExecutionPolicy", "Bypass", "-File", ps_file]
                     result = subprocess.run(
-                        [ps_bin, "-NoProfile", "-NonInteractive", "-Command",
-                         ps_prelude + ps_cmd],
+                        ps_args,
                         capture_output=True, text=True, timeout=timeout,
-                        cwd=cwd, env=_get_clean_env(),
+                        cwd=cwd, env=_get_clean_env(), stdin=subprocess.DEVNULL,
                         encoding="utf-8", errors="replace",
                     )
                 else:
@@ -1032,14 +1071,14 @@ def run_shell_command(command, timeout=300, cwd=None):
                     result = subprocess.run(
                         ps_cmd, shell=True,
                         capture_output=True, text=True, timeout=timeout,
-                        cwd=cwd, env=_get_clean_env(),
+                        cwd=cwd, env=_get_clean_env(), stdin=subprocess.DEVNULL,
                         encoding="utf-8", errors="replace",
                     )
         else:
             result = subprocess.run(
                 command, shell=True,
                 capture_output=True, text=True, timeout=timeout,
-                cwd=cwd, env=_get_clean_env(),
+                cwd=cwd, env=_get_clean_env(), stdin=subprocess.DEVNULL,
                 encoding="utf-8", errors="replace",
             )
 
@@ -1055,6 +1094,12 @@ def run_shell_command(command, timeout=300, cwd=None):
         return False, f"Tool not found: {tool_name}. Is it installed and in PATH?"
     except Exception as e:
         return False, f"Execution error: {e}"
+    finally:
+        if ps_file:
+            try:
+                os.remove(ps_file)
+            except OSError:
+                pass
 
 
 def run_python_snippet(code, timeout=30, cwd=None):

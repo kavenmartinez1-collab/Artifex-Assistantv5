@@ -11,7 +11,7 @@ Endpoints (all bearer-authed via the check_auth callable the server passes in):
     GET  /v1/agent/runs                    list runs (newest first)
     GET  /v1/agent/runs/{id}               snapshot: status + pending approval
     GET  /v1/agent/runs/{id}/events        SSE: replay buffered events, then live
-    POST /v1/agent/runs/{id}/approval      {"decision": "approve"|"deny"|"stop"}
+    POST /v1/agent/runs/{id}/approval      {"decision": "approve"|"always"|"deny"|"stop"}
     POST /v1/agent/runs/{id}/message       follow-up: steer live / revive done
     POST /v1/agent/runs/{id}/stop          abort the run
 
@@ -34,7 +34,10 @@ Design notes:
   the same content in aggregate.
 
 - request_approval blocks the worker thread on a queue. The client answers
-  via POST .../approval; a stop request unblocks it with Decision.STOP. No
+  via POST .../approval; a stop request unblocks it with Decision.STOP.
+  "always" approves AND remembers a rule for the rest of the run
+  (core.sandbox.approvals) — in memory on the AgentRun, so it survives
+  follow-up revivals and disappears with the run; nothing is persisted. No
   timeout: an unanswered prompt holds the run in "awaiting_approval"
   indefinitely, which is visible in the run list and resumable from the
   phone whenever the user comes back.
@@ -64,6 +67,7 @@ from pydantic import BaseModel, Field
 from core.agent_loop import (
     AgentRunner, RunConfig, RunControl, AutonomyLevel, Decision, AgentEvent,
 )
+from core.sandbox.approvals import ApprovalMemory
 from core.logging_config import get_logger
 
 _log = get_logger(__name__)
@@ -120,7 +124,7 @@ class AgentRunRequest(BaseModel):
 
 
 class ApprovalRequest(BaseModel):
-    decision: str = Field(..., description="approve | deny | stop")
+    decision: str = Field(..., description="approve | always | deny | stop")
 
 
 class RunMessageRequest(BaseModel):
@@ -176,6 +180,8 @@ class AgentRun:
         self.created = time.time()
         self.finished_at: Optional[float] = None
         self.control = RunControl()
+        # "Always" rules the user granted; kept across revivals of this run.
+        self.approvals = ApprovalMemory()
         self.history: list = []
         self.events: list[dict] = []      # persisted (non-chunk) events, indexable
         self._cond = threading.Condition()
@@ -232,7 +238,8 @@ class AgentRun:
                 if self.status == "awaiting_approval":
                     self.status = "running"
                 self._cond.notify_all()
-        return {"approve": Decision.APPROVE, "deny": Decision.DENY}.get(reply, Decision.STOP)
+        return {"approve": Decision.APPROVE, "always": Decision.APPROVE_ALWAYS,
+                "deny": Decision.DENY}.get(reply, Decision.STOP)
 
     def answer_approval(self, decision: str) -> bool:
         with self._cond:
@@ -415,6 +422,7 @@ def _worker(run: AgentRun, get_engine, goal: str | None = None):
             request_approval=run.request_approval,
             config=run.config,
             control=run.control,
+            approvals=run.approvals,
         )
         result = runner.run(goal, run.history)
         run.finish(result.status, result.summary)
@@ -582,8 +590,9 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
         _auth(request)
         run = _get_run(run_id)
         decision = body.decision.strip().lower()
-        if decision not in ("approve", "deny", "stop"):
-            raise HTTPException(status_code=422, detail="decision must be approve | deny | stop")
+        if decision not in ("approve", "always", "deny", "stop"):
+            raise HTTPException(status_code=422,
+                                detail="decision must be approve | always | deny | stop")
         if not run.answer_approval(decision):
             raise HTTPException(status_code=409, detail="Run is not awaiting approval")
         return {"ok": True, "decision": decision}

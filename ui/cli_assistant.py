@@ -298,6 +298,10 @@ class _ConsoleHost:
             print(f"{Fore.YELLOW}  human gate: {ev.reason}{Style.RESET_ALL}")
         elif k == "git":
             print(f"{Fore.CYAN}  [git] {ev.text}{Style.RESET_ALL}")
+        elif k == "approval_remembered":
+            print(f"{Fore.CYAN}  {ev.text}{Style.RESET_ALL}")
+        elif k == "auto_approved":
+            print(f"{Fore.CYAN}  auto-approved ({ev.reason}){Style.RESET_ALL}")
         elif k == "error":
             print(f"{Fore.RED}  error: {ev.reason}{Style.RESET_ALL}")
 
@@ -309,9 +313,12 @@ class _ConsoleHost:
         risk = getattr(decision, "risk_level", None)
         risk = risk.name if risk is not None else "?"
         print(f"{Fore.YELLOW}  [{risk}] {action.type}: {Fore.WHITE}{action.display}{Style.RESET_ALL}")
-        ans = input(f"{Fore.YELLOW}  Execute? [y/N/stop]: {Fore.WHITE}").strip().lower()
+        ans = input(f"{Fore.YELLOW}  Execute? [y/a=always this run/N/stop]: "
+                    f"{Fore.WHITE}").strip().lower()
         if ans in ("s", "stop"):
             return Decision.STOP
+        if ans in ("a", "always"):
+            return Decision.APPROVE_ALWAYS
         return Decision.APPROVE if ans in ("y", "yes") else Decision.DENY
 
 

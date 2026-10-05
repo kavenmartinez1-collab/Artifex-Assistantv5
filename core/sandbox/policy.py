@@ -132,26 +132,136 @@ _MEDIUM_SHELL_PATTERNS: list[re.Pattern] = [
     re.compile(r"\bmv\b", re.IGNORECASE),
 ]
 
+# PowerShell reads. Shell blocks on Windows run in PowerShell, so before
+# this existed every command the model actually wrote — Get-Command,
+# Test-Path, Get-ChildItem | Select-Object — classified HIGH and needed a
+# phone approval (run 6024eea3124b: approve `Get-Command claude`).
+# Verb-based: Get/Test/Select/... cmdlets read and never write. ForEach-
+# Object is deliberately absent — `gci | % Delete` deletes every file.
+_PS_SAFE_HEAD = re.compile(
+    r"^\s*(?:(?:get|test|select|where|sort|measure|format|group|compare"
+    r"|resolve|split|join|convertto|convertfrom)-[a-z]+"
+    r"|out-string|write-(?:output|host)"
+    r"|gci|gc|gi|gp|gps|gsv|gcm|gm|gl|gal|gv|gdr|gcim|gwmi|sls|select"
+    r"|sort|measure|ft|fl|fw|group|compare|rvpa|\?)(?=\s|$)",
+    re.IGNORECASE)
+
 _SAFE_SHELL_PATTERNS: list[re.Pattern] = [
     re.compile(r"^\s*(ls|dir|pwd|cd|echo|cat|head|tail|type|wc|find|which|where)\b"),
     re.compile(r"^\s*(git\s+(status|log|diff|show|branch\s*$))\b"),
     re.compile(r"^\s*python\s+--version"),
     re.compile(r"^\s*(node|npm|pip)\s+--version"),
+    _PS_SAFE_HEAD,
 ]
 
-# The SAFE patterns only look at how a command starts, so anything that can
-# run or write something else disqualifies it: `ls && python x.py`,
-# `echo x > file`, `cat $(...)`, `find . -delete`. Plain pipes are allowed
-# when every stage is itself safe (`git log | head`).
+# Read-verb cmdlets that still are not safe to auto-run.
+_UNSAFE_READ_CMDLETS = re.compile(r"^\s*get-credential\b", re.IGNORECASE)
+
+# The SAFE patterns only look at how each command starts, so anything that
+# can run or write something else, from inside an otherwise-safe command,
+# disqualifies it: `echo x > file`, `cat $(...)`, `find . -delete`,
+# `[IO.File]::Delete(...)`, `(gi x).Delete()`. Chains (`;`, `&&`, `|`,
+# newlines) are split by split_shell_segments and every piece is judged on
+# its own, so `ls && python x.py` is unsafe because `python x.py` is.
 _SAFE_DISQUALIFIERS = re.compile(
-    r"[;&`>\n]|\|\||\$\(|\s-(exec|execdir|ok|delete)\b", re.IGNORECASE)
+    r"[`>]|\$\(|::|\.[A-Za-z_]\w*\s*\(|\s-(exec|execdir|ok|delete)\b",
+    re.IGNORECASE)
+
+# Words that run or change things when they appear inside a script block or
+# subexpression of an otherwise-safe command (`gci | ? { rm $_ }`).
+_DESTRUCTIVE_WORDS = frozenset({
+    "rm", "del", "erase", "rd", "rmdir", "ri", "mv", "move", "mi", "cp", "copy",
+    "cpi", "ni", "md", "mkdir", "sc", "ac", "si", "sp", "set", "sv", "nv", "rv",
+    "kill", "spps", "saps", "start", "iex", "icm", "ii", "rni", "ren", "clc",
+    "cli", "clp", "tee", "curl", "wget", "iwr", "irm", "ipmo", "sajb", "nal",
+    "epal", "ipal", "powershell", "pwsh", "cmd", "python", "python3", "py",
+    "node", "bash", "sh", "foreach", "%", "taskkill", "shutdown", "reg",
+})
+_VERB_NOUN_RE = re.compile(r"^[A-Za-z]+-[A-Za-z]+$")
+_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def split_shell_segments(command: str) -> list[str]:
+    """Split a command line or script into the simple commands it runs.
+
+    Separators are newlines, `;`, `|`, `||`, `&&` and `&`, but only outside
+    quotes and outside {...}/(...) — a script block or subexpression stays
+    inside its command and is judged with it. Blank lines and `#` comment
+    lines are dropped. A bare `&` (PowerShell's call operator, or bash's
+    background) also splits, which leaves the called thing as its own
+    segment for the caller to judge. Unbalanced quotes are not an error:
+    the remainder just lands in one segment, which then fails any
+    allow-check on its own, so a bad split errs toward asking.
+    """
+    segs: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    quote = ""
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            buf.append(ch)
+        elif ch in "{(":
+            depth += 1
+            buf.append(ch)
+        elif ch in "})":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif depth == 0 and ch in "\n;|&":
+            segs.append("".join(buf))
+            buf = []
+            if ch in "|&" and i + 1 < n and command[i + 1] == ch:
+                i += 1  # || or &&
+        else:
+            buf.append(ch)
+        i += 1
+    segs.append("".join(buf))
+    return [s.strip() for s in segs
+            if s.strip() and not s.strip().startswith("#")]
+
+
+def inner_regions_safe(segment: str) -> bool:
+    """True if nothing inside the segment's {...} / (...) runs or writes.
+
+    Every Verb-Noun cmdlet in there must itself be a safe read, and no
+    destructive alias may appear as a bare word. Quoted strings are ignored
+    (text, not commands).
+    """
+    if "{" not in segment and "(" not in segment:
+        return True
+    text = _QUOTED_RE.sub(" ", segment)
+    for region in re.findall(r"[{(]([^{}()]*)", text):
+        for tok in re.findall(r"(?<![\w$.\-:\\/])([A-Za-z%][\w-]*)", region):
+            if _VERB_NOUN_RE.match(tok):
+                if (not _PS_SAFE_HEAD.match(tok)
+                        or _UNSAFE_READ_CMDLETS.match(tok)):
+                    return False
+            elif tok.lower() in _DESTRUCTIVE_WORDS:
+                return False
+    return True
+
+
+def _is_safe_segment(segment: str) -> bool:
+    if _UNSAFE_READ_CMDLETS.match(segment):
+        return False
+    if not any(pat.search(segment) for pat in _SAFE_SHELL_PATTERNS):
+        return False
+    return inner_regions_safe(segment)
 
 
 def _is_safe_shell(command: str) -> bool:
     if _SAFE_DISQUALIFIERS.search(command):
         return False
-    return all(any(pat.search(stage) for pat in _SAFE_SHELL_PATTERNS)
-               for stage in command.split("|"))
+    segments = split_shell_segments(command)
+    return bool(segments) and all(_is_safe_segment(s) for s in segments)
 
 
 def classify_shell_risk(command: str) -> RiskLevel:

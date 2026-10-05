@@ -286,6 +286,11 @@ def full_tool_system_prompt(workspace: str) -> str:
             "```bash``` and ```python``` blocks. Relative paths resolve in the "
             "workspace."
         )
+    try:
+        from core.prompts import shell_execution_note
+        base += "\n\n" + shell_execution_note()
+    except Exception:
+        _log.exception("shell execution note failed — prompt sent without it")
     return base + "\n\n" + _CHAT_TOOL_ADDENDUM.format(
         workspace=workspace,
         rounds=MAX_TOOL_ROUNDS,

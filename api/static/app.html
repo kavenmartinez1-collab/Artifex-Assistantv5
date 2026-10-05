@@ -14,7 +14,7 @@
     POST /v1/agent/runs                 start an agent run  -> {run_id, folder}
     GET  /v1/agent/runs/{id}            snapshot (status + pending approval)
     GET  /v1/agent/runs/{id}/events     SSE event feed (?since=<index>)
-    POST /v1/agent/runs/{id}/approval   {"decision": approve|deny|stop}
+    POST /v1/agent/runs/{id}/approval   {"decision": approve|always|deny|stop}
     POST /v1/agent/runs/{id}/stop       abort the run
 
   The streaming UI (thinking collapse, tool-status blocks, segment reset
@@ -776,6 +776,8 @@
     <div class="ap-why" id="ap-why"></div>
     <div class="ap-btns">
       <button class="go" onclick="answerApproval('approve')" id="ap-approve">Approve</button>
+      <button onclick="answerApproval('always')" id="ap-always"
+        title="Approve, and don't ask again in this run for the same kind of action">Always</button>
       <button onclick="answerApproval('deny')" id="ap-deny">Deny</button>
       <button class="no" onclick="answerApproval('stop')">Stop</button>
     </div>
@@ -3430,6 +3432,9 @@ function showApproval(payload, kind) {
   $("ap-why").textContent = why.join(" - ");
   $("ap-approve").textContent = approvalKind === "gate" ? "Continue" : "Approve";
   $("ap-deny").classList.toggle("hidden", approvalKind === "gate");
+  // "Always" remembers a rule for this run (commands with the same prefix,
+  // edits to the same file). A gate/breaker pause has nothing to remember.
+  $("ap-always").classList.toggle("hidden", approvalKind === "gate");
   $("approval").classList.remove("hidden");
   setAgentStatus("awaiting your approval");
   if (activeTab !== "agent") $("tab-agent").classList.add("unread");
@@ -3448,7 +3453,7 @@ async function answerApproval(decision) {
     });
     if (r.status === 409) { agentNote("That prompt was already answered.", "warn"); return; }
     if (!r.ok) { agentNote("Approval failed: HTTP " + r.status, "bad"); return; }
-    agentNote("You chose: " + decision, "warn");
+    agentNote("You chose: " + (decision === "always" ? "always (this run)" : decision), "warn");
   } catch (e) {
     agentNote("Approval failed: " + e.message, "bad");
   }
@@ -3823,6 +3828,12 @@ function agentEvent(ev) {
         risk: ev.risk || "",
         reason: ev.policy_reason || "",
       }, "action");
+      break;
+    case "approval_remembered":
+      agentNote(ev.text || "Approval remembered for this run");
+      break;
+    case "auto_approved":
+      agentNote("Auto-approved: " + (ev.reason || "covered by an earlier approval"));
       break;
     case "compacted":
       agentNote("Context compacted: " + (ev.reason || "fit to model window"));
