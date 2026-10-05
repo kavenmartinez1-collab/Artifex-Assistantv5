@@ -249,7 +249,20 @@ def inner_regions_safe(segment: str) -> bool:
     return True
 
 
+# `$files = Get-ChildItem`: a variable assignment is as safe as what it
+# assigns. Variables die with the one-shot process, so even `$env:X = ...`
+# changes nothing outside it.
+_PS_ASSIGN_RE = re.compile(r"^\s*\$[A-Za-z_][\w:]*\s*[+\-]?=\s*")
+_LITERAL_RE = re.compile(r"""^\s*(?:-?\d+(?:\.\d+)?|'[^']*'|"[^"$]*"|\$(?:true|false|null))\s*$""",
+                         re.IGNORECASE)
+
+
 def _is_safe_segment(segment: str) -> bool:
+    m = _PS_ASSIGN_RE.match(segment)
+    if m:
+        segment = segment[m.end():]
+        if not segment.strip() or _LITERAL_RE.match(segment):
+            return True
     if _UNSAFE_READ_CMDLETS.match(segment):
         return False
     if not any(pat.search(segment) for pat in _SAFE_SHELL_PATTERNS):

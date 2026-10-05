@@ -141,6 +141,8 @@ class TestPowerShellRisk:
         "Get-ChildItem -Path (Join-Path $env:USERPROFILE 'Desktop')",
         "ls; pwd",
         "Get-Date\nGet-Location",
+        "$files = Get-ChildItem .\\scripts\n$n = 3\nWrite-Output $files.Count $n",
+        "$ErrorActionPreference = 'Stop'\nGet-Item x",
     ])
     def test_safe(self, cmd):
         assert classify_shell_risk(cmd) == RiskLevel.SAFE, cmd
@@ -159,6 +161,9 @@ class TestPowerShellRisk:
         "Get-Date\nSet-Content x.txt hi",
         "Start-Process notepad",
         "Get-Help Remove-Item | Out-File help.txt",
+        "$x = Remove-Item y",
+        "$x = python evil.py",
+        "$x = \"$(rm y)\"",
     ])
     def test_not_safe(self, cmd):
         assert classify_shell_risk(cmd) != RiskLevel.SAFE, cmd
