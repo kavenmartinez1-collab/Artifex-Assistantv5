@@ -2122,11 +2122,20 @@ class ArtifexMainWindow(QMainWindow):
         self._auto_approval_label.setWordWrap(True)
         ab.addWidget(self._auto_approval_label, 1)
         self._auto_approve_btn = QPushButton("Approve")
+        # Same rule memory as the phone's "Always" (core.sandbox.approvals):
+        # approve, and stop asking for the same kind of action this run.
+        self._auto_always_btn = QPushButton("Always")
+        self._auto_always_btn.setProperty("class", "secondary")
+        self._auto_always_btn.setToolTip(
+            "Approve, and don't ask again in this run for the same kind of "
+            "action (same command prefix, or edits to the same file). "
+            "CRITICAL actions still ask every time.")
         self._auto_deny_btn = QPushButton("Deny")
         self._auto_deny_btn.setProperty("class", "secondary")
         self._auto_abort_btn = QPushButton("Stop")
         self._auto_abort_btn.setProperty("class", "secondary")
-        for b in (self._auto_approve_btn, self._auto_deny_btn, self._auto_abort_btn):
+        for b in (self._auto_approve_btn, self._auto_always_btn,
+                  self._auto_deny_btn, self._auto_abort_btn):
             ab.addWidget(b)
         rb.addWidget(self._auto_approval)
 
@@ -2152,6 +2161,7 @@ class ArtifexMainWindow(QMainWindow):
         self._auto_pause_btn.clicked.connect(self._on_auto_pause)
         self._auto_stop_btn.clicked.connect(self._on_auto_stop)
         self._auto_approve_btn.clicked.connect(lambda: self._auto_resolve("approve"))
+        self._auto_always_btn.clicked.connect(lambda: self._auto_resolve("always"))
         self._auto_deny_btn.clicked.connect(lambda: self._auto_resolve("deny"))
         self._auto_abort_btn.clicked.connect(lambda: self._auto_resolve("stop"))
         return w
@@ -2395,6 +2405,10 @@ class ArtifexMainWindow(QMainWindow):
             self._auto_append(f"  ⤵ context compacted: {ev.reason}")
         elif k == "git":
             self._auto_append(f"    [git] {ev.text}")
+        elif k == "approval_remembered":
+            self._auto_append(f"    ✓ {ev.text}")
+        elif k == "auto_approved":
+            self._auto_append(f"    ✓ auto-approved: {ev.reason}")
         elif k == "error":
             self._auto_append(f"  ! error: {ev.reason}")
 
@@ -2408,10 +2422,13 @@ class ArtifexMainWindow(QMainWindow):
             self._auto_approval_label.setText(
                 f"Approve {action.type} [{risk}]?  {action.display}")
             self._auto_approve_btn.setText("Approve")
+            self._auto_always_btn.setVisible(True)
             self._auto_deny_btn.setVisible(True)
         else:
+            # Gate / circuit-breaker pause: nothing to remember.
             self._auto_approval_label.setText(f"Paused — {reason}. Continue?")
             self._auto_approve_btn.setText("Continue")
+            self._auto_always_btn.setVisible(False)
             self._auto_deny_btn.setVisible(False)
         self._auto_approval.setVisible(True)
 
@@ -2420,7 +2437,8 @@ class ArtifexMainWindow(QMainWindow):
         self._auto_approval.setVisible(False)
         if self._auto_worker:
             self._auto_worker.resolve(
-                {"approve": Decision.APPROVE, "deny": Decision.DENY,
+                {"approve": Decision.APPROVE, "always": Decision.APPROVE_ALWAYS,
+                 "deny": Decision.DENY,
                  "stop": Decision.STOP}.get(which, Decision.APPROVE))
 
     def _on_auto_finished(self, result):
