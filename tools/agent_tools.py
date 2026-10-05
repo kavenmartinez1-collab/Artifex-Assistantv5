@@ -171,26 +171,12 @@ def _is_bash_syntax(command):
     return False
 
 
-# Syntax only PowerShell writes. Checked BEFORE the bash heuristics: a
-# PowerShell script whose first line happens to be `echo ...`, or that
-# mentions `2>&1`, is still PowerShell, and Git Bash would choke on its
-# `$var = ...` lines. (Shell blocks now run whole, so one bash-looking line
-# no longer gets to decide for a whole script by accident.)
-_PS_SYNTAX_RE = re.compile(
-    r"\b(?:Get|Set|New|Remove|Add|Start|Stop|Test|Invoke|Select|Where|ForEach"
-    r"|Out|Write|Format|Measure|Sort|Resolve|Join|Split|Import|Export"
-    r"|ConvertTo|ConvertFrom|Copy|Move|Rename|Clear|Wait|Restart|Register"
-    r"|Unregister|Enable|Disable|Install|Uninstall|Update|Expand|Compress"
-    r"|Read|Show|Push|Pop|Group|Compare|Tee)-[A-Z][A-Za-z]+\b"
-    r"|\[[A-Za-z_][\w.]*\]::"            # [Type]::Member
-    r"|@[\"']\s*$"                        # here-string opener
-    r"|^\s*\$[A-Za-z_][\w:]*\s*[+\-]?=(?!=)"  # $var = ...
-    r"|-ComObject\b|\$env:|\$_\b|\$PSScriptRoot\b",
-    re.MULTILINE)
-
-
-def _looks_powershell(command):
-    return bool(_PS_SYNTAX_RE.search(command))
+# PowerShell is detected BEFORE the bash heuristics: a PowerShell script
+# whose first line happens to be `echo ...`, or that mentions `2>&1`, is
+# still PowerShell, and Git Bash would choke on its `$var = ...` lines.
+# Shared with the risk policy, which only trusts PowerShell-only read
+# idioms when the script really runs in PowerShell.
+from core.sandbox.policy import looks_powershell as _looks_powershell  # noqa: E402
 
 
 def _bash_to_powershell(command):

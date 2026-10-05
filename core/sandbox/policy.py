@@ -253,7 +253,10 @@ def inner_regions_safe(segment: str) -> bool:
 # assigns. Variables die with the one-shot process, so even `$env:X = ...`
 # changes nothing outside it.
 _PS_ASSIGN_RE = re.compile(r"^\s*\$[A-Za-z_][\w:]*\s*[+\-]?=\s*")
-_LITERAL_RE = re.compile(r"""^\s*(?:-?\d+(?:\.\d+)?|'[^']*'|"[^"$]*"|\$(?:true|false|null))\s*$""",
+# Also a whole line on its own: PowerShell prints a bare value, so
+# `"Count: $n"` is an output statement. `$var` interpolation inside "..."
+# only reads; a `$(command)` in there was already disqualified upstream.
+_LITERAL_RE = re.compile(r"""^\s*(?:-?\d+(?:\.\d+)?|'[^']*'|"[^"]*"|\$(?:true|false|null))\s*$""",
                          re.IGNORECASE)
 
 
@@ -267,10 +270,33 @@ _PROPERTY_SUBEXPR_RE = re.compile(
     r"\$\(\s*\$[A-Za-z_][\w:]*(?:\.[A-Za-z_]\w*|\[\d+\])*\s*\)")
 
 
-def _is_safe_segment(segment: str) -> bool:
-    if _VAR_EXPR_RE.match(segment):
-        return True
-    m = _PS_ASSIGN_RE.match(segment)
+# Syntax only PowerShell writes. The executor (tools.agent_tools) uses this
+# same test to pick the shell — PowerShell wins over the bash heuristics —
+# so the PowerShell-only idioms below are judged safe exactly when the
+# script really runs in PowerShell. In bash a bare `"..."` or `$VAR` line
+# EXECUTES its value as a command.
+PS_SYNTAX_RE = re.compile(
+    r"\b(?:Get|Set|New|Remove|Add|Start|Stop|Test|Invoke|Select|Where|ForEach"
+    r"|Out|Write|Format|Measure|Sort|Resolve|Join|Split|Import|Export"
+    r"|ConvertTo|ConvertFrom|Copy|Move|Rename|Clear|Wait|Restart|Register"
+    r"|Unregister|Enable|Disable|Install|Uninstall|Update|Expand|Compress"
+    r"|Read|Show|Push|Pop|Group|Compare|Tee)-[A-Z][A-Za-z]+\b"
+    r"|\[[A-Za-z_][\w.]*\]::"            # [Type]::Member
+    r"|@[\"']\s*$"                        # here-string opener
+    r"|^\s*\$[A-Za-z_][\w:]*\s*[+\-]?=(?!=)"  # $var = ...
+    r"|-ComObject\b|\$env:|\$_\b|\$PSScriptRoot\b",
+    re.MULTILINE)
+
+
+def looks_powershell(command: str) -> bool:
+    return bool(PS_SYNTAX_RE.search(command))
+
+
+def _is_safe_segment(segment: str, powershell: bool = False) -> bool:
+    if powershell:
+        if _VAR_EXPR_RE.match(segment) or _LITERAL_RE.match(segment):
+            return True
+    m = _PS_ASSIGN_RE.match(segment) if powershell else None
     if m:
         segment = segment[m.end():]
         if not segment.strip() or _LITERAL_RE.match(segment):
@@ -283,11 +309,13 @@ def _is_safe_segment(segment: str) -> bool:
 
 
 def _is_safe_shell(command: str) -> bool:
-    command = _PROPERTY_SUBEXPR_RE.sub("$v", command)
+    powershell = looks_powershell(command)
+    if powershell:
+        command = _PROPERTY_SUBEXPR_RE.sub("$v", command)
     if _SAFE_DISQUALIFIERS.search(command):
         return False
     segments = split_shell_segments(command)
-    return bool(segments) and all(_is_safe_segment(s) for s in segments)
+    return bool(segments) and all(_is_safe_segment(s, powershell) for s in segments)
 
 
 def classify_shell_risk(command: str) -> RiskLevel:

@@ -147,7 +147,11 @@ class TestPowerShellRisk:
         '$files = Get-ChildItem -Path ".\\scripts" -Filter "*.ps1" -File\n'
         'Write-Output "Count: $($files.Count)"\n'
         "$files.Name",
-        "$items[0].FullName",
+        "$items = Get-ChildItem\n$items[0].FullName",
+        # ...and the second live run's variant: a bare string as output.
+        "$files = Get-ChildItem -Path '.\\scripts' -Filter '*.ps1' -File\n"
+        '"Count: $($files.Count)"\n'
+        "$files.Name",
     ])
     def test_safe(self, cmd):
         assert classify_shell_risk(cmd) == RiskLevel.SAFE, cmd
@@ -172,6 +176,11 @@ class TestPowerShellRisk:
         'Write-Output "$($f.Delete())"',
         'Write-Output "$(Remove-Item y)"',
         "$f.Delete()",
+        '"$(Remove-Item y)"',
+        # In bash a bare string or $VAR line EXECUTES its value; the
+        # PowerShell output idioms must not be trusted there.
+        'ls && "./evil.sh"',
+        "ls\n$CMD",
     ])
     def test_not_safe(self, cmd):
         assert classify_shell_risk(cmd) != RiskLevel.SAFE, cmd
