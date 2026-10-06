@@ -139,6 +139,11 @@ class RunConfig:
     # (core/repo_map.py, ~3.5k tokens) in the system prompt, computed once per
     # run so the prompt prefix stays cacheable.
     repo_map: bool = True
+    # "auto": before the loop, the model writes a short step plan
+    # (core/agent_plan.py); a plan of 2+ steps runs each step in a FRESH
+    # context holding only the goal, the plan and the earlier steps'
+    # summaries. One step means a normal run. "off" skips planning.
+    plan: str = "off"
 
     @classmethod
     def default(cls, autonomy: AutonomyLevel = AutonomyLevel.GUIDED) -> "RunConfig":
@@ -229,6 +234,12 @@ class RunControl:
 # RUNNER
 # ═══════════════════════════════════════════════════════════════════════════
 
+def history_has_assistant(history: list) -> bool:
+    """True once a run has produced output — follow-ups continue the loop
+    instead of re-planning."""
+    return any(m.get("role") == "assistant" for m in history)
+
+
 class AgentRunner:
     """Drives the autonomous loop. Synchronous — run it in whatever thread the
     host provides (a QThread for the GUI, the main thread for the CLI).
@@ -281,20 +292,30 @@ class AgentRunner:
 
     def run(self, goal: str, history: list) -> RunResult:
         """Pursue `goal`, mutating `history` in place. Returns a RunResult."""
-        self._t0 = time.monotonic()
+        if self.config.plan != "off" and goal and not history_has_assistant(history):
+            from core.agent_plan import run_planned
+            return run_planned(self, goal, history)
+        return self._run(goal, history)
+
+    def _run(self, goal: str, history: list, *, keep_state: bool = False,
+             max_rounds: Optional[int] = None) -> RunResult:
+        """One loop over `history`. keep_state=True (planned steps) keeps the
+        run's verifier, notes, repo map and clock across calls."""
+        if not keep_state:
+            self._t0 = time.monotonic()
+            self._actions_run = 0
+            self._verifier = None
+            self._notes = []
+            self._repo_map = self._build_repo_map() if self.config.repo_map else ""
         self._round = 0
-        self._actions_run = 0
-        self.goal = goal or ""
-        self._verifier = None
         self._done_holds = 0
-        self._notes = []
-        self._repo_map = self._build_repo_map() if self.config.repo_map else ""
+        self.goal = goal or ""
         if goal:
             history.append({"role": "user", "content": goal})
         consecutive_failures = 0
         format_retries = 0
 
-        for rnd in range(1, self.config.max_rounds + 1):
+        for rnd in range(1, (max_rounds or self.config.max_rounds) + 1):
             self._round = rnd
             if self.control.stop_requested:
                 return self._finish("stopped:user", history)
@@ -568,7 +589,7 @@ class AgentRunner:
                 self.emit(AgentEvent("done", summary=done, round=rnd))
                 return self._finish("done", history, done)
 
-        self.emit(AgentEvent("stopped", reason=f"max rounds ({self.config.max_rounds})",
+        self.emit(AgentEvent("stopped", reason=f"max rounds ({max_rounds or self.config.max_rounds})",
                              round=self._round))
         return self._finish("stopped:max_rounds", history)
 

@@ -121,6 +121,10 @@ class AgentRunRequest(BaseModel):
         "medium",
         description="low|medium|high|xhigh. medium bounds thinking for unattended rounds; the template default (xhigh) can spend the whole budget thinking.",
     )
+    plan: Optional[str] = Field(
+        None,
+        description="off | auto. auto: the model first splits the goal into steps and each step runs in a fresh context (core/agent_plan.py). Default off.",
+    )
 
 
 class ApprovalRequest(BaseModel):
@@ -534,6 +538,8 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
             config.context_window = body.context_window or _CTX_FALLBACK
             config.temperature = body.temperature if body.temperature is not None else 0.7
             config.reasoning_effort = effort or "medium"
+            if (body.plan or "").strip().lower() == "auto":
+                config.plan = "auto"
 
             if body.folder:
                 folder = os.path.abspath(os.path.expanduser(body.folder))
