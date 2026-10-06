@@ -128,6 +128,13 @@ class RunConfig:
     # lossless-ish. Raise toward 1.0 only if you would rather be
     # hard-trimmed than summarized.
     compact_threshold: float = 0.85
+    # After every round that edits Python, import the edited modules and run
+    # their related tests (core/verify.py), report only what the edits
+    # changed, and revert the round if a module stopped importing. @done is
+    # held back (at most `verify_done_retries` times) while the run's edits
+    # leave regressions behind.
+    auto_verify: bool = True
+    verify_done_retries: int = 2
 
     @classmethod
     def default(cls, autonomy: AutonomyLevel = AutonomyLevel.GUIDED) -> "RunConfig":
@@ -261,6 +268,8 @@ class AgentRunner:
         # Set when a round returns zero content: the NEXT generation runs
         # with thinking off. See _generate().
         self._no_think_next = False
+        self._verifier = None
+        self._done_holds = 0
 
     # ── public ──────────────────────────────────────────────────────────────
 
@@ -270,6 +279,8 @@ class AgentRunner:
         self._round = 0
         self._actions_run = 0
         self.goal = goal or ""
+        self._verifier = None
+        self._done_holds = 0
         if goal:
             history.append({"role": "user", "content": goal})
         consecutive_failures = 0
@@ -363,6 +374,10 @@ class AgentRunner:
                                else "no parseable tool call after retries"))
                     return self._finish("stopped:no_action", history)
             if not actions:
+                hold = self._hold_done()
+                if hold:
+                    history.append({"role": "user", "content": hold})
+                    continue
                 summary = done if done else resp.strip()
                 self.emit(AgentEvent("done", summary=summary, round=rnd))
                 return self._finish("done", history, summary)
@@ -376,6 +391,7 @@ class AgentRunner:
             # honored after the actions run, and only if they all succeeded.
             outputs: List[str] = []
             pending_edits: List[str] = []
+            round_edits: List[str] = []
             deferred_done_ok = True
             for action in actions:
                 if self.control.stop_requested:
@@ -456,6 +472,8 @@ class AgentRunner:
                     human_ok = True
 
                 self.emit(AgentEvent("action_started", action=action, round=rnd))
+                if action.type == "edit_file":
+                    self._before_edit(action)
                 try:
                     # policy_check=False: this loop already ran check_policy
                     # (blocked/approval handling above) — re-checking inside
@@ -484,6 +502,8 @@ class AgentRunner:
                     self._safe(lambda: update_session_map(
                         self.session_map, action.type, action.display, out))
                 self._on_action_complete(action, ok, pending_edits)
+                if action.type == "edit_file" and ok:
+                    round_edits.append(action.content.split("\x00", 1)[0].strip())
 
                 cached = out
                 if out:
@@ -499,6 +519,13 @@ class AgentRunner:
                     self.emit(AgentEvent("stopped", reason="too many consecutive failures",
                                          round=rnd))
                     return self._finish("stopped:failures", history)
+
+            if round_edits:
+                check = self._verify_round(round_edits, pending_edits)
+                if check:
+                    outputs.append(check)
+                    if "IMPORT BROKEN" in check or "REGRESSIONS" in check:
+                        deferred_done_ok = False
 
             # Human gate checkpoint (round interval / action cap / risk budget).
             greason = self.gate.should_gate(rnd)
@@ -516,6 +543,10 @@ class AgentRunner:
             # loop so the model sees the failure in its feedback and can
             # recover, instead of us accepting a success claim it can't back up.
             if done is not None and deferred_done_ok:
+                hold = self._hold_done()
+                if hold:
+                    history[-1]["content"] += "\n\n" + hold
+                    continue
                 self.emit(AgentEvent("done", summary=done, round=rnd))
                 return self._finish("done", history, done)
 
@@ -880,6 +911,82 @@ class AgentRunner:
                 if not rok:
                     break
             pending_edits.clear()
+
+    # ── automatic checks (core/verify.py) ───────────────────────────────────
+
+    def _get_verifier(self, path: str):
+        if not self.config.auto_verify:
+            return None
+        if self._verifier is None:
+            import os
+            from core.verify import EditVerifier
+            from tools.agent_tools import _PYTHON_BIN, _find_git_root, _get_clean_env
+            ap = os.path.abspath(path)
+            root = _find_git_root(ap) or os.getcwd()
+            self._verifier = EditVerifier(root, _PYTHON_BIN, env=_get_clean_env())
+        return self._verifier
+
+    def _before_edit(self, action) -> None:
+        path = action.content.split("\x00", 1)[0].strip()
+        if not path.endswith(".py"):
+            return
+        try:
+            v = self._get_verifier(path)
+            if v is not None:
+                v.before_edit(path)
+        except Exception as e:  # a check must never break the run
+            _log.warning("auto-verify baseline failed: %s", e)
+
+    def _verify_round(self, paths: List[str], pending_edits: List[str]) -> str:
+        """Check this round's edits; revert them if a module stopped importing.
+        Returns the feedback section ('' when there was nothing to check)."""
+        py = [p for p in paths if p.endswith(".py")]
+        if not py:
+            return ""
+        try:
+            v = self._get_verifier(py[0])
+            if v is None:
+                return ""
+            rep = v.after_edits(py)
+        except Exception as e:
+            _log.warning("auto-verify failed: %s", e)
+            return ""
+        if not rep.ran:
+            return ""
+        text = rep.render()
+        if rep.broken_imports and pending_edits:
+            for path in reversed(pending_edits):
+                rok, msg = git_revert_last(path)
+                self.emit(AgentEvent("git", text=msg, round=self._round))
+                if not rok:
+                    break
+            pending_edits.clear()
+            text += ("\nThis round's edits were REVERTED because they broke the "
+                     "import. Re-read the file and make the change again correctly.")
+        self.emit(AgentEvent("verify", text=text, success=rep.clean, round=self._round))
+        return ("[AUTO-CHECK — the harness ran these checks after your edits]\n"
+                + text)
+
+    def _hold_done(self) -> str:
+        """Before accepting @done: re-check every file the run edited. Returns
+        a message that sends the model back to work, or '' to accept."""
+        v = self._verifier
+        if v is None or not v.edited or self._done_holds >= self.config.verify_done_retries:
+            return ""
+        try:
+            rep = v.final_check()
+        except Exception as e:
+            _log.warning("auto-verify final check failed: %s", e)
+            return ""
+        if not rep.ran or rep.clean:
+            return ""
+        self._done_holds += 1
+        text = rep.render()
+        self.emit(AgentEvent("verify", text=text, success=False, round=self._round,
+                             reason="done held back"))
+        return ("[AUTO-CHECK — not done yet] Your edits leave these problems:\n"
+                + text + "\nFix them. If a failing test checks behaviour the GOAL "
+                "deliberately changes, update that test instead. Then emit @done again.")
 
     @staticmethod
     def _looks_like_failed_tool_attempt(resp: str) -> bool:
