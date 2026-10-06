@@ -3864,6 +3864,26 @@ function agentEvent(ev) {
     case "stopped":
       agentNote("Stopped: " + (ev.reason || ""), "warn");
       break;
+    case "plan":
+      agentNote("Plan:\n" + (ev.text || ""), "");
+      break;
+    case "step":
+      agentNote("▶ " + (ev.text || ""), "");
+      break;
+    case "step_done":
+      agentNote("Step done: " + (ev.summary || ""), "good");
+      break;
+    case "step_stopped":
+      agentNote("Step stopped: " + (ev.reason || ""), "warn");
+      break;
+    case "verify":
+      agentNote("Auto-check: " + (ev.text || ""), ev.success === false ? "warn" : "good");
+      break;
+    case "note":
+      agentNote("Note pinned: " + (ev.text || ""), "");
+      break;
+    case "repo_map":
+      break;   // internal; the size is not worth a line in the feed
     case "done": {
       const box = el("div", "ev ev-final");
       box.appendChild(el("div", "ft", "DONE"));
