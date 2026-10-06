@@ -3882,6 +3882,17 @@ function agentEvent(ev) {
     case "note":
       agentNote("Note pinned: " + (ev.text || ""), "");
       break;
+    case "attempt":
+    case "attempts":
+    case "judge":
+      agentNote(ev.text || k, "");
+      break;
+    case "attempt_done":
+      agentNote("Attempt done: " + (ev.summary || ""), "good");
+      break;
+    case "attempt_stopped":
+      agentNote("Attempt stopped: " + (ev.reason || ""), "warn");
+      break;
     case "repo_map":
       break;   // internal; the size is not worth a line in the feed
     case "done": {

@@ -125,6 +125,10 @@ class AgentRunRequest(BaseModel):
         None,
         description="off | auto. auto: the model first splits the goal into steps and each step runs in a fresh context (core/agent_plan.py). Default off.",
     )
+    attempts: Optional[int] = Field(
+        None, ge=1, le=5,
+        description="Best-of-N: attempt the goal N times from the same commit and keep the best (core/agent_attempts.py). Needs a clean git worktree. Default 1.",
+    )
 
 
 class ApprovalRequest(BaseModel):
@@ -540,6 +544,8 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
             config.reasoning_effort = effort or "medium"
             if (body.plan or "").strip().lower() == "auto":
                 config.plan = "auto"
+            if body.attempts:
+                config.attempts = body.attempts
 
             if body.folder:
                 folder = os.path.abspath(os.path.expanduser(body.folder))

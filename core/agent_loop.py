@@ -144,6 +144,11 @@ class RunConfig:
     # context holding only the goal, the plan and the earlier steps'
     # summaries. One step means a normal run. "off" skips planning.
     plan: str = "off"
+    # Best-of-N (core/agent_attempts.py): attempt the goal this many times
+    # from the same commit and keep the attempt that passes the automatic
+    # checks and that a fresh-context judge prefers. Needs a clean git
+    # worktree; 1 = a normal run.
+    attempts: int = 1
 
     @classmethod
     def default(cls, autonomy: AutonomyLevel = AutonomyLevel.GUIDED) -> "RunConfig":
@@ -292,6 +297,12 @@ class AgentRunner:
 
     def run(self, goal: str, history: list) -> RunResult:
         """Pursue `goal`, mutating `history` in place. Returns a RunResult."""
+        if self.config.attempts > 1 and goal and not history_has_assistant(history):
+            from core.agent_attempts import run_attempts
+            return run_attempts(self, goal, history)
+        return self._run_once(goal, history)
+
+    def _run_once(self, goal: str, history: list) -> RunResult:
         if self.config.plan != "off" and goal and not history_has_assistant(history):
             from core.agent_plan import run_planned
             return run_planned(self, goal, history)
