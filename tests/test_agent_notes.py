@@ -47,3 +47,15 @@ def test_no_notes_leaves_history_alone():
     runner = AgentRunner(_Engine([]), build_system_prompt=lambda: "sys")
     hist = [{"role": "system", "content": "s"}, {"role": "user", "content": "goal"}]
     assert runner._pin_notes(hist) is hist
+
+
+def test_unparsed_tool_marker_is_not_a_final_answer():
+    # A marker the parser cannot read must get a format retry, not end the run.
+    runner = AgentRunner(_Engine(['Let me look.\n@read_file("a.py", lines=3)', '@done("ok")']),
+                         build_system_prompt=lambda: "sys",
+                         config=RunConfig(autonomy=AutonomyLevel.FULL_AUTO, max_rounds=4,
+                                          repo_map=False))
+    history = []
+    res = runner.run("goal", history)
+    assert res.summary == "ok" and res.rounds == 2
+    assert any("FORMAT ERROR" in m["content"] for m in history if m["role"] == "user")

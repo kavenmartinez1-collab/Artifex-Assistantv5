@@ -1087,6 +1087,14 @@ class AgentRunner:
         # (malformed edit, empty body, unknown structure).
         if re.search(r"```(?:bash|sh|shell|powershell|cmd|python|py|edit)\b", resp):
             return True
+        # Same for an @tool( marker on its own line: it was meant to run.
+        # Accepting it as prose ended a run as "done" whose final answer was
+        # an unparsed '@read_file("core/engine_llama_cpp.py", 60, 85)'
+        # (agent bench 2026-10-06, task B, nothing changed).
+        if re.search(r"(?m)^\s*@(?:read_file|read_function|grep|glob|find_symbol|"
+                     r"find_references|trace_imports|architecture|search|web_read|"
+                     r"download|sysinfo|view_image|describe_images|note)\s*\(", resp):
+            return True
         return False
 
     _PLAN_ANNOUNCE_RE = re.compile(
