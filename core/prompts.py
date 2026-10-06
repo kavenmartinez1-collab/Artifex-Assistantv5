@@ -239,7 +239,16 @@ AUTONOMOUS MODE — you are running in a self-driving loop, not a chat.
   final summary OR emit @done("one-line summary of what you accomplished").
 - If you are genuinely blocked and need the user, say so plainly and stop.
 - @note("fact") pins a finding, decision or plan step for yourself. Older turns
-  get summarized when the context fills up; pinned notes are kept word for word."""
+  get summarized when the context fills up; pinned notes are kept word for word.
+- FIXING A REPORTED BUG: the code the report blames is often only where the
+  symptom shows, not where the wrong value is made. Before you edit:
+  1. Trace the symptom back: find which value is wrong, then follow where that
+     value COMES FROM (the functions and data it is computed from, in other
+     files too). Do not stop at the first plausible suspect.
+  2. Prove the cause: run a short ```python``` snippet (or a test) against the
+     real code that prints the wrong value. A theory you have not run is a guess.
+  3. Fix it where the wrong value is created, minimally.
+  4. Re-run the same snippet to show the value is now right."""
 
 
 def _environment_note() -> str:
