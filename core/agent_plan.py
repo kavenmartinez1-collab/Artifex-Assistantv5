@@ -32,6 +32,9 @@ their own (at most {max_steps}). A step is one coherent change: a separate reque
 feature, a separate bug to find and fix. Do not split one change into "read", "edit"
 and "test" steps; every step already includes reading, editing and checking.
 If the GOAL is one coherent change, give exactly ONE step.
+For a reported bug, the step restates the reported symptom and asks for the root
+cause to be found and fixed. Do NOT guess the cause or name a suspect file or
+function in the plan: the step will investigate.
 
 Reply with exactly this format and nothing else:
 PLAN:

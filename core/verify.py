@@ -66,8 +66,14 @@ class CheckReport:
             if self.new_failing:
                 lines.append("new tests failing: " + ", ".join(self.new_failing[:10]))
             if self.still_failing:
-                lines.append("already failing before your edits (not caused by you): "
-                             + ", ".join(self.still_failing[:10]))
+                # Not "not caused by you": in a bug-fix run these are usually the
+                # bug itself, and that wording got them ignored (agent bench
+                # 2026-10-06: 12 split-mapping tests failed on the planted bug,
+                # the model wrote them off and fixed the wrong code).
+                lines.append("already failing before your edits: "
+                             + ", ".join(self.still_failing[:10])
+                             + " - if the GOAL is fixing a bug, these may be failing "
+                               "BECAUSE of it; read them")
         elif not self.broken_imports:
             lines.append("module imports OK; no related tests found")
         if self.details:
