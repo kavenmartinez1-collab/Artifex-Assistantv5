@@ -135,6 +135,10 @@ class RunConfig:
     # leave regressions behind.
     auto_verify: bool = True
     verify_done_retries: int = 2
+    # Put a map of the workspace's source files and their top-level symbols
+    # (core/repo_map.py, ~3.5k tokens) in the system prompt, computed once per
+    # run so the prompt prefix stays cacheable.
+    repo_map: bool = True
 
     @classmethod
     def default(cls, autonomy: AutonomyLevel = AutonomyLevel.GUIDED) -> "RunConfig":
@@ -271,6 +275,7 @@ class AgentRunner:
         self._verifier = None
         self._done_holds = 0
         self._notes: List[str] = []
+        self._repo_map = ""
 
     # ── public ──────────────────────────────────────────────────────────────
 
@@ -283,6 +288,7 @@ class AgentRunner:
         self._verifier = None
         self._done_holds = 0
         self._notes = []
+        self._repo_map = self._build_repo_map() if self.config.repo_map else ""
         if goal:
             history.append({"role": "user", "content": goal})
         consecutive_failures = 0
@@ -598,7 +604,8 @@ class AgentRunner:
         except Exception as e:
             _log.warning("build_system_prompt failed: %s", e)
             base = ""
-        content = build_autonomous_prompt(base, self.goal) if self.config.framing else base
+        content = (build_autonomous_prompt(base, self.goal, repo_map=self._repo_map)
+                   if self.config.framing else base)
         if history and history[0].get("role") == "system":
             history[0]["content"] = content
         else:
@@ -797,6 +804,18 @@ class AgentRunner:
                        "[EARLIER SESSION — COMPACTED SUMMARY]\n" + summary})
         result.extend(recent)
         return result
+
+    def _build_repo_map(self) -> str:
+        import os
+        try:
+            from core.repo_map import build_repo_map
+            text = build_repo_map(os.getcwd())
+        except Exception as e:  # a map is a nicety; never fail the run
+            _log.warning("repo map failed: %s", e)
+            return ""
+        if text:
+            self.emit(AgentEvent("repo_map", text=f"repo map: {len(text)} chars"))
+        return text
 
     _NOTES_HEADER = "[PINNED NOTES — written by you earlier in this run]"
 

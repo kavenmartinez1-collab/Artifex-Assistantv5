@@ -363,12 +363,15 @@ def shell_execution_note() -> str:
 _ENV_NOTE_CACHE: str = ""
 
 
-def build_autonomous_prompt(base_prompt: str, goal: str = "") -> str:
-    """Wrap the assistant base prompt with the autonomous loop framing + goal."""
+def build_autonomous_prompt(base_prompt: str, goal: str = "", repo_map: str = "") -> str:
+    """Wrap the assistant base prompt with the autonomous loop framing + goal
+    (and the run's repo map, when there is one, right before the goal)."""
     global _ENV_NOTE_CACHE
     if not _ENV_NOTE_CACHE:
         _ENV_NOTE_CACHE = _environment_note()
     out = f"{base_prompt}\n\n{AUTONOMOUS_PREAMBLE}\n\n{_ENV_NOTE_CACHE}"
+    if repo_map:
+        out += f"\n\n{repo_map}"
     if goal:
         out += f"\n\nGOAL:\n{goal.strip()}"
     return out
