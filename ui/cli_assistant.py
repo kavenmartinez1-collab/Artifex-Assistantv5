@@ -304,6 +304,26 @@ class _ConsoleHost:
             print(f"{Fore.CYAN}  auto-approved ({ev.reason}){Style.RESET_ALL}")
         elif k == "error":
             print(f"{Fore.RED}  error: {ev.reason}{Style.RESET_ALL}")
+        elif k == "plan":
+            self._end_stream()
+            print(f"{Fore.CYAN}  PLAN:{Style.RESET_ALL}")
+            for line in (ev.text or "").splitlines():
+                print(f"{Fore.CYAN}    {line}{Style.RESET_ALL}")
+        elif k == "step":
+            self._end_stream()
+            print(f"\n{Fore.CYAN}  ▶ {ev.text}{Style.RESET_ALL}")
+        elif k == "step_done":
+            print(f"{Fore.GREEN}  ✓ step done: {(ev.summary or '')[:200]}{Style.RESET_ALL}")
+        elif k == "step_stopped":
+            print(f"{Fore.YELLOW}  step stopped: {ev.reason}{Style.RESET_ALL}")
+        elif k == "verify":
+            first = (ev.text or "").splitlines()[0] if ev.text else ""
+            color = Fore.GREEN if ev.success else Fore.YELLOW
+            print(f"{color}  [auto-check] {first}{Style.RESET_ALL}")
+        elif k == "note":
+            print(f"{Fore.CYAN}  note pinned: {ev.text}{Style.RESET_ALL}")
+        elif k in ("attempt", "attempts", "judge"):
+            print(f"{Fore.CYAN}  ◆ {ev.text}{Style.RESET_ALL}")
 
     def approval(self, action, decision, reason):
         self._end_stream()
@@ -404,7 +424,7 @@ def run_assistant():
     print()
     print(f"{Fore.WHITE}  Type your questions. The AI can run shell commands, Python, and web searches.")
     print(f"  Commands: /workspace <path>, /harness <detect|adopt|on|off>, /kb search|add|list, /refresh, /clear, /purge")
-    print(f"  Agent:    /run <goal>  (autonomous loop),  /autonomy manual|guided|full")
+    print(f"  Agent:    /run <goal>  (autonomous loop),  /autonomy manual|guided|full,  /plan on|off")
     print(f"  Session:  /save [name], /load [name|#], /sessions, /export [path]")
     print(f"  Pipeline: /mode <mode>, /attach <file>, /output <dir>")
     print(f"  System:   /backend transformers|ollama|llama_cpp, /ctx <num>, /health, /compile, /turboquant")
@@ -504,6 +524,7 @@ def run_assistant():
 
     host = _ConsoleHost()
     cli_autonomy = AutonomyLevel.GUIDED  # level used by /run
+    cli_plan = "off"                      # /plan on|off — plan-first mode for /run
 
     while True:
         try:
@@ -787,6 +808,22 @@ def run_assistant():
                     print(f"  Usage: /autonomy manual|guided|full{Style.RESET_ALL}\n")
                 continue
 
+            # /plan command — plan-first mode for /run (core/agent_plan.py)
+            if user_input.lower().startswith("/plan"):
+                arg = user_input[5:].strip().lower()
+                if arg in ("on", "auto"):
+                    cli_plan = "auto"
+                elif arg == "off":
+                    cli_plan = "off"
+                else:
+                    print(f"{Fore.CYAN}  /run plan first: {'on' if cli_plan == 'auto' else 'off'}")
+                    print(f"  Usage: /plan on|off   (on: split the goal into steps, each in a "
+                          f"fresh context; best for multi-part goals){Style.RESET_ALL}\n")
+                    continue
+                print(f"{Fore.CYAN}  /run plan first → {'on' if cli_plan == 'auto' else 'off'}"
+                      f"{Style.RESET_ALL}\n")
+                continue
+
             # /run command — autonomous goal execution via the shared runner
             if user_input.lower().startswith("/run"):
                 goal = user_input[4:].strip()
@@ -798,6 +835,7 @@ def run_assistant():
                 # Autonomous runs use the bench-tuned agent preset (see
                 # core/sampling.py + agent_bench/TUNING_REPORT.md).
                 run_cfg.sampler_preset = "agent"
+                run_cfg.plan = cli_plan
                 if cli_autonomy == AutonomyLevel.FULL_AUTO:
                     print(f"{Fore.YELLOW}  Full-auto — all policy-allowed actions run unattended; "
                           f"CRITICAL + ratchet still stop it.{Style.RESET_ALL}")

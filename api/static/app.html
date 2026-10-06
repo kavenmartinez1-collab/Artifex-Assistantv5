@@ -751,6 +751,14 @@
         <div class="hint" id="autonomy-hint"></div>
       </div>
       <div style="margin-top:10px">
+        <div style="font-size:11px;letter-spacing:1.5px;color:var(--dim);margin-bottom:6px">PLAN FIRST</div>
+        <div class="seg" id="plan-seg">
+          <button data-v="off" class="on">off</button>
+          <button data-v="auto">plan first</button>
+        </div>
+        <div class="hint" id="plan-hint"></div>
+      </div>
+      <div style="margin-top:10px">
         <div style="font-size:11px;letter-spacing:1.5px;color:var(--dim);margin-bottom:6px">CONTEXT</div>
         <div class="seg" id="agentctx-seg">
           <button data-v="16384" class="on">16k</button>
@@ -1075,6 +1083,7 @@ const store = {
     localStorage.setItem("ax_web", $("web-toggle").checked ? "1" : "0");
     localStorage.setItem("ax_sysprompt", $("system-prompt").value);
     localStorage.setItem("ax_autonomy", currentAutonomy());
+    localStorage.setItem("ax_plan", currentPlan());
     localStorage.setItem("ax_histbudget", $("hist-budget").value);
     localStorage.setItem("ax_agentctx", currentAgentCtx());
   },
@@ -1096,6 +1105,7 @@ const store = {
     $("system-prompt").value = sp;
     setEffort(localStorage.getItem("ax_effort") || "medium");
     setAutonomy(localStorage.getItem("ax_autonomy") || "guided");
+    setPlan(localStorage.getItem("ax_plan") || "off");
     const ectx = localStorage.getItem("ax_engine_ctx");
     if (ectx !== null) $("engine-ctx").value = ectx;
     $("hist-budget").value = localStorage.getItem("ax_histbudget") || String(DEFAULT_HISTORY_BUDGET);
@@ -1130,6 +1140,8 @@ function currentEffort() { return segValue("effort-seg", "medium"); }
 function setEffort(v) { segSet("effort-seg", v); }
 function currentAutonomy() { return segValue("autonomy-seg", "guided"); }
 function setAutonomy(v) { segSet("autonomy-seg", v); autonomyHint(); }
+function currentPlan() { return segValue("plan-seg", "off"); }
+function setPlan(v) { segSet("plan-seg", v === "auto" ? "auto" : "off"); planHint(); }
 // "" = the top rung: send no context_window at all and let the server hand
 // the run the engine's whole loaded window. Tracking the engine beats
 // pinning a number the engine may since have been reloaded away from.
@@ -1217,11 +1229,18 @@ const AUTONOMY_HINTS = {
   manual: "Asks before every single action.",
 };
 function autonomyHint() { $("autonomy-hint").textContent = AUTONOMY_HINTS[currentAutonomy()] || ""; }
+function planHint() {
+  $("plan-hint").textContent = currentPlan() === "auto"
+    ? "Splits the goal into steps and runs each in a fresh context. Best for goals with several parts; slower (measured ~3x) on small ones."
+    : "One continuous run. Fastest for a single change or fix.";
+}
 
 document.querySelectorAll("#effort-seg button").forEach(b =>
   b.addEventListener("click", () => { setEffort(b.dataset.v); store.save(); }));
 document.querySelectorAll("#autonomy-seg button").forEach(b =>
   b.addEventListener("click", () => { setAutonomy(b.dataset.v); store.save(); }));
+document.querySelectorAll("#plan-seg button").forEach(b =>
+  b.addEventListener("click", () => { setPlan(b.dataset.v); store.save(); }));
 // Delegated: applyCtxCap() replaces these buttons whenever the model's cap
 // changes, so a per-button listener would die with the first rebuild.
 $("agentctx-seg").addEventListener("click", e => {
@@ -3486,6 +3505,7 @@ async function startAgentRun() {
         goal: goal,
         model: $("model-select").value || undefined,
         autonomy: currentAutonomy(),
+        plan: currentPlan(),
         reasoning_effort: currentEffort(),
         temperature: Math.max(0, Math.min(2, parseFloat($("temperature").value) || 0.7)),
         max_tokens: Math.max(256, Math.min(32768,

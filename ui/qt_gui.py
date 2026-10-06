@@ -2094,6 +2094,13 @@ class ArtifexMainWindow(QMainWindow):
             "Costs tokens/latency per round; measurably better tool discipline "
             "on Qwen3.6 (agent_bench).")
         goal_row.addWidget(self._auto_thinking)
+        self._auto_plan = QCheckBox("Plan first")
+        self._auto_plan.setChecked(False)
+        self._auto_plan.setToolTip(
+            "Split the goal into steps first and run each step in a fresh context\n"
+            "(core/agent_plan.py). Best for goals with several parts; measured ~3x\n"
+            "slower on a single change. A one-step plan runs normally.")
+        goal_row.addWidget(self._auto_plan)
         rb.addLayout(goal_row)
 
         btn_row = QHBoxLayout()
@@ -2334,6 +2341,7 @@ class ArtifexMainWindow(QMainWindow):
         cfg = RunConfig.default(level)
         cfg.sampler_preset = self._auto_preset.currentText().lower()
         cfg.enable_thinking = self._auto_thinking.isChecked()
+        cfg.plan = "auto" if self._auto_plan.isChecked() else "off"
         # Run on a private copy of the conversation so the chat stays clean;
         # the final summary is folded back into the conversation at the end.
         history = [dict(m) for m in self.messages]
@@ -2342,7 +2350,8 @@ class ArtifexMainWindow(QMainWindow):
         self._auto_append(
             f"▶ GOAL: {goal}\n  autonomy: {self._auto_level.currentText()}"
             f"  sampling: {cfg.sampler_preset}"
-            f"  thinking: {'on' if cfg.enable_thinking else 'off'}")
+            f"  thinking: {'on' if cfg.enable_thinking else 'off'}"
+            f"  plan first: {'on' if cfg.plan == 'auto' else 'off'}")
 
         self._auto_worker = AutonomousWorker(
             self.engine, goal, history,
@@ -2411,6 +2420,21 @@ class ArtifexMainWindow(QMainWindow):
             self._auto_append(f"    ✓ auto-approved: {ev.reason}")
         elif k == "error":
             self._auto_append(f"  ! error: {ev.reason}")
+        elif k == "plan":
+            self._auto_append("  ☰ plan:\n" + "\n".join(
+                "    " + line for line in (ev.text or "").splitlines()))
+        elif k == "step":
+            self._auto_append(f"\n▶ {ev.text}")
+        elif k == "step_done":
+            self._auto_append(f"  ✓ step done: {(ev.summary or '')[:200]}")
+        elif k == "step_stopped":
+            self._auto_append(f"  ■ step stopped: {ev.reason}")
+        elif k == "verify":
+            self._auto_append(f"    [auto-check] {(ev.text or '').splitlines()[0] if ev.text else ''}")
+        elif k == "note":
+            self._auto_append(f"    📌 note: {ev.text}")
+        elif k in ("attempt", "attempts", "judge"):
+            self._auto_append(f"  ◆ {ev.text}")
 
     def _on_auto_approval(self, payload):
         action = payload.get("action")
