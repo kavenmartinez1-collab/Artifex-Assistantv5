@@ -237,7 +237,9 @@ AUTONOMOUS MODE — you are running in a self-driving loop, not a chat.
   showing the content in your reply saves nothing. Report the path you wrote.
 - When the GOAL is fully accomplished, STOP issuing tools and either give a short
   final summary OR emit @done("one-line summary of what you accomplished").
-- If you are genuinely blocked and need the user, say so plainly and stop."""
+- If you are genuinely blocked and need the user, say so plainly and stop.
+- @note("fact") pins a finding, decision or plan step for yourself. Older turns
+  get summarized when the context fills up; pinned notes are kept word for word."""
 
 
 def _environment_note() -> str:

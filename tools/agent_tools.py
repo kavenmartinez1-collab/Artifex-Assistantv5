@@ -893,6 +893,12 @@ def extract_agent_actions(response):
             action = AgentAction("shell", f"# Gemma tool: {display}", f"tool: {display}")
         found.append((m.start(), action))
 
+    # --- Pinned notes: @note("text") (kept by the agent loop across compaction) ---
+    for m in re.finditer(r'(?m)^\s*@note\(\s*(["\'])(.+?)\1\s*\)\s*$', marker_text, re.S):
+        text = m.group(2).strip()
+        if text:
+            found.append((m.start(), AgentAction("note", text, f"note: {text[:60]}")))
+
     # --- Native JSON tool calls: <tool_call>{"name": ...}</tool_call> ---
     found.extend(_extract_json_tool_calls(response))
 

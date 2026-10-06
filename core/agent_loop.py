@@ -270,6 +270,7 @@ class AgentRunner:
         self._no_think_next = False
         self._verifier = None
         self._done_holds = 0
+        self._notes: List[str] = []
 
     # ── public ──────────────────────────────────────────────────────────────
 
@@ -281,6 +282,7 @@ class AgentRunner:
         self.goal = goal or ""
         self._verifier = None
         self._done_holds = 0
+        self._notes = []
         if goal:
             history.append({"role": "user", "content": goal})
         consecutive_failures = 0
@@ -397,6 +399,16 @@ class AgentRunner:
                 if self.control.stop_requested:
                     return self._finish("stopped:user", history)
                 self.control.wait_if_paused()
+
+                if action.type == "note":
+                    # Not a tool: a fact the model pins for itself. It lives
+                    # in this runner's memory and is re-inserted whenever
+                    # history gets compacted (see _pin_notes).
+                    self._notes.append(action.content)
+                    self.emit(AgentEvent("note", text=action.content, round=rnd))
+                    outputs.append(f"[note] pinned ({len(self._notes)} notes kept "
+                                   "across compaction)")
+                    continue
 
                 decision = check_policy(action.type, action.content)
                 self.emit(AgentEvent("action_proposed", action=action,
@@ -605,7 +617,9 @@ class AgentRunner:
         cw = self.config.context_window
         ctx = self._engine_ctx()
         if ctx > 0:
-            new_hist, _ = self._compact_if_needed(history, ctx, cw)
+            new_hist, did = self._compact_if_needed(history, ctx, cw)
+            if did:
+                new_hist = self._pin_notes(new_hist)
             history[:] = new_hist
         # max_tokens turns the input cap into ctx-minus-completion instead of
         # a flat 70% of ctx; without it the agent can never use the top 30%
@@ -783,6 +797,22 @@ class AgentRunner:
                        "[EARLIER SESSION — COMPACTED SUMMARY]\n" + summary})
         result.extend(recent)
         return result
+
+    _NOTES_HEADER = "[PINNED NOTES — written by you earlier in this run]"
+
+    def _pin_notes(self, history):
+        """Put the model's @note()s back right after the goal, once, after a
+        compaction (the synopsis alone may drop them)."""
+        if not self._notes:
+            return history
+        body = self._NOTES_HEADER + "\n" + "\n".join(f"- {n}" for n in self._notes)
+        out = [m for m in history
+               if not str(m.get("content", "")).startswith(self._NOTES_HEADER)]
+        at = 1
+        if len(out) > 1 and out[1].get("role") == "user":
+            at = 2   # after the pinned goal
+        out.insert(at, {"role": "user", "content": body})
+        return out
 
     def _fit_feedback(self, feedback):
         """Pre-append assessment: one round's tool feedback may not eat more
