@@ -261,3 +261,11 @@ class TestModelInfo:
         assert run.vision is True and run.snapshot()["vision"] is True
         model_events = [e for e in run.events if e["kind"] == "model"]
         assert model_events and "can see images" in model_events[0]["text"]
+
+
+def test_agent_run_asks_for_the_full_configured_context():
+    from api.server import agent_ctx_tier
+    assert agent_ctx_tier(32000, 114688) == 114688   # small chat tier loaded: grow
+    assert agent_ctx_tier(None, 114688) == 114688    # nothing loaded yet
+    assert agent_ctx_tier(131072, 114688) == 131072  # never relaunch downward
+    assert agent_ctx_tier(32000, None) == 32000      # no cap configured: keep

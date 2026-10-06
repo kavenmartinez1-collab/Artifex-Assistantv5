@@ -57,6 +57,14 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def agent_ctx_tier(current: int | None, configured_cap: int | None) -> int | None:
+    """The ctx tier an agent run asks for: the model's configured cap, unless
+    a bigger window is already loaded (never relaunch downward)."""
+    if configured_cap and (current is None or configured_cap > current):
+        return configured_cap
+    return current
+
+
 def _get_engine(ctx_tier: int | None = None, exact_ctx: bool = False):
     """Get or create the active engine.
 
@@ -1695,14 +1703,19 @@ def create_app():
                                 f"A chat reply is still generating on "
                                 f"{mq._current_model} - wait for it (or stop "
                                 f"it) before starting a run on {model}.")})
-                # Same model: keep its current tier (no relaunch). New model:
-                # record its configured cap, which is what the worker's load
-                # launches at; _agent_get_engine corrects it after the VRAM
-                # gate has had its say.
+                # An agent run gets the model's full configured context: it
+                # reads whole files and accumulates tool output for many
+                # rounds. Keeping a smaller tier that a short chat loaded
+                # (the old same-model behaviour) left a run on the 114688
+                # entry with a 32000 window, compacting every few rounds.
+                # Same model at a smaller tier: switch_if_needed relaunches
+                # it bigger (a few seconds). _agent_get_engine records what
+                # actually loaded after the VRAM gate has had its say.
                 tier = mq._current_ctx_tier if same else None
-                if not same and backend == "llama_cpp":
+                if backend == "llama_cpp":
                     from core.config import get_llama_cpp_model_config
-                    tier = (get_llama_cpp_model_config(model) or {}).get("num_ctx")
+                    tier = agent_ctx_tier(
+                        tier, (get_llama_cpp_model_config(model) or {}).get("num_ctx"))
                 await mq.switch_if_needed(model, backend, ctx_tier=tier,
                                           ignore_busy=True)
             return model
