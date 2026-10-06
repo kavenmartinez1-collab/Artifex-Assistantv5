@@ -33,6 +33,7 @@ TRUST RULES — these outrank everything below:
 TOOLS:
 - @architecture() — full project map (START HERE when exploring)
 - @read_file("path") — read file (large Python files → SKELETON VIEW with line numbers)
+- @read_file("path", 120, 180) — the exact text of lines 120-180, numbered
 - @read_function("path", "name") — read exact source of a function/class/method
 - @find_symbol("name") — find where a symbol is defined (AST-accurate)
 - @find_references("name") — find where a symbol is used
@@ -192,6 +193,7 @@ TRUST RULES — these outrank everything below:
 TOOLS:
 - @architecture() — full project map (START HERE when exploring)
 - @read_file("path") — read file
+- @read_file("path", 120, 180) — the exact text of lines 120-180, numbered
 - @read_function("path", "name") — read exact source of a function/class/method
 - @find_symbol("name") — find where a symbol is defined
 - @find_references("name") — find where a symbol is used

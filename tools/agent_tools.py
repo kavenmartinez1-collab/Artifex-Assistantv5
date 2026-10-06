@@ -729,16 +729,24 @@ def extract_agent_actions(response):
         query = m.group(1)
         found.append((m.start(), AgentAction("search", query, f'search: "{query}"')))
 
-    # --- File read markers: @read_file("path") or @read_file("path", chunk=N) ---
+    # --- File read markers: @read_file("path"), @read_file("path", chunk=N),
+    #     or a line range @read_file("path", START, END) / ("path", START) ---
     for m in re.finditer(
-            r'@read_file\(["\'](.+?)["\']\s*(?:,\s*chunk\s*=\s*(\d+))?\)',
+            r'@read_file\(["\'](.+?)["\']\s*(?:,\s*chunk\s*=\s*(\d+)'
+            r'|,\s*(?:start\s*=\s*)?(\d+)\s*(?:,\s*(?:end\s*=\s*)?(\d+))?)?\s*\)',
             marker_text):
         filepath, chunk = m.group(1), m.group(2) or ""
-        chunk_num = chunk if chunk else "1"
-        content = f"{filepath}|{chunk_num}"
-        display = f'read_file: "{filepath}"'
-        if chunk:
-            display += f" (chunk {chunk})"
+        if m.group(3):
+            start = int(m.group(3))
+            end = int(m.group(4)) if m.group(4) else start + _RANGE_DEFAULT_LINES - 1
+            content = f"{filepath}|L{start}-{end}"
+            display = f'read_file: "{filepath}" (lines {start}-{end})'
+        else:
+            chunk_num = chunk if chunk else "1"
+            content = f"{filepath}|{chunk_num}"
+            display = f'read_file: "{filepath}"'
+            if chunk:
+                display += f" (chunk {chunk})"
         found.append((m.start(), AgentAction("read_file", content, display)))
 
     # --- Web read markers: @web_read("url") or @web_read(N) ---
@@ -1299,17 +1307,32 @@ def _get_read_chunk_size():
 _MAX_FILE_SIZE = 1_048_576  # 1 MB hard cap
 
 
+_RANGE_DEFAULT_LINES = 80
+_RANGE_MAX_LINES = 400
+
+
 def run_read_file(content):
     """
-    Read a file in chunks that fit the model's context.
+    Read a file in chunks that fit the model's context, or a line range.
 
-    content format: "filepath|chunk_num"  (chunk_num defaults to 1)
+    content format: "filepath|chunk_num" (chunk_num defaults to 1) or
+    "filepath|L<start>-<end>" for numbered lines start..end.
     If the filepath is a URL, redirect to run_web_read() automatically.
     Returns (success, output) tuple.
     """
     parts = content.rsplit("|", 1)
     filepath = parts[0].strip()
-    chunk_num = int(parts[1]) if len(parts) > 1 else 1
+    spec = parts[1].strip() if len(parts) > 1 else "1"
+    line_range = None
+    m = re.fullmatch(r"L(\d+)-(\d+)", spec)
+    if m:
+        line_range = (int(m.group(1)), int(m.group(2)))
+        chunk_num = 1
+    else:
+        try:
+            chunk_num = int(spec)
+        except ValueError:
+            chunk_num = 1
 
     # Auto-detect URLs and redirect to web_read
     if filepath.startswith(("http://", "https://", "www.")):
@@ -1320,7 +1343,18 @@ def run_read_file(content):
         filepath = os.path.join(os.getcwd(), filepath)
 
     if not os.path.isfile(filepath):
-        return False, f"File not found: {filepath}"
+        # Models write the line into the path: "a.py|348", "a.py:348",
+        # "a.py:300-380", "a.py#L348" (observed: Qwen3.8 twice in one run,
+        # both failed). Read that region instead of failing.
+        m = re.fullmatch(r"(.+?\.\w{1,8})\s*(?:\||:|#L?)\s*(\d+)(?:\s*-\s*(\d+))?",
+                         filepath)
+        if m and os.path.isfile(m.group(1)):
+            filepath = m.group(1)
+            first = int(m.group(2))
+            line_range = ((first, int(m.group(3))) if m.group(3) else
+                          (max(1, first - 20), first + _RANGE_DEFAULT_LINES - 21))
+        else:
+            return False, f"File not found: {filepath}"
 
     # Size check
     file_size = os.path.getsize(filepath)
@@ -1358,6 +1392,18 @@ def run_read_file(content):
 
     lines = text.split("\n")
     total_lines = len(lines)
+
+    if line_range is not None:
+        start, end = line_range
+        start = max(1, start)
+        if start > total_lines:
+            return False, f"Line {start} is past the end ({total_lines} lines)."
+        end = min(total_lines, max(start, end), start + _RANGE_MAX_LINES - 1)
+        width = len(str(end))
+        body = "\n".join(f"{i:>{width}}| {lines[i - 1]}" for i in range(start, end + 1))
+        return True, (f"File: {os.path.basename(filepath)} (lines {start}-{end} of "
+                      f"{total_lines}; the 'N| ' prefix is not part of the file)\n---\n"
+                      f"{body}\n---")
 
     # Smart skeleton for large Python files (chunk 1 only)
     if filepath.endswith(".py") and total_lines > 200 and chunk_num == 1:
