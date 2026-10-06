@@ -2344,7 +2344,11 @@ def git_revert_last(file_path: str) -> tuple[bool, str]:
 
 # ─── Agent loop config (P3-T16 / P3-T17) ──────────────────────────────────
 
-MAX_AGENT_ROUNDS = int(os.environ.get("ARTIFEX_MAX_AGENT_ROUNDS", "10"))
+# 30, not 10: a single-file feature took Qwen3.8 16-17 rounds through the real
+# loop (agent bench 2026-10-06, task A), and the automatic checks can add
+# rounds. Runaway runs are still stopped by the wall clock, the consecutive-
+# failure limit and the circuit breaker.
+MAX_AGENT_ROUNDS = int(os.environ.get("ARTIFEX_MAX_AGENT_ROUNDS", "30"))
 AGENT_KEY = os.environ.get("ARTIFEX_AGENT_KEY", "")
 
 # Explicit autonomous-completion marker: a line that is exactly @done(...) or

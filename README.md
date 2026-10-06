@@ -1655,7 +1655,7 @@ See [LEARNING.md](LEARNING.md) for a deep-dive walkthrough of the architecture, 
 | `ARTIFEX_OLLAMA_URL` | `http://localhost:11434` | Ollama server URL. Set to a remote IP for cross-machine inference (e.g., Tailscale). |
 | `ARTIFEX_POLICY` | `strict` | Agent sandbox policy level: `strict`, `moderate`, `permissive`, or `auto`. See [Sandbox](#sandbox--autonomous-execution-safety). |
 | `ARTIFEX_AGENT_KEY` | *(none)* | Required to use `ARTIFEX_POLICY=auto`. Without it, auto falls back to strict. |
-| `ARTIFEX_MAX_AGENT_ROUNDS` | `10` | Max consecutive agent loop iterations before forced stop. |
+| `ARTIFEX_MAX_AGENT_ROUNDS` | `30` | Max consecutive agent loop iterations before forced stop. |
 | `ARTIFEX_DRY_RUN` | *(off)* | Set to `1` to evaluate actions without executing (log-only mode). |
 | `ARTIFEX_CAPABILITIES` | *(all)* | Comma-separated action types to allow (e.g., `read_file,glob,grep` for read-only). Empty = all. |
 | `ARTIFEX_EGRESS_MODE` | `open` | Network egress control: `open`, `allowlist`, or `denylist`. |
@@ -1713,7 +1713,7 @@ For a typical development setup, add these to your `.env`:
 
 ```env
 ARTIFEX_POLICY=moderate
-ARTIFEX_MAX_AGENT_ROUNDS=10
+ARTIFEX_MAX_AGENT_ROUNDS=30
 ```
 
 Everything else has safe defaults. See the full [Environment Variables](#environment-variables) table for all options.

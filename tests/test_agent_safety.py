@@ -77,7 +77,7 @@ class TestBoundedAgentLoop(unittest.TestCase):
         self.assertGreater(MAX_AGENT_ROUNDS, 0)
         # Default should be 10 unless overridden
         if "ARTIFEX_MAX_AGENT_ROUNDS" not in os.environ:
-            self.assertEqual(MAX_AGENT_ROUNDS, 10)
+            self.assertEqual(MAX_AGENT_ROUNDS, 30)
 
     def test_env_override(self):
         with patch.dict(os.environ, {"ARTIFEX_MAX_AGENT_ROUNDS": "5"}):
