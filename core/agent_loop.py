@@ -375,6 +375,13 @@ class AgentRunner:
                 malformed = self._looks_like_failed_tool_attempt(resp)
                 if format_retries < 2 and (blank or malformed):
                     format_retries += 1
+                    if malformed:
+                        # Left in history, a collapsed <tool_call> gets copied
+                        # verbatim on the retry: Qwen3.8 repeated the same
+                        # broken block twice and the run ended (agent bench
+                        # 2026-10-06, task C). Keep the turn, drop the debris.
+                        history[-1]["content"] = (
+                            "[an unparseable tool call was removed from this turn]")
                     if blank and self.config.empty_round_no_think:
                         # A prose nudge cannot fix a token-budget problem —
                         # the model never reaches the end of its own think

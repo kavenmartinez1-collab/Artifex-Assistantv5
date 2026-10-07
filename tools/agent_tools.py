@@ -632,6 +632,8 @@ def _extract_xml_tool_calls(response):
         name = m.group(1).lower().strip()
         body = m.group(2)
         args = {k.lower(): v.strip("\r\n") for k, v in _XML_PARAM_RE.findall(body)}
+        if name in _WRAPPER_TOOL_NAMES:
+            name = _unwrap_tool_name(args) or name
         if not args:
             raw = _XML_PARAM_RE.sub("", body).strip()
             key = _PRIMARY_ARG.get(name)
@@ -640,7 +642,35 @@ def _extract_xml_tool_calls(response):
         action = _action_from_call(name, args)
         if action:
             actions.append((m.start(), action))
+    # Collapsed wrapper form, no <function=...> tag at all (Qwen3.8, agent
+    # bench 2026-10-06; the run died on it after two format retries):
+    #   <tool_call>\nfunction=tool_use\n<parameter=tool_name>\narchitecture\n</parameter>
+    # The tool is named by the tool_name parameter; anything else is its args.
+    for m in _TOOL_CALL_BLOCK_RE.finditer(response):
+        block = m.group(1)
+        if _XML_TOOL_CALL_RE.search(block):
+            continue
+        args = {k.lower(): v.strip() for k, v in _XML_PARAM_RE.findall(block)}
+        name = _unwrap_tool_name(args)
+        if not name:
+            continue
+        action = _action_from_call(name, args)
+        if action:
+            actions.append((m.start(), action))
     return actions
+
+
+_WRAPPER_TOOL_NAMES = {"tool_use", "use_tool", "call_tool", "tool", "invoke", "tool_call"}
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>(.*?)(?=</tool_call>|<tool_call>|\Z)", re.DOTALL)
+
+
+def _unwrap_tool_name(args: dict) -> str:
+    """Pop and return the real tool name from a wrapper call's arguments."""
+    for key in ("tool_name", "name", "tool"):
+        v = args.pop(key, None)
+        if v and re.fullmatch(r"[A-Za-z_]\w*", v.strip()):
+            return v.strip().lower()
+    return ""
 
 
 def extract_agent_actions(response):

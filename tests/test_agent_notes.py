@@ -59,3 +59,30 @@ def test_unparsed_tool_marker_is_not_a_final_answer():
     res = runner.run("goal", history)
     assert res.summary == "ok" and res.rounds == 2
     assert any("FORMAT ERROR" in m["content"] for m in history if m["role"] == "user")
+
+
+def test_collapsed_wrapper_tool_call_is_parsed():
+    s = ('Start.\n<tool_call>\nfunction=tool_use\n<tool_call>\n<parameter=tool_name>\n'
+         'architecture\n</parameter>\n</function>\n</tool_call>')
+    assert [a.type for a in extract_agent_actions(s)] == ["architecture"]
+    s2 = ('<tool_call>\n<function=tool_use>\n<parameter=tool_name>read_file</parameter>\n'
+          '<parameter=path>core/a.py</parameter>\n</function>\n</tool_call>')
+    acts = extract_agent_actions(s2)
+    assert acts[0].type == "read_file" and acts[0].content.startswith("core/a.py")
+
+
+def test_malformed_call_is_removed_before_the_retry():
+    broken = '<tool_call>\nfunction=tool_use\n</function>\n</tool_call>'
+    eng = _Engine([broken, '@done("ok")'])
+    seen = []
+    orig = eng.generate_streaming
+
+    def spy(messages, *a, **k):
+        seen.append([m["content"] for m in messages])
+        return orig(messages, *a, **k)
+    eng.generate_streaming = spy
+    runner = AgentRunner(eng, build_system_prompt=lambda: "sys",
+                         config=RunConfig(autonomy=AutonomyLevel.FULL_AUTO, max_rounds=4,
+                                          repo_map=False))
+    assert runner.run("goal", []).summary == "ok"
+    assert not any("function=tool_use" in c for c in seen[1])
