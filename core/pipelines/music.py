@@ -149,7 +149,10 @@ class MusicPipeline(BasePipeline):
                 inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
             # Calculate max_new_tokens from duration
-            tokens_per_second = self._sampling_rate / 320  # approximate
+            # MusicGen's codec runs at 50 frames/s; sampling_rate / 320 gave
+            # 100 and doubled every clip's length
+            tokens_per_second = getattr(
+                self.model.config.audio_encoder, "frame_rate", None) or 50
             max_new_tokens = int(duration * tokens_per_second)
 
             audio_values = self.model.generate(
@@ -158,7 +161,10 @@ class MusicPipeline(BasePipeline):
                 do_sample=True,
             )
 
-            audio = audio_values[0, 0].cpu().numpy()
+            # 16-bit PCM: scipy rejects the model's float16, and float WAVs
+            # don't play in every phone browser
+            audio = audio_values[0, 0].float().clamp(-1, 1).cpu().numpy()
+            audio = (audio * 32767).astype("int16")
 
             # Save
             if output_path is None:

@@ -64,8 +64,20 @@ def _family(path: str) -> str:
     return "diffusers"
 
 
+def unavailable_reason(tool: str) -> str | None:
+    """Why `tool` can't run on this machine at all, or None."""
+    if tool == "video":
+        from core.device import gpu_info
+        if not gpu_info.is_available or gpu_info.total_gb < 16:
+            return ("Video needs a GPU with 16 GB or more; the video pipeline "
+                    "refuses smaller cards.")
+    return None
+
+
 def list_models(tool: str) -> list[dict]:
     """Models able to do `tool`, default first. Each: {id, label, default}."""
+    if unavailable_reason(tool):
+        return []
     if tool in _HUB_MODELS:
         models = [{"id": mid, "label": label} for mid, label in _HUB_MODELS[tool]]
     else:
@@ -98,7 +110,7 @@ def catalog() -> dict:
     return {
         "tools": [
             {"id": tid, "label": t["label"], "needs_image": bool(t.get("needs_image")),
-             "models": list_models(tid),
+             "models": list_models(tid), "unavailable": unavailable_reason(tid),
              "sizes": list(SIZES) if tid == "image" else []}
             for tid, t in TOOLS.items()
         ],
@@ -112,6 +124,8 @@ def _resolve_model(tool: str, requested: str | None) -> str:
     models = list_models(tool)
     ids = [m["id"] for m in models]
     if requested is None or requested not in ids:
+        if unavailable_reason(tool):
+            raise ValueError(unavailable_reason(tool))
         if requested:
             raise ValueError(f"'{requested}' can't do {tool}. Options: {ids}")
         if not models:

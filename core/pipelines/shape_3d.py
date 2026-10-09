@@ -130,6 +130,7 @@ class Shape3DPipeline(BasePipeline):
                 guidance_scale=15.0,
                 num_inference_steps=params.num_steps,
                 frame_size=params.frame_size,
+                output_type="mesh",   # default "pil" returns rendered frames, not a mesh
             ).images
 
             # Export mesh

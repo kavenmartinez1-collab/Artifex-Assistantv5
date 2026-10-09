@@ -668,6 +668,74 @@
   label.sw input:checked + .sl { background: var(--accent); }
   label.sw input:checked + .sl:before { background: #06121f; transform: translateX(18px); }
 
+  /* ── Create view (media tools) ──────────────────────── */
+  #create-scroll {
+    flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
+    -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+    padding: 10px calc(var(--gut) + var(--sar)) calc(var(--sab) + 14px) calc(var(--gut) + var(--sal));
+  }
+  #create-form {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 11px; margin-bottom: 12px;
+  }
+  .cr-label { font-size: 11px; letter-spacing: 1.5px; color: var(--dim); margin: 10px 0 6px; }
+  .cr-label:first-child { margin-top: 0; }
+  #create-tools { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  #create-tools button {
+    min-height: var(--tap); border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel2); color: var(--dim); font-size: 13px; padding: 0 4px;
+  }
+  #create-tools button.on { background: var(--accent); color: #06121f; font-weight: 700; border-color: var(--accent); }
+  #create-model, #create-duration {
+    width: 100%; background: var(--panel2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 8px; padding: 10px; font: 16px inherit;
+    min-height: var(--tap);
+  }
+  #create-prompt {
+    width: 100%; background: var(--panel2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 10px; padding: 11px;
+    font: 16px/1.4 inherit; resize: vertical; min-height: 78px;   /* 16px: no zoom */
+  }
+  #create-prompt:focus { outline: none; border-color: var(--accent); }
+  #create-source { display: flex; align-items: center; gap: 10px; }
+  #create-source img { width: 64px; height: 64px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); }
+  #create-source .btn { flex: 1; width: auto; }
+  #create-go {
+    width: 100%; margin-top: 12px; border: none; border-radius: 10px;
+    background: var(--accent); color: #06121f; font-weight: 700;
+    min-height: 48px; font-size: 15px;
+  }
+  #create-go:disabled { opacity: .45; }
+  .job { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 10px 11px; margin-bottom: 10px; }
+  .job-h { display: flex; gap: 8px; align-items: baseline; font-size: 12px; color: var(--dim); }
+  .job-h .t { color: var(--text); font-weight: 600; flex: none; }
+  .job-h .m { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .job-p { font-size: 13px; margin: 5px 0 6px; overflow-wrap: anywhere; }
+  .job-s { font-size: 12px; color: var(--dim); }
+  .job-s.err { color: var(--err); }
+  .job-s.run:before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--accent); margin-right: 6px; animation: pulse 1.4s infinite; }
+  .job-out img, .job-out video { display: block; width: 100%; border-radius: 8px; margin-top: 6px; background: #000; }
+  .job-out audio { width: 100%; margin-top: 6px; }
+  .job-btns { display: flex; gap: 6px; margin-top: 8px; }
+  .job-btns .btn { flex: 1; width: auto; min-height: var(--tap); padding: 6px; font-size: 13px; }
+
+  /* ── Voice ──────────────────────────────────────────── */
+  #mic-btn {
+    flex: none; min-width: var(--tap); min-height: var(--tap);
+    border-radius: 12px; background: var(--panel2); border: 1px solid var(--border);
+    color: var(--text); font-size: 18px; padding: 0;
+  }
+  #mic-btn.rec { background: var(--err); border-color: var(--err); animation: pulse 1.4s infinite; }
+  #mic-btn.busy { opacity: .5; }
+  .speak-btn {
+    background: none; border: none; color: var(--dim); font-size: 13px;
+    padding: 0 6px; margin-left: 4px; position: relative; vertical-align: middle;
+  }
+  .speak-btn:after { content: ""; position: absolute; inset: -14px -8px; }   /* 44px tap */
+  .speak-btn.on { color: var(--accent); }
+
   /* ── Narrow phones (iPhone SE / mini, 320-375px) ────── */
   @media (max-width: 375px) {
     :root { --gut: 8px; }
@@ -703,6 +771,7 @@
   </div>
   <div id="tabs">
     <button id="tab-chat" class="on" onclick="showTab('chat')">Chat</button>
+    <button id="tab-create" onclick="showTab('create')">Create<span class="pip"></span></button>
     <button id="tab-agent" onclick="showTab('agent')">Agent<span class="pip"></span></button>
     <button id="tab-files" onclick="showTab('files')">Files</button>
   </div>
@@ -727,6 +796,8 @@
     <div class="composer-row">
       <input type="file" id="chat-image-input" accept="image/*" class="hidden">
       <button id="attach-btn" aria-label="Attach image" onclick="pickImage()">&#128206;</button>
+      <input type="file" id="voice-input" accept="audio/*" capture class="hidden">
+      <button id="mic-btn" aria-label="Dictate" onclick="micTap()">&#127908;</button>
       <textarea id="chat-input" placeholder="Message Artifex..." rows="1"
         enterkeyhint="send" autocapitalize="sentences" autocorrect="on"></textarea>
       <button id="send-btn" onclick="sendOrStop()">Send</button>
@@ -839,6 +910,42 @@
   </div>
 </div>
 
+<div id="create-view" class="view hidden">
+  <div id="create-scroll">
+    <div id="create-form">
+      <div class="cr-label">TOOL</div>
+      <div id="create-tools"></div>
+      <div class="cr-label">MODEL</div>
+      <select id="create-model" onchange="rememberCreateModel()"></select>
+      <div id="create-source-wrap" class="hidden">
+        <div class="cr-label">SOURCE IMAGE</div>
+        <div id="create-source">
+          <img id="create-source-img" class="hidden" alt="">
+          <input type="file" id="create-source-input" accept="image/*" class="hidden">
+          <button class="btn" id="create-source-btn" onclick="$('create-source-input').click()">Choose photo</button>
+        </div>
+      </div>
+      <div id="create-size-wrap" class="hidden">
+        <div class="cr-label">SHAPE</div>
+        <div class="seg" id="create-size">
+          <button data-v="square" class="on">square</button>
+          <button data-v="portrait">portrait</button>
+          <button data-v="landscape">landscape</button>
+        </div>
+      </div>
+      <div id="create-duration-wrap" class="hidden">
+        <div class="cr-label">LENGTH (SECONDS)</div>
+        <input type="number" id="create-duration" value="10" min="1" max="30" inputmode="numeric">
+      </div>
+      <div class="cr-label" id="create-prompt-label">PROMPT</div>
+      <textarea id="create-prompt" spellcheck="true" enterkeyhint="done"></textarea>
+      <button id="create-go" onclick="startCreateJob()">Generate</button>
+      <div class="hint" id="create-hint">Image jobs take the GPU from the chat model; it reloads on your next chat message.</div>
+    </div>
+    <div id="create-jobs"></div>
+  </div>
+</div>
+
 <div id="side-backdrop" onclick="closeSidebar()"></div>
 <div id="sidebar">
   <div class="sb-head">
@@ -933,6 +1040,24 @@
       <label class="sw"><input type="checkbox" id="web-toggle"><span class="sl"></span></label>
     </div>
     <div class="hint" id="web-hint"></div>
+  </div>
+  <div class="panel">
+    <div class="pt">VOICE</div>
+    <div class="toggle-row">
+      <span>Read replies aloud</span>
+      <label class="sw"><input type="checkbox" id="autoread-toggle"><span class="sl"></span></label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <div>
+        <div class="hint" style="margin:0 0 4px">Voice</div>
+        <select id="voice-select"><option value="">(connect first)</option></select>
+      </div>
+      <div>
+        <div class="hint" style="margin:0 0 4px">Dictation</div>
+        <select id="stt-select"><option value="">(connect first)</option></select>
+      </div>
+    </div>
+    <div class="hint" id="voice-hint">Tap &#128266; on any reply to hear it. The &#127908; button types what you say. Both run on the PC's CPU.</div>
   </div>
   <div class="panel">
     <div class="pt">SYSTEM PROMPT</div>
@@ -1273,6 +1398,8 @@ function showTab(name) {
   $("chat-view").classList.toggle("hidden", name !== "chat");
   $("agent-view").classList.toggle("hidden", name !== "agent");
   $("files-view").classList.toggle("hidden", name !== "files");
+  $("create-view").classList.toggle("hidden", name !== "create");
+  $("tab-create").classList.toggle("on", name === "create");
   $("tab-chat").classList.toggle("on", name === "chat");
   $("tab-agent").classList.toggle("on", name === "agent");
   $("tab-files").classList.toggle("on", name === "files");
@@ -1281,6 +1408,7 @@ function showTab(name) {
     scrollAgentToBottom();
   }
   if (name === "files" && !filesLoaded) loadDir("");   // lazy first listing
+  if (name === "create") { $("tab-create").classList.remove("unread"); createOpen(); }
 }
 
 // ── Drawer ───────────────────────────────────────────────
@@ -1697,6 +1825,14 @@ function appendMessage(role, content) {
   meta.className = "meta";
   meta.textContent = role === "user" ? "You" : "Artifex";
   const body = document.createElement("div");
+  if (role !== "user") {
+    const sp = document.createElement("button");
+    sp.className = "speak-btn";
+    sp.setAttribute("aria-label", "Read aloud");
+    sp.innerHTML = "&#128266;";
+    sp.onclick = () => speakBubble(body, sp);
+    meta.appendChild(sp);
+  }
   body.className = "body";
   if (content) {
     if (Array.isArray(content)) {
@@ -2338,6 +2474,7 @@ async function sendMessage() {
   const imgs = pendingImages.slice();
   if ((!text && !imgs.length) || isStreaming) return;
   if (!store.k) { toggleDrawer(); return; }
+  unlockAudio();   // this tap is what lets the reply be read aloud later
 
   // A turn with images becomes OpenAI multimodal content; text-only stays a
   // plain string. An image with no caption gets a default prompt.
@@ -2749,6 +2886,9 @@ async function runAssistantTurn(opts) {
       body.innerHTML = '<span class="err-text">(empty response)</span>';
     }
     if (segText) conversation.push({ role: "assistant", content: segText });
+    if (segText && endStatus !== "stopped" && !aborter.signal.aborted && autoReadOn()) {
+      speakBubble(body, bubble.querySelector(".speak-btn"));
+    }
     // The server already wrote a completed exchange into the session; this
     // PUT is a same-content overwrite, and the only writer for a stopped or
     // errored job.
@@ -3989,6 +4129,460 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
+// ── Create (media tools) ─────────────────────────────────
+// Each tool lists only the models that can do it (GET /v1/media/tools); the
+// server applies that model's own settings. Jobs run in the background on
+// the PC and are polled, so a locked screen or a reload just picks them up
+// again. The job list lives here (ax_media_jobs); finished outputs stay on
+// the PC and are fetched with the auth header, so they're shown as blobs.
+const MEDIA_JOBS_KEY = "ax_media_jobs";
+const MEDIA_POLL_MS = 2500;
+let mediaCatalog = null;
+let createTool = localStorage.getItem("ax_create_tool") || "image";
+let createSourceId = null;
+const mediaPolls = {};
+const blobUrls = {};
+
+async function loadCatalog(force) {
+  if (mediaCatalog && !force) return mediaCatalog;
+  const r = await fetch("/v1/media/tools", { headers: authHeaders() });
+  if (!r.ok) throw new Error(await errText(r));
+  mediaCatalog = await r.json();
+  fillVoiceSelects();
+  return mediaCatalog;
+}
+
+function toolSpec(id) {
+  return ((mediaCatalog && mediaCatalog.tools) || []).find(t => t.id === id);
+}
+
+async function createOpen() {
+  if (!store.k) return;
+  try { await loadCatalog(); }
+  catch (e) { $("create-hint").textContent = "Couldn't load tools: " + e.message; return; }
+  renderCreateTools();
+  renderCreateForm();
+  renderJobs();
+}
+
+function renderCreateTools() {
+  const box = $("create-tools");
+  box.innerHTML = "";
+  for (const t of mediaCatalog.tools) {
+    const b = document.createElement("button");
+    b.textContent = t.label;
+    b.classList.toggle("on", t.id === createTool);
+    b.onclick = () => {
+      createTool = t.id;
+      localStorage.setItem("ax_create_tool", t.id);
+      renderCreateTools();
+      renderCreateForm();
+    };
+    box.appendChild(b);
+  }
+}
+
+const PROMPT_HINTS = {
+  image: "Describe the picture. Put any words it should show in quotes.",
+  edit: "What should change? e.g. give the dog a red scarf",
+  restore: "Optional: describe the photo to guide the AI stage",
+  music: "e.g. calm lo-fi piano with soft rain",
+  video: "e.g. a cat chasing a ball of yarn",
+  "3d": "e.g. a small wooden chair",
+};
+
+function renderCreateForm() {
+  const t = toolSpec(createTool) || mediaCatalog.tools[0];
+  if (!t) return;
+  createTool = t.id;
+  const sel = $("create-model");
+  sel.innerHTML = "";
+  const saved = localStorage.getItem("ax_create_model_" + t.id);
+  for (const m of t.models) {
+    const o = document.createElement("option");
+    o.value = m.id;
+    o.textContent = m.label + (m.default ? " — default" : "");
+    sel.appendChild(o);
+  }
+  if (saved !== null && t.models.some(m => m.id === saved)) sel.value = saved;
+  if (!t.models.length) {
+    sel.innerHTML = "<option>" + (t.unavailable ? "(not available on this PC)" : "(no model installed for this)") + "</option>";
+  }
+  $("create-hint").textContent = t.unavailable ||
+    "Image jobs take the GPU from the chat model; it reloads on your next chat message.";
+  $("create-source-wrap").classList.toggle("hidden", !t.needs_image);
+  $("create-size-wrap").classList.toggle("hidden", !t.sizes.length);
+  $("create-duration-wrap").classList.toggle("hidden", t.id !== "music");
+  $("create-prompt").placeholder = PROMPT_HINTS[t.id] || "";
+  $("create-prompt-label").textContent = t.id === "restore" ? "PROMPT (OPTIONAL)" : "PROMPT";
+  $("create-go").disabled = !t.models.length;
+}
+
+function rememberCreateModel() {
+  localStorage.setItem("ax_create_model_" + createTool, $("create-model").value);
+}
+
+$("create-size").addEventListener("click", e => {
+  const b = e.target.closest("button");
+  if (b) segSet("create-size", b.dataset.v);
+});
+
+function dataUrlToBlob(u) {
+  const [head, b64] = u.split(",");
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: head.slice(5, head.indexOf(";")) });
+}
+
+$("create-source-input").addEventListener("change", async function () {
+  const f = this.files && this.files[0];
+  this.value = "";
+  if (!f) return;
+  const btn = $("create-source-btn");
+  btn.disabled = true;
+  btn.textContent = "Uploading...";
+  try {
+    const dataUrl = await downscaleImage(f);    // 1024px JPEG, like chat attachments
+    const r = await fetch("/v1/media/upload?name=source.jpg", {
+      method: "PUT", headers: authHeaders({ "Content-Type": "image/jpeg" }),
+      body: dataUrlToBlob(dataUrl),
+    });
+    if (!r.ok) throw new Error(await errText(r));
+    setCreateSource((await r.json()).file_id, dataUrl);
+  } catch (e) {
+    $("create-hint").textContent = "Upload failed: " + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = createSourceId ? "Change photo" : "Choose photo";
+  }
+});
+
+function setCreateSource(fileId, url) {
+  createSourceId = fileId;
+  const img = $("create-source-img");
+  img.src = url;
+  img.classList.remove("hidden");
+  $("create-source-btn").textContent = "Change photo";
+}
+
+function storedJobs() {
+  try { return JSON.parse(localStorage.getItem(MEDIA_JOBS_KEY) || "[]"); } catch (e) { return []; }
+}
+function saveJobs(list) { localStorage.setItem(MEDIA_JOBS_KEY, JSON.stringify(list.slice(0, 20))); }
+function updateStoredJob(job) {
+  const list = storedJobs();
+  const i = list.findIndex(j => j.id === job.id);
+  if (i >= 0) { list[i] = Object.assign(list[i], job); saveJobs(list); }
+}
+
+async function startCreateJob() {
+  const t = toolSpec(createTool);
+  if (!t) return;
+  const prompt = $("create-prompt").value.trim();
+  if (t.needs_image && !createSourceId) { $("create-hint").textContent = "Choose a source photo first."; return; }
+  if (!prompt && createTool !== "restore") { $("create-hint").textContent = "Write a prompt first."; return; }
+  const body = { tool: createTool, prompt, model: $("create-model").value,
+                 size: segValue("create-size", "square"),
+                 duration: parseInt($("create-duration").value, 10) || 10 };
+  if (t.needs_image) body.file_id = createSourceId;
+  $("create-go").disabled = true;
+  try {
+    const r = await fetch("/v1/media/jobs", {
+      method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await errText(r));
+    const job = await r.json();
+    $("tab-create").classList.add("live");
+    const list = storedJobs();
+    list.unshift({ id: job.id, tool: job.tool, model: job.model, prompt: job.prompt,
+                   status: job.status, created: job.created });
+    saveJobs(list);
+    $("create-hint").textContent = "Started. You can leave this tab; it keeps running on the PC.";
+    renderJobs();
+  } catch (e) {
+    $("create-hint").textContent = "Couldn't start: " + e.message;
+  } finally {
+    $("create-go").disabled = false;
+  }
+}
+
+function toolLabel(id) { const t = toolSpec(id); return t ? t.label : id; }
+
+function renderJobs() {
+  const box = $("create-jobs");
+  box.innerHTML = "";
+  for (const j of storedJobs()) {
+    const card = el("div", "job");
+    card.id = "job-" + j.id;
+    const h = el("div", "job-h");
+    h.appendChild(el("span", "t", toolLabel(j.tool)));
+    h.appendChild(el("span", "m", j.model || ""));
+    h.appendChild(el("span", "", relTime(j.created)));
+    card.appendChild(h);
+    if (j.prompt) card.appendChild(el("div", "job-p", j.prompt));
+    card.appendChild(el("div", "job-s"));
+    card.appendChild(el("div", "job-out"));
+    card.appendChild(el("div", "job-btns"));
+    box.appendChild(card);
+    paintJob(j);
+    if (j.status !== "done" && j.status !== "error") pollJob(j.id);
+  }
+}
+
+function paintJob(j) {
+  const card = $("job-" + j.id);
+  if (!card) return;
+  const s = card.querySelector(".job-s");
+  const btns = card.querySelector(".job-btns");
+  if (j.status === "done") {
+    const secs = j.finished && j.started ? Math.round(j.finished - j.started) : null;
+    s.className = "job-s";
+    s.textContent = "Done" + (secs ? " in " + secs + " s" : "");
+    showJobOutput(card, j);
+  } else if (j.status === "error") {
+    s.className = "job-s err";
+    s.textContent = j.error || "Failed";
+  } else {
+    s.className = "job-s run";
+    const since = j.started || j.created;
+    s.textContent = (j.stage || "Waiting") +
+      (since ? " · " + Math.max(0, Math.round(Date.now() / 1000 - since)) + " s" : "");
+  }
+  btns.innerHTML = "";
+  if (j.status === "done" || j.status === "error") {
+    const rm = el("button", "btn", "Remove");
+    rm.onclick = () => { saveJobs(storedJobs().filter(x => x.id !== j.id)); card.remove(); };
+    btns.appendChild(rm);
+  }
+}
+
+async function jobBlobUrl(fileId) {
+  if (blobUrls[fileId]) return blobUrls[fileId];
+  const r = await fetch("/v1/media/file/" + fileId, { headers: authHeaders() });
+  if (!r.ok) throw new Error(await errText(r));
+  blobUrls[fileId] = URL.createObjectURL(await r.blob());
+  return blobUrls[fileId];
+}
+
+async function showJobOutput(card, j) {
+  const out = card.querySelector(".job-out");
+  const res = j.result;
+  if (!res || out.dataset.shown === res.file_id) return;
+  out.dataset.shown = res.file_id;
+  let url;
+  try { url = await jobBlobUrl(res.file_id); }
+  catch (e) { out.textContent = "Output not available: " + e.message; return; }
+  const ct = res.content_type || "";
+  let media = null;
+  if (ct.startsWith("image/")) {
+    media = document.createElement("img");
+    media.alt = j.prompt || "";
+  } else if (ct.startsWith("audio/")) {
+    media = document.createElement("audio");
+    media.controls = true;
+  } else if (ct.startsWith("video/")) {
+    media = document.createElement("video");
+    media.controls = true; media.playsInline = true; media.loop = true;
+  }
+  if (media) { media.src = url; out.appendChild(media); }
+  const btns = card.querySelector(".job-btns");
+  const save = el("button", "btn", "Save");
+  save.onclick = () => {
+    const a = document.createElement("a");
+    a.href = url; a.download = res.filename || ("artifex-" + j.id);
+    document.body.appendChild(a); a.click(); a.remove();
+  };
+  btns.prepend(save);
+  if (ct.startsWith("image/")) {
+    const ed = el("button", "btn", "Edit this");
+    ed.onclick = () => {
+      createTool = "edit";
+      localStorage.setItem("ax_create_tool", "edit");
+      renderCreateTools(); renderCreateForm();
+      setCreateSource(res.file_id, url);
+      $("create-prompt").value = "";
+      $("create-prompt").focus();
+      $("create-scroll").scrollTop = 0;
+    };
+    btns.insertBefore(ed, save.nextSibling);
+  }
+}
+
+function pollJob(id) {
+  if (mediaPolls[id]) return;
+  const tick = async () => {
+    try {
+      const r = await fetch("/v1/media/jobs/" + id, { headers: authHeaders() });
+      if (r.status === 404) {
+        const j = { id, status: "error", error: "Lost: the server restarted while this was running." };
+        updateStoredJob(j); paintJob(Object.assign(storedJobs().find(x => x.id === id) || {}, j));
+        delete mediaPolls[id];
+        return;
+      }
+      if (r.ok) {
+        const j = await r.json();
+        const keep = { status: j.status, stage: j.stage, error: j.error, result: j.result,
+                       started: j.started, finished: j.finished };
+        updateStoredJob(Object.assign({ id }, keep));
+        paintJob(Object.assign(storedJobs().find(x => x.id === id) || {}, keep));
+        if (j.status === "done" || j.status === "error") {
+          delete mediaPolls[id];
+          if (!Object.keys(mediaPolls).length) $("tab-create").classList.remove("live");
+          if (activeTab !== "create") $("tab-create").classList.add("unread");
+          return;
+        }
+      }
+    } catch (e) { /* offline or asleep: try again next tick */ }
+    mediaPolls[id] = setTimeout(tick, MEDIA_POLL_MS);
+  };
+  mediaPolls[id] = setTimeout(tick, 0);
+}
+
+// Pick up jobs still running from an earlier visit, so the tab pip lights
+// when they finish even if Create was never opened this time.
+function mediaBoot() {
+  for (const j of storedJobs()) {
+    if (j.status !== "done" && j.status !== "error") {
+      $("tab-create").classList.add("live");
+      pollJob(j.id);
+    }
+  }
+}
+
+// ── Voice ────────────────────────────────────────────────
+// Read aloud: Piper on the PC returns a WAV, played through ONE reused
+// <audio> element. Mobile browsers only let audio start from a tap, so the
+// first tap (send / mic / speaker) "unlocks" it with a silent clip; after
+// that, auto-read can play when a reply lands.
+const ttsAudio = new Audio();
+let speakingBtn = null;
+let audioUnlocked = false;
+const SILENT_WAV = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+
+function unlockAudio() {
+  if (audioUnlocked) return;
+  audioUnlocked = true;
+  ttsAudio.src = SILENT_WAV;
+  ttsAudio.play().catch(() => { audioUnlocked = false; });
+}
+
+function autoReadOn() { return localStorage.getItem("ax_autoread") === "1"; }
+
+function stopSpeaking() {
+  ttsAudio.pause();
+  if (speakingBtn) speakingBtn.classList.remove("on");
+  speakingBtn = null;
+}
+ttsAudio.addEventListener("ended", stopSpeaking);
+
+async function speakBubble(body, btn) {
+  if (btn && speakingBtn === btn) { stopSpeaking(); return; }   // tap again = stop
+  stopSpeaking();
+  unlockAudio();
+  const text = Array.from(body.querySelectorAll(".md")).map(n => n.innerText).join("\n\n").trim();
+  if (!text || !store.k) return;
+  speakingBtn = btn || null;
+  if (btn) btn.classList.add("on");
+  try {
+    const r = await fetch("/v1/voice/tts", {
+      method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ text, voice: localStorage.getItem("ax_voice") || null }),
+    });
+    if (!r.ok) throw new Error(await errText(r));
+    const url = URL.createObjectURL(await r.blob());
+    if (speakingBtn !== (btn || null)) { URL.revokeObjectURL(url); return; }   // superseded
+    ttsAudio.onloadeddata = () => URL.revokeObjectURL(url);
+    ttsAudio.src = url;
+    await ttsAudio.play();
+  } catch (e) {
+    stopSpeaking();
+    if (btn) btn.title = "Couldn't read aloud: " + e.message;
+  }
+}
+
+function fillVoiceSelects() {
+  const fill = (id, items, key) => {
+    const s = $(id);
+    s.innerHTML = "";
+    for (const v of items) {
+      const o = document.createElement("option");
+      o.value = v; o.textContent = v;
+      s.appendChild(o);
+    }
+    const saved = localStorage.getItem(key);
+    if (saved && items.includes(saved)) s.value = saved;
+  };
+  fill("voice-select", mediaCatalog.voices || [], "ax_voice");
+  fill("stt-select", mediaCatalog.stt_models || [], "ax_stt");
+}
+$("voice-select").addEventListener("change", e => localStorage.setItem("ax_voice", e.target.value));
+$("stt-select").addEventListener("change", e => localStorage.setItem("ax_stt", e.target.value));
+$("autoread-toggle").checked = autoReadOn();
+$("autoread-toggle").addEventListener("change", e => {
+  localStorage.setItem("ax_autoread", e.target.checked ? "1" : "0");
+  if (e.target.checked) unlockAudio();
+});
+
+// Dictation. A live mic (MediaRecorder) needs a secure context; the app is
+// served over plain HTTP on the tailnet, so there the phone's own recorder
+// is used instead via a capture file input. Either way the audio goes to
+// Whisper on the PC and the text lands in the composer for review.
+let recorder = null;
+
+async function micTap() {
+  unlockAudio();
+  if (!store.k) { toggleDrawer(); return; }
+  if (recorder) { recorder.stop(); return; }
+  if (!(window.isSecureContext && navigator.mediaDevices && window.MediaRecorder)) {
+    $("voice-input").click();
+    return;
+  }
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch (e) { $("voice-input").click(); return; }
+  const chunks = [];
+  recorder = new MediaRecorder(stream);
+  recorder.ondataavailable = ev => { if (ev.data.size) chunks.push(ev.data); };
+  recorder.onstop = () => {
+    stream.getTracks().forEach(t => t.stop());
+    recorder = null;
+    $("mic-btn").classList.remove("rec");
+    transcribe(new Blob(chunks, { type: chunks[0] ? chunks[0].type : "audio/webm" }));
+  };
+  recorder.start();
+  $("mic-btn").classList.add("rec");
+}
+
+$("voice-input").addEventListener("change", function () {
+  const f = this.files && this.files[0];
+  this.value = "";
+  if (f) transcribe(f);
+});
+
+async function transcribe(blob) {
+  const mic = $("mic-btn");
+  mic.classList.add("busy");
+  mic.disabled = true;
+  try {
+    const model = localStorage.getItem("ax_stt") || "";
+    const r = await fetch("/v1/voice/stt" + (model ? "?model=" + encodeURIComponent(model) : ""), {
+      method: "POST", headers: authHeaders({ "Content-Type": "application/octet-stream" }), body: blob,
+    });
+    if (!r.ok) throw new Error(await errText(r));
+    const text = ((await r.json()).text || "").trim();
+    if (!text) { attachError("Didn't catch any words in that recording."); return; }
+    inputEl.value = inputEl.value.trim() ? inputEl.value.trimEnd() + " " + text : text;
+    inputEl.dispatchEvent(new Event("input"));
+  } catch (e) {
+    attachError("Dictation failed: " + e.message);
+  } finally {
+    mic.classList.remove("busy");
+    mic.disabled = false;
+  }
+}
+
 // ── Input behaviors ──────────────────────────────────────
 inputEl.addEventListener("input", function () {
   this.style.height = "auto";
@@ -4046,6 +4640,8 @@ connect();          // -> bootSession() restores the transcript from the API
 // lands under the question instead of above it.
 bootSession().then(bootChatJob);
 agentBoot();
+mediaBoot();
+if (store.k) loadCatalog().catch(() => {});   // fills the voice pickers
 </script>
 </body>
 </html>
