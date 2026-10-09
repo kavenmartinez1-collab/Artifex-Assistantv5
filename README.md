@@ -218,6 +218,11 @@ python download_model.py --repo Qwen/Qwen3.5-4B                              # S
 python download_model.py --repo stabilityai/stable-diffusion-xl-base-1.0      # Image generation
 python download_model.py --repo openai/shap-e                                 # 3D mesh generation
 
+# Qwen-Image 2.1 Turbo (text-to-image + editing, excellent text in images):
+# downloads the official weights (~32 GB) and saves a 4-bit copy (~11 GB)
+# that runs on an 8 GB GPU (1024px in ~25 s on an RTX 5060 Ti)
+python scripts/quantize_qwen_image.py --cleanup
+
 # See what you have installed
 python download_model.py --list
 ```
@@ -398,6 +403,14 @@ python main_api.py --backend transformers --model qwen3.6-27b --gateway http://l
 | POST | `/v1/video/generations` | Video generation from text prompt |
 | POST | `/v1/3d/generations` | 3D mesh generation (ShapE) |
 | POST | `/v1/embeddings` | Generate embeddings |
+| GET | `/v1/media/tools` | Media tools (image, edit, restore, music, video, 3D), the models each can use, TTS voices, STT models |
+| POST | `/v1/media/jobs` | Run a media tool as a background job (takes the GPU from the chat LLM; it reloads on the next chat) |
+| GET | `/v1/media/jobs/{id}` | Job status and result `file_id` |
+| PUT | `/v1/media/upload?name=` | Upload a source image (raw body) |
+| GET | `/v1/media/file/{file_id}` | Download a stored input or output |
+| POST | `/v1/voice/tts` | Read text aloud with Piper (CPU), returns WAV |
+| POST | `/v1/voice/stt` | Transcribe recorded audio with faster-whisper (CPU) |
+| GET/POST | `/v1/admin/purge` | Preview / run a purge (full tools only; see Remote Access) |
 | POST | `/v1/files` | Upload file (image, audio, video, document) |
 | GET | `/v1/files` | List uploaded and generated files |
 | GET | `/v1/files/{file_id}` | Download a file by ID |
@@ -537,6 +550,24 @@ http://<your-machine's-tailnet-ip>:8000/app
 
 Paste your `ARTIFEX_API_KEY` into the client's settings drawer once; it
 persists in that browser.
+
+Beyond chat and agent runs, the phone client has:
+
+- **Create tab** — image generation and editing, photo restore, music,
+  video and 3D. Each tool lists only the models that can do it; the
+  server applies each model's own settings. Jobs run on the PC, so a
+  locked screen doesn't lose them. A job takes the GPU from the chat
+  LLM, which reloads on your next chat message.
+- **Voice** — a speaker button on every reply (Piper), optional auto-read,
+  and a mic button that types what you say (faster-whisper). Both run on
+  the CPU. Over plain HTTP the browser blocks live recording, so the mic
+  opens the phone's own recorder instead.
+- **Purge** (full tools, bottom of Settings) — shuts Artifex down and
+  deletes chats, agent runs, uploads, generated content, `logs/`, the
+  web cache and the knowledge base; models and configs stay. Logs kept
+  outside the repo that hold chat text can be added to a gitignored
+  `purge_extra.txt` (one path or glob per line). The Qt GUI and the CLI
+  (`/purge`) run the same purge.
 
 Hard-won notes for this setup:
 
