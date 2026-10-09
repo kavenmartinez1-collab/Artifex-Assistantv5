@@ -736,6 +736,22 @@
   .speak-btn:after { content: ""; position: absolute; inset: -14px -8px; }   /* 44px tap */
   .speak-btn.on { color: var(--accent); }
 
+  /* ── Purge (bottom of Settings) ─────────────────────── */
+  #purge-box > summary {
+    list-style: none; cursor: pointer; color: var(--dim); font-size: 11px;
+    letter-spacing: 1.5px; min-height: var(--tap); display: flex; align-items: center;
+  }
+  #purge-box > summary::-webkit-details-marker { display: none; }
+  #purge-list { font-size: 12.5px; margin: 10px 0 8px; }
+  #purge-list div { display: flex; justify-content: space-between; gap: 8px;
+    border-top: 1px solid var(--border); padding: 6px 0; }
+  #purge-list div span:last-child { color: var(--dim); flex: none; }
+  #purge-type {
+    width: 100%; background: var(--panel2); border: 1px solid rgba(248,81,73,.4);
+    color: var(--text); border-radius: 8px; padding: 10px; font: 16px inherit;
+    min-height: var(--tap);
+  }
+
   /* ── Narrow phones (iPhone SE / mini, 320-375px) ────── */
   @media (max-width: 375px) {
     :root { --gut: 8px; }
@@ -1066,6 +1082,22 @@
   </div>
   <div class="panel"><button class="btn danger" onclick="clearChat()">Clear conversation</button></div>
   <div class="panel"><div class="hint" id="conn-info"></div></div>
+  <div class="panel hidden" id="purge-panel">
+    <details id="purge-box">
+      <summary>DANGER ZONE</summary>
+      <div class="hint">Purge shuts Artifex down on the PC and permanently deletes every chat,
+        agent run, upload and generated file, plus the logs that hold chat text.
+        Models and settings stay. Start it again on the PC afterwards.</div>
+      <button class="btn danger" style="margin-top:8px" onclick="purgePreview()">Purge Artifex...</button>
+      <div id="purge-confirm" class="hidden">
+        <div id="purge-list"></div>
+        <input type="text" id="purge-type" placeholder="Type PURGE to confirm" autocomplete="off"
+          autocapitalize="characters" autocorrect="off" spellcheck="false">
+        <button class="btn danger" id="purge-go" style="margin-top:8px" onclick="purgeGo()">Purge and shut down</button>
+      </div>
+      <div class="hint" id="purge-msg"></div>
+    </details>
+  </div>
 </div>
 
 <script>
@@ -1388,6 +1420,7 @@ function applyToolLevel() {
   $("engine-ctx-row").style.display = phoneToolsFull ? "" : "none";
   $("engine-reload-btn").style.display = phoneToolsFull ? "" : "none";
   $("engine-reload-hint").style.display = phoneToolsFull ? "" : "none";
+  $("purge-panel").classList.toggle("hidden", !phoneToolsFull);
   if (!phoneToolsFull && (activeTab === "agent" || activeTab === "files")) {
     showTab("chat");
   }
@@ -4580,6 +4613,62 @@ async function transcribe(blob) {
   } finally {
     mic.classList.remove("busy");
     mic.disabled = false;
+  }
+}
+
+// ── Purge ────────────────────────────────────────────────
+// Two steps on purpose: the first tap only lists what would go; deleting
+// needs PURGE typed. The server answers, then shuts itself down.
+async function purgePreview() {
+  const box = $("purge-list");
+  $("purge-msg").textContent = "";
+  box.textContent = "Checking...";
+  $("purge-confirm").classList.remove("hidden");
+  try {
+    const r = await fetch("/v1/admin/purge", { headers: authHeaders() });
+    if (!r.ok) throw new Error(await errText(r));
+    const d = await r.json();
+    box.innerHTML = "";
+    for (const t of d.targets) {
+      const row = document.createElement("div");
+      row.appendChild(el("span", "", t.label));
+      row.appendChild(el("span", "", t.files + " files, " + fmtSize(t.bytes)));
+      box.appendChild(row);
+    }
+    const tot = document.createElement("div");
+    tot.appendChild(el("span", "", "Total"));
+    tot.appendChild(el("span", "", d.total_files + " files, " + fmtSize(d.total_bytes)));
+    box.appendChild(tot);
+  } catch (e) {
+    box.textContent = "Couldn't list what would be purged: " + e.message;
+  }
+}
+
+async function purgeGo() {
+  if ($("purge-type").value.trim() !== "PURGE") {
+    $("purge-msg").textContent = "Type PURGE (capitals) to confirm.";
+    return;
+  }
+  $("purge-go").disabled = true;
+  try {
+    const r = await fetch("/v1/admin/purge", {
+      method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ confirm: "PURGE" }),
+    });
+    if (!r.ok) throw new Error(await errText(r));
+    // Forget this phone's pointers to what's being deleted; keep the key
+    // and settings so reconnecting after a restart just works.
+    for (const k of [SESSION_KEY, CHAT_JOB_KEY, RUN_KEY, MEDIA_JOBS_KEY]) localStorage.removeItem(k);
+    conversation = [];
+    renderTranscript();
+    $("purge-confirm").classList.add("hidden");
+    $("purge-type").value = "";
+    $("purge-msg").textContent = "Purging. Artifex is shutting down; start it again on the PC (start-artifex.ps1).";
+    $("status-dot").className = "err";
+  } catch (e) {
+    $("purge-msg").textContent = "Purge failed: " + e.message;
+  } finally {
+    $("purge-go").disabled = false;
   }
 }
 

@@ -502,8 +502,8 @@ class ArtifexMainWindow(QMainWindow):
         self._health_btn.setProperty("class", "secondary")
         layout.addWidget(self._health_btn)
 
-        # Purge stored data (media, cache, sessions, knowledge) — configs untouched
-        self._purge_btn = QPushButton("Purge Data")
+        # Purge: shut down + delete chats, runs, media, chat logs (core.purge)
+        self._purge_btn = QPushButton("Purge Artifex...")
         self._purge_btn.setProperty("class", "secondary")
         layout.addWidget(self._purge_btn)
 
@@ -1789,81 +1789,30 @@ class ArtifexMainWindow(QMainWindow):
         self._set_status("STANDBY")
 
     def _on_purge(self):
-        """Purge stored data (media, tool cache, sessions, knowledge).
+        """Shut Artifex down and purge it (core.purge): chats, agent runs,
+        uploads, generated content, the logs that hold chat text, the tool
+        cache and the knowledge base. Models and configs stay.
 
-        Configs (llama_cpp_config.json, ollama_config.json, etc.) are never
-        touched. Sessions and knowledge are curated user data and cannot be
-        recovered — hence the confirmation dialog with a size breakdown.
+        Runs as a detached process because it has to stop this window (and
+        the API, CLI and llama-server) before Windows lets it delete the
+        log files they hold open.
         """
-        from core.config import SESSION_DIR, KNOWLEDGE_DIR
-        from core.session import purge_sessions
-        from tools.tool_cache import CACHE_DIR
+        from PyQt6.QtWidgets import QInputDialog
+        from core import purge
 
-        def _dir_size(path):
-            total = 0
-            if os.path.isdir(path):
-                for root, _, files in os.walk(path):
-                    for f in files:
-                        try:
-                            total += os.path.getsize(os.path.join(root, f))
-                        except OSError:
-                            pass
-            return total
-
-        def _fmt(n):
-            size = float(n)
-            for unit in ("B", "KB", "MB", "GB"):
-                if size < 1024 or unit == "GB":
-                    return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-                size /= 1024
-
-        output_dir = os.path.join(BASE_DIR, "output")
-        stores = [
-            ("Generated media + uploads", output_dir),
-            ("Tool cache", CACHE_DIR),
-            ("Saved sessions", SESSION_DIR),
-            ("Knowledge base", KNOWLEDGE_DIR),
-        ]
-        sizes = [(label, path, _dir_size(path)) for label, path in stores]
-        total = sum(s for _, _, s in sizes)
-
-        breakdown = "\n".join(f"  • {label}: {_fmt(size)}" for label, _, size in sizes)
-        resp = QMessageBox.warning(
-            self,
-            "Purge stored data",
-            "This permanently deletes the following (configs are NOT touched):\n\n"
-            f"{breakdown}\n\n"
-            f"Total to reclaim: {_fmt(total)}\n\n"
-            "Saved sessions and knowledge base are curated data and cannot be "
-            "recovered. Continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if resp != QMessageBox.StandardButton.Yes:
+        rows = purge.preview()
+        breakdown = "\n".join(
+            f"  • {r['label']}: {r['files']} files, {purge.fmt_bytes(r['bytes'])}"
+            for r in rows)
+        text, ok = QInputDialog.getText(
+            self, "Purge Artifex",
+            "This shuts Artifex down (API, this window, CLI, llama-server) and "
+            "permanently deletes:\n\n" + breakdown + "\n\n"
+            "Models and settings stay. Type PURGE to confirm:")
+        if not ok or text.strip() != "PURGE":
             return
-
-        reclaimed = 0
-        try:
-            reclaimed += get_service().file_manager.purge()
-        except Exception as e:
-            _log.warning("Purge (media) error: %s", e)
-        try:
-            reclaimed += _dir_size(CACHE_DIR)
-            clear_cache()
-        except Exception as e:
-            _log.warning("Purge (tool cache) error: %s", e)
-        try:
-            reclaimed += purge_sessions()
-        except Exception as e:
-            _log.warning("Purge (sessions) error: %s", e)
-        try:
-            reclaimed += self.km.purge_all()
-        except Exception as e:
-            _log.warning("Purge (knowledge) error: %s", e)
-
-        self._set_status(f"Purged stored data — reclaimed {_fmt(reclaimed)}")
-        QMessageBox.information(
-            self, "Purge complete", f"Reclaimed {_fmt(reclaimed)} of disk space.")
+        purge.spawn(delay=1.0)
+        QApplication.quit()
 
     def _on_vram_relief(self):
         if self.engine:

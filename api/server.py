@@ -1675,6 +1675,12 @@ def create_app():
     register_media_routes(app, check_auth=_check_auth)
 
     if phone_full_tools:
+        # ─── Purge ───────────────────────────────────────────────────────
+        # Shut Artifex down and delete chats, runs, uploads, generated
+        # content and chat-bearing logs (core.purge, a detached process).
+        from api.purge_api import register_purge_routes
+        register_purge_routes(app, check_auth=_check_auth)
+
         # ─── Workspace files ─────────────────────────────────────────────
         # Browse/read/download/upload, JAILED to the agent-runs area — an
         # artifact space for the phone, not a repo browser.
