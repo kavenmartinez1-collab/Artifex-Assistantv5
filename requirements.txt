@@ -32,6 +32,8 @@ safetensors==0.8.0  # diffusers 0.41 needs >=0.8
 
 # ── Model hub / tokenizers ───────────────────────────────────────────
 huggingface-hub==1.33.0  # diffusers 0.41 needs >=1.32
+hf-xet==1.7.0  # huggingface-hub 1.33 dependency
+click==8.5.0  # huggingface-hub 1.33 dependency
 tiktoken==0.12.0
 
 # ── Image / 3D / Video generation ────────────────────────────────────
@@ -64,8 +66,11 @@ librosa==0.11.0
 
 # ── Voice Assistant ──────────────────────────────────────────────────
 faster-whisper==1.2.1
+ctranslate2==4.7.1  # faster-whisper engine
+av==17.0.0  # faster-whisper audio decoding (phone m4a/webm recordings)
 pynput==1.8.1
 piper-tts==1.4.2
+onnxruntime==1.24.4  # Piper engine
 
 # ── 3D mesh export ───────────────────────────────────────────────────
 trimesh==4.11.5
