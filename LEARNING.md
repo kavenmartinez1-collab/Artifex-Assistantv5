@@ -27,6 +27,10 @@
 17. [Glossary](#17-glossary)
 18. [The Sandbox — Making Agent Execution Safe](#18-the-sandbox--making-agent-execution-safe)
 19. [Measure Before You Build — The MoE Microbenchmarks](#19-measure-before-you-build--the-moe-microbenchmarks)
+20. [Building the MoE Engine — Three Walls and How We Got Past Them](#20-building-the-moe-engine--three-walls-and-how-we-got-past-them)
+21. [Browser Vision — One Descriptor, Many Towers](#21-browser-vision--one-descriptor-many-towers)
+22. [Auditing TurboQuant — When "Available Everywhere" Means "Wrong Somewhere"](#22-auditing-turboquant--when-available-everywhere-means-wrong-somewhere)
+23. [Diffusion on a Small GPU — Where the Time Actually Goes](#23-diffusion-on-a-small-gpu--where-the-time-actually-goes)
 
 ---
 
@@ -2101,6 +2105,86 @@ The audit also caught a memory bug hiding behind correctness: the compressed all
 Validation, by `__TQ_PARITY__` (greedy decode exact-f32 vs 3-bit compressed, report first divergent token): on the 27B DeltaNet hybrid, **42 of 64 tokens identical, first divergence a top-2 near-tie** (`"- Sun"` vs `"- Light"`, both valid). Late single-token divergence is exactly what lossy KV *should* look like; early/frequent divergence is what a broken compressed path looks like. The distinction is the whole point of the harness.
 
 Lesson: a feature being *wired* to every code path is not the same as being *correct* on every code path. When a capability predates a refactor, audit it against the cases the refactor introduced — and when correctness can't be guaranteed yet, refuse loudly instead of trusting silently.
+
+## 23. Diffusion on a Small GPU — Where the Time Actually Goes
+
+Adding a modern image model to Artifex meant fitting a ~7B-parameter diffusion transformer plus an ~8B-parameter text encoder onto an 8 GB consumer card. It works, and well. The interesting part is which "obvious" choices made it 5-20x slower, and which made it quietly worse. Every number below was measured; the lessons carry over to any model and any card.
+
+### Weights set the memory; steps set the time
+
+An image pipeline has three parts:
+
+- **Text encoder**: reads the prompt once per image.
+- **Denoiser** (the diffusion transformer): runs once per step, 8 to 50 times per image.
+- **VAE**: turns the image into latents and back. It runs once at each end.
+
+A "turbo" or distilled variant has the *same* architecture and the *same* weight size as the base model; it just needs fewer steps (8 instead of 40). That makes it faster, not smaller. Memory is decided by the largest component that has to sit on the GPU at once. At bf16 (2 bytes per parameter) a 7B denoiser is ~14 GB; at 4-bit it is ~4 GB. Quantization is what makes the model fit; step count is what makes it fast.
+
+### The spill cliff
+
+When a job needs more VRAM than the card has, the Windows display driver does not crash. It quietly pages the overflow into shared system memory and reads it back over PCIe. The job still finishes and the output is still correct. It just takes 5-20x longer, and the time varies from run to run.
+
+Measured on the same edit job:
+
+| Peak allocation | Time |
+|---|---|
+| ~7.8 GB (fits) | ~48 s |
+| ~9.7-9.9 GB (spills) | 120-250 s |
+
+The usable budget is smaller than the box says. An "8 GB" card reports slightly under 8 GiB, and the desktop itself holds some of it. **Peak allocation is the number to watch.** A sudden, inconsistent jump in run time is the symptom of a spill.
+
+### Three offload modes, and why the "slow" one won
+
+When a pipeline doesn't fit, diffusers can move work off the GPU in three ways:
+
+1. **None**: everything stays resident. Fastest, if it fits.
+2. **Whole-model offload**: each component moves to the GPU when it's needed and back to system RAM after. Good when every *single* component fits.
+3. **Sequential offload**: layers stream to the GPU one at a time. Tiny peak, more transfers. It sounds like the slowest option.
+
+For a 4B model whose denoiser (~7 GB at fp16) *almost* fits on an 8 GB card, whole-model offload took **~230 s** per image because the denoiser spilled. Sequential offload took **~13 s** at a 2.6 GB peak. Streaming weights in order, on purpose, beats the driver paging memory around at random.
+
+There's a postscript worth remembering. An 8 GB card reports 7.96 GiB, so a `< 8` check routed it into the sequential branch. That looked like an off-by-a-hair bug, and "fixing" it made the model 18x slower. The behavior was right; only the reason was accidental. **Measure before you fix.**
+
+4-bit (bitsandbytes) components are the exception: sequential offload can't move them, but they're small enough that whole-model offload fits comfortably.
+
+### Caches trade VRAM for speed, and that isn't always a win
+
+When editing, the source image becomes thousands of extra tokens that never change from step to step. A **prefix KV cache** computes their attention keys and values once and reuses them. It's the same idea as the KV cache in an LLM: save compute, spend memory.
+
+On the 8 GB card, turning it **off** produced *pixel-identical* output and was 2-5x **faster**, because the cache was the few hundred MB that pushed the peak over the cliff. On a 16 GB card the opposite would be true. A cache is a trade, and which side wins depends on how much headroom you have.
+
+### Tiling fits in memory and quietly costs quality
+
+VAE tiling encodes and decodes the image in patches and blends the overlaps. It is the standard trick for decoding big images on small cards, and it did bring the peak under 8 GB. Then a person looking at the output said "this looks worse." A fixed-seed comparison against the untiled result confirmed it:
+
+| VAE tile size | PSNR vs untiled |
+|---|---|
+| 256 px (default) | 28 dB, visibly softer with faint seams |
+| 512 px | 38 dB |
+| 768 px | 41 dB |
+
+When editing, tiling even changed the *content*: the source image is encoded through the same VAE, so the model started from a slightly different picture. Tiling was removed; turning the cache off was enough to fit.
+
+The lesson matches the TurboQuant audit (Chapter 22): **"it runs" is not "it's the same."** Any memory trick that changes the arithmetic (precision, tiling, caching) needs an A/B check on a fixed seed before it ships.
+
+### Two GPUs from different vendors: great for LLMs, bad for diffusion
+
+One PyTorch process can't drive an NVIDIA card (CUDA) and an AMD card (ROCm) together. ggml-based tools, such as llama.cpp and its image sibling stable-diffusion.cpp, can, through Vulkan. So the same split that works well for LLM decoding was tried on the image model:
+
+| Setup | Time per 1024px image |
+|---|---|
+| One card, everything resident (4-bit) | ~25 s |
+| Text encoder on card B, denoiser on card A | ~97 s |
+| Denoiser split across both cards | ~191 s |
+
+The difference is how much data crosses between the cards. An LLM generating text passes **one token's** activations between the cards per step, a few kilobytes. A diffusion step passes **thousands of image tokens'** activations at every split point, and cards from different vendors can't talk to each other directly, so it all goes through system RAM. What *does* make sense is putting a once-per-job component (like the text encoder) on the second card or the CPU. Splitting the per-step work does not.
+
+### Checklist
+
+- Watch **peak allocation**, not just whether the job finished.
+- Fix a seed and compare outputs whenever you change precision, tiling or caching.
+- Prefer **one card, fully resident** over clever splits.
+- Write down the counterintuitive results. Later, they look like bugs.
 
 ---
 
