@@ -46,8 +46,14 @@ def test_delete_all_keeps_placeholders_and_unlisted_files(tree):
     assert os.listdir(tree / "ext") == ["llama-server.log"]      # glob only
 
 
+# Built with the OS's own separators: CI runs on Linux, where "C:\App\x.py"
+# is neither absolute nor split by basename
+APP = os.path.abspath(os.path.join(os.sep, "App"))
+OTHER = os.path.abspath(os.path.join(os.sep, "Other"))
+
+
 class FakeProc:
-    def __init__(self, name, cmdline, cwd="C:\\elsewhere"):
+    def __init__(self, name, cmdline, cwd=os.path.abspath(os.path.join(os.sep, "elsewhere"))):
         self.info = {"name": name, "cmdline": cmdline}
         self._cwd = cwd
 
@@ -57,12 +63,13 @@ class FakeProc:
 
 @pytest.mark.parametrize("proc,expected", [
     (FakeProc("llama-server.exe", ["llama-server.exe", "-m", "x.gguf"]), True),
-    (FakeProc("python.exe", ["python.exe", r"C:\App\main_api.py", "--port", "8000"]), True),
-    (FakeProc("python.exe", ["python.exe", "main_gui_qt.py"], cwd=r"C:\App"), True),
-    (FakeProc("python.exe", ["python.exe", r"C:\Other\main_api.py"]), False),   # other repo
+    (FakeProc("python.exe", ["python.exe", os.path.join(APP, "main_api.py"), "--port", "8000"]), True),
+    (FakeProc("python.exe", ["python.exe", "main_gui_qt.py"], cwd=APP), True),
+    (FakeProc("python3", ["python3", os.path.join(APP, "main.py")]), True),
+    (FakeProc("python.exe", ["python.exe", os.path.join(OTHER, "main_api.py")]), False),  # other repo
     (FakeProc("python.exe", ["python.exe", "-m", "core.purge", "--run"]), False),
-    (FakeProc("python.exe", ["python.exe", r"C:\App\some_script.py"]), False),
+    (FakeProc("python.exe", ["python.exe", os.path.join(APP, "some_script.py")]), False),
     (FakeProc("chrome.exe", ["chrome.exe"]), False),
 ])
 def test_is_artifex(proc, expected):
-    assert purge._is_artifex(proc, os.path.normcase(r"C:\App")) is expected
+    assert purge._is_artifex(proc, os.path.normcase(APP)) is expected
