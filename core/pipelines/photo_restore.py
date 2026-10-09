@@ -73,6 +73,14 @@ VRAM_PRESETS = [
 ]
 
 
+# Qwen-Image edits by instruction (no strength knob), so the "repair, don't
+# reinvent" constraint goes into the words
+QWEN_RESTORE_INSTRUCTION = (
+    "Restore this photograph: remove scratches, dust, stains, creases and "
+    "noise, repair any damage, recover faded colors and contrast, and "
+    "sharpen soft detail. Keep the people, faces, expressions, clothing, "
+    "composition and background exactly as they are.")
+
 REALISM_PROMPT = ("photorealistic photograph of this exact scene, realistic "
                   "materials and textures, natural lighting, sharp detail, "
                   "shot on a DSLR camera, high resolution photo")
@@ -126,6 +134,7 @@ class PhotoRestorePipeline(BasePipeline):
         self._ready = False
         self._model_path = None
         self.img2img = None       # diffusers pipeline (optional)
+        self._qwen = False        # img2img is Qwen-Image 2.1 (instruction edit)
         self._sr_net = None
         self._sr_name = None
         self._gfpgan = None
@@ -160,7 +169,15 @@ class PhotoRestorePipeline(BasePipeline):
                     "model — skipping the AI restore stage.")
             model_path = ""
 
-        if model_path:
+        from core.pipelines.image_gen import is_qwen_image, load_qwen_image
+        self._qwen = bool(model_path) and is_qwen_image(model_path)
+        if self._qwen:
+            if status_callback:
+                status_callback(
+                    f"Loading restore model: {os.path.basename(model_path)}...")
+            self.img2img = load_qwen_image(model_path)
+            self.img2img.enable_model_cpu_offload()
+        elif model_path:
             try:
                 import torch
                 from diffusers import AutoPipelineForImage2Image
@@ -191,6 +208,7 @@ class PhotoRestorePipeline(BasePipeline):
     def unload(self, status_callback=None):
         import gc
         self.img2img = None
+        self._qwen = False
         self._sr_net = None
         self._sr_name = None
         self._gfpgan = None
@@ -281,6 +299,12 @@ class PhotoRestorePipeline(BasePipeline):
                     guidance_scale, status_callback=None,
                     negative_prompt=""):
         """Generative repair. Returns (image, method) — method '' if skipped."""
+        if self.img2img is not None and self._qwen:
+            if status_callback:
+                status_callback("AI restore (Qwen-Image)...")
+            # KV cache off: same pixels, and it keeps the edit inside 8 GB
+            return self.img2img(prompt=prompt, image=image,
+                                use_kv_cache=False).images[0], "qwen-image"
         if self.img2img is not None:
             if status_callback:
                 status_callback("AI restore (img2img)...")
@@ -405,7 +429,8 @@ class PhotoRestorePipeline(BasePipeline):
             # just sharpens the blocks.
             denoise, smooth_radius = params.denoise, params.smooth_radius
             strength = params.strength
-            realism = params.realism and self.img2img is not None
+            # Realism (blur + two strength passes) is an img2img technique
+            realism = params.realism and self.img2img is not None and not self._qwen
             if params.realism and self.img2img is None and status_callback:
                 status_callback("Realism mode needs a diffusion model "
                                 "loaded — running normal restore instead.")
@@ -474,10 +499,14 @@ class PhotoRestorePipeline(BasePipeline):
             if status_callback:
                 status_callback("Stage 2/3: AI restore...")
             t0 = time.time()
-            prompt = params.prompt or (
-                REALISM_PROMPT if realism else
-                "restored old photograph, sharp focus, natural colors, "
-                "high quality photo")
+            if self._qwen:
+                prompt = QWEN_RESTORE_INSTRUCTION + (
+                    " " + params.prompt if params.prompt else "")
+            else:
+                prompt = params.prompt or (
+                    REALISM_PROMPT if realism else
+                    "restored old photograph, sharp focus, natural colors, "
+                    "high quality photo")
             negative = REALISM_NEGATIVE if realism else ""
             restored, method = self._ai_restore(
                 cleaned, prompt, strength, params.num_steps,

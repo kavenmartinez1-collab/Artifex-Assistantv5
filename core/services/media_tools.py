@@ -91,10 +91,6 @@ def list_models(tool: str) -> list[dict]:
             return (hits[0] if hits else len(_IMAGE_PREFERENCE), n)
 
         local.sort(key=rank)
-        if tool == "restore":
-            # The restore stage loads through AutoPipelineForImage2Image,
-            # which doesn't map Qwen-Image 2.1
-            local = [m for m in local if _family(m.path) != "qwen-image"]
         models = [{"id": m.name, "label": f"{m.name} ({m.size_gb:.1f} GB)"}
                   for m in local]
         if tool == "restore":
