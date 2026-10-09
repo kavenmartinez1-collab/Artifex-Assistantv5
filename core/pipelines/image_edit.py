@@ -171,7 +171,8 @@ class ImageEditPipeline(BasePipeline):
             from core.pipelines.image_gen import call_kwargs, is_qwen_image
             if is_qwen_image(self._model_path or ""):
                 # The source image's prefix KV cache costs more VRAM than it
-                # saves time on 8 GB: 1024px edit 48 s off vs 122-250 s on (spills)
+                # saves time on 8 GB: 1024px edit 45 s off vs 119 s on, same
+                # pixels (identical output on the same seed)
                 gen_kwargs["use_kv_cache"] = False
             result = self.pipe(**call_kwargs(self.pipe, gen_kwargs))
             image = result.images[0]

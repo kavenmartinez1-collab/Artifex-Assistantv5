@@ -31,10 +31,9 @@ def load_qwen_image(model_path: str):
     """Load a Qwen-Image 2.1 folder in bf16 (fp16 overflows it). Components
     saved 4-bit (bitsandbytes) load from their own quantization configs."""
     from diffusers import DiffusionPipeline
-    pipe = DiffusionPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
-    # Untiled VAE encode/decode peaks past 8 GB at 1024px (edit: 9.7 GB, spills)
-    pipe.vae.enable_tiling()
-    return pipe
+    # VAE tiling is deliberately off: it fits 8 GB but visibly degrades output
+    # (default 256px tiles: 28 dB PSNR vs untiled on the same seed)
+    return DiffusionPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
 
 
 def call_kwargs(pipe, kwargs: dict) -> dict:
