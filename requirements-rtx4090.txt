@@ -23,7 +23,7 @@ accelerate==1.12.0
 numpy==2.3.5
 huggingface-hub==1.33.0  # diffusers 0.41 needs >=1.32
 tiktoken==0.12.0
-safetensors==0.7.0
+safetensors==0.8.0  # diffusers 0.41 needs >=0.8
 
 # ── Image / 3D / Video generation ────────────────────────────────────
 diffusers==0.41.0  # first release with Qwen-Image 2.1 (QwenImage21Pipeline)
