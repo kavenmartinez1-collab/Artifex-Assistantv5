@@ -23,11 +23,11 @@ bitsandbytes==0.49.2
 accelerate==1.6.0
 numpy==2.3.5
 safetensors==0.7.0
-huggingface-hub==1.7.2
+huggingface-hub==1.33.0  # diffusers 0.41 needs >=1.32
 tiktoken==0.12.0
 
 # ── Image / 3D / Video generation ────────────────────────────────────
-diffusers==0.30.0
+diffusers==0.41.0  # first release with Qwen-Image 2.1 (QwenImage21Pipeline)
 opencv-python-headless==5.0.0.93  # photo restoration (classical clean stage)
 Pillow==12.0.0
 imageio==2.37.3

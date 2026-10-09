@@ -51,7 +51,11 @@ class ImageEditPipeline(BasePipeline):
         if torch.cuda.is_available():
             gpu_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
 
-        if mode == "upscale":
+        from core.pipelines.image_gen import is_qwen_image, load_qwen_image
+        if mode != "upscale" and is_qwen_image(model_path):
+            # One pipeline does generation and editing (condition image)
+            self.pipe = load_qwen_image(model_path)
+        elif mode == "upscale":
             from diffusers import StableDiffusionUpscalePipeline
             self.pipe = StableDiffusionUpscalePipeline.from_pretrained(
                 model_path or "stabilityai/stable-diffusion-x4-upscaler",
@@ -164,7 +168,12 @@ class ImageEditPipeline(BasePipeline):
                 if "strength" in inspect.signature(self.pipe.__call__).parameters:
                     gen_kwargs["strength"] = params.strength
 
-            result = self.pipe(**gen_kwargs)
+            from core.pipelines.image_gen import call_kwargs, is_qwen_image
+            if is_qwen_image(self._model_path or ""):
+                # The source image's prefix KV cache costs more VRAM than it
+                # saves time on 8 GB: 1024px edit 48 s off vs 122-250 s on (spills)
+                gen_kwargs["use_kv_cache"] = False
+            result = self.pipe(**call_kwargs(self.pipe, gen_kwargs))
             image = result.images[0]
 
             # Save output

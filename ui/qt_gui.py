@@ -1236,6 +1236,10 @@ class ArtifexMainWindow(QMainWindow):
             if "klein" in (get_active_model_path() or "").lower():
                 kwargs.update({"width": 1024, "height": 1024,
                                "num_steps": 4, "guidance_scale": 1.0})
+            # Qwen-Image 2.1 is native 1024px; its step schedule comes from
+            # the model folder (Turbo: 8), so num_steps is ignored there
+            elif "qwen-image" in (get_active_model_path() or "").lower():
+                kwargs.update({"width": 1024, "height": 1024})
         elif mode == "Image Edit":
             files = self._drop_zone.attached_files
             if files:

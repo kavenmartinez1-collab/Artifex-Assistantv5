@@ -11,6 +11,42 @@ import torch
 from core.pipelines.base import BasePipeline, PipelineResult
 
 
+def diffusers_class_name(model_path: str) -> str:
+    """The pipeline class a local diffusers folder declares ("" if unknown)."""
+    try:
+        import json
+        with open(os.path.join(model_path, "model_index.json"), encoding="utf-8") as f:
+            return json.load(f).get("_class_name", "")
+    except (OSError, ValueError):
+        return ""
+
+
+def is_qwen_image(model_path: str) -> bool:
+    """Qwen-Image 2.1 (base or Turbo). The Auto* pipelines don't map it, it
+    needs bf16, and one pipeline does both generation and editing."""
+    return diffusers_class_name(model_path) == "QwenImage21Pipeline"
+
+
+def load_qwen_image(model_path: str):
+    """Load a Qwen-Image 2.1 folder in bf16 (fp16 overflows it). Components
+    saved 4-bit (bitsandbytes) load from their own quantization configs."""
+    from diffusers import DiffusionPipeline
+    pipe = DiffusionPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
+    # Untiled VAE encode/decode peaks past 8 GB at 1024px (edit: 9.7 GB, spills)
+    pipe.vae.enable_tiling()
+    return pipe
+
+
+def call_kwargs(pipe, kwargs: dict) -> dict:
+    """Drop the kwargs a pipeline's __call__ doesn't take (Qwen-Image 2.1 has
+    no guidance_scale / strength and is meant to run without CFG)."""
+    import inspect
+    params = inspect.signature(pipe.__call__).parameters
+    if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
 class ImageGenerationPipeline(BasePipeline):
     """Text-to-image generation using HuggingFace diffusers."""
 
@@ -52,23 +88,31 @@ class ImageGenerationPipeline(BasePipeline):
         if torch.cuda.is_available():
             gpu_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
 
-        try:
-            self.pipe = AutoPipelineForText2Image.from_pretrained(
-                model_path,
-                torch_dtype=dtype,
-                use_safetensors=True,
-            )
-        except Exception as e:
-            # Try without safetensors flag
-            self.pipe = AutoPipelineForText2Image.from_pretrained(
-                model_path,
-                torch_dtype=dtype,
-            )
+        if is_qwen_image(model_path):
+            self.pipe = load_qwen_image(model_path)
+            # Sequential offload can't move 4-bit layers; whole-model offload can
+            if enable_cpu_offload == "auto" and gpu_gb < 16:
+                enable_cpu_offload = True
+        else:
+            try:
+                self.pipe = AutoPipelineForText2Image.from_pretrained(
+                    model_path,
+                    torch_dtype=dtype,
+                    use_safetensors=True,
+                )
+            except Exception as e:
+                # Try without safetensors flag
+                self.pipe = AutoPipelineForText2Image.from_pretrained(
+                    model_path,
+                    torch_dtype=dtype,
+                )
 
         # VRAM management: choose offload strategy based on GPU
         if enable_cpu_offload == "auto":
             if gpu_gb < 8:
-                # Very tight: sequential CPU offload (slowest but fits)
+                # Very tight: sequential CPU offload. An "8 GB" card reports
+                # ~7.96 GiB and belongs here: FLUX.2 klein 1024px took 12.9 s
+                # sequential vs 230 s whole-model (its 7.2 GB DiT spills).
                 self.pipe.enable_sequential_cpu_offload()
                 if status_callback:
                     status_callback("Using sequential CPU offload (low VRAM)")
@@ -163,8 +207,12 @@ class ImageGenerationPipeline(BasePipeline):
                 gen_kwargs["negative_prompt"] = params.negative_prompt
             if generator:
                 gen_kwargs["generator"] = generator
+            if is_qwen_image(self._model_path or ""):
+                # Qwen-Image 2.1 needs sides divisible by 32
+                gen_kwargs["width"] = max(256, params.width // 32 * 32)
+                gen_kwargs["height"] = max(256, params.height // 32 * 32)
 
-            result = self.pipe(**gen_kwargs)
+            result = self.pipe(**call_kwargs(self.pipe, gen_kwargs))
             image = result.images[0]
 
             # Save if path provided
