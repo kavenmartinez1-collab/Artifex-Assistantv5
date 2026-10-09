@@ -13,6 +13,7 @@ Usage:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -73,6 +74,9 @@ class ModelQueue:
         self._last_request_at: float | None = None
         self._idle_shrink_task: asyncio.Task | None = None
         self._engine_unload_fn = None  # registered by api layer
+        # Frees GPU media pipelines (image/video/...) before an LLM loads.
+        self._media_unload_fn = None
+        self._media_loaded = False
         # () -> str | None callbacks: a reason string while something outside
         # the lock (an agent run) is using the loaded engine. See
         # register_busy_check.
@@ -94,6 +98,41 @@ class ModelQueue:
         to import api.server directly.
         """
         self._engine_unload_fn = fn
+
+    def register_media_unload(self, fn):
+        """Register () -> None that unloads every cached GPU media pipeline."""
+        self._media_unload_fn = fn
+
+    @contextlib.asynccontextmanager
+    async def exclusive_gpu(self, what: str):
+        """Hold the queue for a GPU media job (image, video, ...).
+
+        The chat LLM spans both cards, so it's unloaded first, including an
+        adopted llama-server (pre-warmed with start-artifex -WithLlama),
+        which a plain unload deliberately leaves running. Chat requests
+        wait on the same lock until the job is done; the next one reloads
+        the LLM (switch_if_needed sees no current model).
+
+        Raises:
+            ModelBusyError: an agent run is using the engine.
+        """
+        busy = self.busy_reason()
+        if busy:
+            raise ModelBusyError(f"{busy} — can't free the GPU for {what} "
+                                 "until it finishes or is stopped.")
+        async with self._lock:
+            if self._current_backend == "ollama" and self._current_model:
+                await self._unload_ollama(self._current_model)
+            await self._unload_engine()
+            self._current_model = None
+            self._current_backend = None
+            self._current_ctx_tier = None
+            from core.gpu_pool import get_pool
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, get_pool()._kill_stale_servers)
+            self._media_loaded = True
+            _log.info("Queue: GPU handed to %s", what)
+            yield
 
     def register_busy_check(self, fn):
         """Register () -> str | None; a string means "the engine is in use".
@@ -211,6 +250,13 @@ class ModelQueue:
                 # request silently runs against Ollama instead of the
                 # new backend.
                 await self._unload_engine()
+
+            # A media job left its pipeline on the GPU; the LLM needs it back
+            if self._media_loaded and self._media_unload_fn is not None:
+                _log.info("Queue: unloading media pipelines for %s", model)
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self._media_unload_fn)
+                self._media_loaded = False
 
             # If backend changed, the engine needs to be recreated
             if self._current_backend != backend:

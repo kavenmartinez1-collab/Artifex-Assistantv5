@@ -1454,6 +1454,12 @@ def create_app():
 
     get_model_queue().register_transformers_unload(_unload_transformers_engine)
 
+    def _unload_media_pipelines():
+        from core.services import get_service
+        get_service().unload_all()
+
+    get_model_queue().register_media_unload(_unload_media_pipelines)
+
     # ─── Phone app service (OPT-IN) ──────────────────────────────────────
     # The phone-facing surface — /app page, engine control, chat sessions,
     # persistent chat jobs, workspace files, agent runs — is DISABLED by
@@ -1661,6 +1667,12 @@ def create_app():
     # entry ("Add with defaults") is a phone full-tools action.
     from api.inventory_api import register_inventory_routes
     register_inventory_routes(app, check_auth=_check_auth, allow_write=phone_full_tools)
+
+    # ─── Media tools + voice ─────────────────────────────────────────────
+    # Image/edit/restore/music/video/3D as background jobs that take the GPU
+    # from the chat LLM, plus Piper TTS and Whisper STT on the CPU.
+    from api.media_api import register_media_routes
+    register_media_routes(app, check_auth=_check_auth)
 
     if phone_full_tools:
         # ─── Workspace files ─────────────────────────────────────────────
