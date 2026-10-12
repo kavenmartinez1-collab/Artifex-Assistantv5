@@ -78,36 +78,25 @@ def _family(path: str) -> str:
 ASSIST_TOOLS = ("image", "edit")
 _ASSIST_CFG = 4.0      # true CFG for an edit that comes back with a negative
 
+# Short and open on purpose. A/B on the South Park edit (same seed): this
+# wording got the show's real look (big white eyes, round head) and kept
+# the scene; a rule list for style changes gave a generic dot-eyed cartoon,
+# and thinking on lost the person entirely (and took 3x as long).
 _ASSIST_SYSTEM = {
     "image": (
-        "You expand a short image request into a detailed prompt for Qwen-Image, "
-        "a text-to-image model that follows long prompts closely and renders text "
-        "well. Write one paragraph of 60-150 words in English covering the subject, "
-        "composition, setting, art style or medium, lighting and colours. Keep "
-        "every detail the user gave and don't contradict any of it. Any text the "
-        "image should show stays word for word, in double quotes.\n"
+        "The user wants a picture made by Qwen-Image, an AI image generator that "
+        "follows long written prompts closely. Interpret the user's request to the "
+        "best of your ability and write a specific, detailed prompt of 80-120 words "
+        "that will get the generator to produce what they want.\n"
         'Reply with JSON only: {"prompt": "..."}'
     ),
     "edit": (
-        "You turn a short photo-edit request into a detailed instruction for "
-        "Qwen-Image-Edit, an editor that sees the photo and follows instructions. "
-        "You can't see the photo, so don't invent details about what is in it. "
-        "Write one paragraph of 60-150 words in English.\n"
-        "- If the request changes the art style (cartoon, anime, a named TV show "
-        "or film, painting, sketch, pixel art, clay...), say the WHOLE image is "
-        "redrawn in that style: every person, every object and the background. "
-        "Describe the style's concrete visual traits (line work, colour, shading, "
-        "proportions, how characters' heads, eyes and bodies are drawn); for a "
-        "named show, film or artist, describe its real signature character design "
-        "as you know it, not a generic cartoon. Say the result must not look like "
-        "a photograph. Say to keep the people's "
-        "clothing, colours, poses, the objects and the layout recognisable.\n"
-        "- Otherwise, for a local change, say exactly what changes and that "
-        "everything else stays as it is.\n"
-        "Also write a short negative prompt: for a style change, the look to move "
-        "away from (for a photo: photograph, photorealistic, realistic skin, "
-        "realistic lighting, 3d render, detailed texture); for a local change, "
-        "an empty string.\n"
+        "The user wants a photo edited by Qwen-Image-Edit, an AI editor that sees "
+        "the photo and follows written instructions. Interpret the user's request "
+        "to the best of your ability and write a specific, detailed instruction of "
+        "80-120 words that will get the editor to carry out the request properly. "
+        "Also write a short negative prompt listing what the result must not look "
+        "like (empty if nothing).\n"
         'Reply with JSON only: {"prompt": "...", "negative": "..."}'
     ),
 }

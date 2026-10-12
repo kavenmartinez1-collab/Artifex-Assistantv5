@@ -963,7 +963,7 @@
           <span>AI-assisted prompt</span>
           <label class="sw"><input type="checkbox" id="create-assist"><span class="sl"></span></label>
         </div>
-        <div class="hint">The chat model writes a detailed prompt from yours first. Better results for short prompts and style changes (cartoon, anime, painting), but it loads the chat model before the image model: about a minute longer.</div>
+        <div class="hint">The chat model writes a detailed prompt from yours first. Better results for short prompts and style changes (cartoon, anime, painting), but it loads the chat model first and edits run a second pass: about 1-2 minutes longer.</div>
       </div>
       <button id="create-go" onclick="startCreateJob()">Generate</button>
       <div class="hint" id="create-hint">Image jobs take the GPU from the chat model; it reloads on your next chat message.</div>
