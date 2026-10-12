@@ -102,6 +102,7 @@ class ImageEditInput(BaseModel):
     strength: float = 0.75
     num_steps: int = 30
     guidance_scale: float = 7.5
+    true_cfg_scale: float = 1.0    # Qwen-Image: >1 turns on the negative prompt
     output_path: Optional[str] = None
 
 

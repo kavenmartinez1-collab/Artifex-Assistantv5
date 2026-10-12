@@ -697,6 +697,7 @@
     font: 16px/1.4 inherit; resize: vertical; min-height: 78px;   /* 16px: no zoom */
   }
   #create-prompt:focus { outline: none; border-color: var(--accent); }
+  #create-assist-wrap { margin-top: 8px; }
   #create-source { display: flex; align-items: center; gap: 10px; }
   #create-source img { width: 64px; height: 64px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); }
   #create-source .btn { flex: 1; width: auto; }
@@ -712,6 +713,8 @@
   .job-h .t { color: var(--text); font-weight: 600; flex: none; }
   .job-h .m { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .job-p { font-size: 13px; margin: 5px 0 6px; overflow-wrap: anywhere; }
+  .job-ap { font-size: 12px; color: var(--dim); margin: -2px 0 6px; overflow-wrap: anywhere; }
+  .job-ap summary { cursor: pointer; color: var(--accent); }
   .job-s { font-size: 12px; color: var(--dim); }
   .job-s.err { color: var(--err); }
   .job-s.run:before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%;
@@ -955,6 +958,13 @@
       </div>
       <div class="cr-label" id="create-prompt-label">PROMPT</div>
       <textarea id="create-prompt" spellcheck="true" enterkeyhint="done"></textarea>
+      <div id="create-assist-wrap" class="hidden">
+        <div class="toggle-row">
+          <span>AI-assisted prompt</span>
+          <label class="sw"><input type="checkbox" id="create-assist"><span class="sl"></span></label>
+        </div>
+        <div class="hint">The chat model writes a detailed prompt from yours first. Better results for short prompts and style changes (cartoon, anime, painting), but it loads the chat model before the image model: about a minute longer.</div>
+      </div>
       <button id="create-go" onclick="startCreateJob()">Generate</button>
       <div class="hint" id="create-hint">Image jobs take the GPU from the chat model; it reloads on your next chat message.</div>
     </div>
@@ -4246,6 +4256,8 @@ function renderCreateForm() {
   $("create-source-wrap").classList.toggle("hidden", !t.needs_image);
   $("create-size-wrap").classList.toggle("hidden", !t.sizes.length);
   $("create-duration-wrap").classList.toggle("hidden", t.id !== "music");
+  $("create-assist-wrap").classList.toggle("hidden", !t.assist);
+  $("create-assist").checked = localStorage.getItem("ax_create_assist_" + t.id) === "1";
   $("create-prompt").placeholder = PROMPT_HINTS[t.id] || "";
   $("create-prompt-label").textContent = t.id === "restore" ? "PROMPT (OPTIONAL)" : "PROMPT";
   $("create-go").disabled = !t.models.length;
@@ -4254,6 +4266,10 @@ function renderCreateForm() {
 function rememberCreateModel() {
   localStorage.setItem("ax_create_model_" + createTool, $("create-model").value);
 }
+
+$("create-assist").addEventListener("change", function () {
+  localStorage.setItem("ax_create_assist_" + createTool, this.checked ? "1" : "0");
+});
 
 $("create-size").addEventListener("click", e => {
   const b = e.target.closest("button");
@@ -4319,6 +4335,7 @@ async function startCreateJob() {
                  size: segValue("create-size", "square"),
                  duration: parseInt($("create-duration").value, 10) || 10 };
   if (t.needs_image) body.file_id = createSourceId;
+  if (t.assist && $("create-assist").checked) body.assist = true;
   $("create-go").disabled = true;
   try {
     const r = await fetch("/v1/media/jobs", {
@@ -4355,6 +4372,7 @@ function renderJobs() {
     h.appendChild(el("span", "", relTime(j.created)));
     card.appendChild(h);
     if (j.prompt) card.appendChild(el("div", "job-p", j.prompt));
+    card.appendChild(el("div", "job-ap hidden"));
     card.appendChild(el("div", "job-s"));
     card.appendChild(el("div", "job-out"));
     card.appendChild(el("div", "job-btns"));
@@ -4369,6 +4387,7 @@ function paintJob(j) {
   if (!card) return;
   const s = card.querySelector(".job-s");
   const btns = card.querySelector(".job-btns");
+  paintAssist(card.querySelector(".job-ap"), j);
   if (j.status === "done") {
     const secs = j.finished && j.started ? Math.round(j.finished - j.started) : null;
     s.className = "job-s";
@@ -4443,6 +4462,25 @@ async function showJobOutput(card, j) {
   }
 }
 
+// The prompt the chat model wrote, folded away under the user's own
+function paintAssist(box, j) {
+  if (!box) return;
+  if (j.assist_error) {
+    box.textContent = j.assist_error;
+    box.classList.remove("hidden");
+  } else if (j.assisted_prompt && box.dataset.shown !== j.assisted_prompt) {
+    box.dataset.shown = j.assisted_prompt;
+    box.innerHTML = "";
+    const d = document.createElement("details");
+    d.appendChild(el("summary", "", "AI-written prompt"));
+    d.appendChild(el("div", "", j.assisted_prompt +
+      (j.negative_prompt ? "\n\nAvoid: " + j.negative_prompt : "")));
+    d.lastChild.style.whiteSpace = "pre-wrap";
+    box.appendChild(d);
+    box.classList.remove("hidden");
+  }
+}
+
 function pollJob(id) {
   if (mediaPolls[id]) return;
   const tick = async () => {
@@ -4457,7 +4495,9 @@ function pollJob(id) {
       if (r.ok) {
         const j = await r.json();
         const keep = { status: j.status, stage: j.stage, error: j.error, result: j.result,
-                       started: j.started, finished: j.finished };
+                       started: j.started, finished: j.finished,
+                       assisted_prompt: j.assisted_prompt, negative_prompt: j.negative_prompt,
+                       assist_error: j.assist_error };
         updateStoredJob(Object.assign({ id }, keep));
         paintJob(Object.assign(storedJobs().find(x => x.id === id) || {}, keep));
         if (j.status === "done" || j.status === "error") {

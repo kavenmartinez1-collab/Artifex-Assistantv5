@@ -9,12 +9,21 @@ ModelQueue.exclusive_gpu, which unloads the chat LLM first.
 
 Jobs live in memory only, like agent runs: the last _KEEP_JOBS are kept,
 and outputs themselves are stored by FileManager.
+
+AI-assisted prompts (opt-in per job, image and edit only): the chat model
+rewrites a short prompt into a detailed one before the job takes the GPU.
+Measured on a "turn him into a South Park character" edit, a short prompt
+only cartoonified the face; a detailed one turned the whole person, and
+adding a "photograph, photorealistic" negative at true CFG 4 redrew the
+background too (101 s vs 70 s, since CFG runs the model twice per step).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 import time
 import uuid
 
@@ -64,6 +73,82 @@ def _family(path: str) -> str:
     return "diffusers"
 
 
+# ── AI-assisted prompts ─────────────────────────────────────────────────
+
+ASSIST_TOOLS = ("image", "edit")
+_ASSIST_CFG = 4.0      # true CFG for an edit that comes back with a negative
+
+_ASSIST_SYSTEM = {
+    "image": (
+        "You expand a short image request into a detailed prompt for Qwen-Image, "
+        "a text-to-image model that follows long prompts closely and renders text "
+        "well. Write one paragraph of 60-150 words in English covering the subject, "
+        "composition, setting, art style or medium, lighting and colours. Keep "
+        "every detail the user gave and don't contradict any of it. Any text the "
+        "image should show stays word for word, in double quotes.\n"
+        'Reply with JSON only: {"prompt": "..."}'
+    ),
+    "edit": (
+        "You turn a short photo-edit request into a detailed instruction for "
+        "Qwen-Image-Edit, an editor that sees the photo and follows instructions. "
+        "You can't see the photo, so don't invent details about what is in it. "
+        "Write one paragraph of 60-150 words in English.\n"
+        "- If the request changes the art style (cartoon, anime, a named TV show "
+        "or film, painting, sketch, pixel art, clay...), say the WHOLE image is "
+        "redrawn in that style: every person, every object and the background. "
+        "Describe the style's concrete visual traits (line work, colour, shading, "
+        "proportions, how characters' heads, eyes and bodies are drawn); for a "
+        "named show, film or artist, describe its real signature character design "
+        "as you know it, not a generic cartoon. Say the result must not look like "
+        "a photograph. Say to keep the people's "
+        "clothing, colours, poses, the objects and the layout recognisable.\n"
+        "- Otherwise, for a local change, say exactly what changes and that "
+        "everything else stays as it is.\n"
+        "Also write a short negative prompt: for a style change, the look to move "
+        "away from (for a photo: photograph, photorealistic, realistic skin, "
+        "realistic lighting, 3d render, detailed texture); for a local change, "
+        "an empty string.\n"
+        'Reply with JSON only: {"prompt": "...", "negative": "..."}'
+    ),
+}
+
+# async (messages) -> str: one reply from the chat model (api/server.py)
+_prompt_llm = None
+
+
+def set_prompt_llm(fn):
+    global _prompt_llm
+    _prompt_llm = fn
+
+
+def parse_assist_reply(reply: str, fallback: str) -> tuple[str, str]:
+    """The model's {"prompt", "negative"} JSON -> (prompt, negative).
+    Prose instead of JSON is used as the prompt; nothing usable keeps the
+    user's own prompt."""
+    text = (reply or "").strip()
+    m = re.search(r"\{.*\}", text, re.S)
+    prompt, negative = "", ""
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            prompt = str(data.get("prompt") or "").strip()
+            negative = str(data.get("negative") or "").strip()
+        except (ValueError, AttributeError):
+            pass
+    if not prompt and "{" not in text:      # prose, not cut-off JSON
+        prompt = re.sub(r"^```\w*|```$", "", text).strip()
+    return (prompt or fallback)[:2000], negative[:500]
+
+
+async def assist_prompt(tool: str, prompt: str) -> tuple[str, str]:
+    """Expand `prompt` for `tool` with the chat model -> (prompt, negative)."""
+    reply = await _prompt_llm([
+        {"role": "system", "content": _ASSIST_SYSTEM[tool]},
+        {"role": "user", "content": prompt},
+    ])
+    return parse_assist_reply(reply, prompt)
+
+
 def unavailable_reason(tool: str) -> str | None:
     """Why `tool` can't run on this machine at all, or None."""
     if tool == "video":
@@ -107,7 +192,8 @@ def catalog() -> dict:
         "tools": [
             {"id": tid, "label": t["label"], "needs_image": bool(t.get("needs_image")),
              "models": list_models(tid), "unavailable": unavailable_reason(tid),
-             "sizes": list(SIZES) if tid == "image" else []}
+             "sizes": list(SIZES) if tid == "image" else [],
+             "assist": tid in ASSIST_TOOLS and _prompt_llm is not None}
             for tid, t in TOOLS.items()
         ],
         "voices": voice_io.list_voices(),
@@ -199,20 +285,40 @@ def start_job(tool: str, params: dict) -> dict:
     if tool != "restore" and not (params.get("prompt") or "").strip():
         raise ValueError("A prompt is required.")
     kwargs = _pipeline_kwargs(tool, model_path, params, image_path)
+    assist = bool(params.get("assist")) and tool in ASSIST_TOOLS and _prompt_llm is not None
 
     job = {
         "id": uuid.uuid4().hex[:12], "tool": tool, "status": "queued",
-        "stage": "Waiting for the GPU", "created": time.time(),
+        "stage": "Writing a detailed prompt" if assist else "Waiting for the GPU",
+        "created": time.time(), "assist": assist,
         "started": None, "finished": None, "error": None, "result": None,
         "model": os.path.basename(model_path) or "classic",
         "prompt": kwargs.get("prompt", ""),
     }
     _remember(job)
-    asyncio.get_event_loop().create_task(_run(job, spec["pipeline"], model_path, kwargs))
+    asyncio.get_event_loop().create_task(
+        _run(job, spec["pipeline"], model_path, kwargs, assist))
     return job
 
 
-async def _run(job: dict, pipeline_type: str, model_path: str, kwargs: dict):
+async def _assist(job: dict, kwargs: dict):
+    """Swap in the chat model's detailed prompt. A failure keeps the user's
+    prompt and says so on the job; the image still gets made."""
+    job.update(status="running", started=time.time())
+    try:
+        prompt, negative = await assist_prompt(job["tool"], kwargs["prompt"])
+        kwargs["prompt"] = job["assisted_prompt"] = prompt
+        if job["tool"] == "edit" and negative:
+            kwargs.update(negative_prompt=negative, true_cfg_scale=_ASSIST_CFG)
+            job["negative_prompt"] = negative
+    except Exception as e:
+        _log.warning("Prompt assist for job %s failed: %s", job["id"], e)
+        job["assist_error"] = f"AI prompt skipped ({e}); used your prompt."
+    job["stage"] = "Waiting for the GPU"
+
+
+async def _run(job: dict, pipeline_type: str, model_path: str, kwargs: dict,
+               assist: bool = False):
     from core.model_queue import ModelBusyError, get_model_queue
     from core.services import get_service
 
@@ -232,8 +338,11 @@ async def _run(job: dict, pipeline_type: str, model_path: str, kwargs: dict):
                                 progress_callback=progress, store_output=True)
 
     try:
+        if assist:
+            await _assist(job, kwargs)
         async with get_model_queue().exclusive_gpu(job["tool"]):
-            job.update(status="running", started=time.time(), stage="Loading model")
+            job.update(status="running", started=job["started"] or time.time(),
+                       stage="Loading model")
             result = await asyncio.get_event_loop().run_in_executor(None, work)
         if not result.success:
             raise RuntimeError(result.error or "failed")

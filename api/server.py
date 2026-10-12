@@ -1672,7 +1672,38 @@ def create_app():
     # Image/edit/restore/music/video/3D as background jobs that take the GPU
     # from the chat LLM, plus Piper TTS and Whisper STT on the CPU.
     from api.media_api import register_media_routes
-    register_media_routes(app, check_auth=_check_auth)
+
+    async def _media_prompt_llm(messages, max_tokens=600):
+        # One short reply from the active chat model, for the Create tab's
+        # "AI-assisted prompt" option. Runs before the media job takes the
+        # GPU, through the same queue switch chat uses, at the smallest tier.
+        backend = get_active_backend()
+        model = _resolve_model_for_request(None, False, backend)
+        ctx_tier = None
+        if backend == "llama_cpp":
+            from core.config import get_llama_cpp_model_config
+            from core.engine_llama_cpp import pick_ctx_tier
+            ctx_tier = pick_ctx_tier(
+                4096, max_cap=(get_llama_cpp_model_config(model) or {}).get("num_ctx"))
+        mq = get_model_queue()
+        loop = asyncio.get_event_loop()
+        async with mq._lock:
+            await mq.switch_if_needed(model, backend, ctx_tier=ctx_tier)
+            # A cold llama-server load takes ~25 s: off the event loop, so
+            # the phone's job polls keep answering meanwhile
+            engine = await loop.run_in_executor(None, lambda: _get_engine(ctx_tier=ctx_tier))
+            if backend == "ollama":
+                result = await loop.run_in_executor(None, lambda: _proxy_ollama_chat(
+                    _convert_messages_for_ollama(messages), model, 0.7,
+                    max_tokens, None, 300))
+                text = result["choices"][0]["message"]["content"]
+            else:
+                text = await loop.run_in_executor(None, lambda: engine.generate_streaming(
+                    messages, max_tokens=max_tokens, temperature=0.7,
+                    raw_output=True, enable_thinking=False))
+        return strip_think_blocks(text or "")
+
+    register_media_routes(app, check_auth=_check_auth, prompt_llm=_media_prompt_llm)
 
     if phone_full_tools:
         # ─── Purge ───────────────────────────────────────────────────────

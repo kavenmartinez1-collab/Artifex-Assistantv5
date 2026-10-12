@@ -120,6 +120,8 @@ class ImageEditPipeline(BasePipeline):
             strength: Denoising strength 0.0-1.0 (img2img, default 0.75)
             num_steps: Inference steps (default 30)
             guidance_scale: CFG scale (default 7.5)
+            true_cfg_scale: Qwen-Image true CFG; >1 applies negative_prompt
+                and runs the model twice per step (default 1, off)
             output_path: Where to save result
 
         Returns:
@@ -159,6 +161,8 @@ class ImageEditPipeline(BasePipeline):
 
             if params.negative_prompt:
                 gen_kwargs["negative_prompt"] = params.negative_prompt
+            if params.true_cfg_scale > 1:
+                gen_kwargs["true_cfg_scale"] = params.true_cfg_scale
 
             if self._mode == "inpaint" and params.mask_path and os.path.isfile(params.mask_path):
                 gen_kwargs["mask_image"] = Image.open(params.mask_path).convert("L")

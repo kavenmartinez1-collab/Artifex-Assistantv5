@@ -3,7 +3,7 @@ Artifex Assistant V5 — Media tools and voice over the REST API (phone app).
 
     GET  /v1/media/tools              tools, the models each can use, voices
     PUT  /v1/media/upload?name=       raw body -> stored file (source images)
-    POST /v1/media/jobs               {tool, prompt, model?, file_id?, ...}
+    POST /v1/media/jobs               {tool, prompt, model?, file_id?, assist?, ...}
     GET  /v1/media/jobs[/{id}]        job status / result file_id
     GET  /v1/media/file/{file_id}     a stored input or output
     POST /v1/voice/tts                {text, voice?} -> audio/wav
@@ -37,6 +37,7 @@ class MediaJobRequest(BaseModel):
     seed: Optional[int] = -1
     duration: Optional[int] = 10         # music seconds
     upscale: Optional[int] = 2           # restore: 2 or 4
+    assist: Optional[bool] = False       # image / edit: chat model expands the prompt
 
 
 class TTSRequest(BaseModel):
@@ -44,8 +45,10 @@ class TTSRequest(BaseModel):
     voice: Optional[str] = None
 
 
-def register_media_routes(app, check_auth):
+def register_media_routes(app, check_auth, prompt_llm=None):
     from core.services import get_file_manager, media_tools, voice_io
+
+    media_tools.set_prompt_llm(prompt_llm)
 
     def _auth(request: Request):
         if not check_auth(request):
