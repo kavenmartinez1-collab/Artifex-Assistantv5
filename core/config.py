@@ -327,6 +327,8 @@ def get_llama_cpp_model_config(model_name: str) -> dict:
         model_cfg["server_path"] = cfg.get("server_path", "llama-server")
     if "port" not in model_cfg:
         model_cfg["port"] = cfg.get("default_port", 8081)
+    if "dll_dirs" not in model_cfg and cfg.get("dll_dirs"):
+        model_cfg["dll_dirs"] = list(cfg["dll_dirs"])
     return model_cfg
 
 

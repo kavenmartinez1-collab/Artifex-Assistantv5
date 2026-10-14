@@ -40,6 +40,38 @@ class TestHealthTimeoutConfig(unittest.TestCase):
         self.assertEqual(engine._health_timeout, HEALTH_TIMEOUT)
 
 
+class TestDllDirs(unittest.TestCase):
+    """dll_dirs reach llama-server's PATH no matter which shell launched us
+    (a CUDA+ROCm split lost ROCm0 when the ROCm runtime was off PATH)."""
+
+    def test_existing_dirs_prepended_in_order_missing_skipped(self):
+        import tempfile
+        from core.engine_llama_cpp import LlamaCppEngine
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            missing = os.path.join(a, "nope")
+            engine = LlamaCppEngine("test", {
+                "path": "/fake/model.gguf", "dll_dirs": [a, missing, b],
+            })
+            env = {"PATH": "orig"}
+            engine._prepend_dll_dirs(env)
+            self.assertEqual(env["PATH"], os.pathsep.join([a, b, "orig"]))
+
+    def test_no_dll_dirs_leaves_path_alone(self):
+        from core.engine_llama_cpp import LlamaCppEngine
+        engine = LlamaCppEngine("test", {"path": "/fake/model.gguf"})
+        env = {"PATH": "orig"}
+        engine._prepend_dll_dirs(env)
+        self.assertEqual(env["PATH"], "orig")
+
+    def test_global_dll_dirs_merged_per_model_wins(self):
+        import core.config as cfgmod
+        cfg = {"dll_dirs": ["G"], "models": {
+            "plain": {"path": "x"}, "own": {"path": "y", "dll_dirs": ["M"]}}}
+        with patch.object(cfgmod, "_load_llama_cpp_config", return_value=cfg):
+            self.assertEqual(cfgmod.get_llama_cpp_model_config("plain")["dll_dirs"], ["G"])
+            self.assertEqual(cfgmod.get_llama_cpp_model_config("own")["dll_dirs"], ["M"])
+
+
 class TestGrammarPayload(unittest.TestCase):
     """P1-T6: Grammar and response_format pass through to llama-server payload."""
 

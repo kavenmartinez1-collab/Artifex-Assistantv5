@@ -223,6 +223,11 @@ class LlamaCppEngine(BaseEngine):
         self.num_gpu_layers = model_config.get("num_gpu_layers", 99)
         self.extra_flags = list(model_config.get("extra_flags", []))
         self.server_path = model_config.get("server_path", "llama-server")
+        # Extra DLL/shared-lib dirs prepended to the child's PATH (per-model
+        # override > global). A CUDA+ROCm build needs the ROCm runtime here:
+        # without it ggml-hip.dll fails to load SILENTLY and "--device ROCm0"
+        # dies as an unknown device, depending on which shell launched us.
+        self._dll_dirs = list(model_config.get("dll_dirs") or [])
         # Cap from config — the engine will never launch above this, even if
         # set_target_tier is called with a larger value.  Semantics changed
         # with tier-aware launch: this is the upper bound, not the value.
@@ -379,6 +384,21 @@ class LlamaCppEngine(BaseEngine):
             _log.info("No GPUs enumerated; defaulting to device 0")
             return 0
         return picked
+
+    def _prepend_dll_dirs(self, env: dict) -> None:
+        """Put configured dll_dirs in front of env["PATH"], in config order.
+
+        Missing dirs are skipped with a warning rather than failing the
+        launch: the server may not need them (e.g. a CUDA-only device list).
+        """
+        present = []
+        for d in self._dll_dirs:
+            if os.path.isdir(d):
+                present.append(d)
+            else:
+                _log.warning("dll_dirs entry does not exist: %s", d)
+        if present:
+            env["PATH"] = os.pathsep.join(present + [env.get("PATH", "")])
 
     def _parse_ts_shares(self) -> list:
         """Relative device shares from -ts / --tensor-split, or []."""
@@ -787,6 +807,8 @@ class LlamaCppEngine(BaseEngine):
                     if os.path.isfile(os.path.join(cuda_bin, "cudart64_12.dll")):
                         launch_env["PATH"] = cuda_bin + os.pathsep + launch_env.get("PATH", "")
                         break
+
+        self._prepend_dll_dirs(launch_env)
 
         _log.info("llama-server cmd: %s  (CUDA_VISIBLE_DEVICES=%d)",
                   " ".join(cmd), gpu_index)
