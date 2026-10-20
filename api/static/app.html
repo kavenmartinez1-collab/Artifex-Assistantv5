@@ -1051,13 +1051,20 @@
   <div class="panel">
     <div class="pt">HISTORY BUDGET</div>
     <select id="hist-budget">
+      <option value="auto">Auto - the model's full window (default)</option>
       <option value="24000">24k chars (short)</option>
-      <option value="48000">48k chars (default)</option>
+      <option value="48000">48k chars</option>
       <option value="96000">96k chars</option>
       <option value="144000">144k chars</option>
-      <option value="192000">192k chars (max)</option>
+      <option value="192000">192k chars</option>
     </select>
-    <div class="hint">Past 80% of this, the older half of the conversation is auto-compacted into a summary before the next send - like /compact.</div>
+    <div class="pt" style="margin-top:10px">COMPACT DOWN TO</div>
+    <select id="compact-target">
+      <option value="0.1">10% of the budget (default)</option>
+      <option value="0.2">20%</option>
+      <option value="0.3">30%</option>
+    </select>
+    <div class="hint">Past 80% of the budget, everything but the newest messages is folded into one summary, leaving the conversation at about this size. Lower means rarer compactions (and less verbatim recent context). Each one costs a summary plus one re-read of what is left, so rare is fast.</div>
   </div>
   <div class="panel">
     <div class="pt">WEB SEARCH</div>
@@ -1207,29 +1214,74 @@ CAPABILITIES IN THIS CHAT:
 - The server is running in web-only mode: there is no agent or file access from this app at all. If asked for anything that needs the user's machine, say the server operator has not enabled those tools.`);
 }
 
-// Sliding context. The char budget is a user setting; past COMPACT_AT of it
-// the older half of the conversation is summarized away (see autoCompact)
-// instead of being silently dropped. trimmedHistory() is the hard floor that
-// still applies if a compaction fails.
-const MAX_HISTORY_MESSAGES = 60;
-const DEFAULT_HISTORY_BUDGET = 48000;
+// Sliding context, with hysteresis. Past COMPACT_AT of the budget, everything
+// but the newest compactTarget() slice is folded into ONE synopsis (see
+// autoCompact). Folding only the older half used to leave the conversation
+// near the threshold, so it re-compacted every few sends, and every
+// compaction changes the prompt's prefix: this hybrid model then re-reads
+// the whole window from scratch. Folding down to ~10% buys a long stretch of
+// cache-friendly sends before the next one. trimmedHistory() is the hard
+// floor that still applies if a compaction fails.
+//
+// The message cap is a backstop only: once it binds, every send drops the
+// oldest message, which also shifts the prefix (a full re-read per send).
+// compactCut() fires before it can.
+const MAX_HISTORY_MESSAGES = 200;
+const DEFAULT_HISTORY_BUDGET = "auto";
+const DEFAULT_COMPACT_TARGET = 0.1;
 const COMPACT_AT = 0.8;
+const COMPACT_KEEP_MAX = 20;   // verbatim messages kept, so the count trigger bites
 const COMPACT_TAG = "[EARLIER CONVERSATION — AUTO-COMPACTED SUMMARY]";
-const COMPACT_SYSTEM =
-  "Summarize this conversation prefix into a dense factual synopsis preserving " +
-  "all names, paths, numbers, decisions, and open questions. Output only the synopsis.";
-function historyBudget() {
-  const n = parseInt($("hist-budget").value, 10);
-  const user = (isNaN(n) || n < 4000) ? DEFAULT_HISTORY_BUDGET : n;
-  if (!engineCtx) return user;
-  // Clamp to what the LOADED tier can hold: ctx minus the completion
-  // reservation minus a template margin, tokens->chars at 4/token with a
-  // 0.85 safety factor (dense text tokenizes above chars/4). Keeps the
-  // synopsis compaction firing BEFORE the server has to hard-trim.
+// Asked as the next turn of the SAME conversation (same system prompt, same
+// effort), so the server's prompt cache already holds everything above it
+// and the synopsis costs only its own decode, not a re-read of the history.
+const COMPACT_REQUEST =
+  "[CONTEXT COMPACTION — not a question from the user] The conversation above " +
+  "is about to be replaced by a synopsis. Write that synopsis now: a dense, " +
+  "factual summary of the whole conversation so far, preserving all names, " +
+  "paths, numbers, code identifiers, decisions, the user's preferences, and " +
+  "open questions or unfinished tasks. The newest few messages stay visible " +
+  "verbatim, so spend the detail on the earlier material. At most about 700 " +
+  "words. Do not call tools. Output only the synopsis.";
+// Set when the server had to compact/trim to fit (e.g. the VRAM gate loaded
+// a smaller window than the cap). The next send compacts client-side once,
+// instead of the server re-compacting (and re-reading the window) every send.
+let compactNext = false;
+// Real context use of the last exchange (prompt + completion tokens), with
+// the conversation length and session it belongs to. Chars/4 under-counts
+// code and dense text; this lets compactCut() see the real number.
+let lastCtxUse = { tok: 0, len: -1, sid: null };
+
+// The window the conversation will actually get, in tokens: the selected
+// model's configured cap, not the LOADED tier. The server starts a chat at
+// the smallest tier that fits (32k/64k) and relaunches bigger as the request
+// grows, so budgeting against the loaded tier compacted the chat to fit 64k
+// and it never grew into the rest of a 73k/114k window.
+function windowTokens() {
+  return selectedCtxCap() || engineCtx || 0;
+}
+// Input tokens a send may use: window minus the completion reservation minus
+// a template margin (mirrors context_input_budget() in core/inference.py).
+function tokenBudget() {
+  const ctx = windowTokens();
+  if (!ctx) return 0;
   const maxTok = parseInt($("max-tokens").value, 10) || 12288;
-  const margin = Math.max(512, engineCtx >> 5);
-  const tokBudget = Math.max(engineCtx - maxTok - margin, engineCtx >> 2);
-  return Math.min(user, Math.floor(tokBudget * 4 * 0.85));
+  const margin = Math.max(512, ctx >> 5);
+  return Math.max(ctx - maxTok - margin, ctx >> 2);
+}
+function historyBudget() {
+  const raw = $("hist-budget").value;
+  const n = parseInt(raw, 10);
+  const user = (raw === "auto" || isNaN(n) || n < 4000) ? Infinity : n;
+  const tok = tokenBudget();
+  // Tokens->chars at 4/token with a 0.85 safety factor (dense text
+  // tokenizes above chars/4). Unknown window: a conservative 48k chars.
+  const fromCtx = tok ? Math.floor(tok * 4 * 0.85) : 48000;
+  return Math.min(user, fromCtx);
+}
+function compactTarget() {
+  const f = parseFloat($("compact-target").value);
+  return (f > 0 && f < COMPACT_AT) ? f : DEFAULT_COMPACT_TARGET;
 }
 
 // Re-render cadence while streaming. Every token re-rendered the whole
@@ -1252,6 +1304,7 @@ const store = {
     localStorage.setItem("ax_autonomy", currentAutonomy());
     localStorage.setItem("ax_plan", currentPlan());
     localStorage.setItem("ax_histbudget", $("hist-budget").value);
+    localStorage.setItem("ax_compact_target", $("compact-target").value);
     localStorage.setItem("ax_agentctx", currentAgentCtx());
   },
   restore() {
@@ -1275,8 +1328,16 @@ const store = {
     setPlan(localStorage.getItem("ax_plan") || "off");
     const ectx = localStorage.getItem("ax_engine_ctx");
     if (ectx !== null) $("engine-ctx").value = ectx;
-    $("hist-budget").value = localStorage.getItem("ax_histbudget") || String(DEFAULT_HISTORY_BUDGET);
-    if (!$("hist-budget").value) $("hist-budget").value = String(DEFAULT_HISTORY_BUDGET);
+    // Migrate once to Auto: the fixed char budgets topped out at 192k chars
+    // (~48k tokens), which capped every model well below its window.
+    if (localStorage.getItem("ax_histbudget_v2") !== "1") {
+      localStorage.setItem("ax_histbudget", DEFAULT_HISTORY_BUDGET);
+      localStorage.setItem("ax_histbudget_v2", "1");
+    }
+    $("hist-budget").value = localStorage.getItem("ax_histbudget") || DEFAULT_HISTORY_BUDGET;
+    if (!$("hist-budget").value) $("hist-budget").value = DEFAULT_HISTORY_BUDGET;
+    $("compact-target").value = localStorage.getItem("ax_compact_target") || String(DEFAULT_COMPACT_TARGET);
+    if (!$("compact-target").value) $("compact-target").value = String(DEFAULT_COMPACT_TARGET);
     // "" is a real stored value (the full-window rung), so test for null
     // rather than falsiness — `|| "16384"` would turn every saved "full"
     // back into 16k on the next boot. applyCtxCap() rebuilds this segment
@@ -1419,6 +1480,7 @@ $("agentctx-seg").addEventListener("click", e => {
   store.save();
 });
 $("hist-budget").addEventListener("change", () => store.save());
+$("compact-target").addEventListener("change", () => store.save());
 
 // ── Tabs ─────────────────────────────────────────────────
 // Web-only servers (phone_tools:"web" in /health) don't register the
@@ -2262,34 +2324,63 @@ function isCompactSummary(m) {
   return !!m && m.role === "user" && flattenContent(m.content).indexOf(COMPACT_TAG) === 0;
 }
 
+// Record the real context use of the exchange that just finished.
+function noteCtxUse(usage) {
+  const tok = (usage && (usage.prompt_tokens || 0) + (usage.completion_tokens || 0)) || 0;
+  if (tok) lastCtxUse = { tok: tok, len: conversation.length, sid: activeSessionId };
+}
+
+// Is the conversation due a compaction? Any of: the char estimate, the real
+// token count of the last exchange (only while it still describes this
+// conversation, plus the one new user turn), or the message backstop.
+function compactDue() {
+  const n = conversation.length;
+  if (compactNext) return true;
+  if (convChars() > historyBudget() * COMPACT_AT) return true;
+  const tok = tokenBudget();
+  if (tok && lastCtxUse.tok > tok * COMPACT_AT && lastCtxUse.sid === activeSessionId
+      && n - lastCtxUse.len >= 0 && n - lastCtxUse.len <= 1) return true;
+  return n > MAX_HISTORY_MESSAGES * COMPACT_AT;
+}
+
 // How many of the oldest messages to fold away, or 0 for "don't".
 function compactCut() {
   const n = conversation.length;
-  if (n < 6) return 0;                                  // nothing worth folding
-  if (convChars() <= historyBudget() * COMPACT_AT) return 0;
-  const cut = Math.floor(n / 2);
-  if (cut < 2) return 0;
-  let headChars = 0, summaryChars = 0;
-  for (let i = 0; i < cut; i++) {
+  if (n < 4) return 0;                                  // nothing worth folding
+  if (!compactDue()) return 0;
+  // Keep the newest messages that fit the target slice of the budget, and
+  // always the current turn plus the reply before it. Everything older,
+  // earlier synopses included, folds into the new synopsis.
+  const keepChars = historyBudget() * compactTarget();
+  let kept = 0, chars = 0;
+  for (let i = n - 1; i >= 0; i--) {
+    if (isCompactSummary(conversation[i])) break;     // never keep an old synopsis verbatim
     const c = flattenContent(conversation[i] && conversation[i].content).length;
-    headChars += c;
-    if (isCompactSummary(conversation[i])) summaryChars += c;
+    if (kept >= 2 && (chars + c > keepChars || kept >= COMPACT_KEEP_MAX)) break;
+    chars += c;
+    kept++;
   }
-  if (!headChars) return 0;
-  // Don't compact a compaction. If the older half is a previous synopsis plus
-  // only a little new text, a second pass would spend a model call re-decaying
-  // text that is already compressed. Require real new material first. (A
-  // synopsis is capped at 800 tokens, so this stays true at any budget.)
-  if (summaryChars && (headChars - summaryChars) < 4000) return 0;
+  const cut = n - kept;
+  // A head that is only the previous synopsis has nothing new to fold.
+  if (cut < 1 || (cut === 1 && isCompactSummary(conversation[0]))) return 0;
   return cut;
 }
 
-// Replace the older half with one synopsis message. Never throws, never
-// blocks the send: on any failure the caller falls through to trimmedHistory.
+// Fold the head into one synopsis message. Never throws, never blocks the
+// send: on any failure the caller falls through to trimmedHistory.
+//
+// The request is the conversation itself plus one more user turn, sent with
+// the chat's own system prompt and reasoning effort. Both sit at the very
+// top of the rendered prompt (Qwen3.8's template opens the system block with
+// the effort line), so the old dedicated summarizer prompt at effort "low"
+// missed the server's prompt cache at token 0 and re-read the whole head;
+// this way only the new instruction is prefilled.
 async function autoCompact(signal, onStatus) {
   const cut = compactCut();
   if (!cut) return 0;
-  const head = conversation.slice(0, cut);
+  const n = conversation.length;
+  // Everything the last request already sent, i.e. all but the new user turn.
+  const upto = (conversation[n - 1] && conversation[n - 1].role === "user") ? n - 1 : n;
   if (onStatus) onStatus("compacting context...");
   try {
     const r = await fetch("/v1/chat/completions", {
@@ -2298,14 +2389,15 @@ async function autoCompact(signal, onStatus) {
       signal: signal,
       body: JSON.stringify({
         model: $("model-select").value || undefined,
-        messages: [{ role: "system", content: COMPACT_SYSTEM }]
-          .concat(head.map(m => ({ role: m.role, content: flattenContent(m.content) })))
-          .concat([{ role: "user", content: "Produce the synopsis now." }]),
+        messages: [{ role: "system", content: chatSystemPrompt() }]
+          .concat(conversation.slice(0, upto).map(m => ({ role: m.role, content: flattenContent(m.content) })))
+          .concat([{ role: "user", content: COMPACT_REQUEST }]),
         stream: false,
-        web_tools: false,
+        web_tools: false,      // the tool prompt still rides in the system text
         temperature: 0.3,
-        max_tokens: 800,
-        options: { reasoning_effort: "low" },
+        // Thinking is spent from this first, at the chat's effort.
+        max_tokens: 4096,
+        options: { reasoning_effort: currentEffort() },
       }),
     });
     if (!r.ok) throw new Error("HTTP " + r.status);
@@ -2314,6 +2406,7 @@ async function autoCompact(signal, onStatus) {
     const text = String((choice.message && choice.message.content) || "").trim();
     if (!text) throw new Error("empty synopsis");
     conversation.splice(0, cut, { role: "user", content: COMPACT_TAG + "\n" + text });
+    compactNext = false;
     return cut;
   } catch (e) {
     return 0;              // silent fallback to the hard trim
@@ -2562,12 +2655,20 @@ function reattachChat(jobId) {
   runAssistantTurn({ attachJob: jobId });
 }
 
-function buildChatPayload() {
+// The chat system prompt. autoCompact() sends this exact string too, so its
+// request shares the cached prefix of the conversation it summarizes.
+function chatSystemPrompt() {
   const webOn = $("web-toggle").checked;
   let sys = $("system-prompt").value.trim() || DEFAULT_SYSTEM_PROMPT;
   sys += "\n\nTODAY'S DATE: " + new Date().toDateString();
   sys += capabilitiesNote(webOn);
   if (webOn) sys += TOOL_PROMPT;
+  return sys;
+}
+
+function buildChatPayload() {
+  const webOn = $("web-toggle").checked;
+  const sys = chatSystemPrompt();
   const msgs = trimmedHistory();
   // Any kept message may carry real images now: trimmedHistory preserves the
   // current turn AND the most recent image turn (see IMAGE_RECALL_TURNS), so
@@ -2813,7 +2914,9 @@ async function runAssistantTurn(opts) {
     if (data.x_tool_status) { addToolStatus(data.x_tool_status); return; }
     if (data.x_context_fit) {
       // Server-side pre-flight had to compact/trim to fit the model window
-      // (e.g. a single message bigger than the whole tier).
+      // (e.g. a single message bigger than the whole tier). Its cut changes
+      // the prompt's prefix on every send, so compact for real next time.
+      compactNext = true;
       addBlock(Object.assign(document.createElement("div"), {
         className: "tool-status",
         textContent: "— context " +
@@ -2936,6 +3039,7 @@ async function runAssistantTurn(opts) {
     // PUT is a same-content overwrite, and the only writer for a stopped or
     // errored job.
     syncSession(false);            // fire-and-forget; never blocks the UI
+    if (usage) noteCtxUse(usage);
     if (usage) {
       const el = ((Date.now() - t0) / 1000);
       $("stats").style.display = "block";

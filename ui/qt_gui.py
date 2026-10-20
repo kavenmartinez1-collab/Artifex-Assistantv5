@@ -1136,27 +1136,10 @@ class ArtifexMainWindow(QMainWindow):
         self._update_system_prompt(mode)
 
         # Build active messages — scale to engine's real context size
-        from core.inference import (build_active_messages,
-                                    trim_messages_to_context,
-                                    auto_compact_if_needed)
         mode_cfg = MODES.get(mode.upper(), MODES["ASSISTANT"])
         ctx = self.engine.get_context_size() if self.engine else 0
-
-        # Auto-compact history before building active messages
-        if ctx > 0:
-            self.messages, compacted = auto_compact_if_needed(
-                self.messages, ctx, mode_cfg.context_window
-            )
-            if compacted:
-                self._set_status(
-                    f"Context compacted: {len(self.messages)} messages kept"
-                )
-
-        _, active_msgs = build_active_messages(
-            self.messages, mode_cfg.context_window, engine_ctx=ctx
-        )
-        if ctx > 0:
-            active_msgs = trim_messages_to_context(active_msgs, int(ctx * 0.85))
+        active_msgs, compact_cut = self._history_for_send(
+            ctx, max_tokens, mode_cfg.context_window)
 
         # Show user message in chat
         user_bubble = self._chat_view.add_bubble("user")
@@ -1171,7 +1154,9 @@ class ArtifexMainWindow(QMainWindow):
             self.engine, active_msgs, max_tokens, temperature,
             enable_thinking=mode_cfg.enable_thinking,
             cancel_event=self._cancel_event,
+            compact_cut=compact_cut,
         )
+        worker.compacted.connect(self._on_history_compacted)
         worker.response_received.connect(self._response_batcher.add)
         worker.thinking_received.connect(self._thinking_batcher.add)
         worker.status_changed.connect(self._set_status)
@@ -1181,6 +1166,38 @@ class ArtifexMainWindow(QMainWindow):
         self._viz_panel.reset()
         self._current_worker = worker
         worker.start()
+
+    def _history_for_send(self, ctx, max_tokens, context_window):
+        """(messages to send, conversation messages to compact first).
+
+        With a known window the whole history is sent as-is: compaction
+        is hysteretic (core.inference.plan_compaction — fold to ~10% at
+        80% full), so the prompt's prefix stays put between compactions
+        and llama-server re-reads only the new turn. The old path slid a
+        message window and re-ran key-point compression on every send
+        past 60% of ctx, which changed the prefix each time and made the
+        model re-read the whole window per message.
+        """
+        from core.inference import (build_active_messages,
+                                    context_input_budget, plan_compaction,
+                                    trim_messages_to_context)
+        if ctx <= 0:
+            _, active = build_active_messages(self.messages, context_window)
+            return active, 0
+        # "max" (-1) still needs room to answer in.
+        if not max_tokens or max_tokens <= 0:
+            max_tokens = min(12288, ctx // 4)
+        cut = plan_compaction(self.messages, ctx, max_tokens)
+        if cut:
+            # The worker folds these first; it sends the compacted list.
+            return list(self.messages), cut
+        return trim_messages_to_context(
+            list(self.messages), context_input_budget(ctx, max_tokens)), 0
+
+    def _on_history_compacted(self, messages):
+        self.messages = messages
+        self._set_status(
+            f"Context compacted: {len(self.messages)} messages kept")
 
     def _run_pipeline(self, mode: str, prompt: str):
         """Start a non-text pipeline in a background thread."""
@@ -1697,26 +1714,10 @@ class ArtifexMainWindow(QMainWindow):
         self.messages.append({"role": "user", "content": feedback_msg})
         self._update_system_prompt()
 
-        from core.inference import (build_active_messages,
-                                    trim_messages_to_context,
-                                    auto_compact_if_needed)
         mode_cfg = MODES["ASSISTANT"]
         ctx = self.engine.get_context_size()
-
-        if ctx > 0:
-            self.messages, compacted = auto_compact_if_needed(
-                self.messages, ctx, mode_cfg.context_window
-            )
-            if compacted:
-                self._set_status(
-                    f"Context compacted: {len(self.messages)} messages kept"
-                )
-
-        _, active_msgs = build_active_messages(
-            self.messages, mode_cfg.context_window, engine_ctx=ctx
-        )
-        if ctx > 0:
-            active_msgs = trim_messages_to_context(active_msgs, int(ctx * 0.85))
+        active_msgs, compact_cut = self._history_for_send(
+            ctx, mode_cfg.max_tokens, mode_cfg.context_window)
 
         self._current_bubble = self._chat_view.add_bubble("assistant")
         self._current_bubble.add_text("")
@@ -1726,7 +1727,9 @@ class ArtifexMainWindow(QMainWindow):
             mode_cfg.temperature,
             enable_thinking=mode_cfg.enable_thinking,
             cancel_event=self._cancel_event,
+            compact_cut=compact_cut,
         )
+        worker.compacted.connect(self._on_history_compacted)
         worker.response_received.connect(self._response_batcher.add)
         worker.thinking_received.connect(self._thinking_batcher.add)
         worker.status_changed.connect(self._set_status)

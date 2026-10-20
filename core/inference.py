@@ -520,6 +520,121 @@ def auto_compact_if_needed(messages, engine_ctx, context_window, threshold=0.60)
     return compacted, True
 
 
+# ── Hysteresis compaction (chat) ──────────────────────────────────────
+# Fold the conversation down to a small fraction of the budget once it
+# passes a high-water mark, then leave the prefix alone until it fills
+# again. This hybrid model cannot reuse a cached prompt past the first
+# changed token, so every compaction (and every per-send slide of a
+# message window) means re-reading everything that remains. Compacting
+# rarely and far is what keeps long chats fast. Mirrors compactCut() in
+# api/static/app.html.
+COMPACT_HIGH = 0.80
+COMPACT_TARGET = 0.10
+COMPACT_MAX_MESSAGES = 160
+COMPACT_KEEP_MAX = 20      # verbatim messages kept, so the count trigger bites
+COMPACT_TAG = "[EARLIER CONVERSATION — AUTO-COMPACTED SUMMARY]"
+# Sent as the next turn of the SAME conversation, so the prompt cache holds
+# everything above it and the synopsis costs only its own decode.
+COMPACT_REQUEST = (
+    "[CONTEXT COMPACTION — not a question from the user] The conversation "
+    "above is about to be replaced by a synopsis. Write that synopsis now: a "
+    "dense, factual summary of the whole conversation so far, preserving all "
+    "names, paths, numbers, code identifiers, decisions, the user's "
+    "preferences, and open questions or unfinished tasks. The newest few "
+    "messages stay visible verbatim, so spend the detail on the earlier "
+    "material. At most about 700 words. Do not call tools. Output only the "
+    "synopsis."
+)
+
+
+def _is_compact_summary(msg):
+    return (msg.get("role") == "user"
+            and isinstance(msg.get("content"), str)
+            and msg["content"].startswith("[EARLIER CONVERSATION"))
+
+
+def plan_compaction(messages, engine_ctx, max_tokens, high=COMPACT_HIGH,
+                    target=COMPACT_TARGET, max_messages=COMPACT_MAX_MESSAGES):
+    """How many conversation messages to fold, or 0 when not due.
+
+    messages is [system, ...conversation]. Due when the estimate passes
+    `high` of context_input_budget() or the conversation passes
+    max_messages. The cut keeps the newest messages that fit `target` of the
+    budget (at most COMPACT_KEEP_MAX of them), never fewer than the last two (the current turn and the reply
+    before it); everything older, earlier synopses included, is folded.
+    Returns the count of conversation messages (after the system prompt) to
+    replace.
+    """
+    convo = messages[1:]
+    if engine_ctx <= 0 or len(convo) < 4:
+        return 0
+    budget = context_input_budget(engine_ctx, max_tokens)
+    if (_count_tokens(messages) <= budget * high
+            and len(convo) <= max_messages):
+        return 0
+    keep_budget = budget * target
+    kept, used = 0, 0
+    for msg in reversed(convo):
+        if _is_compact_summary(msg):
+            break
+        cost = _count_tokens([msg])
+        if kept >= 2 and (used + cost > keep_budget or kept >= COMPACT_KEEP_MAX):
+            break
+        kept += 1
+        used += cost
+    cut = len(convo) - kept
+    if cut < 1 or (cut == 1 and _is_compact_summary(convo[0])):
+        return 0
+    return cut
+
+
+def extractive_synopsis(head):
+    """Model-free fallback synopsis: one key point per message."""
+    points = []
+    for msg in head:
+        if _is_compact_summary(msg):
+            points.append(msg["content"].split("\n", 1)[-1].strip())
+            continue
+        role = "Q" if msg.get("role") == "user" else "A"
+        points.append(f"{role}: {_extract_key_point(msg)}")
+    return "\n".join(points)
+
+
+def apply_compaction(messages, cut, synopsis):
+    """[system, synopsis, ...the newest messages] with the first `cut`
+    conversation messages folded into `synopsis`."""
+    return ([messages[0], {"role": "user",
+                           "content": f"{COMPACT_TAG}\n{synopsis.strip()}"}]
+            + list(messages[1 + cut:]))
+
+
+def compact_with_engine(messages, cut, engine, enable_thinking=True):
+    """Fold the first `cut` conversation messages, summarized by `engine`.
+
+    The request is the conversation as last sent (all but a trailing new
+    user turn) plus COMPACT_REQUEST, with the same template settings as a
+    normal chat send, so llama-server's prompt cache covers everything but
+    the instruction. Falls back to the extractive synopsis on any failure.
+    """
+    upto = len(messages) - 1 if messages[-1].get("role") == "user" else len(messages)
+    synopsis = ""
+    try:
+        synopsis = engine.generate_streaming(
+            list(messages[:upto]) + [{"role": "user", "content": COMPACT_REQUEST}],
+            max_tokens=4096, temperature=0.3,
+            enable_thinking=enable_thinking) or ""
+        synopsis = strip_think_blocks(synopsis).strip()
+    except Exception as e:
+        _log.warning("Compaction summary failed (%s); using key points", e)
+    if not synopsis:
+        synopsis = extractive_synopsis(messages[1:1 + cut])
+    new = apply_compaction(messages, cut, synopsis)
+    _log.info("Compacted: %d tok -> %d tok (%d -> %d messages)",
+              _count_tokens(messages), _count_tokens(new),
+              len(messages), len(new))
+    return new
+
+
 def compress_history(history, context_window):
     """Compress old messages into key-point summaries.
 

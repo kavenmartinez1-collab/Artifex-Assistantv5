@@ -64,6 +64,9 @@ class GenerationWorker(QThread):
         status_changed(str): Status updates during loading
         telemetry_received(dict): Per-token forward-pass telemetry frame
             (per-layer norms + MoE routing); see core/forward_telemetry.py
+        compacted(list): The full message list after a compaction ran at
+            the start of this generation (compact_cut > 0); the GUI adopts
+            it as its history
     """
 
     token_received = pyqtSignal(str)
@@ -73,13 +76,18 @@ class GenerationWorker(QThread):
     error = pyqtSignal(str)
     status_changed = pyqtSignal(str)
     telemetry_received = pyqtSignal(dict)
+    compacted = pyqtSignal(list)
 
     def __init__(self, engine, messages: list, max_tokens: int,
                  temperature: float, enable_thinking: bool = True,
-                 cancel_event: threading.Event = None):
+                 cancel_event: threading.Event = None, compact_cut: int = 0):
         super().__init__()
         self.engine = engine
         self.messages = list(messages)  # Snapshot
+        # Conversation messages to fold into a synopsis before generating
+        # (core.inference.plan_compaction); 0 = none. Done here, off the GUI
+        # thread, because the summary is a model call.
+        self.compact_cut = compact_cut
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.enable_thinking = enable_thinking
@@ -131,6 +139,16 @@ class GenerationWorker(QThread):
                 self.engine.load(
                     status_callback=lambda m: self.status_changed.emit(m)
                 )
+
+            if self.compact_cut:
+                from core.inference import compact_with_engine
+                self.status_changed.emit("Compacting context...")
+                self.messages = compact_with_engine(
+                    self.messages, self.compact_cut, self.engine,
+                    enable_thinking=self.enable_thinking)
+                self.compacted.emit(list(self.messages))
+                if self.cancel_event.is_set():
+                    raise InterruptedError("Generation cancelled")
 
             self.status_changed.emit("Generating...")
 

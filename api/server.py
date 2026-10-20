@@ -1637,6 +1637,15 @@ def create_app():
                 ctx_tier = pick_ctx_tier(est.total_context_needed, cfg.get("num_ctx"))
             mq = get_model_queue()
             async with mq._lock:
+                # A conversation that has outgrown the loaded tier keeps
+                # growing: go straight to the cap rather than one rung up.
+                # Every relaunch drops the prompt cache and re-reads the whole
+                # conversation, and the phone budgets against the cap, so
+                # stepping 32k -> 64k -> cap paid that twice per chat.
+                if (ctx_tier and model == mq._current_model
+                        and mq._current_ctx_tier
+                        and ctx_tier > mq._current_ctx_tier):
+                    ctx_tier = agent_ctx_tier(ctx_tier, cfg.get("num_ctx"))
                 await mq.switch_if_needed(model, backend, ctx_tier=ctx_tier)
                 if backend != "ollama":
                     loop = asyncio.get_event_loop()
