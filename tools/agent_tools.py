@@ -2314,6 +2314,47 @@ def _find_git_root(path: str) -> str | None:
     return None
 
 
+def _git_ignored(repo: str, abs_path: str) -> bool:
+    try:
+        return subprocess.run(
+            ["git", "check-ignore", "-q", "--", abs_path],
+            cwd=repo, capture_output=True, timeout=10,
+        ).returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def ensure_workspace_git(folder: str) -> tuple[bool, str]:
+    """Make an agent workspace commit-able: its own git repo with a local
+    identity. Returns (ready, message).
+
+    The API's default workspaces live under the repo's output/, which
+    .gitignore excludes — so without this, every auto-commit-on-edit failed
+    with git's "pathspec did not match any file(s) known to git" and the
+    auto-revert safety net never had anything to revert. A folder that is
+    already its own repo, or sits inside a repo that does NOT ignore it (a
+    real project the user pointed the run at), is left alone. The identity
+    is local to the workspace repo because this box has none configured
+    globally, and a commit with no author is the same failure in a new hat.
+    """
+    folder = os.path.abspath(folder)
+    root = _find_git_root(folder)
+    if root == folder:
+        return True, "workspace repo already present"
+    if root and not _git_ignored(root, folder):
+        return True, f"inside {root}"
+    try:
+        r = subprocess.run(["git", "init", "-q", folder], capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return False, r.stderr.strip() or "git init failed"
+        for key, val in (("user.name", "Artifex Agent"), ("user.email", "agent@artifex.local"),
+                         ("commit.gpgsign", "false")):
+            subprocess.run(["git", "config", key, val], cwd=folder, capture_output=True, timeout=10)
+        return True, "initialized workspace repo"
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return False, str(e)
+
+
 def git_commit_edit(file_path: str, summary: str) -> tuple[bool, str]:
     """Stage and commit a single file edit. Returns (success, message).
 
@@ -2330,6 +2371,10 @@ def git_commit_edit(file_path: str, summary: str) -> tuple[bool, str]:
     if not repo:
         return False, "Not inside a git repository."
     abs_path = os.path.abspath(file_path)
+    if _git_ignored(repo, abs_path):
+        rel = os.path.relpath(abs_path, repo)
+        return False, (f"Auto-commit skipped: {rel} is excluded by .gitignore in {repo} "
+                       f"(the file itself was written; nothing to roll back)")
     try:
         subprocess.run(
             ["git", "add", "--", abs_path],

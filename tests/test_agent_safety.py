@@ -69,6 +69,78 @@ class TestGitCommitEdit(unittest.TestCase):
         self.assertIn("not an agent edit", msg)
 
 
+class TestWorkspaceGit(unittest.TestCase):
+    """The API's default workspaces live under a gitignored output/ — the
+    auto-commit used to fail there with git's pathspec error on every edit."""
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp()
+        subprocess.run(["git", "init", "-q"], cwd=self.repo, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t"], cwd=self.repo, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=self.repo, capture_output=True)
+        with open(os.path.join(self.repo, ".gitignore"), "w") as f:
+            f.write("output/*\n")
+        subprocess.run(["git", "add", "."], cwd=self.repo, capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=self.repo, capture_output=True)
+        self.ws = os.path.join(self.repo, "output", "agent_runs", "abc123")
+        os.makedirs(self.ws)
+
+    def test_ignored_path_gets_a_clear_message_not_a_pathspec_error(self):
+        from tools.agent_tools import git_commit_edit
+        path = os.path.join(self.ws, "new.txt")
+        with open(path, "w") as f:
+            f.write("x")
+        ok, msg = git_commit_edit(path, "write new.txt")
+        self.assertFalse(ok)
+        self.assertIn("Auto-commit skipped", msg)
+        self.assertIn("excluded by .gitignore", msg)
+        self.assertNotIn("pathspec", msg)
+
+    def test_workspace_repo_makes_commit_and_revert_work(self):
+        from tools.agent_tools import ensure_workspace_git, git_commit_edit, git_revert_last
+        ready, msg = ensure_workspace_git(self.ws)
+        self.assertTrue(ready, msg)
+        self.assertIn("initialized", msg)
+        self.assertTrue(os.path.isdir(os.path.join(self.ws, ".git")))
+        # identity is local to the workspace repo (this box has no global one)
+        name = subprocess.run(["git", "config", "user.name"], cwd=self.ws,
+                              capture_output=True, text=True).stdout.strip()
+        self.assertEqual(name, "Artifex Agent")
+
+        path = os.path.join(self.ws, "new.txt")
+        with open(path, "w") as f:
+            f.write("x")
+        ok, msg = git_commit_edit(path, "write new.txt")
+        self.assertTrue(ok, msg)
+        self.assertIn("Committed:", msg)
+        with open(path, "w") as f:
+            f.write("y")
+        ok, msg = git_commit_edit(path, "edit new.txt")
+        self.assertTrue(ok, msg)
+        ok, msg = git_revert_last(path)
+        self.assertTrue(ok, msg)
+        with open(path) as f:
+            self.assertEqual(f.read(), "x")
+        # the outer repo never saw any of it
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=self.repo,
+                                capture_output=True, text=True).stdout
+        self.assertEqual(status.strip(), "")
+
+    def test_idempotent_and_leaves_real_projects_alone(self):
+        from tools.agent_tools import ensure_workspace_git
+        ensure_workspace_git(self.ws)
+        ready, msg = ensure_workspace_git(self.ws)
+        self.assertTrue(ready)
+        self.assertIn("already present", msg)
+        # a folder the outer repo tracks (user pointed a run at their project)
+        src = os.path.join(self.repo, "src")
+        os.makedirs(src)
+        ready, msg = ensure_workspace_git(src)
+        self.assertTrue(ready)
+        self.assertIn("inside", msg)
+        self.assertFalse(os.path.isdir(os.path.join(src, ".git")))
+
+
 class TestBoundedAgentLoop(unittest.TestCase):
     """P3-T16: MAX_AGENT_ROUNDS is configurable and enforced."""
 

@@ -565,6 +565,11 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
                                requested_ctx=body.context_window, model=model)
                 run.folder = os.path.join(default_workspace_root, run.id)
                 os.makedirs(run.folder, exist_ok=True)
+                # output/ is gitignored, so without its own repo every
+                # auto-commit-on-edit in here fails and auto-revert is inert.
+                from tools.agent_tools import ensure_workspace_git
+                _ok, _msg = ensure_workspace_git(run.folder)
+                _log.debug("workspace git for %s: %s", run.id, _msg)
 
             _runs[run.id] = run
             _prune_finished()

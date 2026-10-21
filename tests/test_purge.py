@@ -46,6 +46,28 @@ def test_delete_all_keeps_placeholders_and_unlisted_files(tree):
     assert os.listdir(tree / "ext") == ["llama-server.log"]      # glob only
 
 
+def test_delete_all_removes_a_workspace_git_repo(tree):
+    """Each agent-run workspace is its own git repo (ensure_workspace_git);
+    git's object files are read-only, which os.remove refuses on Windows."""
+    import stat
+    import subprocess
+    ws = tree / "output" / "agent_runs" / "run2"
+    ws.mkdir()
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    subprocess.run(["git", "-C", str(ws), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(ws), "config", "user.name", "T"], check=True)
+    (ws / "edit.py").write_text("x = 1")
+    subprocess.run(["git", "-C", str(ws), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-q", "-m", "[agent] edit"], check=True)
+    objects = [os.path.join(r, n) for r, _, ns in os.walk(ws / ".git" / "objects") for n in ns]
+    assert objects and all(not os.stat(p).st_mode & stat.S_IWRITE for p in objects)
+
+    count, size, locked = purge.delete_all(retries=2)
+    assert locked == []
+    assert not ws.exists()
+    assert sorted(os.listdir(tree / "output")) == [".gitkeep"]
+
+
 # Built with the OS's own separators: CI runs on Linux, where "C:\App\x.py"
 # is neither absolute nor split by basename
 APP = os.path.abspath(os.path.join(os.sep, "App"))

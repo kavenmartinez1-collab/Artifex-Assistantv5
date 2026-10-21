@@ -7,7 +7,9 @@ to stop the app that asked for it: Windows won't delete a log file the
 API or GUI still holds open, and the API can't delete itself mid-request.
 
 Deleted:
-  - chats (sessions/), agent runs, uploads and generated content (output/)
+  - chats (sessions/), agent runs (each workspace with its own small git
+    repo, see tools.agent_tools.ensure_workspace_git), uploads and
+    generated content (output/)
   - logs/ (Artifex's own log folder)
   - the web tool cache and the knowledge base (both built from chats)
   - extra files listed in purge_extra.txt (gitignored, one path or glob
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import glob
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -155,9 +158,17 @@ def delete_all(retries: int = 5) -> tuple[int, int, list[str]]:
                 except FileNotFoundError:
                     break
                 except OSError:
+                    # Windows refuses os.remove on read-only files, and git
+                    # marks every object file read-only — each agent-run
+                    # workspace is its own repo, so without this a purge
+                    # left every .git/objects behind as "still locked".
+                    try:
+                        os.chmod(p, stat.S_IWRITE)
+                    except OSError:
+                        pass
                     if attempt == retries - 1:
                         locked.append(p)
-                    else:
+                    elif attempt:
                         time.sleep(1)   # a just-killed process may still hold it
         if os.path.isdir(path):
             for root, dirs, _ in os.walk(path, topdown=False):
