@@ -10,12 +10,12 @@
     "package": "npm run build && electron-builder"
   },
   "dependencies": {
-    "ws": "8.20.0"
+    "ws": "8.22.0"
   },
   "devDependencies": {
+    "@types/ws": "8.18.1",
     "electron": "34.2.0",
     "electron-builder": "25.1.8",
-    "@types/ws": "8.18.1",
     "typescript": "5.6.3"
   }
 }

@@ -17,7 +17,7 @@ torchvision==0.21.0
 torchaudio==2.6.0
 
 # ── Model loading / quantization ──────────────────────────────────────
-transformers==5.2.0
+transformers==5.10.0
 bitsandbytes==0.49.1
 accelerate==1.12.0
 numpy==2.3.5
@@ -30,7 +30,7 @@ safetensors==0.8.0  # diffusers 0.41 needs >=0.8
 # ── Image / 3D / Video generation ────────────────────────────────────
 diffusers==0.41.0  # first release with Qwen-Image 2.1 (QwenImage21Pipeline)
 opencv-python-headless==5.0.0.93  # photo restoration (classical clean stage)
-Pillow==12.0.0
+Pillow==13.0.0
 imageio==2.37.3
 imageio-ffmpeg==0.6.0
 
@@ -44,8 +44,8 @@ PyOpenGL==3.1.10       # OpenGL backend for pyqtgraph
 # ── Application ──────────────────────────────────────────────────────
 colorama==0.4.6
 duckduckgo-search==8.1.1
-pypdf==6.9.1
-lxml==6.0.2
+pypdf==6.19.0
+lxml==6.1.3
 psutil==7.2.2
 pyperclip==1.11.0
 sounddevice==0.5.1
@@ -67,3 +67,19 @@ fastapi==0.135.1
 uvicorn==0.42.0
 httpx==0.28.1
 slowapi==0.1.9
+
+# ── Security pins (transitive) ───────────────────────────────────────
+# Not imported directly; pinned so a fresh install can't resolve back to
+# a vulnerable release. Minimum fixed versions as of 2026-10-21.
+starlette==1.3.1        # fastapi's ASGI core (several CVEs < 1.3.1)
+aiohttp==3.14.4
+multidict==6.9.1        # aiohttp dependency
+anyio==4.14.2
+urllib3==2.8.0
+requests==2.33.0
+idna==3.15
+certifi==2026.10.19     # drops the compromised eMudhra intermediate CA
+filelock==3.20.3
+lxml-html-clean==0.4.5
+msgpack==1.2.1
+pygments==2.20.0

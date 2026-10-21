@@ -16,7 +16,7 @@
     "@huggingface/transformers": "3.8.1",
     "cors": "2.8.6",
     "express": "4.22.1",
-    "ws": "8.20.0"
+    "ws": "8.22.0"
   },
   "devDependencies": {
     "@playwright/test": "1.60.0",
@@ -24,9 +24,12 @@
     "@types/express": "5.0.6",
     "@types/ws": "8.18.1",
     "@webgpu/types": "0.1.69",
-    "concurrently": "9.2.1",
+    "concurrently": "9.2.5",
     "tsx": "4.21.0",
     "typescript": "5.9.3",
-    "vite": "6.4.2"
+    "vite": "6.4.5"
+  },
+  "overrides": {
+    "sharp": "0.35.5"
   }
 }
