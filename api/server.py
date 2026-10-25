@@ -35,6 +35,8 @@ from core.logging_config import get_logger
 from api.web_tools import (
     extract_web_tools, execute_web_tools, tool_status_labels,
     gateway_available, MAX_TOOL_ROUNDS,
+    new_request_state, collapse_repeated_tool_calls, clear_old_tool_results,
+    TOOL_RESULTS_PREFIX,
 )
 
 _log = get_logger(__name__)
@@ -1121,6 +1123,7 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
 
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     search_cache = []  # Request-scoped cache for @web_read(N)
+    web_state = new_request_state()  # max_uses / dedupe / URL cache for this request
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
     last_finish_reason = "stop"  # Updated from engine usage events
 
@@ -1354,7 +1357,7 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                 )
             else:
                 tool_output = await loop.run_in_executor(
-                    None, lambda: execute_web_tools(tools, search_cache)
+                    None, lambda: execute_web_tools(tools, search_cache, web_state)
                 )
             _log.info("[%s] Tool results: %d chars, preview='%s'",
                       chat_id, len(tool_output), tool_output[:200])
@@ -1367,14 +1370,17 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
 
         # Build follow-up messages with tool results
         msg_count_before = len(current_messages)
-        current_messages.append({"role": "assistant", "content": full_response})
+        # A looping answer goes back without its repeated call lines, so the
+        # model does not read its own loop and continue it (2026-10-25).
+        current_messages.append({"role": "assistant",
+                                 "content": collapse_repeated_tool_calls(full_response)})
         current_messages.append({
             "role": "user",
-            "content": (
-                f"[Tool results — use this data to answer the original question]\n\n"
-                f"{tool_output}"
-            ),
+            "content": f"{TOOL_RESULTS_PREFIX}\n\n{tool_output}",
         })
+        # Context editing: past ~60K chars of tool results in this request,
+        # the older rounds' results become a short placeholder (newest 2 kept).
+        clear_old_tool_results(current_messages)
 
         # Fit-to-context happens at the top of the next loop iteration
         # (the pre-context assessment), with exact token counts.
