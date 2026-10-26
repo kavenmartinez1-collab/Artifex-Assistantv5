@@ -31,7 +31,8 @@ Design notes:
   otherwise buffer tens of thousands of events, and a phone reconnecting
   after backgrounding would replay them all. Reconnects rebuild from the
   round-complete events (assistant_message, action_result, ...), which carry
-  the same content in aggregate.
+  the same content in aggregate, plus one chunk_snapshot holding the text of
+  the round still in progress.
 
 - request_approval blocks the worker thread on a queue. The client answers
   via POST .../approval; a stop request unblocks it with Decision.STOP.
@@ -195,6 +196,11 @@ class AgentRun:
         self._cond = threading.Condition()
         self._live_chunks: list[tuple[int, dict]] = []   # (serial, chunk) ring for live listeners
         self._chunk_serial = 0
+        # Text streamed since the last persisted event, so a listener that
+        # attaches mid-round sees the round so far instead of a blank feed
+        # until the round ends. One round's worth; reset by the next event.
+        self._round_text: list[str] = []
+        self._round_thinking: list[str] = []
         self.pending_approval: Optional[dict] = None
         self._approval_q: "queue.Queue[str]" = queue.Queue()
         self.thread: Optional[threading.Thread] = None
@@ -208,9 +214,13 @@ class AgentRun:
                 self._live_chunks.append((self._chunk_serial, d))
                 if len(self._live_chunks) > 400:
                     del self._live_chunks[:200]
+                (self._round_thinking if ev.kind == "thinking_chunk"
+                 else self._round_text).append(d.get("text") or "")
             else:
                 d["i"] = len(self.events)
                 self.events.append(d)
+                self._round_text.clear()
+                self._round_thinking.clear()
             self._cond.notify_all()
 
     # ── approval bridge ─────────────────────────────────────────────────
@@ -702,8 +712,18 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
                 out, done_now = [], False
                 with run._cond:
                     if last_chunk_serial is None:
+                        # Instead of the backlog: the missed events, then the
+                        # current round's text as one chunk_snapshot.
                         last_chunk_serial = run._chunk_serial
-                    if next_idx >= len(run.events) and not run.terminal:
+                        out.extend(run.events[next_idx:])
+                        next_idx = len(run.events)
+                        if run._round_text or run._round_thinking:
+                            out.append({
+                                "kind": "chunk_snapshot",
+                                "text": "".join(run._round_text),
+                                "thinking": "".join(run._round_thinking),
+                            })
+                    if not out and next_idx >= len(run.events) and not run.terminal:
                         run._cond.wait(timeout=15.0)
                     while next_idx < len(run.events):
                         out.append(run.events[next_idx])

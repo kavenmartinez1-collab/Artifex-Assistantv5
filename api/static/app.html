@@ -2580,6 +2580,32 @@ $("chat-image-input").addEventListener("change", async function () {
 const CHAT_JOB_KEY = "ax_chat_job";
 let chatJobId = null;        // job this page is attached to right now
 let pendingTurnEl = null;    // bubble of a turn whose stream died unfinished
+let pendingTurnText = "";    // its partial answer, kept if the job is gone
+let chatReattachTimer = null;
+let chatReattachTries = 0;
+
+// Both SSE feeds send ": ping" every 15 s, so this long without a single byte
+// means the connection died without erroring — iOS does that to a fetch when
+// the phone locks or the app is backgrounded. Abort it so it can reattach.
+const STALL_MS = 40000;
+function stallWatch(ac) {
+  let last = Date.now();
+  const t = setInterval(() => {
+    if (Date.now() - last > STALL_MS) { ac._stall = true; ac.abort(); }
+  }, 5000);
+  return { poke: () => { last = Date.now(); }, stop: () => clearInterval(t) };
+}
+
+// How long the page was hidden before it last became visible. A stream that
+// lived through more than a few seconds of that is suspect. Registered ahead
+// of the chat / agent visibility handlers, which read it on the same event.
+let pageHiddenAt = 0, pageAwayMs = 0;
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { pageHiddenAt = Date.now(); return; }
+  pageAwayMs = pageHiddenAt ? Date.now() - pageHiddenAt : 0;
+  pageHiddenAt = 0;
+});
+function wasAway() { return pageAwayMs > 3000; }
 
 function sendOrStop() {
   if (isStreaming) { stopChat(); return; }
@@ -2652,7 +2678,20 @@ async function sendMessage() {
 function reattachChat(jobId) {
   if (isStreaming) return;
   if (pendingTurnEl) { pendingTurnEl.remove(); pendingTurnEl = null; }
+  pendingTurnText = "";
   runAssistantTurn({ attachJob: jobId });
+}
+
+// A dropped stream retries on its own instead of waiting for the user to
+// send something (which used to be the only way back in, via the 409).
+function scheduleChatReattach(delay) {
+  if (chatReattachTimer) return;
+  if (chatReattachTries > 40) return;      // the next visibility change resets
+  chatReattachTries++;
+  chatReattachTimer = setTimeout(() => {
+    chatReattachTimer = null;
+    bootChatJob();
+  }, delay != null ? delay : Math.min(1000 + chatReattachTries * 500, 8000));
 }
 
 // The chat system prompt. autoCompact() sends this exact string too, so its
@@ -2749,13 +2788,14 @@ async function streamDirect(base, onPayload, signal) {
   await readSSE(resp, onPayload);
 }
 
-async function readSSE(resp, onPayload) {
+async function readSSE(resp, onPayload, onBytes) {
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
+    if (onBytes) onBytes();
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split("\n");
     buffer = lines.pop();
@@ -2789,8 +2829,10 @@ async function runAssistantTurn(opts) {
   let usage = null;
   let renderTimer = null;
   let jobFinished = false;       // the job reached a terminal state
+  let dropped = false;           // feed died while the job may still be running
   let endStatus = "";
   let t0 = Date.now();           // reset from the snapshot when reattaching
+  const turnSession = activeSessionId;
 
   isStreaming = true;
   sendBtn.textContent = "Stop";
@@ -2999,24 +3041,40 @@ async function runAssistantTurn(opts) {
       const r = await fetch("/v1/chat/jobs/" + jobId + "/events", {
         headers: authHeaders(), signal: aborter.signal,
       });
-      if (r.status === 404) throw new Error("That reply is no longer on the server");
+      if (r.status === 404) {
+        jobFinished = true;
+        throw new Error("That reply is no longer on the server");
+      }
       if (!r.ok) throw new Error("Server returned " + r.status);
       // Attaching to an already-finished job yields the snapshot and then
       // [DONE] with no x_job_end — applySnapshot has set jobFinished.
-      await readSSE(r, handlePayload);
+      const watch = stallWatch(aborter);
+      try {
+        await readSSE(r, handlePayload, watch.poke);
+      } finally {
+        watch.stop();
+      }
+      // A clean EOF without x_job_end is a proxy or network cut, not the end.
+      if (!jobFinished) dropped = true;
     }
   } catch (err) {
     flushRender();
-    if (err.name === "AbortError") {
-      // Only stopChat() aborts, and it already told the server.
+    if (err.name === "AbortError" && !aborter._stall) {
+      // stopChat() / newChat() abort; stopChat already told the server.
       addNote("- stopped -");
       jobFinished = true;
+    } else if (chatJobId && !jobFinished) {
+      // A dropped connection is NOT the end of the job: the stored id stays
+      // and this bubble is swapped for a fresh attach once we reconnect.
+      dropped = true;
     } else {
       addError("Error: " + err.message);
-      // A dropped connection is NOT the end of the job: leave the stored id
-      // in place so boot / returning to the tab can reattach to it.
     }
   } finally {
+    if (dropped) {
+      flushRender();
+      addNote("- connection lost, reconnecting... -");
+    }
     if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
     if (segText) paintAnswer();          // one final, complete markdown pass
     cursor.remove();
@@ -3028,19 +3086,23 @@ async function runAssistantTurn(opts) {
         (segText ? "" : " before any answer text (thinking consumed the budget - lower the effort or raise max tokens)");
       body.appendChild(n);
     }
-    if (!sawContent && !thinkingText && !body.textContent.trim()) {
+    if (!dropped && !sawContent && !thinkingText && !body.textContent.trim()) {
       body.innerHTML = '<span class="err-text">(empty response)</span>';
     }
-    if (segText) conversation.push({ role: "assistant", content: segText });
-    if (segText && endStatus !== "stopped" && !aborter.signal.aborted && autoReadOn()) {
+    // A dropped turn is not history yet: the reattach brings the whole answer
+    // back. Pushing the partial here duplicated it once the job finished. A
+    // turn whose chat was left (New chat) must not land in the new one.
+    const keep = !dropped && activeSessionId === turnSession;
+    if (segText && keep) conversation.push({ role: "assistant", content: segText });
+    if (segText && keep && endStatus !== "stopped" && !aborter.signal.aborted && autoReadOn()) {
       speakBubble(body, bubble.querySelector(".speak-btn"));
     }
     // The server already wrote a completed exchange into the session; this
     // PUT is a same-content overwrite, and the only writer for a stopped or
     // errored job.
-    syncSession(false);            // fire-and-forget; never blocks the UI
-    if (usage) noteCtxUse(usage);
-    if (usage) {
+    if (keep) syncSession(false);  // fire-and-forget; never blocks the UI
+    if (usage && keep) noteCtxUse(usage);
+    if (usage && keep) {
       const el = ((Date.now() - t0) / 1000);
       $("stats").style.display = "block";
       $("stats").textContent =
@@ -3052,6 +3114,7 @@ async function runAssistantTurn(opts) {
     // Keep the bubble marked stale while the job may still be running, so a
     // reattach replaces it instead of stacking a second copy underneath.
     pendingTurnEl = jobFinished ? null : bubble;
+    pendingTurnText = dropped ? segText : "";
     chatJobId = null;
     isStreaming = false;
     refreshModelBadge();          // this reply may have switched the model
@@ -3060,6 +3123,13 @@ async function runAssistantTurn(opts) {
     sendBtn.textContent = "Send";
     sendBtn.classList.remove("stop");
     updateToBottom();
+    if (dropped && activeSessionId === turnSession) {
+      // Straight back in when the page is up; a hidden page waits for the
+      // visibility change, since iOS would only kill the next fetch too.
+      if (!document.hidden) scheduleChatReattach(chatReattachTries === 0 ? 300 : undefined);
+    } else if (jobFinished) {
+      chatReattachTries = 0;
+    }
   }
 }
 
@@ -3089,9 +3159,22 @@ async function bootChatJob() {
   chatJobBooting = true;
   try {
     const r = await fetch("/v1/chat/jobs/" + id, { headers: authHeaders() });
-    if (r.status === 404) { localStorage.removeItem(CHAT_JOB_KEY); return; }
-    if (!r.ok) return;                       // offline / bad key: try again later
+    if (r.status === 404) {
+      // The API restarted (jobs live in its memory). Keep what we saw of
+      // the answer rather than losing it with the job.
+      localStorage.removeItem(CHAT_JOB_KEY);
+      if (pendingTurnEl && pendingTurnText) {
+        conversation.push({ role: "assistant", content: pendingTurnText });
+        syncSession(false);
+      }
+      pendingTurnEl = null;
+      pendingTurnText = "";
+      return;
+    }
+    if (r.status === 401) return;            // bad key: retrying won't help
+    if (!r.ok) { scheduleChatReattach(); return; }
     const s = await r.json();
+    chatReattachTries = 0;
     if (s.status === "running") {
       reattachChat(id);                      // snapshot repaints what we missed
       return;
@@ -3100,6 +3183,7 @@ async function bootChatJob() {
     // the session itself, so the answer comes back with the transcript.
     localStorage.removeItem(CHAT_JOB_KEY);
     if (pendingTurnEl) { pendingTurnEl.remove(); pendingTurnEl = null; }
+    pendingTurnText = "";
     await reloadActiveSession(s.session_id);
     if (s.status !== "done" && s.text) {
       // stopped / error: the server did NOT persist it. Keep the partial
@@ -3109,7 +3193,9 @@ async function bootChatJob() {
       syncSession(false);
     }
   } catch (e) {
-    /* leave the key in place; the next visibility change retries */
+    // Offline for a moment (phone just woke, Wi-Fi handoff): keep the key
+    // and keep trying while the page is up.
+    if (!document.hidden) scheduleChatReattach();
   } finally {
     chatJobBooting = false;
   }
@@ -3136,10 +3222,25 @@ function releaseWakeLock() {
 // The lock is auto-released if the user switches tabs; re-acquire when
 // they come back while a stream is still running. If nothing is streaming
 // here but a job was left running on the server, pick it back up.
+//
+// A job stream that sat through the page being hidden is usually dead even
+// though it still looks open (iOS fires this event BEFORE it fails the old
+// fetch, or never fails it at all). Don't wait to find out: drop it and
+// reattach now — the snapshot repaints everything, so it costs nothing.
+function resumeChat() {
+  chatReattachTries = 0;
+  if (isStreaming) {
+    if (chatJobId && aborter && wasAway()) { aborter._stall = true; aborter.abort(); }
+    else acquireWakeLock();
+  } else {
+    bootChatJob();
+  }
+}
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "visible") return;
-  if (isStreaming) acquireWakeLock();
-  else bootChatJob();
+  if (document.visibilityState === "visible") resumeChat();
+});
+window.addEventListener("online", () => {
+  if (!document.hidden && !isStreaming) { chatReattachTries = 0; bootChatJob(); }
 });
 
 // Settings-drawer button. Same semantics as the sidebar's "New chat": the
@@ -3964,6 +4065,7 @@ async function agentAttach(since) {
   agentDetach();
   const runId = agentRunId;
   const ac = new AbortController();
+  let watch = null;
   agentAborter = ac;
   agentStreaming = true;
   agentSawEnd = false;
@@ -3991,9 +4093,11 @@ async function agentAttach(since) {
     const reader = r.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
+    watch = stallWatch(ac);
     while (true) {
       const chunk = await reader.read();
       if (chunk.done) break;
+      watch.poke();
       buf += dec.decode(chunk.value, { stream: true });
       const lines = buf.split("\n");
       buf = lines.pop();
@@ -4009,20 +4113,23 @@ async function agentAttach(since) {
       }
     }
   } catch (e) {
-    if (e.name !== "AbortError" && agentRunId === runId) {
-      agentNote("Event stream dropped (" + e.message + ").", "warn");
-    }
+    // Drops are routine on a phone and heal on their own; only say so when
+    // retrying is about to give up (scheduleReattach's status line).
   } finally {
+    if (watch) watch.stop();
+    // Detached on purpose (finishRun, or a newer attach superseded this one):
+    // the newer stream owns the state now, leave it alone.
+    if (ac.signal.aborted && !ac._stall) return;
     agentStreaming = false;
     if (agentAborter === ac) agentAborter = null;
-    if (agentRunId === runId && !agentSawEnd && !agentDone) scheduleReattach();
+    if (agentRunId === runId && !agentSawEnd && !agentDone) scheduleReattach(ac._stall ? 200 : undefined);
     updateAgentUi();
   }
 }
 
-function scheduleReattach() {
+function scheduleReattach(delay) {
   if (agentRetryTimer || !agentRunId) return;
-  if (agentRetries > 40) { setAgentStatus("disconnected - pull to reload"); return; }
+  if (agentRetries > 40) { setAgentStatus("disconnected - reopen the app to retry"); return; }
   agentRetries++;
   setAgentStatus("reconnecting...");
   agentRetryTimer = setTimeout(async () => {
@@ -4039,7 +4146,7 @@ function scheduleReattach() {
     } catch (e) {
       scheduleReattach();
     }
-  }, Math.min(2000 + agentRetries * 500, 8000));
+  }, delay != null ? delay : Math.min(1000 + agentRetries * 500, 8000));
 }
 
 // A terminal run is NOT forgotten: it can be revived in place by a follow-up,
@@ -4087,6 +4194,15 @@ function agentEvent(ev) {
   }
   if (k === "assistant_chunk") { agentChunk(ev.text || "", false); return; }
   if (k === "thinking_chunk") { agentChunk(ev.text || "", true); return; }
+  if (k === "chunk_snapshot") {
+    // Sent first on (re)attach: the round so far, in place of the tokens
+    // this page missed. Replaces any half-drawn block from the old stream.
+    agentEndChunks();
+    agGenerating = true;
+    agentChunk(ev.thinking || "", true);
+    agentChunk(ev.text || "", false);
+    return;
+  }
 
   // Any persisted event closes the live-token block and, except for the
   // ones that raise it, dismisses a stale approval panel.
@@ -4268,13 +4384,25 @@ async function agentBoot() {
   }
 }
 
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "visible") return;
-  if (agentRunId && !agentDone && !agentStreaming && !agentRetryTimer) {
-    agentRetries = 0;
-    scheduleReattach();
+// Same story as the chat feed: a stream that sat through the page being
+// hidden is probably dead but still "open", so reconnect instead of trusting
+// it. ?since= plus the server's chunk_snapshot make that seamless.
+function resumeAgent(away) {
+  if (!agentRunId) { agentBoot(); return; }   // load-time boot was offline
+  if (agentDone) return;
+  agentRetries = 0;
+  if (agentStreaming && agentAborter && away) {
+    agentAborter._stall = true;
+    agentAborter.abort();                 // its finally reattaches
+  } else if (!agentStreaming) {
+    if (agentRetryTimer) { clearTimeout(agentRetryTimer); agentRetryTimer = null; }
+    scheduleReattach(200);
   }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") resumeAgent(wasAway());
 });
+window.addEventListener("online", () => { if (!document.hidden) resumeAgent(false); });
 
 // ── Create (media tools) ─────────────────────────────────
 // Each tool lists only the models that can do it (GET /v1/media/tools); the
