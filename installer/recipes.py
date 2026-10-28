@@ -154,9 +154,52 @@ def write_config(pl: dict, force: bool = False) -> str:
     return f"added '{mid}' to {path}"
 
 
-LOCKS = {"core": os.path.join(HERE, "requirements-core.txt"),
-         "gui": os.path.join(HERE, "requirements-gui.txt")}
+LOCKS = {name: os.path.join(HERE, f"requirements-{name}.txt")
+         for name in ("core", "gui", "voice", "create")}
+PYTORCH_INDEX = "https://download.pytorch.org/whl/cu128"
+ALLOWED_EXTRA_INDEXES = (PYTORCH_INDEX,)
 SUPPORTED_PYTHON = ((3, 11), (3, 13))   # wheels in the locks cover these
+INSTALLER_MARKER = "artifex-installer.txt"
+GATEWAY_URL = "http://127.0.0.1:8080"   # the web-search pack's gateway (loopback only)
+
+
+def venv_python(root: str) -> str:
+    venv = os.path.join(os.path.abspath(root), "venv")
+    return (os.path.join(venv, "Scripts", "python.exe") if os.name == "nt"
+            else os.path.join(venv, "bin", "python"))
+
+
+def add_locked_packages(root: str, lock: str, needed_modules, log=print,
+                        run=subprocess.run, extra_index: str = "") -> str:
+    """Install a pack's hash-locked packages into the installer's venv.
+
+    A venv the installer didn't create (a hand-built full install) is left
+    alone: if it already has the modules, fine; if not, say what's missing
+    instead of changing someone's environment behind their back.
+    """
+    py = venv_python(root)
+    venv = os.path.dirname(os.path.dirname(py))
+    if not os.path.isfile(py):
+        raise RuntimeError("no Python environment yet: run python -m installer install first")
+    if os.path.isfile(os.path.join(venv, INSTALLER_MARKER)):
+        log(f"installing the locked packages from {os.path.basename(lock)}")
+        # An extra index (PyTorch's, for CUDA builds) only widens where pip
+        # may look; every file must still match a hash in the committed lock.
+        if extra_index and extra_index not in ALLOWED_EXTRA_INDEXES:
+            raise ValueError(f"refusing package index {extra_index!r}")
+        run([py, "-m", "pip", "install", "--isolated", "--require-hashes",
+             "--only-binary=:all:", "--no-input", "--disable-pip-version-check"]
+            + (["--extra-index-url", extra_index] if extra_index else [])
+            + ["-r", LOCKS["core"], "-r", lock], check=True)
+        return py
+    probe = "import importlib.util,sys; sys.exit(0 if all(importlib.util.find_spec(m) for m in sys.argv[1:]) else 1)"
+    if run([py, "-c", probe] + list(needed_modules)).returncode != 0:
+        raise RuntimeError(
+            f"{venv} wasn't created by the installer, so it isn't changed automatically, "
+            f"and it lacks {', '.join(needed_modules)}. Install them yourself with: "
+            f'"{py}" -m pip install --require-hashes --only-binary=:all: -r "{lock}"')
+    log(f"your environment {venv} already has what this pack needs (not modified)")
+    return py
 
 
 def python_ok(version=None) -> bool:
@@ -196,6 +239,11 @@ def install_env(root: str, gui: bool = True, log=print, run=subprocess.run) -> s
         cmd += ["-r", LOCKS["gui"]]
     log("installing the locked packages (core" + (" + desktop GUI" if gui else "") + ")")
     run(cmd, check=True)
+    # Marks the venv as the installer's own: packs may add their locked
+    # packages to it, but never to a venv someone built by hand.
+    os.makedirs(venv, exist_ok=True)
+    with open(os.path.join(venv, INSTALLER_MARKER), "w", encoding="utf-8") as f:
+        f.write("created by python -m installer; packs may add hash-locked packages here\n")
     return py
 
 
@@ -210,12 +258,13 @@ def write_launchers(root: str, model_id: str, gui: bool = True) -> list:
     # (only in the text: the files themselves go in the real folder).
     root = disk_root.replace("%", "%%")
     py = os.path.join(root, "venv", "Scripts", "python.exe")
-    common = ["@echo off", "chcp 65001 >nul", f'cd /d "{root}"', "set ARTIFEX_BACKEND=llama_cpp"]
+    common = ["@echo off", "chcp 65001 >nul", f'cd /d "{root}"', "set ARTIFEX_BACKEND=llama_cpp",
+              f"set WEB_GATEWAY_URL={GATEWAY_URL}"]
     files = {
         "Artifex CLI.cmd": common + [f'"{py}" main.py', "pause"],
         "Artifex API (this PC only).cmd": common + [
             f'"{py}" main_api.py --host 127.0.0.1 --port 8000 --backend llama_cpp '
-            f'--model {model_id}', "pause"],
+            f'--model {model_id} --gateway {GATEWAY_URL}', "pause"],
     }
     if gui:
         files["Artifex GUI.cmd"] = common + [f'start "" "{py[:-len("python.exe")]}pythonw.exe" main_gui_qt.py']
@@ -226,6 +275,33 @@ def write_launchers(root: str, model_id: str, gui: bool = True) -> list:
             f.write("\n".join(lines) + "\n")
         written.append(path)
     return written
+
+
+def write_phone_launcher(root: str, port: int = 8000, model_id: str = None) -> str:
+    """The API for the phone app: loads the key from artifex_api_key.txt and
+    still binds to 127.0.0.1 (Tailscale serve forwards the tailnet to it).
+    Agent and file tools stay off; turn them on deliberately with
+    ARTIFEX_PHONE_FULL_TOOLS=1 if you want them from the phone."""
+    if model_id is not None and not re.fullmatch(r"[A-Za-z0-9._-]+", model_id):
+        raise ValueError(f"refusing to write a launcher for model id {model_id!r}")
+    if not isinstance(port, int) or not 1024 <= port <= 65535:
+        raise ValueError(f"bad port {port!r}")
+    disk_root = os.path.abspath(root)
+    croot = disk_root.replace("%", "%%")
+    py = os.path.join(croot, "venv", "Scripts", "python.exe")
+    model = f" --model {model_id}" if model_id else ""
+    lines = ["@echo off", "chcp 65001 >nul", f'cd /d "{croot}"',
+             "set ARTIFEX_BACKEND=llama_cpp",
+             'if not exist "artifex_api_key.txt" (echo Run: python -m installer remote setup & pause & exit /b 1)',
+             'set /p ARTIFEX_API_KEY=<"artifex_api_key.txt"',
+             f"set WEB_GATEWAY_URL={GATEWAY_URL}",
+             f'"{py}" main_api.py --host 127.0.0.1 --port {port} --backend llama_cpp --phone-app'
+             f'{model} --gateway {GATEWAY_URL}',
+             "pause"]
+    path = os.path.join(disk_root, "Artifex API (phone via Tailscale).cmd")
+    with open(path, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
 
 
 def install_core(pl: dict, catalog: dict, reuse_dirs=None, force=False, log=print,

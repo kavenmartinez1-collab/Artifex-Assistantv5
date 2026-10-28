@@ -8,33 +8,51 @@
       "cuda-13.4": {
         "label": "NVIDIA CUDA 13",
         "files": [
-          {"name": "llama-b11945-bin-win-cuda-13.4-x64.zip", "size": 164817929,
-           "sha256": "590b7fd0a85ffea0ca09419a60d31fa5e38126a6a0eba42b12cd76a4f00f8761"},
-          {"name": "cudart-llama-bin-win-cuda-13.4-x64.zip", "size": 423535356,
-           "sha256": "738f8c251ac22b70c3ae6f83a10cf222725df0395246a2cf58f32bdb85fbe668"}
+          {
+            "name": "llama-b11945-bin-win-cuda-13.4-x64.zip",
+            "size": 164817929,
+            "sha256": "590b7fd0a85ffea0ca09419a60d31fa5e38126a6a0eba42b12cd76a4f00f8761"
+          },
+          {
+            "name": "cudart-llama-bin-win-cuda-13.4-x64.zip",
+            "size": 423535356,
+            "sha256": "738f8c251ac22b70c3ae6f83a10cf222725df0395246a2cf58f32bdb85fbe668"
+          }
         ]
       },
       "cuda-12.4": {
         "label": "NVIDIA CUDA 12",
         "files": [
-          {"name": "llama-b11945-bin-win-cuda-12.4-x64.zip", "size": 279503533,
-           "sha256": "1227c700c4f1687d85da15c83eb00df70e9219d30890d27f9543d2af082a12b2"},
-          {"name": "cudart-llama-bin-win-cuda-12.4-x64.zip", "size": 391443627,
-           "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"}
+          {
+            "name": "llama-b11945-bin-win-cuda-12.4-x64.zip",
+            "size": 279503533,
+            "sha256": "1227c700c4f1687d85da15c83eb00df70e9219d30890d27f9543d2af082a12b2"
+          },
+          {
+            "name": "cudart-llama-bin-win-cuda-12.4-x64.zip",
+            "size": 391443627,
+            "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"
+          }
         ]
       },
       "vulkan": {
         "label": "Vulkan (AMD, Intel, or NVIDIA without a new enough driver)",
         "files": [
-          {"name": "llama-b11945-bin-win-vulkan-x64.zip", "size": 37240393,
-           "sha256": "3b9ccbffb6b293860de1dfb9942eae48806166a12266708898021a8d2e34da67"}
+          {
+            "name": "llama-b11945-bin-win-vulkan-x64.zip",
+            "size": 37240393,
+            "sha256": "3b9ccbffb6b293860de1dfb9942eae48806166a12266708898021a8d2e34da67"
+          }
         ]
       },
       "cpu": {
         "label": "CPU only",
         "files": [
-          {"name": "llama-b11945-bin-win-cpu-x64.zip", "size": 24314391,
-           "sha256": "c420f05240e1af28c2194b9a4741ef797142a0cca783c6079be792de88e72d78"}
+          {
+            "name": "llama-b11945-bin-win-cpu-x64.zip",
+            "size": 24314391,
+            "sha256": "c420f05240e1af28c2194b9a4741ef797142a0cca783c6079be792de88e72d78"
+          }
         ]
       }
     }
@@ -52,8 +70,18 @@
       "min_vram_mb": 0,
       "num_ctx": 32768,
       "native_tools": true,
-      "extra_flags": ["-fa", "on", "-np", "1", "--jinja", "--metrics",
-                      "--reasoning-budget", "2048", "--reasoning-budget-message", "Time to answer."]
+      "extra_flags": [
+        "-fa",
+        "on",
+        "-np",
+        "1",
+        "--jinja",
+        "--metrics",
+        "--reasoning-budget",
+        "2048",
+        "--reasoning-budget-message",
+        "Time to answer."
+      ]
     },
     {
       "id": "qwen3.5-9b-q4km",
@@ -66,8 +94,27 @@
       "license": "Apache-2.0",
       "min_vram_mb": 7500,
       "num_ctx": 32768,
-      "extra_flags": ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "-np", "1", "--jinja",
-                      "--reasoning-format", "deepseek", "--metrics"]
+      "extra_flags": [
+        "-fa",
+        "on",
+        "-ctk",
+        "q8_0",
+        "-ctv",
+        "q8_0",
+        "-np",
+        "1",
+        "--jinja",
+        "--reasoning-format",
+        "deepseek",
+        "--metrics"
+      ],
+      "mmproj": {
+        "repo": "bartowski/Qwen_Qwen3.5-9B-GGUF",
+        "revision": "182be2fd6c7bc44887d88a91cb03ff009cc9f549",
+        "file": "mmproj-Qwen_Qwen3.5-9B-f16.gguf",
+        "size": 918165952,
+        "sha256": "97f420245a85ce129bb764e86a5e21e27d782fe6d6056c6839b9c5fdb8f38289"
+      }
     },
     {
       "id": "qwen3.8-27b-q3km",
@@ -80,10 +127,266 @@
       "license": "Apache-2.0",
       "min_vram_mb": 15500,
       "num_ctx": 32768,
-      "extra_flags": ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "-np", "1", "--jinja",
-                      "--reasoning-format", "deepseek", "--metrics"]
+      "extra_flags": [
+        "-fa",
+        "on",
+        "-ctk",
+        "q8_0",
+        "-ctv",
+        "q8_0",
+        "-np",
+        "1",
+        "--jinja",
+        "--reasoning-format",
+        "deepseek",
+        "--metrics"
+      ],
+      "mmproj": {
+        "repo": "bartowski/Qwen3.8-27B-GGUF",
+        "revision": "87410e7b9a5c21e6ca70c0c9cc5237de909fe621",
+        "file": "mmproj-Qwen3.8-27B-f16.gguf",
+        "size": 927607008,
+        "sha256": "cb0a71fe9b84af2552fc6260acf8e9773a29d115c683aba01c72a7ac537b212b"
+      }
     }
   ],
-  "allowed_hosts": ["github.com", ".githubusercontent.com",
-                    "huggingface.co", ".huggingface.co", ".hf.co"]
+  "allowed_hosts": [
+    "github.com",
+    ".githubusercontent.com",
+    "huggingface.co",
+    ".huggingface.co",
+    ".hf.co",
+    "pkgs.tailscale.com",
+    "nodejs.org"
+  ],
+  "tailscale": {
+    "_comment": "Official Windows MSI, latest stable when pinned (2026-10-28). size + sha256 from pkgs.tailscale.com/stable/<file>.sha256, cross-checked against the downloaded file; the installer also requires a valid Authenticode signature from O=Tailscale Inc. before opening it. The remote check warns when the installed Tailscale is older than min_version; bump both when Tailscale ships security fixes.",
+    "version": "1.104.4",
+    "min_version": "1.104.4",
+    "base_url": "https://pkgs.tailscale.com/stable/",
+    "file": "tailscale-setup-1.104.4-amd64.msi",
+    "size": 38796288,
+    "sha256": "1d12cd8b1d6dbb447da8579b1a5268ae2fc050967bebfaa02e32d2bb645ef6ee"
+  },
+  "voice": {
+    "whisper": {
+      "repo": "Systran/faster-whisper-small.en",
+      "revision": "d1d751a5f8271d482d14ca55d9e2deeebbae577f",
+      "files": [
+        {
+          "path": "config.json",
+          "size": 2657,
+          "sha256": "666a9605530ac1f61fa8177f3702b4dacec9966749e42610839fcc32661d5fae"
+        },
+        {
+          "path": "model.bin",
+          "size": 483545366,
+          "sha256": "62b2a45b05ee59acb4a5341b33ee35e041395d378d418a18acfe4c9e768ee37a"
+        },
+        {
+          "path": "tokenizer.json",
+          "size": 2128466,
+          "sha256": "929c5252409436dce1b38a75d1abbcb5e132d170d8e324e4e04ed915fa2d22df"
+        },
+        {
+          "path": "vocabulary.txt",
+          "size": 422309,
+          "sha256": "ff77588746d3a2595d32ab5b69ffd7b95ce2441ac57533cb66fc3eb575a115cf"
+        }
+      ],
+      "dest": "models/whisper/small.en"
+    },
+    "piper": {
+      "repo": "rhasspy/piper-voices",
+      "revision": "5041a7a49ae5b3a0f30e6837769eb03fdbb231bd",
+      "files": [
+        {
+          "path": "en/en_US/joe/medium/en_US-joe-medium.onnx",
+          "size": 63201294,
+          "sha256": "58afce0321b8d9c46d7cdf9c16500cc55a793b4220212dba6b70fb788b3baf06"
+        },
+        {
+          "path": "en/en_US/joe/medium/en_US-joe-medium.onnx.json",
+          "size": 4794,
+          "sha256": "3d6d5410b3795cb1950595247ef8f06190719e6fdbfa3a2356d8ec368e1aad33"
+        }
+      ],
+      "dest": "models/piper-voices"
+    },
+    "_comment": "Voice pack model files, pinned to a commit. Large files' SHA-256 come from the Hugging Face LFS pointer; small (non-LFS) files were downloaded at that commit and hashed when pinning, since Hugging Face only gives their git hash."
+  },
+  "vision_helper": {
+    "_comment": "Vision pack: LFM3-VL-2B on the CPU (core/vision_helper.py) for the Create prompt assist and agent image tools when the chat model can't see.",
+    "model": {
+      "repo": "LiquidAI/LFM3-VL-2B-GGUF",
+      "revision": "017b19da2dcffadb41d67745941f3d785f0d162f",
+      "file": "LFM3-VL-2B-Q4_K_M.gguf",
+      "size": 1099627808,
+      "sha256": "56dac2e192ff0d9ab8507f4f1aeb4aed0463449bbbefaac79497f041c95f21eb"
+    },
+    "mmproj": {
+      "repo": "LiquidAI/LFM3-VL-2B-GGUF",
+      "revision": "017b19da2dcffadb41d67745941f3d785f0d162f",
+      "file": "mmproj-LFM3-VL-2B-Q8_0.gguf",
+      "size": 203031872,
+      "sha256": "c5c5b58d544a18da919172d2d0368090ea1a4a351b6feb7f8a326a264a5918ab"
+    },
+    "license": "LFM Open License v1.0 (LiquidAI; check commercial terms)",
+    "num_ctx": 8192,
+    "port": 8095,
+    "idle_unload_s": 600
+  },
+  "node": {
+    "_comment": "Portable Node.js for the webgpu/game packs when no Node 20+ is installed. sha256 from https://nodejs.org/dist/v24.22.1/SHASUMS256.txt.",
+    "version": "24.22.1",
+    "min_major": 20,
+    "base_url": "https://nodejs.org/dist/v24.22.1/",
+    "file": "node-v24.22.1-win-x64.zip",
+    "size": 37748064,
+    "sha256": "d2046d28c2c3dcd211ac5145c0bf30e2047ef9dfb306693c8c6e2eccd8b95fa5"
+  },
+  "game": {
+    "_comment": "A Tale of Yarn (the WebGPU game), cloned over https and checked out at this exact commit; git verifies the content by hash. Bump deliberately after reviewing the new commits.",
+    "name": "A Tale of Yarn",
+    "repo": "https://github.com/kavenmartinez1-collab/A_Tale_of_Yarn.git",
+    "commit": "8d91d5e94ea653b150e79909c3164daab805cbbb",
+    "dest": "games/a-tale-of-yarn",
+    "models": [
+      {
+        "dest": "models/unsloth--Qwen3-1.7B-GGUF/Qwen3-1.7B-Q4_K_M.gguf",
+        "repo": "unsloth/Qwen3-1.7B-GGUF",
+        "revision": "d7f544eead698dbd1f15126ef60b45a1e1933222",
+        "path": "Qwen3-1.7B-Q4_K_M.gguf",
+        "size": 1107409472,
+        "sha256": "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897"
+      },
+      {
+        "dest": "models/unsloth--Qwen3-1.7B-GGUF/tokenizer.json",
+        "repo": "Qwen/Qwen3-8B",
+        "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+        "path": "tokenizer.json",
+        "size": 11422654,
+        "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+      },
+      {
+        "dest": "models/unsloth--Qwen3-1.7B-GGUF/tokenizer_config.json",
+        "repo": "Qwen/Qwen3-8B",
+        "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+        "path": "tokenizer_config.json",
+        "size": 9732,
+        "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+      },
+      {
+        "dest": "models/Xenova--whisper-base.en/onnx/encoder_model_quantized.onnx",
+        "repo": "Xenova/whisper-base.en",
+        "revision": "95bf40a508535962c6483ead40270b2e32267508",
+        "path": "onnx/encoder_model_quantized.onnx",
+        "size": 23200856,
+        "sha256": "d0d4e59e2842617b39787cece73d7e8f76f99b1697d3386c0e682eca2269f4a1"
+      },
+      {
+        "dest": "models/Xenova--whisper-base.en/onnx/decoder_model_merged_quantized.onnx",
+        "repo": "Xenova/whisper-base.en",
+        "revision": "95bf40a508535962c6483ead40270b2e32267508",
+        "path": "onnx/decoder_model_merged_quantized.onnx",
+        "size": 53707027,
+        "sha256": "a25afc5858a20aabb7652cb2d555996ebe10691a69bbdb423d5073d52f060325"
+      },
+      {
+        "dest": "models/Xenova--whisper-base.en/config.json",
+        "repo": "Xenova/whisper-base.en",
+        "revision": "95bf40a508535962c6483ead40270b2e32267508",
+        "path": "config.json",
+        "size": 2202,
+        "sha256": "5c390f2c6ba84ddeb7e362cd8b2123832911407850174e64d7081ccc36df2d64"
+      },
+      {
+        "dest": "models/Xenova--whisper-base.en/generation_config.json",
+        "repo": "Xenova/whisper-base.en",
+        "revision": "95bf40a508535962c6483ead40270b2e32267508",
+        "path": "generation_config.json",
+        "size": 1500,
+        "sha256": "1e57ed56ad1bd7f08a49ece7fe7daada674573805a35f8bdbbe68380aab5b1ee"
+      },
+      {
+        "dest": "models/Xenova--whisper-base.en/preprocessor_config.json",
+        "repo": "Xenova/whisper-base.en",
+        "revision": "95bf40a508535962c6483ead40270b2e32267508",
+        "path": "preprocessor_config.json",
+        "size": 339,
+        "sha256": "a6a76d28c93edb273669eb9e0b0636a2bddbb1272c3261e47b7ca6dfdbac1b8d"
+      },
+      {
+        "dest": "models/Xenova--whisper-base.en/tokenizer.json",
+        "repo": "Xenova/whisper-base.en",
+        "revision": "95bf40a508535962c6483ead40270b2e32267508",
+        "path": "tokenizer.json",
+        "size": 2128494,
+        "sha256": "c6ee8f089220a5b1188f6426456772572671c6141ae007eecb83c6a8349f5deb"
+      },
+      {
+        "dest": "models/Xenova--whisper-base.en/tokenizer_config.json",
+        "repo": "Xenova/whisper-base.en",
+        "revision": "95bf40a508535962c6483ead40270b2e32267508",
+        "path": "tokenizer_config.json",
+        "size": 835,
+        "sha256": "e082c1ad251541bf277967a703252cddd4bb37a71a43737e03d050c22ec08238"
+      },
+      {
+        "dest": "models/rhasspy--piper-en-us-joe-medium/en_US-joe-medium.onnx",
+        "repo": "rhasspy/piper-voices",
+        "revision": "5041a7a49ae5b3a0f30e6837769eb03fdbb231bd",
+        "path": "en/en_US/joe/medium/en_US-joe-medium.onnx",
+        "size": 63201294,
+        "sha256": "58afce0321b8d9c46d7cdf9c16500cc55a793b4220212dba6b70fb788b3baf06"
+      },
+      {
+        "dest": "models/rhasspy--piper-en-us-joe-medium/en_US-joe-medium.onnx.json",
+        "repo": "rhasspy/piper-voices",
+        "revision": "5041a7a49ae5b3a0f30e6837769eb03fdbb231bd",
+        "path": "en/en_US/joe/medium/en_US-joe-medium.onnx.json",
+        "size": 4794,
+        "sha256": "3d6d5410b3795cb1950595247ef8f06190719e6fdbfa3a2356d8ec368e1aad33"
+      },
+      {
+        "dest": "models/rhasspy--piper-en-us-ljspeech-medium/en_US-ljspeech-medium.onnx",
+        "repo": "rhasspy/piper-voices",
+        "revision": "5041a7a49ae5b3a0f30e6837769eb03fdbb231bd",
+        "path": "en/en_US/ljspeech/medium/en_US-ljspeech-medium.onnx",
+        "size": 63531379,
+        "sha256": "6f52a751e2349abe7a76735eb09dc1875298c77ea2342ffd2fef79ff81b87f22"
+      },
+      {
+        "dest": "models/rhasspy--piper-en-us-ljspeech-medium/en_US-ljspeech-medium.onnx.json",
+        "repo": "rhasspy/piper-voices",
+        "revision": "5041a7a49ae5b3a0f30e6837769eb03fdbb231bd",
+        "path": "en/en_US/ljspeech/medium/en_US-ljspeech-medium.onnx.json",
+        "size": 4972,
+        "sha256": "141d612cc0a95ed7efc1ca936b845c2364967f2e9217c5dbfcf69fc4d6c65860"
+      }
+    ],
+    "models_comment": "The game's ship set (scripts/fetch-weights.mts), each file pinned to a Hugging Face commit; all 14 matched the developer's own copies when pinned (2026-10-28).",
+    "cmudict": {
+      "_comment": "Source for the pronunciation lexicon. Placed in build-lexicon.mts's cache so it never fetches master; the built output is then checked against expected_output.",
+      "commit": "74790861f652b15e4ac49015a90074ad62a27690",
+      "base_url": "https://raw.githubusercontent.com/cmusphinx/cmudict/74790861f652b15e4ac49015a90074ad62a27690/",
+      "files": [
+        {
+          "name": "cmudict.dict",
+          "size": 3618488,
+          "sha256": "81917843c7f44ce2b094ac63873c2c7a4cf802040792c455ba3ca406891c3d22"
+        },
+        {
+          "name": "LICENSE",
+          "size": 1754,
+          "sha256": "bd4ce8e44170a5f9f481310ca85c51de3c4f851a65e679b40e603b143bd3542a"
+        }
+      ],
+      "cache_dir": "node_modules/.cache/cmudict",
+      "expected_output": {
+        "models/rhasspy--piper-en-us-joe-medium/lexicon-en-us.txt": "90ba4891427d0f4e9b95ddddc703aa878f0475e732e7ad9d12bcb7418fa40680",
+        "models/rhasspy--piper-en-us-joe-medium/LICENSE-cmudict.txt": "990447c673e6222b3df69adb992a080bacd0d56b0950aff847c0aaa2795c6142"
+      }
+    }
+  }
 }

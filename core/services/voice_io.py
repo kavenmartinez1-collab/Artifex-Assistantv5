@@ -79,7 +79,13 @@ def stt(audio: bytes, model: str | None = None) -> str:
         wm = _whisper.get(model)
         if wm is None:
             from faster_whisper import WhisperModel
-            wm = _whisper[model] = WhisperModel(model, device="cpu",
+            # The installer's voice pack puts pinned, checksum-verified files
+            # in models/whisper/<name>; use them when present instead of
+            # letting faster-whisper fetch the model by name on first use.
+            from core.config import BASE_DIR
+            local = os.path.join(BASE_DIR, "models", "whisper", model)
+            src = local if os.path.isfile(os.path.join(local, "model.bin")) else model
+            wm = _whisper[model] = WhisperModel(src, device="cpu",
                                                 compute_type="int8")
         segments, _ = wm.transcribe(io.BytesIO(audio), beam_size=5,
                                     language="en", vad_filter=True)

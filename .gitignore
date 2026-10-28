@@ -129,3 +129,6 @@ purge_extra.txt
 
 # Launchers written by python -m installer
 /Artifex *.cmd
+
+# API key written by python -m installer remote setup
+/artifex_api_key.txt

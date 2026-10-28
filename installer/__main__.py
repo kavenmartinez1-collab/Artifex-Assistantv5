@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -35,6 +36,79 @@ def _describe(pl) -> str:
     return "\n".join(lines)
 
 
+def _remote(a) -> int:
+    from installer import remote
+    catalog = recipes.load_catalog()
+    root = os.path.abspath(a.root)
+    min_v = catalog["tailscale"]["min_version"]
+    if a.action == "setup":
+        if a.model and not re.fullmatch(r"[A-Za-z0-9._-]+", a.model):
+            print(f"error: bad model id {a.model!r}")
+            return 2
+        steps = []
+        if not remote.tailscale_exe():
+            steps.append(f"install Tailscale {catalog['tailscale']['version']} (pinned and "
+                         "signature-checked; Windows will ask you to approve it), then you sign in")
+        steps += [f"create {remote.KEY_FILE} (a random 256-bit API key) if it doesn't exist",
+                  f"forward your tailnet's port {a.port} to 127.0.0.1:{a.port} "
+                  "(tailscale serve, tailnet only; never Funnel)",
+                  "write 'Artifex API (phone via Tailscale).cmd' (still bound to 127.0.0.1)",
+                  "run the exposure check"]
+        print("Remote access setup will:\n" + "\n".join(f"  {i + 1}. {s}" for i, s in enumerate(steps)))
+        if not a.yes and input("\nGo ahead? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Nothing changed.")
+            return 1
+        try:
+            if not remote.tailscale_exe():
+                remote.install_tailscale(catalog, os.path.join(root, "runtime", "downloads"))
+            if not remote.wait_connected():
+                print("Tailscale isn't connected yet; sign in, then run this again.")
+                return 5
+            print("API key: " + remote.ensure_api_key(root))
+            remote.serve_api(a.port)
+            print("launcher: " + recipes.write_phone_launcher(root, a.port, a.model))
+        except (VerifyError, RuntimeError, ValueError, subprocess.CalledProcessError) as e:
+            print(f"\nSTOPPED: {e}")
+            return 4
+    findings = remote.check_exposure(root, a.port, min_version=min_v)
+    print("\nExposure check:\n" + remote.report(findings))
+    return 3 if any(f["level"] == remote.FAIL for f in findings) else 0
+
+
+def _packs(a) -> int:
+    from installer import packs, remote
+    catalog = recipes.load_catalog()
+    if a.cmd == "packs":
+        for pid, p in packs.PACKS.items():
+            print(f"  {pid:12} {p['label']}  ({p['size']})")
+        print("\nInstall one with: python -m installer pack <id>")
+        return 0
+    if a.id not in packs.PACKS:
+        print(f"error: no pack {a.id!r}; see python -m installer packs")
+        return 2
+    p, root = packs.PACKS[a.id], os.path.abspath(a.root)
+    print(f"{p['label']} ({p['size']}) will:\n" + "\n".join(
+        f"  {i + 1}. {s}" for i, s in enumerate(p["plan"](root, catalog))))
+    if not a.yes and input("\nGo ahead? [y/N] ").strip().lower() not in ("y", "yes"):
+        print("Nothing changed.")
+        return 1
+    try:
+        result = p["install"](root, catalog)
+    except packs.PackUnavailable as e:
+        print(f"\nNot installed: {e}")
+        return 6
+    except (VerifyError, RuntimeError, ValueError, subprocess.CalledProcessError) as e:
+        print(f"\nSTOPPED: {e}")
+        return 4
+    if isinstance(result, list):
+        for path in result:
+            print(f"launcher: {path}")
+    findings = remote.check_exposure(root, min_version=catalog["tailscale"]["min_version"])
+    bad = [f for f in findings if f["level"] == remote.FAIL]
+    print("\nDone." if not bad else "\nInstalled, but the exposure check FAILED:\n" + remote.report(bad))
+    return 3 if bad else 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m installer")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -55,12 +129,27 @@ def main(argv=None) -> int:
                            help="skip the Python environment (backend and model only)")
             s.add_argument("--no-gui", action="store_true",
                            help="leave out the desktop GUI (PyQt6, ~100 MB)")
+    rm = sub.add_parser("remote", help="phone access over Tailscale, and the exposure check")
+    rm.add_argument("action", choices=["check", "setup"])
+    rm.add_argument("--root", default=REPO_ROOT)
+    rm.add_argument("--port", type=int, default=8000, help="Artifex API port (default 8000)")
+    rm.add_argument("--model", help="model id the phone launcher starts with")
+    rm.add_argument("--yes", action="store_true", help="don't ask before changing anything")
+    sub.add_parser("packs", help="list the optional packs")
+    pk = sub.add_parser("pack", help="install an optional pack")
+    pk.add_argument("id")
+    pk.add_argument("--root", default=REPO_ROOT)
+    pk.add_argument("--yes", action="store_true", help="don't ask first")
     a = ap.parse_args(argv)
 
+    if a.cmd in ("packs", "pack"):
+        return _packs(a)
     if a.cmd == "probe":
         p = probe_mod.probe(REPO_ROOT)
         print(json.dumps(p, indent=2) if a.json else probe_mod.summary(p))
         return 0
+    if a.cmd == "remote":
+        return _remote(a)
 
     catalog = recipes.load_catalog()
     p = probe_mod.probe(a.root)

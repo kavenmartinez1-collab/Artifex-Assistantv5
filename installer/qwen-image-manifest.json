@@ -1,0 +1,168 @@
+{
+ "_comment": "Create pack: the official Qwen-Image 2.1 Turbo (bf16) pinned to a commit. LFS files' SHA-256 from Hugging Face; small files were downloaded at this commit and hashed when pinning (2026-10-28). The pack downloads these, then scripts/quantize_qwen_image.py makes the 4-bit folder Artifex loads.",
+ "repo": "Qwen/Qwen-Image-2.1-Turbo",
+ "revision": "fc13ba1986fcb905854dc8de2f52eee395f49b5b",
+ "license": "other",
+ "files": [
+  {
+   "path": ".gitattributes",
+   "size": 2463,
+   "sha256": "aacf7c087ca029f114c7086a841c92aef81780275e90ed7507de8106bec4aa15"
+  },
+  {
+   "path": "LICENSE",
+   "size": 7831,
+   "sha256": "8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d"
+  },
+  {
+   "path": "README.md",
+   "size": 15116,
+   "sha256": "9a262724d564444f1fd41a1a3fc1aae75bfb7873cd623abb3acd3d59f02ee4c5"
+  },
+  {
+   "path": "assets/edit-preview.png",
+   "size": 867046,
+   "sha256": "ab8bea3ec5e5456ccaf5e225a79b60c02e743785fd5bffed5ed31f2a5b225334"
+  },
+  {
+   "path": "assets/t2i-preview.png",
+   "size": 850319,
+   "sha256": "32c84b89d31e2c62f1e8feb62e7dc88941945d2a622e1784984e7272bc5f428a"
+  },
+  {
+   "path": "assets/turbo-ballet.png",
+   "size": 4509235,
+   "sha256": "bea468baa657e35e81f74373964a257c2eb6bf1556b304ab59801a92fea9a372"
+  },
+  {
+   "path": "assets/turbo-boat-input.png",
+   "size": 1878998,
+   "sha256": "903f87e2553cbae5b400469a95aac46ea3068f7525d98cab448b4564aee5ab05"
+  },
+  {
+   "path": "assets/turbo-composition-input-grid.png",
+   "size": 726912,
+   "sha256": "61f86f317d9114ea5ecfcb879fcc83c848919682930da8a84aa8c430cfded991"
+  },
+  {
+   "path": "assets/turbo-composition.png",
+   "size": 4153287,
+   "sha256": "2981c6ae9ecbc48cd7e1d846210231a38cd04afb980194f076686ed6f78226f6"
+  },
+  {
+   "path": "assets/turbo-figure-input-1.png",
+   "size": 550642,
+   "sha256": "e3c3c75bc05a1740b22b09653022c0e6077d626f3f94df0ff6e3e8d1eeab7728"
+  },
+  {
+   "path": "assets/turbo-figure.png",
+   "size": 4477801,
+   "sha256": "cf69433e51c20eb9cf05b10f62f3fd8e55c8f276a0867a851f6872a09de436ba"
+  },
+  {
+   "path": "assets/turbo-interior-input-grid.png",
+   "size": 847488,
+   "sha256": "dcfd59fe3eacdabab99d5a077e0c6a149a8634261f40d0e9a035fc5cf5f17612"
+  },
+  {
+   "path": "assets/turbo-interior.png",
+   "size": 4486660,
+   "sha256": "90d37b3880d179caa158a0273dd61756f567c5ca16144f61fd08cca2e608da49"
+  },
+  {
+   "path": "assets/turbo-portrait.png",
+   "size": 6273797,
+   "sha256": "8855135944f03a78e274c14059c6b0cec5cb5932262774ba3ce87d32f99dc155"
+  },
+  {
+   "path": "assets/turbo-poster.png",
+   "size": 5771548,
+   "sha256": "a6ca151f459650596133fe0d78802f5604bc3a757d2a4740ddae46a23531c8e1"
+  },
+  {
+   "path": "assets/turbo-rgba.png",
+   "size": 2615160,
+   "sha256": "a7ffdacf26f8686e42d9947e90a2b9f8dd3407dcb3402cd8dd61f733efc619ae"
+  },
+  {
+   "path": "assets/turbo-ui.png",
+   "size": 3693778,
+   "sha256": "d7b8a7cea1f33c6f5711b5309902640fdf7470fd727fc387cf5c137fe8cdf570"
+  },
+  {
+   "path": "model_index.json",
+   "size": 578,
+   "sha256": "97e2febeb19d93cb41fa44807cde8bd42757950b5dffeacdb0331fb2d390cf20"
+  },
+  {
+   "path": "processor/chat_template.jinja",
+   "size": 5292,
+   "sha256": "3636d0f0bd6bef02654cdffdc447b79cb2cef8ab02cc75267345946291a489e4"
+  },
+  {
+   "path": "processor/processor_config.json",
+   "size": 1300,
+   "sha256": "14932921ca485d458a04dafd8069fbb0a4505622a48208d19ed247115801385b"
+  },
+  {
+   "path": "processor/tokenizer.json",
+   "size": 11422650,
+   "sha256": "be75606093db2094d7cd20f3c2f385c212750648bd6ea4fb2bf507a6a4c55506"
+  },
+  {
+   "path": "processor/tokenizer_config.json",
+   "size": 705,
+   "sha256": "fd42a0b35a8d13cd473e88e310b50cbf1bccaa9eb60ed0fd873af5f8f0c59307"
+  },
+  {
+   "path": "scheduler/scheduler_config.json",
+   "size": 486,
+   "sha256": "16c948c71f9152a34cce6e3a2f309e97ad2dca32beecbe5e2fd3a7925b7eb4bb"
+  },
+  {
+   "path": "text_encoder/config.json",
+   "size": 1542,
+   "sha256": "89050cba6b66c4f68f52305b54fc37efe28d95232246b94aa8dc0cfa36f3b734"
+  },
+  {
+   "path": "text_encoder/generation_config.json",
+   "size": 241,
+   "sha256": "d04d0c6fdd1dc056cf68178425a3ecf17a0b9e848cf1a8378ad31c623263472c"
+  },
+  {
+   "path": "text_encoder/model.safetensors",
+   "size": 17534340584,
+   "sha256": "a1eee8233f3063466dd3b06e857b0a2cf13a77c543908374771d51a546beb2e0"
+  },
+  {
+   "path": "transformer/config.json",
+   "size": 370,
+   "sha256": "2c567038ca190824728844b8d06d94ae02360e668707afd9734e789a7eb58ce3"
+  },
+  {
+   "path": "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+   "size": 9968332504,
+   "sha256": "6cccd922767f01694461bdcf1f34ea7b771f3442e4d5e338ea9aa55277431cc0"
+  },
+  {
+   "path": "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+   "size": 4261951904,
+   "sha256": "69f53ebb063d2f606bdaff7e22e0e2144f28d978d73dc75e6e4293fc5982eab5"
+  },
+  {
+   "path": "transformer/diffusion_pytorch_model.safetensors.index.json",
+   "size": 30283,
+   "sha256": "17987f6623b1c814d0ef55a137d99142b7b3b040eb1bf241b5575dd35af803a2"
+  },
+  {
+   "path": "vae/config.json",
+   "size": 2172,
+   "sha256": "42bfdec412459bbb7bc38a0617ab70edcfc873f84ec47e0c7d01c53ba09885a5"
+  },
+  {
+   "path": "vae/diffusion_pytorch_model.safetensors",
+   "size": 675508656,
+   "sha256": "71879ffd5321e6d10c3c87513e2b474b1252efa7f3dec2969214a9bf06a6dd5c"
+  }
+ ]
+}
