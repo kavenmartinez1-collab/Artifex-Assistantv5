@@ -36,6 +36,7 @@ from api.web_tools import (
     extract_web_tools, execute_web_tools, tool_status_labels,
     gateway_available, MAX_TOOL_ROUNDS,
     new_request_state, collapse_repeated_tool_calls, clear_old_tool_results,
+    NATIVE_WEB_TOOLS, NATIVE_WEB_TOOL_SYSTEM_PROMPT, native_calls_to_web_tools,
     TOOL_RESULTS_PREFIX,
 )
 
@@ -921,7 +922,8 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
                              grammar=None, response_format=None,
                              enable_thinking=True,
                              web_tools=False,
-                             reasoning_effort=None):
+                             reasoning_effort=None,
+                             native_tools=None):
     """Stream from Transformers/llama.cpp/claude_cli engine into a queue.
     Runs in a background thread.
 
@@ -934,6 +936,10 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
 
     reasoning_effort bounds thinking depth on templates that expose it;
     only the llama_cpp engine acts on it, the rest accept and ignore.
+
+    native_tools: OpenAI tool definitions, sent only for a llama_cpp entry
+    marked native_tools (other engines do not take the kwarg). Its calls are
+    queued as ("tool_calls", [...]) before the usage event.
     """
     tf = ThinkFilter(
         on_response=lambda t: out_queue.put(("content", t)),
@@ -948,6 +954,7 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
         tf.feed(text)
 
     try:
+        extra = {"tools": native_tools} if native_tools else {}
         engine.generate_streaming(
             messages, max_tokens=max_tokens if max_tokens and max_tokens > 0 else -1,
             temperature=temperature, on_token=on_token,
@@ -956,12 +963,15 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
             enable_thinking=enable_thinking,
             web_tools=web_tools,
             reasoning_effort=reasoning_effort,
+            **extra,
         )
         tf.flush()
 
         # Use real token counts from engine._last_gen_stats (populated by
         # TransformersEngine.generate_streaming) instead of char//4 heuristic.
         stats = getattr(engine, "_last_gen_stats", None) or {}
+        if native_tools and stats.get("tool_calls"):
+            out_queue.put(("tool_calls", stats["tool_calls"]))
         out_queue.put(("usage", {
             "prompt_tokens": stats.get("prompt_tokens", 0),
             "completion_tokens": stats.get("completion_tokens", 0),
@@ -1125,6 +1135,7 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
     search_cache = []  # Request-scoped cache for @web_read(N)
     web_state = new_request_state()  # max_uses / dedupe / URL cache for this request
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    first_prompt_tokens = 0  # round 0 prompt: what the conversation itself costs
     last_finish_reason = "stop"  # Updated from engine usage events
 
     mode = (use_web_tools if isinstance(use_web_tools, str)
@@ -1150,11 +1161,26 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
               chat_id, mode, backend, len(current_messages), msg_tokens_est,
               max_tokens, f", workspace={ws}" if full_mode else "")
 
+    # Web mode on an entry marked native_tools: real tool definitions go
+    # with the request instead of the @marker prompt. Full mode keeps the
+    # text protocol (its tool set is far larger than web search).
+    native_tools = None
+    if mode == chat_tools.MODE_WEB and backend == "llama_cpp":
+        try:
+            if getattr(_get_engine(), "native_tools", False):
+                native_tools = NATIVE_WEB_TOOLS
+        except Exception as e:
+            _log.debug("[%s] native tool check skipped: %s", chat_id, e)
+
     if full_mode:
         _inject_tool_prompt(current_messages,
                             chat_tools.full_tool_system_prompt(ws))
         _log.info("[%s] Injected FULL tool system prompt (workspace=%s)",
                   chat_id, ws)
+    elif native_tools:
+        _inject_tool_prompt(current_messages, NATIVE_WEB_TOOL_SYSTEM_PROMPT)
+        _log.info("[%s] Native tool calling: sending %d tool definitions",
+                  chat_id, len(native_tools))
     elif use_web_tools:
         _inject_tool_prompt(current_messages, _WEB_TOOL_SYSTEM_PROMPT)
         _log.info("[%s] Injected web tool system prompt", chat_id)
@@ -1215,7 +1241,8 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                 target=_stream_transformers_raw,
                 args=(engine, current_messages, max_tokens, temperature, q,
                       grammar, response_format, enable_thinking, use_web_tools),
-                kwargs={"reasoning_effort": reasoning_effort},
+                kwargs={"reasoning_effort": reasoning_effort,
+                        "native_tools": native_tools},
                 daemon=True,
             )
 
@@ -1223,6 +1250,7 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
 
         # Consume queue and yield SSE events, collecting full response
         full_response = ""
+        native_calls = []
         usage = {"prompt_tokens": 0, "completion_tokens": 0}
         loop = asyncio.get_event_loop()
 
@@ -1239,6 +1267,8 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                 yield _make_sse_chunk(chat_id, model, {"content": data})
             elif kind == "usage":
                 usage = data
+            elif kind == "tool_calls":
+                native_calls = data
             elif kind == "error":
                 yield f"data: {json.dumps({'error': data})}\n\n"
 
@@ -1247,6 +1277,15 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
         # Accumulate usage across rounds
         total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
         total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+        # The sums above re-count the prompt once per tool round, so they are
+        # no measure of how full the conversation is: a 3-round web answer
+        # read as ~3x its size and made the phone compact a ~2K-token chat
+        # (2026-10-27). What the NEXT turn will carry is the first round's
+        # prompt plus the final answer; tool results are not kept.
+        if round_count == 0:
+            first_prompt_tokens = usage.get("prompt_tokens", 0)
+        total_usage["context_tokens"] = (first_prompt_tokens
+                                         + usage.get("completion_tokens", 0))
         # Derive finish_reason: Ollama passes done_reason, Transformers
         # passes finish_reason directly. Map Ollama's "length" through;
         # everything else collapses to "stop".
@@ -1277,7 +1316,10 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
             # tools are local. A failing one reports its own failure back
             # to the model, which is how an agent run behaves too.
         else:
-            tools = extract_web_tools(full_response)
+            # A native-tools model can still write a call as text; the text
+            # parsers stay as the fallback when it made no structured call.
+            tools = (native_calls_to_web_tools(native_calls) if native_calls
+                     else extract_web_tools(full_response))
             has_gw = gateway_available() if tools else False
             _log.info("[%s] Tool extraction: found %d tool calls, gateway_up=%s",
                       chat_id, len(tools), has_gw)
@@ -1372,12 +1414,35 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
         msg_count_before = len(current_messages)
         # A looping answer goes back without its repeated call lines, so the
         # model does not read its own loop and continue it (2026-10-25).
-        current_messages.append({"role": "assistant",
-                                 "content": collapse_repeated_tool_calls(full_response)})
-        current_messages.append({
-            "role": "user",
-            "content": f"{TOOL_RESULTS_PREFIX}\n\n{tool_output}",
-        })
+        if native_calls:
+            # Results go back the way the model's template expects them: an
+            # assistant turn carrying the calls, then one tool message per
+            # call. execute_web_tools reports all calls as one block (its
+            # per-turn caps span the whole round), so it rides on the first.
+            ids = [c.get("id") or f"call_{round_count}_{i}"
+                   for i, c in enumerate(native_calls)]
+            current_messages.append({
+                "role": "assistant",
+                "content": full_response,
+                "tool_calls": [
+                    {"id": ids[i], "type": "function",
+                     "function": {"name": c.get("name", ""),
+                                  "arguments": c.get("arguments") or "{}"}}
+                    for i, c in enumerate(native_calls)],
+            })
+            for i in range(len(native_calls)):
+                current_messages.append({
+                    "role": "tool", "tool_call_id": ids[i],
+                    "content": (f"{TOOL_RESULTS_PREFIX}\n\n{tool_output}" if i == 0
+                                else "(results for this call are in the first tool result)"),
+                })
+        else:
+            current_messages.append({"role": "assistant",
+                                     "content": collapse_repeated_tool_calls(full_response)})
+            current_messages.append({
+                "role": "user",
+                "content": f"{TOOL_RESULTS_PREFIX}\n\n{tool_output}",
+            })
         # Context editing: past ~60K chars of tool results in this request,
         # the older rounds' results become a short placeholder (newest 2 kept).
         clear_old_tool_results(current_messages)

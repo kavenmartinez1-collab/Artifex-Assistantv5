@@ -105,6 +105,72 @@ def _extract_native_tool_calls(text: str) -> list[dict]:
     return tools
 
 
+# ── Native (structured) tool calling ────────────────────────────────────
+# For model entries with "native_tools": true. Instead of teaching the model
+# the @marker syntax in the prompt, the request carries these definitions
+# and llama-server (--jinja) parses whatever call format the model was
+# trained on into OpenAI tool_calls. Small models such as LFM3 never learn
+# the @marker syntax from a prompt: they echo the placeholders or fall back
+# to their own format (2026-10-27, LFM3-1.7B on the phone).
+NATIVE_WEB_TOOLS = [
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the web. Returns numbered results with titles, "
+                       "URLs and snippets.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "The search query."}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "web_read",
+        "description": "Read the full text of a page: a result number from "
+                       "the last web_search, or a URL.",
+        "parameters": {"type": "object", "properties": {
+            "ref": {"type": "string",
+                    "description": "Result number (e.g. \"2\") or a full URL."}},
+            "required": ["ref"]}}},
+]
+
+NATIVE_WEB_TOOL_SYSTEM_PROMPT = (
+    "You can search the web with the web_search and web_read tools. Use them "
+    "for current events or facts you are unsure of, not for general "
+    "knowledge, math or coding. After a search, read the most relevant "
+    "results, then answer using what you found."
+)
+
+
+def native_calls_to_web_tools(calls: list[dict]) -> list[dict]:
+    """Map OpenAI tool_calls ({id, name, arguments}) to web tool dicts.
+
+    The result has the same shape extract_web_tools() returns, so the calls
+    run through execute_web_tools() and every guard there (max_uses, dedupe,
+    placeholder refusal, per-turn caps). Names and argument keys get the
+    same tolerance as the <tool_call> text parser.
+    """
+    tools = []
+    for c in calls or []:
+        name = str(c.get("name", "")).lower().lstrip("@")
+        args = c.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except json.JSONDecodeError:
+                args = {}
+        if not isinstance(args, dict):
+            continue
+        raw = f"{name}({json.dumps(args, ensure_ascii=False)})"
+        if name in ("search", "web_search", "websearch"):
+            query = args.get("query") or args.get("q") or args.get("text")
+            if query:
+                tools.append({"type": "search", "query": str(query), "raw": raw})
+        elif name in ("web_read", "webread", "fetch", "read_url", "open_url"):
+            ref = (args.get("ref") or args.get("url")
+                   or args.get("n") or args.get("index"))
+            if ref is not None:
+                tools.append({"type": "web_read", "ref": str(ref).strip(),
+                              "raw": raw})
+    return tools
+
+
 def extract_web_tools(text: str) -> list[dict]:
     """Extract @search and @web_read tool calls from model response text.
 

@@ -59,6 +59,8 @@ def _classify_capabilities(
                 break
     if has_vision:
         caps.append("vision")
+    if llama_cpp_config and llama_cpp_config.get("native_tools"):
+        caps.append("native_tools")
     for p in _CODE_PATTERNS:
         if p.search(name):
             caps.append("code")

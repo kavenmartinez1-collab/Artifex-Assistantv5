@@ -249,6 +249,10 @@ class LlamaCppEngine(BaseEngine):
         self._split_gpu_indices = model_config.get("split_gpu_indices")
         # Per-model default reasoning effort; see DEFAULT_REASONING_EFFORT.
         self._configured_reasoning_effort = model_config.get("reasoning_effort")
+        # Entry flag: the model calls tools through its trained format, so
+        # the chat tool loop sends real tool definitions instead of the
+        # @marker prompt (api/web_tools.NATIVE_WEB_TOOLS).
+        self.native_tools = bool(model_config.get("native_tools"))
         # Per-device VRAM requirements of the last gate pass, for the
         # launch-retry path: [(pool_device_index, needed_mb)].
         self._gate_requirements: list = []
@@ -1069,7 +1073,8 @@ class LlamaCppEngine(BaseEngine):
                            web_tools=False,
                            reasoning_effort=None,
                            on_telemetry=None,
-                           sampling=None) -> str:
+                           sampling=None,
+                           tools=None) -> str:
         """Stream from llama-server's OpenAI-compatible /v1/chat/completions.
 
         Thinking is handled via <think> tags in the content stream (same as
@@ -1085,6 +1090,10 @@ class LlamaCppEngine(BaseEngine):
         web_tools is accepted-and-ignored — local llama.cpp models don't
         have native tool execution; Artifex's @search/@web_read
         post-processor in api/server.py handles tools for this backend.
+
+        tools: OpenAI tool definitions for a native_tools entry. The calls
+        the model makes come back in self._last_gen_stats["tool_calls"] as
+        [{id, name, arguments}] for the caller to execute.
 
         reasoning_effort ("low"/"medium"/"high"/"xhigh") rides along in
         chat_template_kwargs for templates that read it.  It only applies
@@ -1149,6 +1158,8 @@ class LlamaCppEngine(BaseEngine):
             payload["grammar"] = grammar
         if response_format:
             payload["response_format"] = response_format
+        if tools:
+            payload["tools"] = tools
 
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -1160,6 +1171,7 @@ class LlamaCppEngine(BaseEngine):
 
         full_text = ""
         in_thinking = False
+        tool_calls: dict = {}   # stream index -> {id, name, arguments}
 
         max_retries = 2
         for attempt in range(max_retries):
@@ -1220,6 +1232,20 @@ class LlamaCppEngine(BaseEngine):
                             if on_token:
                                 on_token(content)
 
+                        # Streamed tool calls: the name and id arrive once,
+                        # the arguments JSON in fragments, keyed by index.
+                        for tc in delta.get("tool_calls") or []:
+                            slot = tool_calls.setdefault(
+                                tc.get("index", len(tool_calls)),
+                                {"id": "", "name": "", "arguments": ""})
+                            if tc.get("id"):
+                                slot["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                slot["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                slot["arguments"] += fn["arguments"]
+
                         finish = choices[0].get("finish_reason")
                         if finish:
                             self._last_gen_stats["finish_reason"] = finish
@@ -1236,6 +1262,7 @@ class LlamaCppEngine(BaseEngine):
                     time.sleep(2)
                     full_text = ""
                     in_thinking = False
+                    tool_calls = {}
                     continue
                 if self._is_server_healthy():
                     raise ConnectionError(f"Lost connection to llama-server: {e}")
@@ -1246,6 +1273,9 @@ class LlamaCppEngine(BaseEngine):
 
         if in_thinking:
             full_text += "</think>"
+        if tool_calls:
+            self._last_gen_stats["tool_calls"] = [
+                tool_calls[k] for k in sorted(tool_calls)]
 
         if raw_output:
             clean = strip_think_blocks(full_text)

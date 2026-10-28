@@ -1387,6 +1387,7 @@ const CTX_RUNGS = [16384, 32768, 49152, 65536, 98304, 131072, 196608, 262144];
 const AGENT_SEG_MAX = 5;        // buttons a phone-width segmented control fits
 const modelCtxCaps = {};
 const modelVision = {};   // id -> true when /v1/models lists "vision" (llama.cpp: --mmproj)
+const modelNativeTools = {};   // id -> true: the server sends real tool definitions (no @search prompt)
 function ctxLabel(v) { return Math.round(v / 1024) + "k"; }
 function ctxRungsFor(cap) {
   const rungs = CTX_RUNGS.filter(v => !cap || v <= cap);
@@ -1575,6 +1576,7 @@ async function loadModels() {
     if (!chosen && m.x_active) chosen = m.id;
     modelCtxCaps[m.id] = m.x_context_length || 0;
     modelVision[m.id] = (m.x_capabilities || []).includes("vision");
+    modelNativeTools[m.id] = (m.x_capabilities || []).includes("native_tools");
     sel.appendChild(o);
   }
   if (chosen) sel.value = chosen;
@@ -2326,7 +2328,10 @@ function isCompactSummary(m) {
 
 // Record the real context use of the exchange that just finished.
 function noteCtxUse(usage) {
-  const tok = (usage && (usage.prompt_tokens || 0) + (usage.completion_tokens || 0)) || 0;
+  // context_tokens: the server's measure of the conversation itself. The
+  // prompt_tokens sum counts the prompt again for every tool round.
+  const tok = (usage && (usage.context_tokens ||
+    (usage.prompt_tokens || 0) + (usage.completion_tokens || 0))) || 0;
   if (tok) lastCtxUse = { tok: tok, len: conversation.length, sid: activeSessionId };
 }
 
@@ -2701,7 +2706,10 @@ function chatSystemPrompt() {
   let sys = $("system-prompt").value.trim() || DEFAULT_SYSTEM_PROMPT;
   sys += "\n\nTODAY'S DATE: " + new Date().toDateString();
   sys += capabilitiesNote(webOn);
-  if (webOn) sys += TOOL_PROMPT;
+  // A native-tools model gets real tool definitions from the server; the
+  // @search marker instructions would only contradict them (LFM3 copied
+  // the placeholders literally).
+  if (webOn && !modelNativeTools[$("model-select").value]) sys += TOOL_PROMPT;
   return sys;
 }
 
