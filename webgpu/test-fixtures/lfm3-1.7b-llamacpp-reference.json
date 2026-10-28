@@ -1,0 +1,5324 @@
+{
+ "source": "llama.cpp b11945 CPU (d05706b4f), greedy, cache_prompt false",
+ "model": "LiquidAI/LFM3-1.7B-GGUF@4b423c332fd9 LFM3-1.7B-Q4_K_M.gguf",
+ "cases": {
+  "short": {
+   "prompt": "The capital of France is",
+   "prompt_tokens": [
+    597,
+    5205,
+    302,
+    3980,
+    355
+   ],
+   "n_prompt_tokens": 5,
+   "generated_tokens": [
+    4741,
+    20,
+    309,
+    278,
+    5205,
+    302,
+    3888,
+    355,
+    18943,
+    22,
+    440,
+    5205,
+    302,
+    10749,
+    355,
+    11210,
+    19192,
+    20,
+    309,
+    278,
+    5205,
+    302,
+    5881,
+    355
+   ],
+   "generated_text": " Paris, and the capital of Japan is Tokyo. The capital of Brazil is Brasília, and the capital of Australia is",
+   "steps": [
+    {
+     "token": 4741,
+     "text": " Paris",
+     "top": [
+      {
+       "id": 4741,
+       "token": " Paris",
+       "prob": 0.755106
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.123047
+      },
+      {
+       "id": 41176,
+       "token": "Paris",
+       "prob": 0.016885
+      },
+      {
+       "id": 2037,
+       "token": " known",
+       "prob": 0.015555
+      },
+      {
+       "id": 267,
+       "token": " a",
+       "prob": 0.005617
+      }
+     ]
+    },
+    {
+     "token": 20,
+     "text": ",",
+     "top": [
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.302313
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.190957
+      },
+      {
+       "id": 318,
+       "token": ".\n",
+       "prob": 0.177669
+      },
+      {
+       "id": 63908,
+       "token": ".\n\n",
+       "prob": 0.150871
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.033753
+      }
+     ]
+    },
+    {
+     "token": 309,
+     "text": " and",
+     "top": [
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.533224
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.15355
+      },
+      {
+       "id": 702,
+       "token": " but",
+       "prob": 0.109912
+      },
+      {
+       "id": 1657,
+       "token": " while",
+       "prob": 0.020736
+      },
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 0.020563
+      }
+     ]
+    },
+    {
+     "token": 278,
+     "text": " the",
+     "top": [
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.716316
+      },
+      {
+       "id": 851,
+       "token": " its",
+       "prob": 0.13609
+      },
+      {
+       "id": 435,
+       "token": " it",
+       "prob": 0.091605
+      },
+      {
+       "id": 509,
+       "token": " you",
+       "prob": 0.00525
+      },
+      {
+       "id": 358,
+       "token": " I",
+       "prob": 0.00452
+      }
+     ]
+    },
+    {
+     "token": 5205,
+     "text": " capital",
+     "top": [
+      {
+       "id": 5205,
+       "token": " capital",
+       "prob": 0.585486
+      },
+      {
+       "id": 2942,
+       "token": " population",
+       "prob": 0.231507
+      },
+      {
+       "id": 6083,
+       "token": " largest",
+       "prob": 0.033578
+      },
+      {
+       "id": 2873,
+       "token": " country",
+       "prob": 0.009453
+      },
+      {
+       "id": 1008,
+       "token": " first",
+       "prob": 0.009232
+      }
+     ]
+    },
+    {
+     "token": 302,
+     "text": " of",
+     "top": [
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 0.989996
+      },
+      {
+       "id": 3270,
+       "token": " city",
+       "prob": 0.0083
+      },
+      {
+       "id": 355,
+       "token": " is",
+       "prob": 0.000628
+      },
+      {
+       "id": 374,
+       "token": " for",
+       "prob": 3.7e-05
+      },
+      {
+       "id": 5205,
+       "token": " capital",
+       "prob": 3.5e-05
+      }
+     ]
+    },
+    {
+     "token": 3888,
+     "text": " Japan",
+     "top": [
+      {
+       "id": 3888,
+       "token": " Japan",
+       "prob": 0.291726
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.203299
+      },
+      {
+       "id": 10125,
+       "token": " Italy",
+       "prob": 0.125289
+      },
+      {
+       "id": 5177,
+       "token": " Canada",
+       "prob": 0.108547
+      },
+      {
+       "id": 6398,
+       "token": " Germany",
+       "prob": 0.052614
+      }
+     ]
+    },
+    {
+     "token": 355,
+     "text": " is",
+     "top": [
+      {
+       "id": 355,
+       "token": " is",
+       "prob": 0.999254
+      },
+      {
+       "id": 342,
+       "token": " (",
+       "prob": 0.000117
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 8.9e-05
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 8.2e-05
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 7e-05
+      }
+     ]
+    },
+    {
+     "token": 18943,
+     "text": " Tokyo",
+     "top": [
+      {
+       "id": 18943,
+       "token": " Tokyo",
+       "prob": 0.997008
+      },
+      {
+       "id": 40049,
+       "token": "Tok",
+       "prob": 0.000537
+      },
+      {
+       "id": 2096,
+       "token": "...",
+       "prob": 0.000478
+      },
+      {
+       "id": 336,
+       "token": " T",
+       "prob": 0.00032
+      },
+      {
+       "id": 93017,
+       "token": "...\n\n",
+       "prob": 0.000187
+      }
+     ]
+    },
+    {
+     "token": 22,
+     "text": ".",
+     "top": [
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.611161
+      },
+      {
+       "id": 318,
+       "token": ".\n",
+       "prob": 0.144872
+      },
+      {
+       "id": 63908,
+       "token": ".\n\n",
+       "prob": 0.113513
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.102998
+      },
+      {
+       "id": 35,
+       "token": ";",
+       "prob": 0.005553
+      }
+     ]
+    },
+    {
+     "token": 440,
+     "text": " The",
+     "top": [
+      {
+       "id": 440,
+       "token": " The",
+       "prob": 0.236998
+      },
+      {
+       "id": 3246,
+       "token": " What",
+       "prob": 0.182438
+      },
+      {
+       "id": 19962,
+       "token": " Which",
+       "prob": 0.061294
+      },
+      {
+       "id": 64019,
+       "token": " \n\n",
+       "prob": 0.059476
+      },
+      {
+       "id": 529,
+       "token": " In",
+       "prob": 0.051068
+      }
+     ]
+    },
+    {
+     "token": 5205,
+     "text": " capital",
+     "top": [
+      {
+       "id": 5205,
+       "token": " capital",
+       "prob": 0.544762
+      },
+      {
+       "id": 2942,
+       "token": " population",
+       "prob": 0.0472
+      },
+      {
+       "id": 1008,
+       "token": " first",
+       "prob": 0.036001
+      },
+      {
+       "id": 6083,
+       "token": " largest",
+       "prob": 0.032969
+      },
+      {
+       "id": 2203,
+       "token": " United",
+       "prob": 0.013893
+      }
+     ]
+    },
+    {
+     "token": 302,
+     "text": " of",
+     "top": [
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 0.923765
+      },
+      {
+       "id": 3270,
+       "token": " city",
+       "prob": 0.069851
+      },
+      {
+       "id": 355,
+       "token": " is",
+       "prob": 0.000998
+      },
+      {
+       "id": 7842,
+       "token": " cities",
+       "prob": 0.00089
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.000389
+      }
+     ]
+    },
+    {
+     "token": 10749,
+     "text": " Brazil",
+     "top": [
+      {
+       "id": 10749,
+       "token": " Brazil",
+       "prob": 0.404287
+      },
+      {
+       "id": 5881,
+       "token": " Australia",
+       "prob": 0.134479
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.122229
+      },
+      {
+       "id": 5177,
+       "token": " Canada",
+       "prob": 0.088646
+      },
+      {
+       "id": 6398,
+       "token": " Germany",
+       "prob": 0.077995
+      }
+     ]
+    },
+    {
+     "token": 355,
+     "text": " is",
+     "top": [
+      {
+       "id": 355,
+       "token": " is",
+       "prob": 0.99774
+      },
+      {
+       "id": 452,
+       "token": " was",
+       "prob": 0.000833
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.000431
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.000327
+      },
+      {
+       "id": 39,
+       "token": "?",
+       "prob": 0.000103
+      }
+     ]
+    },
+    {
+     "token": 11210,
+     "text": " Bras",
+     "top": [
+      {
+       "id": 11210,
+       "token": " Bras",
+       "prob": 0.708836
+      },
+      {
+       "id": 14605,
+       "token": " Brasil",
+       "prob": 0.18535
+      },
+      {
+       "id": 14019,
+       "token": " Rio",
+       "prob": 0.059247
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.017571
+      },
+      {
+       "id": 10749,
+       "token": " Brazil",
+       "prob": 0.006822
+      }
+     ]
+    },
+    {
+     "token": 19192,
+     "text": "ília",
+     "top": [
+      {
+       "id": 19192,
+       "token": "ília",
+       "prob": 0.989205
+      },
+      {
+       "id": 15669,
+       "token": "ilia",
+       "prob": 0.007233
+      },
+      {
+       "id": 307,
+       "token": "el",
+       "prob": 0.001764
+      },
+      {
+       "id": 313,
+       "token": "il",
+       "prob": 0.0003
+      },
+      {
+       "id": 23961,
+       "token": "íl",
+       "prob": 0.000247
+      }
+     ]
+    },
+    {
+     "token": 20,
+     "text": ",",
+     "top": [
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.565213
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.331064
+      },
+      {
+       "id": 318,
+       "token": ".\n",
+       "prob": 0.055652
+      },
+      {
+       "id": 63908,
+       "token": ".\n\n",
+       "prob": 0.028395
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.012428
+      }
+     ]
+    },
+    {
+     "token": 309,
+     "text": " and",
+     "top": [
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.921511
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.041504
+      },
+      {
+       "id": 1657,
+       "token": " while",
+       "prob": 0.01341
+      },
+      {
+       "id": 643,
+       "token": " which",
+       "prob": 0.009408
+      },
+      {
+       "id": 440,
+       "token": " The",
+       "prob": 0.003428
+      }
+     ]
+    },
+    {
+     "token": 278,
+     "text": " the",
+     "top": [
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.983626
+      },
+      {
+       "id": 435,
+       "token": " it",
+       "prob": 0.005074
+      },
+      {
+       "id": 851,
+       "token": " its",
+       "prob": 0.00141
+      },
+      {
+       "id": 358,
+       "token": " I",
+       "prob": 0.000744
+      },
+      {
+       "id": 522,
+       "token": " we",
+       "prob": 0.000684
+      }
+     ]
+    },
+    {
+     "token": 5205,
+     "text": " capital",
+     "top": [
+      {
+       "id": 5205,
+       "token": " capital",
+       "prob": 0.975417
+      },
+      {
+       "id": 2942,
+       "token": " population",
+       "prob": 0.008216
+      },
+      {
+       "id": 6083,
+       "token": " largest",
+       "prob": 0.005651
+      },
+      {
+       "id": 1028,
+       "token": " most",
+       "prob": 0.001843
+      },
+      {
+       "id": 2334,
+       "token": " current",
+       "prob": 0.000677
+      }
+     ]
+    },
+    {
+     "token": 302,
+     "text": " of",
+     "top": [
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 0.99564
+      },
+      {
+       "id": 3270,
+       "token": " city",
+       "prob": 0.004129
+      },
+      {
+       "id": 355,
+       "token": " is",
+       "prob": 7.7e-05
+      },
+      {
+       "id": 432,
+       "token": " or",
+       "prob": 1e-05
+      },
+      {
+       "id": 5205,
+       "token": " capital",
+       "prob": 9e-06
+      }
+     ]
+    },
+    {
+     "token": 5881,
+     "text": " Australia",
+     "top": [
+      {
+       "id": 5881,
+       "token": " Australia",
+       "prob": 0.331844
+      },
+      {
+       "id": 6398,
+       "token": " Germany",
+       "prob": 0.171725
+      },
+      {
+       "id": 5177,
+       "token": " Canada",
+       "prob": 0.132888
+      },
+      {
+       "id": 4456,
+       "token": " India",
+       "prob": 0.10041
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.097081
+      }
+     ]
+    },
+    {
+     "token": 355,
+     "text": " is",
+     "top": [
+      {
+       "id": 355,
+       "token": " is",
+       "prob": 0.998678
+      },
+      {
+       "id": 452,
+       "token": " was",
+       "prob": 0.000364
+      },
+      {
+       "id": 589,
+       "token": "'s",
+       "prob": 0.000191
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.000142
+      },
+      {
+       "id": 342,
+       "token": " (",
+       "prob": 0.000111
+      }
+     ]
+    }
+   ],
+   "steps_cuda": [
+    {
+     "token": 4741,
+     "text": " Paris",
+     "top": [
+      {
+       "id": 4741,
+       "token": " Paris",
+       "prob": 0.756892
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.106694
+      },
+      {
+       "id": 2037,
+       "token": " known",
+       "prob": 0.021112
+      },
+      {
+       "id": 41176,
+       "token": "Paris",
+       "prob": 0.014607
+      },
+      {
+       "id": 267,
+       "token": " a",
+       "prob": 0.007759
+      }
+     ]
+    },
+    {
+     "token": 20,
+     "text": ",",
+     "top": [
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.30603
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.237353
+      },
+      {
+       "id": 318,
+       "token": ".\n",
+       "prob": 0.161645
+      },
+      {
+       "id": 63908,
+       "token": ".\n\n",
+       "prob": 0.132569
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.034495
+      }
+     ]
+    },
+    {
+     "token": 309,
+     "text": " and",
+     "top": [
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.537658
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.151289
+      },
+      {
+       "id": 702,
+       "token": " but",
+       "prob": 0.112285
+      },
+      {
+       "id": 513,
+       "token": " not",
+       "prob": 0.021662
+      },
+      {
+       "id": 851,
+       "token": " its",
+       "prob": 0.021245
+      }
+     ]
+    },
+    {
+     "token": 278,
+     "text": " the",
+     "top": [
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.697517
+      },
+      {
+       "id": 851,
+       "token": " its",
+       "prob": 0.148954
+      },
+      {
+       "id": 435,
+       "token": " it",
+       "prob": 0.093255
+      },
+      {
+       "id": 358,
+       "token": " I",
+       "prob": 0.005311
+      },
+      {
+       "id": 4741,
+       "token": " Paris",
+       "prob": 0.005157
+      }
+     ]
+    },
+    {
+     "token": 5205,
+     "text": " capital",
+     "top": [
+      {
+       "id": 5205,
+       "token": " capital",
+       "prob": 0.553335
+      },
+      {
+       "id": 2942,
+       "token": " population",
+       "prob": 0.233226
+      },
+      {
+       "id": 6083,
+       "token": " largest",
+       "prob": 0.037683
+      },
+      {
+       "id": 2873,
+       "token": " country",
+       "prob": 0.01142
+      },
+      {
+       "id": 1008,
+       "token": " first",
+       "prob": 0.009271
+      }
+     ]
+    },
+    {
+     "token": 302,
+     "text": " of",
+     "top": [
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 0.988397
+      },
+      {
+       "id": 3270,
+       "token": " city",
+       "prob": 0.009701
+      },
+      {
+       "id": 355,
+       "token": " is",
+       "prob": 0.000745
+      },
+      {
+       "id": 5205,
+       "token": " capital",
+       "prob": 5e-05
+      },
+      {
+       "id": 374,
+       "token": " for",
+       "prob": 4.2e-05
+      }
+     ]
+    },
+    {
+     "token": 3888,
+     "text": " Japan",
+     "top": [
+      {
+       "id": 3888,
+       "token": " Japan",
+       "prob": 0.272667
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.194773
+      },
+      {
+       "id": 10125,
+       "token": " Italy",
+       "prob": 0.145146
+      },
+      {
+       "id": 5177,
+       "token": " Canada",
+       "prob": 0.110606
+      },
+      {
+       "id": 6398,
+       "token": " Germany",
+       "prob": 0.063431
+      }
+     ]
+    },
+    {
+     "token": 355,
+     "text": " is",
+     "top": [
+      {
+       "id": 355,
+       "token": " is",
+       "prob": 0.999188
+      },
+      {
+       "id": 342,
+       "token": " (",
+       "prob": 0.000136
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.000103
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 9.7e-05
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 6.5e-05
+      }
+     ]
+    },
+    {
+     "token": 18943,
+     "text": " Tokyo",
+     "top": [
+      {
+       "id": 18943,
+       "token": " Tokyo",
+       "prob": 0.99653
+      },
+      {
+       "id": 40049,
+       "token": "Tok",
+       "prob": 0.00058
+      },
+      {
+       "id": 2096,
+       "token": "...",
+       "prob": 0.000557
+      },
+      {
+       "id": 336,
+       "token": " T",
+       "prob": 0.000454
+      },
+      {
+       "id": 93017,
+       "token": "...\n\n",
+       "prob": 0.000217
+      }
+     ]
+    },
+    {
+     "token": 22,
+     "text": ".",
+     "top": [
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.615385
+      },
+      {
+       "id": 318,
+       "token": ".\n",
+       "prob": 0.151076
+      },
+      {
+       "id": 63908,
+       "token": ".\n\n",
+       "prob": 0.105222
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.100903
+      },
+      {
+       "id": 35,
+       "token": ";",
+       "prob": 0.004685
+      }
+     ]
+    },
+    {
+     "token": 440,
+     "text": " The",
+     "top": [
+      {
+       "id": 440,
+       "token": " The",
+       "prob": 0.251335
+      },
+      {
+       "id": 3246,
+       "token": " What",
+       "prob": 0.1856
+      },
+      {
+       "id": 19962,
+       "token": " Which",
+       "prob": 0.057647
+      },
+      {
+       "id": 64019,
+       "token": " \n\n",
+       "prob": 0.057257
+      },
+      {
+       "id": 529,
+       "token": " In",
+       "prob": 0.045116
+      }
+     ]
+    },
+    {
+     "token": 5205,
+     "text": " capital",
+     "top": [
+      {
+       "id": 5205,
+       "token": " capital",
+       "prob": 0.507493
+      },
+      {
+       "id": 2942,
+       "token": " population",
+       "prob": 0.05076
+      },
+      {
+       "id": 1008,
+       "token": " first",
+       "prob": 0.040645
+      },
+      {
+       "id": 6083,
+       "token": " largest",
+       "prob": 0.028589
+      },
+      {
+       "id": 2203,
+       "token": " United",
+       "prob": 0.015639
+      }
+     ]
+    },
+    {
+     "token": 302,
+     "text": " of",
+     "top": [
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 0.92307
+      },
+      {
+       "id": 3270,
+       "token": " city",
+       "prob": 0.069881
+      },
+      {
+       "id": 355,
+       "token": " is",
+       "prob": 0.001223
+      },
+      {
+       "id": 7842,
+       "token": " cities",
+       "prob": 0.00112
+      },
+      {
+       "id": 5205,
+       "token": " capital",
+       "prob": 0.000361
+      }
+     ]
+    },
+    {
+     "token": 10749,
+     "text": " Brazil",
+     "top": [
+      {
+       "id": 10749,
+       "token": " Brazil",
+       "prob": 0.378152
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.126997
+      },
+      {
+       "id": 5881,
+       "token": " Australia",
+       "prob": 0.123065
+      },
+      {
+       "id": 5177,
+       "token": " Canada",
+       "prob": 0.093073
+      },
+      {
+       "id": 6398,
+       "token": " Germany",
+       "prob": 0.087239
+      }
+     ]
+    },
+    {
+     "token": 355,
+     "text": " is",
+     "top": [
+      {
+       "id": 355,
+       "token": " is",
+       "prob": 0.997319
+      },
+      {
+       "id": 452,
+       "token": " was",
+       "prob": 0.001149
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.000416
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.000373
+      },
+      {
+       "id": 39,
+       "token": "?",
+       "prob": 0.000124
+      }
+     ]
+    },
+    {
+     "token": 11210,
+     "text": " Bras",
+     "top": [
+      {
+       "id": 11210,
+       "token": " Bras",
+       "prob": 0.723066
+      },
+      {
+       "id": 14605,
+       "token": " Brasil",
+       "prob": 0.178347
+      },
+      {
+       "id": 14019,
+       "token": " Rio",
+       "prob": 0.058504
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.015121
+      },
+      {
+       "id": 10749,
+       "token": " Brazil",
+       "prob": 0.006283
+      }
+     ]
+    },
+    {
+     "token": 19192,
+     "text": "ília",
+     "top": [
+      {
+       "id": 19192,
+       "token": "ília",
+       "prob": 0.988405
+      },
+      {
+       "id": 15669,
+       "token": "ilia",
+       "prob": 0.008774
+      },
+      {
+       "id": 307,
+       "token": "el",
+       "prob": 0.001121
+      },
+      {
+       "id": 313,
+       "token": "il",
+       "prob": 0.000316
+      },
+      {
+       "id": 23961,
+       "token": "íl",
+       "prob": 0.000283
+      }
+     ]
+    },
+    {
+     "token": 20,
+     "text": ",",
+     "top": [
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.537204
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.343026
+      },
+      {
+       "id": 318,
+       "token": ".\n",
+       "prob": 0.071257
+      },
+      {
+       "id": 63908,
+       "token": ".\n\n",
+       "prob": 0.027263
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.013434
+      }
+     ]
+    },
+    {
+     "token": 309,
+     "text": " and",
+     "top": [
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.908174
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.050558
+      },
+      {
+       "id": 1657,
+       "token": " while",
+       "prob": 0.014191
+      },
+      {
+       "id": 643,
+       "token": " which",
+       "prob": 0.012523
+      },
+      {
+       "id": 440,
+       "token": " The",
+       "prob": 0.002717
+      }
+     ]
+    },
+    {
+     "token": 278,
+     "text": " the",
+     "top": [
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.983694
+      },
+      {
+       "id": 435,
+       "token": " it",
+       "prob": 0.004256
+      },
+      {
+       "id": 851,
+       "token": " its",
+       "prob": 0.001426
+      },
+      {
+       "id": 522,
+       "token": " we",
+       "prob": 0.000784
+      },
+      {
+       "id": 1119,
+       "token": " what",
+       "prob": 0.000722
+      }
+     ]
+    },
+    {
+     "token": 5205,
+     "text": " capital",
+     "top": [
+      {
+       "id": 5205,
+       "token": " capital",
+       "prob": 0.980836
+      },
+      {
+       "id": 2942,
+       "token": " population",
+       "prob": 0.005568
+      },
+      {
+       "id": 6083,
+       "token": " largest",
+       "prob": 0.00354
+      },
+      {
+       "id": 1028,
+       "token": " most",
+       "prob": 0.001301
+      },
+      {
+       "id": 2334,
+       "token": " current",
+       "prob": 0.000632
+      }
+     ]
+    },
+    {
+     "token": 302,
+     "text": " of",
+     "top": [
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 0.996879
+      },
+      {
+       "id": 3270,
+       "token": " city",
+       "prob": 0.002927
+      },
+      {
+       "id": 355,
+       "token": " is",
+       "prob": 6.6e-05
+      },
+      {
+       "id": 5205,
+       "token": " capital",
+       "prob": 8e-06
+      },
+      {
+       "id": 432,
+       "token": " or",
+       "prob": 7e-06
+      }
+     ]
+    },
+    {
+     "token": 5881,
+     "text": " Australia",
+     "top": [
+      {
+       "id": 5881,
+       "token": " Australia",
+       "prob": 0.315558
+      },
+      {
+       "id": 6398,
+       "token": " Germany",
+       "prob": 0.195009
+      },
+      {
+       "id": 5177,
+       "token": " Canada",
+       "prob": 0.122485
+      },
+      {
+       "id": 4456,
+       "token": " India",
+       "prob": 0.100761
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.088699
+      }
+     ]
+    },
+    {
+     "token": 355,
+     "text": " is",
+     "top": [
+      {
+       "id": 355,
+       "token": " is",
+       "prob": 0.998731
+      },
+      {
+       "id": 452,
+       "token": " was",
+       "prob": 0.000375
+      },
+      {
+       "id": 589,
+       "token": "'s",
+       "prob": 0.000199
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.000119
+      },
+      {
+       "id": 342,
+       "token": " (",
+       "prob": 8.9e-05
+      }
+     ]
+    }
+   ]
+  },
+  "long_over_swa_window": {
+   "prompt": "The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. The river ran past the old mill, where the miller kept a ledger of every sack of grain, every visitor, and every storm. At the end of the ledger, the last line read:",
+   "prompt_tokens": [
+    597,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    440,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472,
+    33147,
+    20,
+    309,
+    1472,
+    9819,
+    22,
+    2304,
+    278,
+    1263,
+    302,
+    278,
+    3961,
+    1355,
+    20,
+    278,
+    2158,
+    2216,
+    1561,
+    34
+   ],
+   "n_prompt_tokens": 709,
+   "generated_tokens": [
+    496,
+    597,
+    7507,
+    9156,
+    3149,
+    278,
+    2230,
+    2150,
+    20,
+    1194,
+    278,
+    2150,
+    269,
+    8042,
+    267,
+    3961,
+    1355,
+    302,
+    1472,
+    63624,
+    302,
+    15687,
+    20,
+    1472
+   ],
+   "generated_text": " \"The river ran past the old mill, where the miller kept a ledger of every sack of grain, every",
+   "steps": [
+    {
+     "token": 496,
+     "text": " \"",
+     "top": [
+      {
+       "id": 496,
+       "token": " \"",
+       "prob": 0.258806
+      },
+      {
+       "id": 440,
+       "token": " The",
+       "prob": 0.187413
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.11357
+      },
+      {
+       "id": 870,
+       "token": " “",
+       "prob": 0.073404
+      },
+      {
+       "id": 1472,
+       "token": " every",
+       "prob": 0.0316
+      }
+     ]
+    },
+    {
+     "token": 597,
+     "text": "The",
+     "top": [
+      {
+       "id": 597,
+       "token": "The",
+       "prob": 0.60219
+      },
+      {
+       "id": 14055,
+       "token": "Every",
+       "prob": 0.041213
+      },
+      {
+       "id": 2083,
+       "token": "We",
+       "prob": 0.031409
+      },
+      {
+       "id": 1319,
+       "token": "the",
+       "prob": 0.030239
+      },
+      {
+       "id": 4215,
+       "token": "All",
+       "prob": 0.030228
+      }
+     ]
+    },
+    {
+     "token": 7507,
+     "text": " river",
+     "top": [
+      {
+       "id": 7507,
+       "token": " river",
+       "prob": 0.934843
+      },
+      {
+       "id": 3961,
+       "token": " led",
+       "prob": 0.012829
+      },
+      {
+       "id": 2150,
+       "token": " mill",
+       "prob": 0.009759
+      },
+      {
+       "id": 1263,
+       "token": " end",
+       "prob": 0.007204
+      },
+      {
+       "id": 5094,
+       "token": " River",
+       "prob": 0.007043
+      }
+     ]
+    },
+    {
+     "token": 9156,
+     "text": " ran",
+     "top": [
+      {
+       "id": 9156,
+       "token": " ran",
+       "prob": 0.88233
+      },
+      {
+       "id": 819,
+       "token": " had",
+       "prob": 0.027627
+      },
+      {
+       "id": 10295,
+       "token": " runs",
+       "prob": 0.016865
+      },
+      {
+       "id": 677,
+       "token": " has",
+       "prob": 0.009508
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.007463
+      }
+     ]
+    },
+    {
+     "token": 3149,
+     "text": " past",
+     "top": [
+      {
+       "id": 3149,
+       "token": " past",
+       "prob": 0.975846
+      },
+      {
+       "id": 729,
+       "token": " out",
+       "prob": 0.004406
+      },
+      {
+       "id": 383,
+       "token": " on",
+       "prob": 0.001451
+      },
+      {
+       "id": 1125,
+       "token": " through",
+       "prob": 0.001365
+      },
+      {
+       "id": 851,
+       "token": " its",
+       "prob": 0.001333
+      }
+     ]
+    },
+    {
+     "token": 278,
+     "text": " the",
+     "top": [
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.983747
+      },
+      {
+       "id": 851,
+       "token": " its",
+       "prob": 0.003073
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.002025
+      },
+      {
+       "id": 532,
+       "token": " this",
+       "prob": 0.001041
+      },
+      {
+       "id": 580,
+       "token": " us",
+       "prob": 0.000955
+      }
+     ]
+    },
+    {
+     "token": 2230,
+     "text": " old",
+     "top": [
+      {
+       "id": 2230,
+       "token": " old",
+       "prob": 0.993528
+      },
+      {
+       "id": 2150,
+       "token": " mill",
+       "prob": 0.003816
+      },
+      {
+       "id": 2158,
+       "token": " last",
+       "prob": 0.001215
+      },
+      {
+       "id": 860,
+       "token": " new",
+       "prob": 0.000359
+      },
+      {
+       "id": 7507,
+       "token": " river",
+       "prob": 0.000142
+      }
+     ]
+    },
+    {
+     "token": 2150,
+     "text": " mill",
+     "top": [
+      {
+       "id": 2150,
+       "token": " mill",
+       "prob": 0.999042
+      },
+      {
+       "id": 325,
+       "token": " S",
+       "prob": 6.2e-05
+      },
+      {
+       "id": 3961,
+       "token": " led",
+       "prob": 5.6e-05
+      },
+      {
+       "id": 41820,
+       "token": " mills",
+       "prob": 5e-05
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 4.7e-05
+      }
+     ]
+    },
+    {
+     "token": 20,
+     "text": ",",
+     "top": [
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.878397
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.045806
+      },
+      {
+       "id": 35,
+       "token": ";",
+       "prob": 0.020709
+      },
+      {
+       "id": 2426,
+       "token": ".\"",
+       "prob": 0.015728
+      },
+      {
+       "id": 10,
+       "token": "\"",
+       "prob": 0.003855
+      }
+     ]
+    },
+    {
+     "token": 1194,
+     "text": " where",
+     "top": [
+      {
+       "id": 1194,
+       "token": " where",
+       "prob": 0.872813
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.084418
+      },
+      {
+       "id": 1472,
+       "token": " every",
+       "prob": 0.009189
+      },
+      {
+       "id": 702,
+       "token": " but",
+       "prob": 0.003513
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.003238
+      }
+     ]
+    },
+    {
+     "token": 278,
+     "text": " the",
+     "top": [
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.994513
+      },
+      {
+       "id": 1472,
+       "token": " every",
+       "prob": 0.001559
+      },
+      {
+       "id": 43875,
+       "token": "...\"",
+       "prob": 0.000528
+      },
+      {
+       "id": 522,
+       "token": " we",
+       "prob": 0.000427
+      },
+      {
+       "id": 358,
+       "token": " I",
+       "prob": 0.000325
+      }
+     ]
+    },
+    {
+     "token": 2150,
+     "text": " mill",
+     "top": [
+      {
+       "id": 2150,
+       "token": " mill",
+       "prob": 0.992286
+      },
+      {
+       "id": 3961,
+       "token": " led",
+       "prob": 0.002054
+      },
+      {
+       "id": 2158,
+       "token": " last",
+       "prob": 0.001214
+      },
+      {
+       "id": 7507,
+       "token": " river",
+       "prob": 0.000717
+      },
+      {
+       "id": 295,
+       "token": " m",
+       "prob": 0.000317
+      }
+     ]
+    },
+    {
+     "token": 269,
+     "text": "er",
+     "top": [
+      {
+       "id": 269,
+       "token": "er",
+       "prob": 0.998963
+      },
+      {
+       "id": 644,
+       "token": "ier",
+       "prob": 9.8e-05
+      },
+      {
+       "id": 270,
+       "token": "en",
+       "prob": 7.3e-05
+      },
+      {
+       "id": 370,
+       "token": "ers",
+       "prob": 6.6e-05
+      },
+      {
+       "id": 2096,
+       "token": "...",
+       "prob": 6.2e-05
+      }
+     ]
+    },
+    {
+     "token": 8042,
+     "text": " kept",
+     "top": [
+      {
+       "id": 8042,
+       "token": " kept",
+       "prob": 0.99665
+      },
+      {
+       "id": 819,
+       "token": " had",
+       "prob": 0.000593
+      },
+      {
+       "id": 589,
+       "token": "'s",
+       "prob": 0.000426
+      },
+      {
+       "id": 43875,
+       "token": "...\"",
+       "prob": 0.000312
+      },
+      {
+       "id": 6186,
+       "token": " ...",
+       "prob": 0.000253
+      }
+     ]
+    },
+    {
+     "token": 267,
+     "text": " a",
+     "top": [
+      {
+       "id": 267,
+       "token": " a",
+       "prob": 0.978229
+      },
+      {
+       "id": 709,
+       "token": " his",
+       "prob": 0.007866
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.00766
+      },
+      {
+       "id": 532,
+       "token": " this",
+       "prob": 0.00108
+      },
+      {
+       "id": 851,
+       "token": " its",
+       "prob": 0.000958
+      }
+     ]
+    },
+    {
+     "token": 3961,
+     "text": " led",
+     "top": [
+      {
+       "id": 3961,
+       "token": " led",
+       "prob": 0.991475
+      },
+      {
+       "id": 2583,
+       "token": " record",
+       "prob": 0.005953
+      },
+      {
+       "id": 2023,
+       "token": " final",
+       "prob": 0.000719
+      },
+      {
+       "id": 5946,
+       "token": " perfect",
+       "prob": 0.00013
+      },
+      {
+       "id": 2158,
+       "token": " last",
+       "prob": 0.000105
+      }
+     ]
+    },
+    {
+     "token": 1355,
+     "text": "ger",
+     "top": [
+      {
+       "id": 1355,
+       "token": "ger",
+       "prob": 0.999975
+      },
+      {
+       "id": 9920,
+       "token": "gers",
+       "prob": 9e-06
+      },
+      {
+       "id": 476,
+       "token": "ge",
+       "prob": 5e-06
+      },
+      {
+       "id": 1265,
+       "token": "get",
+       "prob": 2e-06
+      },
+      {
+       "id": 505,
+       "token": "ber",
+       "prob": 1e-06
+      }
+     ]
+    },
+    {
+     "token": 302,
+     "text": " of",
+     "top": [
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 0.97972
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.004926
+      },
+      {
+       "id": 2426,
+       "token": ".\"",
+       "prob": 0.003261
+      },
+      {
+       "id": 43875,
+       "token": "...\"",
+       "prob": 0.002812
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.002165
+      }
+     ]
+    },
+    {
+     "token": 1472,
+     "text": " every",
+     "top": [
+      {
+       "id": 1472,
+       "token": " every",
+       "prob": 0.977428
+      },
+      {
+       "id": 6070,
+       "token": " everything",
+       "prob": 0.014025
+      },
+      {
+       "id": 612,
+       "token": " all",
+       "prob": 0.0011
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.001079
+      },
+      {
+       "id": 6186,
+       "token": " ...",
+       "prob": 0.000807
+      }
+     ]
+    },
+    {
+     "token": 63624,
+     "text": " sack",
+     "top": [
+      {
+       "id": 63624,
+       "token": " sack",
+       "prob": 0.994043
+      },
+      {
+       "id": 325,
+       "token": " S",
+       "prob": 0.000673
+      },
+      {
+       "id": 2096,
+       "token": "...",
+       "prob": 0.000614
+      },
+      {
+       "id": 43875,
+       "token": "...\"",
+       "prob": 0.000372
+      },
+      {
+       "id": 6186,
+       "token": " ...",
+       "prob": 0.000365
+      }
+     ]
+    },
+    {
+     "token": 302,
+     "text": " of",
+     "top": [
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 0.992824
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.004147
+      },
+      {
+       "id": 2426,
+       "token": ".\"",
+       "prob": 0.000756
+      },
+      {
+       "id": 2096,
+       "token": "...",
+       "prob": 0.000526
+      },
+      {
+       "id": 43875,
+       "token": "...\"",
+       "prob": 0.000488
+      }
+     ]
+    },
+    {
+     "token": 15687,
+     "text": " grain",
+     "top": [
+      {
+       "id": 15687,
+       "token": " grain",
+       "prob": 0.999611
+      },
+      {
+       "id": 1472,
+       "token": " every",
+       "prob": 8.1e-05
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 3.2e-05
+      },
+      {
+       "id": 2096,
+       "token": "...",
+       "prob": 3e-05
+      },
+      {
+       "id": 6186,
+       "token": " ...",
+       "prob": 2.6e-05
+      }
+     ]
+    },
+    {
+     "token": 20,
+     "text": ",",
+     "top": [
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.986161
+      },
+      {
+       "id": 2426,
+       "token": ".\"",
+       "prob": 0.005107
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.003688
+      },
+      {
+       "id": 35,
+       "token": ";",
+       "prob": 0.00205
+      },
+      {
+       "id": 43875,
+       "token": "...\"",
+       "prob": 0.000705
+      }
+     ]
+    },
+    {
+     "token": 1472,
+     "text": " every",
+     "top": [
+      {
+       "id": 1472,
+       "token": " every",
+       "prob": 0.996242
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.001776
+      },
+      {
+       "id": 6186,
+       "token": " ...",
+       "prob": 0.00039
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.000131
+      },
+      {
+       "id": 229,
+       "token": " ",
+       "prob": 9.9e-05
+      }
+     ]
+    }
+   ],
+   "steps_cuda": [
+    {
+     "token": 496,
+     "text": " \"",
+     "top": [
+      {
+       "id": 496,
+       "token": " \"",
+       "prob": 0.232483
+      },
+      {
+       "id": 440,
+       "token": " The",
+       "prob": 0.205946
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.117265
+      },
+      {
+       "id": 870,
+       "token": " “",
+       "prob": 0.097966
+      },
+      {
+       "id": 1472,
+       "token": " every",
+       "prob": 0.030323
+      }
+     ]
+    },
+    {
+     "token": 597,
+     "text": "The",
+     "top": [
+      {
+       "id": 597,
+       "token": "The",
+       "prob": 0.620704
+      },
+      {
+       "id": 14055,
+       "token": "Every",
+       "prob": 0.037491
+      },
+      {
+       "id": 2083,
+       "token": "We",
+       "prob": 0.029731
+      },
+      {
+       "id": 4215,
+       "token": "All",
+       "prob": 0.029148
+      },
+      {
+       "id": 1319,
+       "token": "the",
+       "prob": 0.027726
+      }
+     ]
+    },
+    {
+     "token": 7507,
+     "text": " river",
+     "top": [
+      {
+       "id": 7507,
+       "token": " river",
+       "prob": 0.933173
+      },
+      {
+       "id": 3961,
+       "token": " led",
+       "prob": 0.015142
+      },
+      {
+       "id": 2150,
+       "token": " mill",
+       "prob": 0.012245
+      },
+      {
+       "id": 1263,
+       "token": " end",
+       "prob": 0.006534
+      },
+      {
+       "id": 5094,
+       "token": " River",
+       "prob": 0.005789
+      }
+     ]
+    },
+    {
+     "token": 9156,
+     "text": " ran",
+     "top": [
+      {
+       "id": 9156,
+       "token": " ran",
+       "prob": 0.876809
+      },
+      {
+       "id": 819,
+       "token": " had",
+       "prob": 0.029941
+      },
+      {
+       "id": 10295,
+       "token": " runs",
+       "prob": 0.016659
+      },
+      {
+       "id": 677,
+       "token": " has",
+       "prob": 0.008337
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.008024
+      }
+     ]
+    },
+    {
+     "token": 3149,
+     "text": " past",
+     "top": [
+      {
+       "id": 3149,
+       "token": " past",
+       "prob": 0.975369
+      },
+      {
+       "id": 729,
+       "token": " out",
+       "prob": 0.004541
+      },
+      {
+       "id": 383,
+       "token": " on",
+       "prob": 0.00164
+      },
+      {
+       "id": 851,
+       "token": " its",
+       "prob": 0.001609
+      },
+      {
+       "id": 1125,
+       "token": " through",
+       "prob": 0.001506
+      }
+     ]
+    },
+    {
+     "token": 278,
+     "text": " the",
+     "top": [
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.98644
+      },
+      {
+       "id": 851,
+       "token": " its",
+       "prob": 0.002663
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.001463
+      },
+      {
+       "id": 532,
+       "token": " this",
+       "prob": 0.001043
+      },
+      {
+       "id": 580,
+       "token": " us",
+       "prob": 0.000736
+      }
+     ]
+    },
+    {
+     "token": 2230,
+     "text": " old",
+     "top": [
+      {
+       "id": 2230,
+       "token": " old",
+       "prob": 0.992461
+      },
+      {
+       "id": 2150,
+       "token": " mill",
+       "prob": 0.004845
+      },
+      {
+       "id": 2158,
+       "token": " last",
+       "prob": 0.001271
+      },
+      {
+       "id": 860,
+       "token": " new",
+       "prob": 0.000318
+      },
+      {
+       "id": 7507,
+       "token": " river",
+       "prob": 0.000167
+      }
+     ]
+    },
+    {
+     "token": 2150,
+     "text": " mill",
+     "top": [
+      {
+       "id": 2150,
+       "token": " mill",
+       "prob": 0.998886
+      },
+      {
+       "id": 3961,
+       "token": " led",
+       "prob": 8.5e-05
+      },
+      {
+       "id": 325,
+       "token": " S",
+       "prob": 7.8e-05
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 4.6e-05
+      },
+      {
+       "id": 41820,
+       "token": " mills",
+       "prob": 4.5e-05
+      }
+     ]
+    },
+    {
+     "token": 20,
+     "text": ",",
+     "top": [
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.877723
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.048769
+      },
+      {
+       "id": 35,
+       "token": ";",
+       "prob": 0.021592
+      },
+      {
+       "id": 2426,
+       "token": ".\"",
+       "prob": 0.016948
+      },
+      {
+       "id": 10,
+       "token": "\"",
+       "prob": 0.003145
+      }
+     ]
+    },
+    {
+     "token": 1194,
+     "text": " where",
+     "top": [
+      {
+       "id": 1194,
+       "token": " where",
+       "prob": 0.877721
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.082033
+      },
+      {
+       "id": 1472,
+       "token": " every",
+       "prob": 0.008485
+      },
+      {
+       "id": 702,
+       "token": " but",
+       "prob": 0.003602
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.003136
+      }
+     ]
+    },
+    {
+     "token": 278,
+     "text": " the",
+     "top": [
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.994434
+      },
+      {
+       "id": 1472,
+       "token": " every",
+       "prob": 0.00166
+      },
+      {
+       "id": 43875,
+       "token": "...\"",
+       "prob": 0.000552
+      },
+      {
+       "id": 522,
+       "token": " we",
+       "prob": 0.000351
+      },
+      {
+       "id": 358,
+       "token": " I",
+       "prob": 0.000271
+      }
+     ]
+    },
+    {
+     "token": 2150,
+     "text": " mill",
+     "top": [
+      {
+       "id": 2150,
+       "token": " mill",
+       "prob": 0.99264
+      },
+      {
+       "id": 3961,
+       "token": " led",
+       "prob": 0.002213
+      },
+      {
+       "id": 2158,
+       "token": " last",
+       "prob": 0.001232
+      },
+      {
+       "id": 7507,
+       "token": " river",
+       "prob": 0.000597
+      },
+      {
+       "id": 295,
+       "token": " m",
+       "prob": 0.000326
+      }
+     ]
+    },
+    {
+     "token": 269,
+     "text": "er",
+     "top": [
+      {
+       "id": 269,
+       "token": "er",
+       "prob": 0.999074
+      },
+      {
+       "id": 644,
+       "token": "ier",
+       "prob": 8.6e-05
+      },
+      {
+       "id": 270,
+       "token": "en",
+       "prob": 6.1e-05
+      },
+      {
+       "id": 370,
+       "token": "ers",
+       "prob": 5.6e-05
+      },
+      {
+       "id": 3961,
+       "token": " led",
+       "prob": 5.3e-05
+      }
+     ]
+    },
+    {
+     "token": 8042,
+     "text": " kept",
+     "top": [
+      {
+       "id": 8042,
+       "token": " kept",
+       "prob": 0.996563
+      },
+      {
+       "id": 819,
+       "token": " had",
+       "prob": 0.00072
+      },
+      {
+       "id": 589,
+       "token": "'s",
+       "prob": 0.000431
+      },
+      {
+       "id": 43875,
+       "token": "...\"",
+       "prob": 0.000267
+      },
+      {
+       "id": 6186,
+       "token": " ...",
+       "prob": 0.000229
+      }
+     ]
+    },
+    {
+     "token": 267,
+     "text": " a",
+     "top": [
+      {
+       "id": 267,
+       "token": " a",
+       "prob": 0.975255
+      },
+      {
+       "id": 709,
+       "token": " his",
+       "prob": 0.00924
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.008459
+      },
+      {
+       "id": 532,
+       "token": " this",
+       "prob": 0.001317
+      },
+      {
+       "id": 1472,
+       "token": " every",
+       "prob": 0.001027
+      }
+     ]
+    },
+    {
+     "token": 3961,
+     "text": " led",
+     "top": [
+      {
+       "id": 3961,
+       "token": " led",
+       "prob": 0.988382
+      },
+      {
+       "id": 2583,
+       "token": " record",
+       "prob": 0.008639
+      },
+      {
+       "id": 2023,
+       "token": " final",
+       "prob": 0.000893
+      },
+      {
+       "id": 5946,
+       "token": " perfect",
+       "prob": 0.000167
+      },
+      {
+       "id": 2158,
+       "token": " last",
+       "prob": 0.000111
+      }
+     ]
+    },
+    {
+     "token": 1355,
+     "text": "ger",
+     "top": [
+      {
+       "id": 1355,
+       "token": "ger",
+       "prob": 0.999972
+      },
+      {
+       "id": 9920,
+       "token": "gers",
+       "prob": 1.1e-05
+      },
+      {
+       "id": 476,
+       "token": "ge",
+       "prob": 6e-06
+      },
+      {
+       "id": 505,
+       "token": "ber",
+       "prob": 1e-06
+      },
+      {
+       "id": 1265,
+       "token": "get",
+       "prob": 1e-06
+      }
+     ]
+    },
+    {
+     "token": 302,
+     "text": " of",
+     "top": [
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 0.977917
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.005426
+      },
+      {
+       "id": 2426,
+       "token": ".\"",
+       "prob": 0.003862
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.003242
+      },
+      {
+       "id": 43875,
+       "token": "...\"",
+       "prob": 0.002311
+      }
+     ]
+    },
+    {
+     "token": 1472,
+     "text": " every",
+     "top": [
+      {
+       "id": 1472,
+       "token": " every",
+       "prob": 0.975183
+      },
+      {
+       "id": 6070,
+       "token": " everything",
+       "prob": 0.016873
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.001138
+      },
+      {
+       "id": 612,
+       "token": " all",
+       "prob": 0.000942
+      },
+      {
+       "id": 6186,
+       "token": " ...",
+       "prob": 0.000729
+      }
+     ]
+    },
+    {
+     "token": 63624,
+     "text": " sack",
+     "top": [
+      {
+       "id": 63624,
+       "token": " sack",
+       "prob": 0.993073
+      },
+      {
+       "id": 325,
+       "token": " S",
+       "prob": 0.000891
+      },
+      {
+       "id": 2096,
+       "token": "...",
+       "prob": 0.000657
+      },
+      {
+       "id": 4379,
+       "token": " thing",
+       "prob": 0.000462
+      },
+      {
+       "id": 43875,
+       "token": "...\"",
+       "prob": 0.000437
+      }
+     ]
+    },
+    {
+     "token": 302,
+     "text": " of",
+     "top": [
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 0.992487
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.004548
+      },
+      {
+       "id": 2426,
+       "token": ".\"",
+       "prob": 0.00077
+      },
+      {
+       "id": 2096,
+       "token": "...",
+       "prob": 0.000508
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.000422
+      }
+     ]
+    },
+    {
+     "token": 15687,
+     "text": " grain",
+     "top": [
+      {
+       "id": 15687,
+       "token": " grain",
+       "prob": 0.999621
+      },
+      {
+       "id": 1472,
+       "token": " every",
+       "prob": 8.3e-05
+      },
+      {
+       "id": 2096,
+       "token": "...",
+       "prob": 2.8e-05
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 2.8e-05
+      },
+      {
+       "id": 417,
+       "token": " G",
+       "prob": 2.3e-05
+      }
+     ]
+    },
+    {
+     "token": 20,
+     "text": ",",
+     "top": [
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.989998
+      },
+      {
+       "id": 2426,
+       "token": ".\"",
+       "prob": 0.003827
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.002607
+      },
+      {
+       "id": 35,
+       "token": ";",
+       "prob": 0.001301
+      },
+      {
+       "id": 43875,
+       "token": "...\"",
+       "prob": 0.000548
+      }
+     ]
+    },
+    {
+     "token": 1472,
+     "text": " every",
+     "top": [
+      {
+       "id": 1472,
+       "token": " every",
+       "prob": 0.997449
+      },
+      {
+       "id": 309,
+       "token": " and",
+       "prob": 0.00104
+      },
+      {
+       "id": 6186,
+       "token": " ...",
+       "prob": 0.000282
+      },
+      {
+       "id": 33147,
+       "token": " visitor",
+       "prob": 0.000176
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 9.9e-05
+      }
+     ]
+    }
+   ]
+  },
+  "chat_template": {
+   "prompt": "<|startoftext|><|im_start|>user\nName three colours of the rainbow, one per line.<|im_end|>\n<|im_start|>assistant\n<think>",
+   "prompt_tokens": [
+    124894,
+    124899,
+    5922,
+    207,
+    2617,
+    1703,
+    25988,
+    302,
+    278,
+    52514,
+    20,
+    734,
+    593,
+    2216,
+    22,
+    124900,
+    207,
+    124899,
+    63514,
+    207,
+    124901
+   ],
+   "n_prompt_tokens": 21,
+   "generated_tokens": [
+    2083,
+    1094,
+    310,
+    5141,
+    278,
+    3451,
+    34,
+    496,
+    2617,
+    1703,
+    25988,
+    302,
+    278,
+    52514,
+    20,
+    734,
+    593,
+    2216,
+    2426,
+    969,
+    355,
+    267,
+    90139,
+    1456
+   ],
+   "generated_text": "We need to answer the question: \"Name three colours of the rainbow, one per line.\" This is a straightforward fact",
+   "steps": [
+    {
+     "token": 2083,
+     "text": "We",
+     "top": [
+      {
+       "id": 2083,
+       "token": "We",
+       "prob": 0.505922
+      },
+      {
+       "id": 597,
+       "token": "The",
+       "prob": 0.492057
+      },
+      {
+       "id": 8914,
+       "token": "User",
+       "prob": 0.001964
+      },
+      {
+       "id": 25,
+       "token": "1",
+       "prob": 1e-05
+      },
+      {
+       "id": 9077,
+       "token": "First",
+       "prob": 8e-06
+      }
+     ]
+    },
+    {
+     "token": 1094,
+     "text": " need",
+     "top": [
+      {
+       "id": 1094,
+       "token": " need",
+       "prob": 0.999986
+      },
+      {
+       "id": 21346,
+       "token": " Need",
+       "prob": 4e-06
+      },
+      {
+       "id": 437,
+       "token": " are",
+       "prob": 3e-06
+      },
+      {
+       "id": 1946,
+       "token": " must",
+       "prob": 2e-06
+      },
+      {
+       "id": 3487,
+       "token": " needs",
+       "prob": 2e-06
+      }
+     ]
+    },
+    {
+     "token": 310,
+     "text": " to",
+     "top": [
+      {
+       "id": 310,
+       "token": " to",
+       "prob": 0.996891
+      },
+      {
+       "id": 3547,
+       "token": " simple",
+       "prob": 0.000258
+      },
+      {
+       "id": 3501,
+       "token": " rate",
+       "prob": 0.000132
+      },
+      {
+       "id": 52514,
+       "token": " rainbow",
+       "prob": 0.000112
+      },
+      {
+       "id": 6284,
+       "token": " round",
+       "prob": 0.0001
+      }
+     ]
+    },
+    {
+     "token": 5141,
+     "text": " answer",
+     "top": [
+      {
+       "id": 5141,
+       "token": " answer",
+       "prob": 0.77331
+      },
+      {
+       "id": 1653,
+       "token": " name",
+       "prob": 0.201678
+      },
+      {
+       "id": 2675,
+       "token": " provide",
+       "prob": 0.014678
+      },
+      {
+       "id": 6119,
+       "token": " respond",
+       "prob": 0.00794
+      },
+      {
+       "id": 6159,
+       "token": " output",
+       "prob": 0.00093
+      }
+     ]
+    },
+    {
+     "token": 278,
+     "text": " the",
+     "top": [
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.833189
+      },
+      {
+       "id": 34,
+       "token": ":",
+       "prob": 0.166722
+      },
+      {
+       "id": 496,
+       "token": " \"",
+       "prob": 5.9e-05
+      },
+      {
+       "id": 4695,
+       "token": " user",
+       "prob": 1.1e-05
+      },
+      {
+       "id": 415,
+       "token": " with",
+       "prob": 7e-06
+      }
+     ]
+    },
+    {
+     "token": 3451,
+     "text": " question",
+     "top": [
+      {
+       "id": 3451,
+       "token": " question",
+       "prob": 0.515298
+      },
+      {
+       "id": 4695,
+       "token": " user",
+       "prob": 0.483186
+      },
+      {
+       "id": 13174,
+       "token": " query",
+       "prob": 0.00143
+      },
+      {
+       "id": 5439,
+       "token": " request",
+       "prob": 7.4e-05
+      },
+      {
+       "id": 90139,
+       "token": " straightforward",
+       "prob": 3e-06
+      }
+     ]
+    },
+    {
+     "token": 34,
+     "text": ":",
+     "top": [
+      {
+       "id": 34,
+       "token": ":",
+       "prob": 0.999995
+      },
+      {
+       "id": 5327,
+       "token": " directly",
+       "prob": 3e-06
+      },
+      {
+       "id": 94557,
+       "token": " concisely",
+       "prob": 1e-06
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.0
+      },
+      {
+       "id": 4916,
+       "token": " simply",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 496,
+     "text": " \"",
+     "top": [
+      {
+       "id": 496,
+       "token": " \"",
+       "prob": 1.0
+      },
+      {
+       "id": 951,
+       "token": " '",
+       "prob": 0.0
+      },
+      {
+       "id": 10955,
+       "token": " Name",
+       "prob": 0.0
+      },
+      {
+       "id": 43015,
+       "token": " \"$",
+       "prob": 0.0
+      },
+      {
+       "id": 1653,
+       "token": " name",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 2617,
+     "text": "Name",
+     "top": [
+      {
+       "id": 2617,
+       "token": "Name",
+       "prob": 0.999999
+      },
+      {
+       "id": 54,
+       "token": "N",
+       "prob": 0.0
+      },
+      {
+       "id": 3120,
+       "token": "List",
+       "prob": 0.0
+      },
+      {
+       "id": 105980,
+       "token": "\"Name",
+       "prob": 0.0
+      },
+      {
+       "id": 48684,
+       "token": "Give",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 1703,
+     "text": " three",
+     "top": [
+      {
+       "id": 1703,
+       "token": " three",
+       "prob": 0.999998
+      },
+      {
+       "id": 1046,
+       "token": " two",
+       "prob": 0.0
+      },
+      {
+       "id": 12515,
+       "token": " Three",
+       "prob": 0.0
+      },
+      {
+       "id": 734,
+       "token": " one",
+       "prob": 0.0
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 25988,
+     "text": " colours",
+     "top": [
+      {
+       "id": 25988,
+       "token": " colours",
+       "prob": 0.999777
+      },
+      {
+       "id": 10776,
+       "token": " colors",
+       "prob": 0.000207
+      },
+      {
+       "id": 11783,
+       "token": " colour",
+       "prob": 1e-05
+      },
+      {
+       "id": 45333,
+       "token": " coloured",
+       "prob": 5e-06
+      },
+      {
+       "id": 974,
+       "token": " col",
+       "prob": 1e-06
+      }
+     ]
+    },
+    {
+     "token": 302,
+     "text": " of",
+     "top": [
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 1.0
+      },
+      {
+       "id": 296,
+       "token": " in",
+       "prob": 0.0
+      },
+      {
+       "id": 374,
+       "token": " for",
+       "prob": 0.0
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.0
+      },
+      {
+       "id": 117988,
+       "token": " of",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 278,
+     "text": " the",
+     "top": [
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.999996
+      },
+      {
+       "id": 267,
+       "token": " a",
+       "prob": 3e-06
+      },
+      {
+       "id": 52514,
+       "token": " rainbow",
+       "prob": 0.0
+      },
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 0.0
+      },
+      {
+       "id": 7624,
+       "token": " rain",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 52514,
+     "text": " rainbow",
+     "top": [
+      {
+       "id": 52514,
+       "token": " rainbow",
+       "prob": 0.999966
+      },
+      {
+       "id": 7624,
+       "token": " rain",
+       "prob": 2.3e-05
+      },
+      {
+       "id": 26617,
+       "token": " alphabet",
+       "prob": 2e-06
+      },
+      {
+       "id": 56445,
+       "token": " Rainbow",
+       "prob": 1e-06
+      },
+      {
+       "id": 53756,
+       "token": " rainforest",
+       "prob": 1e-06
+      }
+     ]
+    },
+    {
+     "token": 20,
+     "text": ",",
+     "top": [
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 1.0
+      },
+      {
+       "id": 2784,
+       "token": "\".",
+       "prob": 0.0
+      },
+      {
+       "id": 3279,
+       "token": "،",
+       "prob": 0.0
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.0
+      },
+      {
+       "id": 734,
+       "token": " one",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 734,
+     "text": " one",
+     "top": [
+      {
+       "id": 734,
+       "token": " one",
+       "prob": 1.0
+      },
+      {
+       "id": 673,
+       "token": "one",
+       "prob": 0.0
+      },
+      {
+       "id": 6030,
+       "token": " ones",
+       "prob": 0.0
+      },
+      {
+       "id": 3231,
+       "token": " One",
+       "prob": 0.0
+      },
+      {
+       "id": 34555,
+       "token": " ONE",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 593,
+     "text": " per",
+     "top": [
+      {
+       "id": 593,
+       "token": " per",
+       "prob": 0.999999
+      },
+      {
+       "id": 3062,
+       "token": " Per",
+       "prob": 0.0
+      },
+      {
+       "id": 383,
+       "token": " on",
+       "prob": 0.0
+      },
+      {
+       "id": 398,
+       "token": " pro",
+       "prob": 0.0
+      },
+      {
+       "id": 374,
+       "token": " for",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 2216,
+     "text": " line",
+     "top": [
+      {
+       "id": 2216,
+       "token": " line",
+       "prob": 0.999997
+      },
+      {
+       "id": 5190,
+       "token": " lines",
+       "prob": 3e-06
+      },
+      {
+       "id": 11856,
+       "token": " Line",
+       "prob": 0.0
+      },
+      {
+       "id": 229,
+       "token": " ",
+       "prob": 0.0
+      },
+      {
+       "id": 38444,
+       "token": " lined",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 2426,
+     "text": ".\"",
+     "top": [
+      {
+       "id": 2426,
+       "token": ".\"",
+       "prob": 0.999981
+      },
+      {
+       "id": 1917,
+       "token": ".\"\n",
+       "prob": 1.1e-05
+      },
+      {
+       "id": 11657,
+       "token": ".'",
+       "prob": 3e-06
+      },
+      {
+       "id": 41769,
+       "token": ".**",
+       "prob": 2e-06
+      },
+      {
+       "id": 1875,
+       "token": ".”",
+       "prob": 1e-06
+      }
+     ]
+    },
+    {
+     "token": 969,
+     "text": " This",
+     "top": [
+      {
+       "id": 969,
+       "token": " This",
+       "prob": 0.756487
+      },
+      {
+       "id": 3584,
+       "token": " That",
+       "prob": 0.201452
+      },
+      {
+       "id": 440,
+       "token": " The",
+       "prob": 0.01655
+      },
+      {
+       "id": 810,
+       "token": " It",
+       "prob": 0.011081
+      },
+      {
+       "id": 1672,
+       "token": " So",
+       "prob": 0.010821
+      }
+     ]
+    },
+    {
+     "token": 355,
+     "text": " is",
+     "top": [
+      {
+       "id": 355,
+       "token": " is",
+       "prob": 0.999775
+      },
+      {
+       "id": 5917,
+       "token": " seems",
+       "prob": 0.000222
+      },
+      {
+       "id": 6334,
+       "token": " requires",
+       "prob": 1e-06
+      },
+      {
+       "id": 3348,
+       "token": " likely",
+       "prob": 0.0
+      },
+      {
+       "id": 1252,
+       "token": " should",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 267,
+     "text": " a",
+     "top": [
+      {
+       "id": 267,
+       "token": " a",
+       "prob": 0.614953
+      },
+      {
+       "id": 90139,
+       "token": " straightforward",
+       "prob": 0.382394
+      },
+      {
+       "id": 3547,
+       "token": " simple",
+       "prob": 0.002527
+      },
+      {
+       "id": 3348,
+       "token": " likely",
+       "prob": 4.9e-05
+      },
+      {
+       "id": 34766,
+       "token": " trivial",
+       "prob": 4.2e-05
+      }
+     ]
+    },
+    {
+     "token": 90139,
+     "text": " straightforward",
+     "top": [
+      {
+       "id": 90139,
+       "token": " straightforward",
+       "prob": 0.798281
+      },
+      {
+       "id": 3547,
+       "token": " simple",
+       "prob": 0.200564
+      },
+      {
+       "id": 1442,
+       "token": " very",
+       "prob": 0.000998
+      },
+      {
+       "id": 34766,
+       "token": " trivial",
+       "prob": 8.5e-05
+      },
+      {
+       "id": 2123,
+       "token": " common",
+       "prob": 1.6e-05
+      }
+     ]
+    },
+    {
+     "token": 1456,
+     "text": " fact",
+     "top": [
+      {
+       "id": 1456,
+       "token": " fact",
+       "prob": 0.753739
+      },
+      {
+       "id": 5439,
+       "token": " request",
+       "prob": 0.16828
+      },
+      {
+       "id": 3451,
+       "token": " question",
+       "prob": 0.06712
+      },
+      {
+       "id": 13174,
+       "token": " query",
+       "prob": 0.008639
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.00106
+      }
+     ]
+    }
+   ],
+   "steps_cuda": [
+    {
+     "token": 2083,
+     "text": "We",
+     "top": [
+      {
+       "id": 2083,
+       "token": "We",
+       "prob": 0.516501
+      },
+      {
+       "id": 597,
+       "token": "The",
+       "prob": 0.481651
+      },
+      {
+       "id": 8914,
+       "token": "User",
+       "prob": 0.001796
+      },
+      {
+       "id": 25,
+       "token": "1",
+       "prob": 8e-06
+      },
+      {
+       "id": 440,
+       "token": " The",
+       "prob": 5e-06
+      }
+     ]
+    },
+    {
+     "token": 1094,
+     "text": " need",
+     "top": [
+      {
+       "id": 1094,
+       "token": " need",
+       "prob": 0.999982
+      },
+      {
+       "id": 437,
+       "token": " are",
+       "prob": 6e-06
+      },
+      {
+       "id": 21346,
+       "token": " Need",
+       "prob": 4e-06
+      },
+      {
+       "id": 1946,
+       "token": " must",
+       "prob": 3e-06
+      },
+      {
+       "id": 3487,
+       "token": " needs",
+       "prob": 2e-06
+      }
+     ]
+    },
+    {
+     "token": 310,
+     "text": " to",
+     "top": [
+      {
+       "id": 310,
+       "token": " to",
+       "prob": 0.99542
+      },
+      {
+       "id": 3547,
+       "token": " simple",
+       "prob": 0.000905
+      },
+      {
+       "id": 462,
+       "token": " at",
+       "prob": 0.00017
+      },
+      {
+       "id": 4916,
+       "token": " simply",
+       "prob": 0.00013
+      },
+      {
+       "id": 4695,
+       "token": " user",
+       "prob": 0.000111
+      }
+     ]
+    },
+    {
+     "token": 5141,
+     "text": " answer",
+     "top": [
+      {
+       "id": 5141,
+       "token": " answer",
+       "prob": 0.704064
+      },
+      {
+       "id": 1653,
+       "token": " name",
+       "prob": 0.270342
+      },
+      {
+       "id": 2675,
+       "token": " provide",
+       "prob": 0.016312
+      },
+      {
+       "id": 6119,
+       "token": " respond",
+       "prob": 0.006442
+      },
+      {
+       "id": 6159,
+       "token": " output",
+       "prob": 0.001181
+      }
+     ]
+    },
+    {
+     "token": 278,
+     "text": " the",
+     "top": [
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.834926
+      },
+      {
+       "id": 34,
+       "token": ":",
+       "prob": 0.164956
+      },
+      {
+       "id": 496,
+       "token": " \"",
+       "prob": 8.2e-05
+      },
+      {
+       "id": 415,
+       "token": " with",
+       "prob": 1.2e-05
+      },
+      {
+       "id": 4695,
+       "token": " user",
+       "prob": 8e-06
+      }
+     ]
+    },
+    {
+     "token": 3451,
+     "text": " question",
+     "top": [
+      {
+       "id": 3451,
+       "token": " question",
+       "prob": 0.553091
+      },
+      {
+       "id": 4695,
+       "token": " user",
+       "prob": 0.444929
+      },
+      {
+       "id": 13174,
+       "token": " query",
+       "prob": 0.001889
+      },
+      {
+       "id": 5439,
+       "token": " request",
+       "prob": 7.6e-05
+      },
+      {
+       "id": 90139,
+       "token": " straightforward",
+       "prob": 5e-06
+      }
+     ]
+    },
+    {
+     "token": 34,
+     "text": ":",
+     "top": [
+      {
+       "id": 34,
+       "token": ":",
+       "prob": 0.999993
+      },
+      {
+       "id": 5327,
+       "token": " directly",
+       "prob": 4e-06
+      },
+      {
+       "id": 94557,
+       "token": " concisely",
+       "prob": 1e-06
+      },
+      {
+       "id": 4916,
+       "token": " simply",
+       "prob": 0.0
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 496,
+     "text": " \"",
+     "top": [
+      {
+       "id": 496,
+       "token": " \"",
+       "prob": 1.0
+      },
+      {
+       "id": 951,
+       "token": " '",
+       "prob": 0.0
+      },
+      {
+       "id": 10955,
+       "token": " Name",
+       "prob": 0.0
+      },
+      {
+       "id": 43015,
+       "token": " \"$",
+       "prob": 0.0
+      },
+      {
+       "id": 1653,
+       "token": " name",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 2617,
+     "text": "Name",
+     "top": [
+      {
+       "id": 2617,
+       "token": "Name",
+       "prob": 0.999999
+      },
+      {
+       "id": 54,
+       "token": "N",
+       "prob": 0.0
+      },
+      {
+       "id": 3120,
+       "token": "List",
+       "prob": 0.0
+      },
+      {
+       "id": 105980,
+       "token": "\"Name",
+       "prob": 0.0
+      },
+      {
+       "id": 48684,
+       "token": "Give",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 1703,
+     "text": " three",
+     "top": [
+      {
+       "id": 1703,
+       "token": " three",
+       "prob": 0.999998
+      },
+      {
+       "id": 12515,
+       "token": " Three",
+       "prob": 0.0
+      },
+      {
+       "id": 1046,
+       "token": " two",
+       "prob": 0.0
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.0
+      },
+      {
+       "id": 734,
+       "token": " one",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 25988,
+     "text": " colours",
+     "top": [
+      {
+       "id": 25988,
+       "token": " colours",
+       "prob": 0.99972
+      },
+      {
+       "id": 10776,
+       "token": " colors",
+       "prob": 0.000264
+      },
+      {
+       "id": 11783,
+       "token": " colour",
+       "prob": 9e-06
+      },
+      {
+       "id": 45333,
+       "token": " coloured",
+       "prob": 4e-06
+      },
+      {
+       "id": 974,
+       "token": " col",
+       "prob": 2e-06
+      }
+     ]
+    },
+    {
+     "token": 302,
+     "text": " of",
+     "top": [
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 1.0
+      },
+      {
+       "id": 296,
+       "token": " in",
+       "prob": 0.0
+      },
+      {
+       "id": 374,
+       "token": " for",
+       "prob": 0.0
+      },
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.0
+      },
+      {
+       "id": 286,
+       "token": " o",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 278,
+     "text": " the",
+     "top": [
+      {
+       "id": 278,
+       "token": " the",
+       "prob": 0.999995
+      },
+      {
+       "id": 267,
+       "token": " a",
+       "prob": 4e-06
+      },
+      {
+       "id": 52514,
+       "token": " rainbow",
+       "prob": 0.0
+      },
+      {
+       "id": 302,
+       "token": " of",
+       "prob": 0.0
+      },
+      {
+       "id": 7624,
+       "token": " rain",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 52514,
+     "text": " rainbow",
+     "top": [
+      {
+       "id": 52514,
+       "token": " rainbow",
+       "prob": 0.999962
+      },
+      {
+       "id": 7624,
+       "token": " rain",
+       "prob": 2.4e-05
+      },
+      {
+       "id": 26617,
+       "token": " alphabet",
+       "prob": 3e-06
+      },
+      {
+       "id": 11859,
+       "token": " spectrum",
+       "prob": 1e-06
+      },
+      {
+       "id": 56445,
+       "token": " Rainbow",
+       "prob": 1e-06
+      }
+     ]
+    },
+    {
+     "token": 20,
+     "text": ",",
+     "top": [
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 1.0
+      },
+      {
+       "id": 2784,
+       "token": "\".",
+       "prob": 0.0
+      },
+      {
+       "id": 734,
+       "token": " one",
+       "prob": 0.0
+      },
+      {
+       "id": 22,
+       "token": ".",
+       "prob": 0.0
+      },
+      {
+       "id": 3279,
+       "token": "،",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 734,
+     "text": " one",
+     "top": [
+      {
+       "id": 734,
+       "token": " one",
+       "prob": 1.0
+      },
+      {
+       "id": 673,
+       "token": "one",
+       "prob": 0.0
+      },
+      {
+       "id": 6030,
+       "token": " ones",
+       "prob": 0.0
+      },
+      {
+       "id": 3231,
+       "token": " One",
+       "prob": 0.0
+      },
+      {
+       "id": 34555,
+       "token": " ONE",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 593,
+     "text": " per",
+     "top": [
+      {
+       "id": 593,
+       "token": " per",
+       "prob": 0.999999
+      },
+      {
+       "id": 3062,
+       "token": " Per",
+       "prob": 0.0
+      },
+      {
+       "id": 398,
+       "token": " pro",
+       "prob": 0.0
+      },
+      {
+       "id": 383,
+       "token": " on",
+       "prob": 0.0
+      },
+      {
+       "id": 374,
+       "token": " for",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 2216,
+     "text": " line",
+     "top": [
+      {
+       "id": 2216,
+       "token": " line",
+       "prob": 0.999997
+      },
+      {
+       "id": 5190,
+       "token": " lines",
+       "prob": 3e-06
+      },
+      {
+       "id": 11856,
+       "token": " Line",
+       "prob": 0.0
+      },
+      {
+       "id": 229,
+       "token": " ",
+       "prob": 0.0
+      },
+      {
+       "id": 1421,
+       "token": "line",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 2426,
+     "text": ".\"",
+     "top": [
+      {
+       "id": 2426,
+       "token": ".\"",
+       "prob": 0.999978
+      },
+      {
+       "id": 1917,
+       "token": ".\"\n",
+       "prob": 1.5e-05
+      },
+      {
+       "id": 11657,
+       "token": ".'",
+       "prob": 3e-06
+      },
+      {
+       "id": 41769,
+       "token": ".**",
+       "prob": 2e-06
+      },
+      {
+       "id": 1875,
+       "token": ".”",
+       "prob": 1e-06
+      }
+     ]
+    },
+    {
+     "token": 969,
+     "text": " This",
+     "top": [
+      {
+       "id": 969,
+       "token": " This",
+       "prob": 0.764278
+      },
+      {
+       "id": 3584,
+       "token": " That",
+       "prob": 0.189164
+      },
+      {
+       "id": 440,
+       "token": " The",
+       "prob": 0.018984
+      },
+      {
+       "id": 1672,
+       "token": " So",
+       "prob": 0.01314
+      },
+      {
+       "id": 810,
+       "token": " It",
+       "prob": 0.010355
+      }
+     ]
+    },
+    {
+     "token": 355,
+     "text": " is",
+     "top": [
+      {
+       "id": 355,
+       "token": " is",
+       "prob": 0.999792
+      },
+      {
+       "id": 5917,
+       "token": " seems",
+       "prob": 0.000206
+      },
+      {
+       "id": 6334,
+       "token": " requires",
+       "prob": 1e-06
+      },
+      {
+       "id": 3348,
+       "token": " likely",
+       "prob": 0.0
+      },
+      {
+       "id": 1252,
+       "token": " should",
+       "prob": 0.0
+      }
+     ]
+    },
+    {
+     "token": 267,
+     "text": " a",
+     "top": [
+      {
+       "id": 267,
+       "token": " a",
+       "prob": 0.555227
+      },
+      {
+       "id": 90139,
+       "token": " straightforward",
+       "prob": 0.441563
+      },
+      {
+       "id": 3547,
+       "token": " simple",
+       "prob": 0.003088
+      },
+      {
+       "id": 34766,
+       "token": " trivial",
+       "prob": 4.4e-05
+      },
+      {
+       "id": 3348,
+       "token": " likely",
+       "prob": 4.2e-05
+      }
+     ]
+    },
+    {
+     "token": 90139,
+     "text": " straightforward",
+     "top": [
+      {
+       "id": 90139,
+       "token": " straightforward",
+       "prob": 0.801343
+      },
+      {
+       "id": 3547,
+       "token": " simple",
+       "prob": 0.19745
+      },
+      {
+       "id": 1442,
+       "token": " very",
+       "prob": 0.00105
+      },
+      {
+       "id": 34766,
+       "token": " trivial",
+       "prob": 9.2e-05
+      },
+      {
+       "id": 2123,
+       "token": " common",
+       "prob": 1.5e-05
+      }
+     ]
+    },
+    {
+     "token": 1456,
+     "text": " fact",
+     "top": [
+      {
+       "id": 1456,
+       "token": " fact",
+       "prob": 0.717296
+      },
+      {
+       "id": 5439,
+       "token": " request",
+       "prob": 0.207846
+      },
+      {
+       "id": 3451,
+       "token": " question",
+       "prob": 0.063828
+      },
+      {
+       "id": 13174,
+       "token": " query",
+       "prob": 0.008895
+      },
+      {
+       "id": 20,
+       "token": ",",
+       "prob": 0.000908
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "captured_with": "llama-server -m LFM3-1.7B-Q4_K_M.gguf -c 4096 -ngl 0 --jinja; /tokenize add_special+parse_special, /completion temperature 0 top_k 1 n_probs 5 cache_prompt false; prob = exp(top_logprobs.logprob)",
+ "chat_messages": [
+  {
+   "role": "user",
+   "content": "Name three colours of the rainbow, one per line."
+  }
+ ],
+ "source_cuda": "llama.cpp b11945 CUDA (-ngl 99), same requests; steps_cuda = its top-5 per step (same greedy tokens as the CPU run)"
+}

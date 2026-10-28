@@ -102,6 +102,8 @@ export async function createTokenizer(config: TokenizerConfig): Promise<Tokenize
       // Gemma 4 family shares one tokenizer; google/ repos are gated (401),
       // the unsloth mirror ships tokenizer.json ungated.
       else if (name.includes('gemma4') || name.includes('gemma-4')) modelId = 'unsloth/gemma-4-e4b-it';
+      // LFM3 GGUF repos ship no tokenizer.json; the base repo does.
+      else if (name.includes('lfm3')) modelId = 'LiquidAI/LFM3-1.7B';
       console.log(`[Tokenizer] Local model fallback, using tokenizer from: ${modelId}`);
     }
   }
@@ -238,6 +240,34 @@ export function applyChatTemplate(
       chat_template: tpl,
     });
     console.log(`[Tokenizer] Gemma template applied (thinking=${enableThinking})`);
+    return Array.from(result as ArrayLike<number | bigint>).map(Number);
+  }
+
+  // ── LFM2/LFM3: ChatML with a leading <|startoftext|> ───────────────────
+  // Simplified from LFM3's official template (no tools/multimodal): the
+  // template emits bos itself; earlier assistant turns are rendered with an
+  // empty <think></think> and their reasoning dropped; the generation prompt
+  // is '<|im_start|>assistant\n<think>' (thinking) or '...<think></think>'.
+  if (isSingleToken(tokenizer, '<|startoftext|>') && isSingleToken(tokenizer, '<|im_start|>')) {
+    const msgs = messages.map((m) => {
+      if (m.role !== 'assistant') return m;
+      const i = m.content.lastIndexOf('</think>');
+      const answer = i >= 0 ? m.content.slice(i + '</think>'.length).trim() : m.content;
+      return { role: m.role, content: `<think></think>${answer}` };
+    });
+    const gen = enableThinking ? '<think>' : '<think></think>';
+    const tpl =
+      `{{ bos_token }}{% for message in messages %}`
+      + `{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}`
+      + `{% endfor %}`
+      + `{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n${gen}' }}{% endif %}`;
+    const result = (tokenizer.inner as any).apply_chat_template(msgs, {
+      add_generation_prompt: true,
+      tokenize: true,
+      return_tensor: false,
+      chat_template: tpl,
+    });
+    console.log(`[Tokenizer] LFM template applied (thinking=${enableThinking})`);
     return Array.from(result as ArrayLike<number | bigint>).map(Number);
   }
 

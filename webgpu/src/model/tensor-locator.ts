@@ -35,7 +35,9 @@ export type TensorRole =
   // per-layer: Gemma 4 per-layer embeddings (Phase D)
   | 'pleInpGate' | 'pleProj' | 'plePostNorm'
   // global: Gemma 4 PLE projections + RoPE frequency factors (Phase D)
-  | 'pleTokenEmbed' | 'pleModelProj' | 'pleProjNorm' | 'ropeFreqs';
+  | 'pleTokenEmbed' | 'pleModelProj' | 'pleProjNorm' | 'ropeFreqs'
+  // per-layer: LFM3 gated short conv + per-head attention gate
+  | 'shortConvInProj' | 'shortConvWeight' | 'shortConvOutProj' | 'attnHeadGate';
 
 export interface TensorLocator {
   /**
@@ -176,6 +178,11 @@ const GGUF_LAYER: Partial<Record<TensorRole, string[]>> = {
   pleInpGate: ['inp_gate.weight'],
   pleProj: ['proj.weight'],
   plePostNorm: ['post_norm.weight'],
+  // LFM3 (llama.cpp LLM_TENSOR_SHORTCONV_*, attn_gate = per-head gate)
+  shortConvInProj: ['shortconv.in_proj.weight'],
+  shortConvWeight: ['shortconv.conv.weight'],
+  shortConvOutProj: ['shortconv.out_proj.weight'],
+  attnHeadGate: ['attn_gate.weight'],
 };
 
 /**
@@ -188,6 +195,11 @@ const GGUF_LAYER: Partial<Record<TensorRole, string[]>> = {
  */
 const GGUF_LAYER_ARCH: Record<string, Partial<Record<TensorRole, string[]>>> = {
   gemma4: {
+    postAttnNorm: ['ffn_norm.weight'],
+    attnPostNorm: ['post_attention_norm.weight'],
+  },
+  // lfm3.cpp uses the same sandwich layout as gemma4.
+  lfm3: {
     postAttnNorm: ['ffn_norm.weight'],
     attnPostNorm: ['post_attention_norm.weight'],
   },

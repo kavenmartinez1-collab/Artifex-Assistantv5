@@ -62,6 +62,7 @@ import hadamardWGSL from '../shaders/hadamard.wgsl?raw';
 import dequantQ4BF16WGSL from '../shaders/dequant_q4_bf16.wgsl?raw';
 import matmulGgufWGSL from '../shaders/matmul_gguf.wgsl?raw';
 import repackQ2kWGSL from '../shaders/repack_q2k.wgsl?raw';
+import shortConvWGSL from '../shaders/short_conv.wgsl?raw';
 import { GGML_TYPES, ggmlTypeTraits } from '../model/gguf';
 import { dequantGGML, GGUF_GPU_LAYOUT } from '../model/gguf-dequant';
 import { topKSoftmax, MOE_MAX_TOKENS, type MoEBackend } from './moe-cpu';
@@ -168,6 +169,16 @@ export interface LayerWeights {
   linearInProjB_gg?: GGUFWeight;
   linearInProjZ_gg?: GGUFWeight;
   linearOutProj_gg?: GGUFWeight;
+
+  // LFM3 gated short conv (layer kind 'short_conv')
+  shortConvInProj?: GPUBuffer;      // [3*hidden, hidden] → B | C | X
+  shortConvInProj_gg?: GGUFWeight;
+  shortConvWeight?: GPUBuffer;      // [hidden, kernel] f32 depthwise taps
+  shortConvOutProj?: GPUBuffer;     // [hidden, hidden]
+  shortConvOutProj_gg?: GGUFWeight;
+  // LFM3 per-head attention gate: [num_heads, hidden]
+  attnHeadGate?: GPUBuffer;
+  attnHeadGate_gg?: GGUFWeight;
 
   // Linear attention (Gated DeltaNet) weights — only for hybrid models
   linearInProjQKV?: GPUBuffer;
@@ -884,6 +895,16 @@ export function createForwardPassEngine(
     ? createComputePipeline(device, elementwiseWGSL, 'decay_compute', 'decay') : null;
   const l2NormPipeline = isHybrid
     ? createComputePipeline(device, l2normWGSL, 'l2_normalize', 'l2-norm') : null;
+  // LFM3: gated short conv (whole chunk per dispatch) + per-head attn gate.
+  const hasShortConv = config.layers.some(d => d.kind === 'short_conv');
+  const shortConvK = config.shortConvKernel ?? 0;
+  if (hasShortConv && !(shortConvK >= 2 && shortConvK <= 16)) {
+    throw new Error(`[forward-pass] short conv kernel ${shortConvK} outside 2..16 (short_conv.wgsl MAX_K)`);
+  }
+  const shortConvPipeline = hasShortConv
+    ? createComputePipeline(device, shortConvWGSL, 'short_conv', 'short-conv') : null;
+  const headGatePipeline = config.attnHeadGate
+    ? createComputePipeline(device, elementwiseWGSL, 'head_gate_sigmoid', 'head-gate-sigmoid') : null;
   // Fusion lever F7: attn output gate a*sigmoid(b) in one dispatch. A/B: ?fuseGate=0.
   const gateSigmoidPipeline = config.attnOutputGate && gemvSearch?.get('fuseGate') !== '0'
     ? createComputePipeline(device, elementwiseWGSL, 'gate_sigmoid', 'gate-sigmoid') : null;
@@ -1222,6 +1243,15 @@ export function createForwardPassEngine(
   const tokenIdBuf = createStorageBuffer(device, null, MAX_PREFILL * 4, 'token-ids', true);
   // Small buffer for extracting last token's hidden state (for LM head after batch prefill)
   const lastHiddenBuf = createStorageBuffer(device, null, H * 4, 'last-hidden', true);
+
+  // LFM3 short conv: in_proj output [B | C | X] and the gated conv output.
+  const convProjBuf = hasShortConv
+    ? createStorageBuffer(device, null, MAX_PREFILL * 3 * H * 4, 'shortconv-bcx', true) : null;
+  const convOutBuf = hasShortConv
+    ? createStorageBuffer(device, null, MAX_PREFILL * H * 4, 'shortconv-out', true) : null;
+  // LFM3 per-head attention gate logits [seq, nHeads].
+  const headGateBuf = config.attnHeadGate
+    ? createStorageBuffer(device, null, MAX_PREFILL * nHeads * 4, 'attn-head-gate', true) : null;
 
   // DeepStack feature staging buffers — one per tap layer, lazily created.
   const dsFeatBufs: GPUBuffer[] = [];
@@ -2348,7 +2378,29 @@ export function createForwardPassEngine(
         dispatchHadamard(ffnTempBuf, normedBuf, seqLen, H, 0, `L${l}-had1`);
       }
 
-      if (isLinearLayer && kvCache.ssmState) {
+      if (config.layers[l].kind === 'short_conv') {
+        // ── LFM3 GATED SHORT CONV ────────────────────────────────────
+        // in_proj → [B | C | X]; y = C ⊙ conv(B ⊙ X) over the carried
+        // (K-1)-token state; out_proj → attnProjBuf (shared residual path).
+        const convState = kvCache.ssmState?.convStates[kvCache.ssmState.layerToSSMIndex[l]];
+        if (!convState || !shortConvPipeline || !lw.shortConvWeight) {
+          throw new Error(`[forward-pass] L${l}: short_conv layer without conv state/weights`);
+        }
+        dispatchProjection(normedBuf, lw, 'shortConvInProj', convProjBuf!, seqLen, 3 * H, H, `L${l}-sc-in`);
+        await maybeAudit(l, convProjBuf!, `L${l}-sc-in-out`, seqLen, 3 * H);
+        const scParams = getCachedUniform(
+          new Uint32Array([seqLen, H, shortConvK, 0]), `L${l}-sc-p`);
+        const scBG = cachedBindGroup(shortConvPipeline, 0, [
+          { binding: 0, resource: { buffer: convProjBuf! } },
+          { binding: 1, resource: { buffer: lw.shortConvWeight } },
+          { binding: 2, resource: { buffer: convState } },
+          { binding: 3, resource: { buffer: convOutBuf! } },
+          { binding: 4, resource: { buffer: scParams } },
+        ], `L${l}-sc`);
+        bd(shortConvPipeline, [scBG], [workgroupCount(H, 256)], `L${l}-sc`);
+        dispatchProjection(convOutBuf!, lw, 'shortConvOutProj', attnProjBuf, seqLen, H, H, `L${l}-sc-out`);
+        await maybeAudit(l, attnProjBuf, `L${l}-sc-out-out`, seqLen, H);
+      } else if (isLinearLayer && kvCache.ssmState) {
         // ── GATED DELTANET LINEAR ATTENTION ──────────────────────────
         const ssmIdx = kvCache.ssmState.layerToSSMIndex[l];
         const hBuf = kvCache.ssmState.hiddenStates[ssmIdx];
@@ -2916,6 +2968,11 @@ export function createForwardPassEngine(
           dispatchProjection(normedBuf, lw, 'vProj', vBuf, seqLen, kvDimL, H, `L${l}-v`);
           await maybeAudit(l, vBuf, `L${l}-v-out`, seqLen, kvDimL);
         }
+        // LFM3 per-head gate logits, from the same normed input as Q/K/V
+        // (projected now, while normedBuf is known intact).
+        if (config.attnHeadGate) {
+          dispatchProjection(normedBuf, lw, 'attnHeadGate', headGateBuf!, seqLen, nHeads, H, `L${l}-hgate`);
+        }
 
         // Per-head RMSNorm on Q and K (q_norm, k_norm) — Qwen3.5, Gemma 4.
         // Weight convention follows useResidualWeight (same as input layernorm).
@@ -3122,7 +3179,12 @@ export function createForwardPassEngine(
         // reads it from there. Skipped under useHadamard (it scratches
         // ffnTempBuf) — that path keeps the legacy 3-command sequence.
         let attnGated = attnOutBuf;
-        if (config.attnOutputGate && attnGateBuf && gateSigmoidPipeline && !useHadamard) {
+        if (config.attnHeadGate && headGatePipeline) {
+          // LFM3: attn_out[s, h, :] *= sigmoid(gate[s, h]) → ffnTempBuf
+          dispatchElementwise(headGatePipeline, attnOutBuf, ffnTempBuf, seqLen * nHeads * dHeadL,
+            `L${l}-attn-hgate`, headGateBuf!, dHeadL);
+          attnGated = ffnTempBuf;
+        } else if (config.attnOutputGate && attnGateBuf && gateSigmoidPipeline && !useHadamard) {
           const gateDim = seqLen * nHeads * dHead;
           dispatchElementwise(gateSigmoidPipeline, attnOutBuf, ffnTempBuf, gateDim, `L${l}-attn-gate`, attnGateBuf);
           attnGated = ffnTempBuf;
@@ -3816,8 +3878,21 @@ export function createForwardPassEngine(
       mtpValues = createStorageBuffer(device, null, maxSeqLen * kvDim * 4, 'mtp-kv-v', true);
     }
 
-    // For hybrid models, allocate SSM state for linear attention layers
+    // LFM3 short conv: one [K-1, hidden] conv state per conv layer, carried
+    // in ssmState.convStates (so spec-decode snapshot/restore covers it).
+    // These models have no DeltaNet layers, so hiddenStates stays empty.
     let ssmState: SSMState | undefined;
+    if (hasShortConv) {
+      const convStates: GPUBuffer[] = [];
+      const layerToSSMIndex: number[] = new Array(L).fill(-1);
+      for (let l = 0; l < L; l++) {
+        if (config.layers[l].kind !== 'short_conv') continue;
+        layerToSSMIndex[l] = convStates.length;
+        convStates.push(createStorageBuffer(device, null, (shortConvK - 1) * H * 4, `shortconv-state-${l}`, true));
+      }
+      ssmState = { hiddenStates: [], convStates, layerToSSMIndex };
+    }
+    // For hybrid models, allocate SSM state for linear attention layers
     if (config.isHybrid) {
       const hiddenStates: GPUBuffer[] = [];
       const convStates: GPUBuffer[] = [];
@@ -3855,8 +3930,9 @@ export function createForwardPassEngine(
       const values: GPUBuffer[] = [];
       for (let l = 0; l < L; l++) {
         // For hybrid models, only full attention layers need KV cache
-        if (config.isHybrid && config.layers[l].kind === 'linear_attention') {
-          keys.push(null as any);   // placeholder — not used for linear layers
+        if ((config.isHybrid && config.layers[l].kind === 'linear_attention')
+            || config.layers[l].kind === 'short_conv') {
+          keys.push(null as any);   // placeholder — not used for linear/conv layers
           values.push(null as any);
         } else if (config.layers[l].kvSourceLayer !== undefined) {
           // KV sharing (Gemma 4 layers 24-41): alias the source layer's
@@ -3896,7 +3972,8 @@ export function createForwardPassEngine(
     // the 27B's 64 layers are linear).
     let tqLayers = 0;
     for (let l = 0; l < L; l++) {
-      const usesKV = config.layers[l].kind !== 'linear_attention';
+      const usesKV = config.layers[l].kind !== 'linear_attention'
+        && config.layers[l].kind !== 'short_conv';
       const sz = (bytes: number) => usesKV ? bytes : 4;
       quantizedK.push(createStorageBuffer(device, null, sz(quantBufSize), `tq-qk-${l}`, false));
       quantizedV.push(createStorageBuffer(device, null, sz(quantBufSize), `tq-qv-${l}`, false));

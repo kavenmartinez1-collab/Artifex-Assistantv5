@@ -1975,7 +1975,11 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
       attnPostNorm: roleBuf('attnPostNorm', l),
       ffnPostNorm: roleBuf('ffnPostNorm', l),
     };
-    if (config.layers[l].kind === 'linear_attention') {
+    if (config.layers[l].kind === 'short_conv') {
+      assignProj(lw, 'shortConvInProj', 'shortConvInProj', l);
+      assignProj(lw, 'shortConvOutProj', 'shortConvOutProj', l);
+      lw.shortConvWeight = requireBuf('shortConvWeight', l);
+    } else if (config.layers[l].kind === 'linear_attention') {
       assignProj(lw, 'linearInProjQKV', 'linInProjQKV', l);
       assignProj(lw, 'linearInProjA', 'linInProjA', l);
       assignProj(lw, 'linearInProjB', 'linInProjB', l);
@@ -1996,6 +2000,7 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
       assignProj(lw, 'oProj', 'oProj', l);
       lw.qNorm = roleBuf('qNorm', l);
       lw.kNorm = roleBuf('kNorm', l);
+      if (config.attnHeadGate) assignProj(lw, 'attnHeadGate', 'attnHeadGate', l);
       if (config.attentionBias) {
         lw.qBias = roleBuf('qBias', l);
         lw.kBias = roleBuf('kBias', l);
@@ -2021,6 +2026,12 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
       lw.layerOutScale = roleBuf('layerOutScale', l);
     }
     layers.push(lw);
+  }
+  const convCount = config.layers.filter(d => d.kind === 'short_conv').length;
+  if (convCount > 0) {
+    const swaCount = config.layers.filter(d => d.kind === 'sliding_attention').length;
+    console.log(`[GGUF] Short-conv hybrid: ${convCount} conv + ${swaCount} sliding + `
+      + `${config.numLayers - convCount - swaCount} global attention layers`);
   }
   if (config.isHybrid) {
     const linCount = config.layers.filter(d => d.kind === 'linear_attention').length;
@@ -2086,7 +2097,11 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
   const tokenizer = await createTokenizer({ modelId: repo });
   // Guard: a tokenizer from the wrong model family silently produces garbage
   // (e.g. Qwen3-8B fallback vocab 151936 vs Qwen3.6 vocab 248320).
-  if (tokenizer.vocabSize && Math.abs(tokenizer.vocabSize - config.vocabSize) > 1024) {
+  // The embedding table may be padded past the real vocab (LFM3: 125033
+  // tokens, 128000 rows), so allow more slack on the model side; a tokenizer
+  // LARGER than the table would index past it.
+  const vocabSlack = tokenizer.vocabSize - config.vocabSize;
+  if (tokenizer.vocabSize && (vocabSlack > 1024 || vocabSlack < -4096)) {
     throw new Error(
       `Tokenizer/model vocab mismatch: tokenizer ${tokenizer.modelId} has ${tokenizer.vocabSize} tokens ` +
       `but model expects ${config.vocabSize}. Wrong tokenizer fallback?`);
@@ -2201,6 +2216,61 @@ async function buildGGUFSession(repo: string, ggufFile: string, progressEl: HTML
   (globalThis as any).__flux2Embed = async (prompt: string) => {
     const { embedFlux2Prompt } = await import('./diffusion/text-embedder');
     return embedFlux2Prompt(engine, tokenizer, prompt);
+  };
+  // Golden-parity hooks (scripts/test-lfm3-parity.mts). __logitProbe
+  // prefills raw prompt ids in `chunk`-token forwards, then decodes `steps`
+  // tokens — greedy, or teacher-forced with `forced` (the reference's
+  // tokens, so every step stays comparable) — returning each step's top-5
+  // (id, softmax prob) in float64. It runs on its own KV cache; the chat
+  // session's cache is untouched.
+  (globalThis as any).__tokenize = (text: string) => tokenizer.encode(text);
+  (globalThis as any).__chatTokens = (messages: Array<{ role: string; content: string }>, enableThinking = true) =>
+    applyChatTemplate(tokenizer, messages, { enableThinking });
+  // `want[s]` lists extra ids whose probability step s should also report.
+  (globalThis as any).__logitProbe = async (
+    promptIds: number[], steps: number, chunk = 512, forced?: number[], want?: number[][],
+  ) => {
+    const { readBuffer } = await import('./engine/buffers');
+    const V = config.vocabSize;
+    const kv = engine.createKVCache(Math.min(promptIds.length + steps + 1, MAX_ATTN_SEQ_LEN));
+    const top5 = async (buf: GPUBuffer, extra: number[] = []) => {
+      const lg = new Float32Array(await readBuffer(gpu!.device, buf, V * 4));
+      let max = -Infinity;
+      for (let i = 0; i < V; i++) if (lg[i] > max) max = lg[i];
+      let sum = 0;
+      for (let i = 0; i < V; i++) sum += Math.exp(lg[i] - max);
+      const idx: number[] = [];
+      for (let k = 0; k < 5; k++) {
+        let best = -1;
+        for (let i = 0; i < V; i++) {
+          if ((best < 0 || lg[i] > lg[best]) && !idx.includes(i)) best = i;
+        }
+        idx.push(best);
+      }
+      const p = (id: number) => Math.exp(lg[id] - max) / sum;
+      return {
+        top: idx.map((id) => ({ id, prob: p(id) })),
+        probs: Object.fromEntries(extra.map((id) => [id, p(id)])) as Record<number, number>,
+      };
+    };
+    try {
+      let out: { logitsBuffer: GPUBuffer } | undefined;
+      for (let i = 0; i < promptIds.length; i += chunk) {
+        out = await engine.forward(new Uint32Array(promptIds.slice(i, i + chunk)), kv);
+      }
+      const result: Array<{
+        token: number; top: Array<{ id: number; prob: number }>; probs: Record<number, number>;
+      }> = [];
+      for (let s = 0; s < steps; s++) {
+        const { top, probs } = await top5(out!.logitsBuffer, want?.[s]);
+        result.push({ token: top[0].id, top, probs });
+        const next = forced?.[s] ?? top[0].id;
+        if (s + 1 < steps) out = await engine.forward(new Uint32Array([next]), kv);
+      }
+      return result;
+    } finally {
+      engine.destroyKVCache(kv);
+    }
   };
 
   promptEl.disabled = false;
@@ -3349,7 +3419,11 @@ if (savedToken) {
 
 restoreUISettings();
 const lastModel = localStorage.getItem(UI_STORE + 'last-model');
+// ?model=local/lfm3-1.7b (the installer's launcher) only fills the field on
+// a first run; the user's last choice wins, and nothing loads until Load.
+const urlModel = new URLSearchParams(window.location.search).get('model');
 if (lastModel) ($('model-repo') as HTMLInputElement).value = lastModel;
+else if (urlModel && /^[\w.-]+\/[\w.:-]+$/.test(urlModel)) ($('model-repo') as HTMLInputElement).value = urlModel;
 restoreLastConversation();
 
 // PWA service worker — production builds only. In dev, vite owns module

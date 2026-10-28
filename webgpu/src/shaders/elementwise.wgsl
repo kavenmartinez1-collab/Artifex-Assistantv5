@@ -149,6 +149,17 @@ fn gate_sigmoid(@builtin(global_invocation_id) gid: vec3u) {
   output[idx] = input_a[idx] * s;
 }
 
+// Per-head gate (LFM3): output = a * sigmoid(b[idx / broadcast_b]) where
+// a is [rows, heads, head_dim], b is [rows, heads] raw gate logits and
+// broadcast_b carries head_dim (elements sharing one gate).
+@compute @workgroup_size(256)
+fn head_gate_sigmoid(@builtin(global_invocation_id) gid: vec3u) {
+  let idx = gid.x;
+  if (idx >= params.n) { return; }
+  let s = 1.0 / (1.0 + exp(-input_b[idx / params.broadcast_b]));
+  output[idx] = input_a[idx] * s;
+}
+
 // Decay: output = exp(-exp(a) * b) where a=A_log, b=dt
 // Computes the SSM state decay factor. Always in (0, 1).
 @compute @workgroup_size(256)

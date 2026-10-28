@@ -293,6 +293,8 @@ export async function loadGGUFModel(
   const MAX_PREFILL = isHybrid ? 64 : 512;
   const fullAttnInterval = archKV<number>(file, 'full_attention_interval', 1);
   let nKV = archKV<number | number[]>(file, 'attention.head_count_kv', headCount);
+  // Per-layer array: 0 marks a layer with no KV cache (LFM3 short conv).
+  const kvPerLayer = Array.isArray(nKV) ? nKV.slice(0, numLayers) : undefined;
   if (Array.isArray(nKV)) { const nz = nKV.filter(v => v > 0); nKV = nz.length ? Math.max(...nz) : headCount; }
   const kLen = archKV<number>(file, 'attention.key_length', Math.floor(hiddenSize / headCount));
   const vLen = archKV<number>(file, 'attention.value_length', kLen);
@@ -300,7 +302,9 @@ export async function loadGGUFModel(
   // layers, minus the trailing shared-KV layers that reuse another's.
   let attnLayers = 0;
   for (let i = 0; i < numLayers; i++) {
-    if (!isHybrid || (i + 1) % fullAttnInterval === 0) attnLayers++;
+    if (kvPerLayer && archKV<number>(file, 'shortconv.l_cache', 0) > 0) {
+      if (kvPerLayer[i] > 0) attnLayers++;
+    } else if (!isHybrid || (i + 1) % fullAttnInterval === 0) attnLayers++;
   }
   const kvCacheLayers = Math.max(0, attnLayers - sharedKvLayers);
   const kvBytes = kvCacheLayers * MAX_SEQ * (nKV as number) * (kLen + vLen) * 4;

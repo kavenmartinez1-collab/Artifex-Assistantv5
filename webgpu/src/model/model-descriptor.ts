@@ -13,7 +13,9 @@
 import { parseModelConfig, type ModelConfig } from './model-config';
 import { archKV, ggufArchitecture, type GGUFFile } from './gguf';
 
-export type LayerKind = 'full_attention' | 'sliding_attention' | 'linear_attention';
+/** 'short_conv' = LFM2/LFM3 gated short convolution: no attention, no KV
+ *  cache, a (kernel-1)-token conv state instead. */
+export type LayerKind = 'full_attention' | 'sliding_attention' | 'linear_attention' | 'short_conv';
 
 export interface RopeSpec {
   /** RoPE base frequency for this layer. */
@@ -77,6 +79,12 @@ export interface ModelDescriptor extends ModelConfig {
   perLayerEmbedDim?: number;
   /** Multiply token embeddings by this after lookup (Gemma: √hiddenSize). */
   embedScale?: number;
+  /** LFM3 per-head attention gate: attn_out[head h] *= sigmoid((W_gate·x)[h])
+   *  before o_proj, from a separate [nHeads, hidden] projection. */
+  attnHeadGate?: boolean;
+  /** Short-conv kernel length (GGUF `shortconv.l_cache`); the conv state
+   *  holds kernel-1 past tokens. Set iff some layer is 'short_conv'. */
+  shortConvKernel?: number;
 }
 
 /** Build per-layer descriptors from a parsed ModelConfig (HF semantics). */
@@ -164,6 +172,11 @@ const GGUF_ARCHS: Record<string, GGUFArchInfo> = {
   //    end-to-end verified. (Gemma 2/3, Phi3 fused-QKV, DeepSeek MLA, and the
   //    Mamba2 hybrids are intentionally NOT here — they need real compute work,
   //    and a bad mapping would produce wrong output rather than a clean error.)
+  // LFM3 (LiquidAI, llama.cpp PR #31252): gated short-conv layers mixed with
+  // sliding-window and global attention, sandwich norms, per-head attn gate.
+  // Verified against llama.cpp b11945 greedy + top-5 probabilities
+  // (test-fixtures/lfm3-1.7b-llamacpp-reference.json).
+  lfm3:      { modelType: 'lfm3' },
   qwen2:     { modelType: 'qwen2', experimental: true },     // attn bias, no qk-norm
   qwen2moe:  { modelType: 'qwen2_moe', experimental: true },
   mistral3:  { modelType: 'llama', experimental: true },     // llama-architecture
@@ -228,6 +241,23 @@ export function descriptorFromGGUF(file: GGUFFile): ModelDescriptor {
       throw new Error(`[GGUF] sliding_window_pattern has ${swaPattern.length} entries, need ${numLayers}`);
     }
     layerTypes = swaPattern.slice(0, numLayers).map(b => (b ? 'sliding_attention' : 'full_attention'));
+  }
+  // LFM3 gated short conv: a layer with head_count_kv 0 is a conv layer
+  // (llama.cpp: is_recr_impl[il] = n_head_kv(il) == 0); the SWA pattern only
+  // classifies the remaining attention layers.
+  const shortConvKernel = archKVOpt<number>(file, 'shortconv.l_cache');
+  if (shortConvKernel !== undefined) {
+    if (!Array.isArray(kvRaw) || kvRaw.length < numLayers) {
+      throw new Error('[GGUF] shortconv model needs a per-layer attention.head_count_kv array');
+    }
+    if (kvRaw.some((v) => v !== 0 && v !== numKVHeads)) {
+      throw new Error(`[GGUF] per-layer KV head counts differ (${kvRaw.join(',')}) — unsupported`);
+    }
+    layerTypes = [];
+    for (let i = 0; i < numLayers; i++) {
+      layerTypes.push(kvRaw[i] === 0 ? 'short_conv'
+        : swaPattern?.[i] ? 'sliding_attention' : 'full_attention');
+    }
   }
   const slidingWindow = archKVOpt<number>(file, 'attention.sliding_window');
   // Gemma 4 dual head_dim: sliding layers use *_swa key/value lengths.
@@ -302,9 +332,12 @@ export function descriptorFromGGUF(file: GGUFFile): ModelDescriptor {
     const kind: LayerKind =
       t === 'linear_attention' ? 'linear_attention'
       : t === 'sliding_attention' ? 'sliding_attention'
+      : t === 'short_conv' ? 'short_conv'
       : 'full_attention';
     const layer: LayerDescriptor = { kind, rope, moe };
-    if (swaPattern !== undefined) {
+    if (kind === 'short_conv') {
+      layer.rope = undefined;
+    } else if (swaPattern !== undefined) {
       const sliding = kind === 'sliding_attention';
       layer.headDim = sliding ? headDimSwa : headDim;
       // Full layers: proportional RoPE — rotatedPairs filled later from the
@@ -335,6 +368,10 @@ export function descriptorFromGGUF(file: GGUFFile): ModelDescriptor {
     perLayerEmbedDim: perLayerEmbedDim > 0 ? perLayerEmbedDim : undefined,
     // Gemma scales embeddings by √hiddenSize (gemma4.cpp:155)
     embedScale: arch === 'gemma4' ? Math.sqrt(hiddenSize) : undefined,
+    // lfm3.cpp: gate = sigmoid(attn_gate · x), one scalar per head. qwen35
+    // names its DeltaNet z-projection attn_gate too, so key on the arch.
+    attnHeadGate: arch === 'lfm3' ? true : undefined,
+    shortConvKernel,
   };
 }
 
