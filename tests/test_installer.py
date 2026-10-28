@@ -245,3 +245,73 @@ def test_installer_never_shells_out_or_evals():
         src += open(os.path.join(os.path.dirname(recipes.__file__), name), encoding="utf-8").read()
     assert "shell=True" not in src
     assert not re.search(r"\beval\(|\bexec\(|os\.system\(|os\.popen\(", src)
+
+
+# ── Python environment, locks, launchers ────────────────────────────────────
+
+def _lock_entries(path):
+    """[(name==ver, [hashes])] from a pip requirements lock."""
+    text = re.sub(r"\\\n", " ", open(path, encoding="utf-8").read())  # join continuations
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        assert not line.startswith("-"), f"option line in a lock: {line!r}"
+        req, *rest = line.split()
+        out.append((req, [r.split(":", 1)[1] for r in rest if r.startswith("--hash=sha256:")]))
+    return out
+
+
+@pytest.mark.parametrize("lock", ["core", "gui"])
+def test_locks_are_exact_and_fully_hashed(lock):
+    entries = _lock_entries(recipes.LOCKS[lock])
+    assert entries
+    text = open(recipes.LOCKS[lock], encoding="utf-8").read()
+    for bad in ("--index-url", "--extra-index-url", "--trusted-host", "git+", "http://", " -e "):
+        assert bad not in text
+    for req, hashes in entries:
+        assert re.fullmatch(r"[A-Za-z0-9_.\-]+==[A-Za-z0-9_.+\-]+", req), req
+        assert hashes and all(re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes), req
+
+
+def test_chat_only_lock_leaves_out_the_heavy_stack():
+    names = {r.split("==")[0].lower() for r, _ in _lock_entries(recipes.LOCKS["core"])}
+    assert {"fastapi", "uvicorn", "requests"} <= names
+    assert not names & {"torch", "transformers", "diffusers", "bitsandbytes", "pyqt6"}
+
+
+def test_env_runs_pip_locked_isolated_and_wheels_only(tmp_path):
+    calls = []
+    recipes.install_env(str(tmp_path), gui=True, log=lambda *a: None,
+                        run=lambda cmd, check: calls.append(cmd))
+    venv_cmd, pip_cmd = calls
+    assert venv_cmd[1:3] == ["-m", "venv"]
+    for flag in ("--isolated", "--require-hashes", "--only-binary=:all:", "--no-input"):
+        assert flag in pip_cmd
+    assert recipes.LOCKS["core"] in pip_cmd and recipes.LOCKS["gui"] in pip_cmd
+    assert not any("index" in c for c in pip_cmd)
+
+
+def test_env_never_touches_an_existing_venv(tmp_path):
+    (tmp_path / "venv").mkdir()
+    def boom(*a, **k):
+        raise AssertionError("must not run")
+    recipes.install_env(str(tmp_path), log=lambda *a: None, run=boom)
+
+
+def test_python_version_gate():
+    assert recipes.python_ok((3, 11)) and recipes.python_ok((3, 13))
+    assert not recipes.python_ok((3, 9)) and not recipes.python_ok((3, 14))
+
+
+def test_launchers_stay_local_and_escape_the_path(tmp_path):
+    root = tmp_path / "100% Artifex"
+    root.mkdir()
+    paths = recipes.write_launchers(str(root), "qwen3.5-9b-q4km", gui=True)
+    api = open(next(p for p in paths if "API" in p), encoding="utf-8").read()
+    assert "--host 127.0.0.1" in api and "0.0.0.0" not in api
+    assert "100%% Artifex" in api                      # cmd would expand a lone %
+    assert len(paths) == 3
+    with pytest.raises(ValueError):
+        recipes.write_launchers(str(root), "x & calc.exe")

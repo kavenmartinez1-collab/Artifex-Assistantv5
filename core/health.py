@@ -63,9 +63,15 @@ def _check_cuda():
 
 def _check_models():
     """Check discovered local models."""
+    try:
+        from core.config import get_llama_cpp_models
+        llama_cpp = list(get_llama_cpp_models())
+    except Exception:
+        llama_cpp = []
     return {
         "count": len(MODELS),
         "models": list(MODELS.keys())[:20],  # cap display
+        "llama_cpp_count": len(llama_cpp),
         "active_model": get_active_model_name(),
         "active_backend": get_active_backend(),
     }
@@ -157,16 +163,22 @@ def run_health_check():
     disk = _check_disk()
     knowledge = _check_knowledge()
 
-    # Determine overall health
-    issues = []
+    # Determine overall health. PyTorch, transformers and torch-visible CUDA
+    # are only needed by the transformers backend: a chat-only install
+    # (llama.cpp or Ollama, python -m installer) runs without them, and
+    # llama-server finds the GPU itself. Without them there they are listed as
+    # optional extras (the Create pack), not as faults.
+    issues, optional = [], []
+    needs_torch = models.get("active_backend") == "transformers"
     if not cuda.get("available"):
-        issues.append("no_cuda")
-    if models["count"] == 0:
+        (issues if needs_torch else optional).append("no_cuda")
+    if not (models["count"] or models.get("llama_cpp_count")
+            or ollama.get("model_count")):
         issues.append("no_models")
     if deps.get("torch") is None:
-        issues.append("no_torch")
+        (issues if needs_torch else optional).append("no_torch")
     if deps.get("transformers") is None:
-        issues.append("no_transformers")
+        (issues if needs_torch else optional).append("no_transformers")
     disk_free = disk.get("free_gb", 999)
     if disk_free < 5:
         issues.append("low_disk")
@@ -183,6 +195,7 @@ def run_health_check():
     report = {
         "overall": overall,
         "issues": issues,
+        "optional_missing": optional,
         "cuda": cuda,
         "models": models,
         "ollama": ollama,

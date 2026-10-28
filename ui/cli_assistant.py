@@ -9,7 +9,6 @@ import gc
 import platform
 import subprocess
 
-import torch
 from colorama import Fore, Style
 
 from core.config import (
@@ -563,7 +562,12 @@ def run_assistant():
             if user_input.lower() == "/refresh":
                 history = compress_history(history, mode_cfg.context_window)
                 gc.collect()
-                if torch.cuda.is_available():
+                # torch only exists on transformers installs; chat-only runs without it.
+                try:
+                    import torch
+                except ImportError:
+                    torch = None
+                if torch is not None and torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 n = len(history) - 1
                 print(f"{Fore.CYAN}  Refreshed — {n} messages cached as key points")

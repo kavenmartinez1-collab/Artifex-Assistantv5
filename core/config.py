@@ -293,6 +293,26 @@ _llama_cpp_config: dict = {}
 _llama_cpp_config_mtime: float = 0.0
 
 
+def _default_backend() -> str:
+    """Backend to start on when nothing chose one (CLI, GUI).
+
+    $ARTIFEX_BACKEND wins. Otherwise a chat-only install (python -m
+    installer: llama.cpp models configured, no PyTorch) starts on llama_cpp
+    instead of failing to import torch for transformers; every other install
+    keeps the historical transformers default.
+    """
+    env = os.environ.get("ARTIFEX_BACKEND", "").strip().lower()
+    if env in ("transformers", "ollama", "llama_cpp", "claude_cli", "webgpu"):
+        return env
+    import importlib.util
+    if importlib.util.find_spec("torch") is None and os.path.isfile(LLAMA_CPP_CONFIG_PATH):
+        return "llama_cpp"
+    return "transformers"
+
+
+_active_backend = _default_backend()
+
+
 def _load_llama_cpp_config():
     """Load llama.cpp config from disk.  Re-reads when file mtime changes."""
     global _llama_cpp_config, _llama_cpp_config_mtime

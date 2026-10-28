@@ -10,7 +10,6 @@ import shutil
 import platform
 import subprocess
 
-import torch
 import psutil
 
 from core.config import IS_WINDOWS

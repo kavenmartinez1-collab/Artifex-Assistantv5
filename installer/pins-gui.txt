@@ -1,0 +1,8 @@
+# Desktop GUI (PyQt6) on top of pins-core.txt. numpy is held at the full install's
+# 2.3.5 so adding the Create pack later doesn't fight over it.
+PyOpenGL==3.1.10
+PyQt6-Qt6==6.11.0
+PyQt6==6.11.0
+PyQt6_sip==13.11.1
+numpy==2.3.5
+pyqtgraph==0.14.0

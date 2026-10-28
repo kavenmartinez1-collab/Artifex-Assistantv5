@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 from installer import probe as probe_mod
@@ -50,6 +51,10 @@ def main(argv=None) -> int:
             s.add_argument("--force", action="store_true",
                            help="replace an existing config entry with the same id")
             s.add_argument("--yes", action="store_true", help="don't ask before downloading")
+            s.add_argument("--no-env", action="store_true",
+                           help="skip the Python environment (backend and model only)")
+            s.add_argument("--no-gui", action="store_true",
+                           help="leave out the desktop GUI (PyQt6, ~100 MB)")
     a = ap.parse_args(argv)
 
     if a.cmd == "probe":
@@ -77,9 +82,16 @@ def main(argv=None) -> int:
         return 1
     try:
         recipes.install_core(pl, catalog, reuse_dirs=a.reuse, force=a.force, progress=_bar)
+        if not a.no_env:
+            recipes.install_env(pl["root"], gui=not a.no_gui)
+            for path in recipes.write_launchers(pl["root"], pl["model"]["id"], gui=not a.no_gui):
+                print(f"launcher: {path}")
     except VerifyError as e:
         print(f"\nSTOPPED for safety: {e}")
         return 4
+    except (RuntimeError, subprocess.CalledProcessError) as e:
+        print(f"\nSTOPPED: {e}")
+        return 5
     print("\nDone. Start Artifex and pick "
           f"'{pl['model']['id']}' in the model list.")
     return 0

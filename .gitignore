@@ -126,3 +126,6 @@ purge_extra.txt
 
 # Installer downloads (prebuilt llama.cpp servers): python -m installer
 /runtime/
+
+# Launchers written by python -m installer
+/Artifex *.cmd

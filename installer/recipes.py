@@ -9,6 +9,7 @@ no PATH changes, no services: everything lands under the install root.
 import datetime
 import json
 import os
+import re
 import subprocess
 
 from installer import fetch
@@ -151,6 +152,80 @@ def write_config(pl: dict, force: bool = False) -> str:
         f.write("\n")
     os.replace(tmp, path)
     return f"added '{mid}' to {path}"
+
+
+LOCKS = {"core": os.path.join(HERE, "requirements-core.txt"),
+         "gui": os.path.join(HERE, "requirements-gui.txt")}
+SUPPORTED_PYTHON = ((3, 11), (3, 13))   # wheels in the locks cover these
+
+
+def python_ok(version=None) -> bool:
+    import sys
+    v = tuple((version or sys.version_info)[:2])
+    return SUPPORTED_PYTHON[0] <= v <= SUPPORTED_PYTHON[1]
+
+
+def install_env(root: str, gui: bool = True, log=print, run=subprocess.run) -> str:
+    """Create <root>/venv and install the hash-locked packages into it.
+
+    An existing venv is never modified: it may be a full install with
+    PyTorch, and replacing packages under it could break the Create tools.
+    pip runs isolated (no user/site pip.ini, no PIP_* environment, so nothing
+    can add an index or turn checks off), with --require-hashes and
+    --only-binary=:all:, so any file whose SHA-256 isn't in the committed
+    lock is refused and no package's setup code ever runs.
+    """
+    import sys
+    venv = os.path.join(os.path.abspath(root), "venv")
+    py = os.path.join(venv, "Scripts", "python.exe") if os.name == "nt" \
+        else os.path.join(venv, "bin", "python")
+    if os.path.exists(venv):
+        log(f"keeping your existing Python environment {venv} (not modified)")
+        return py
+    if not python_ok():
+        raise RuntimeError(
+            f"Python {sys.version_info[0]}.{sys.version_info[1]} is not supported here; "
+            f"use {SUPPORTED_PYTHON[0][0]}.{SUPPORTED_PYTHON[0][1]} to "
+            f"{SUPPORTED_PYTHON[1][0]}.{SUPPORTED_PYTHON[1][1]}")
+    log(f"creating {venv}")
+    run([sys.executable, "-m", "venv", venv], check=True)
+    cmd = [py, "-m", "pip", "install", "--isolated", "--require-hashes",
+           "--only-binary=:all:", "--no-input", "--disable-pip-version-check",
+           "-r", LOCKS["core"]]
+    if gui:
+        cmd += ["-r", LOCKS["gui"]]
+    log("installing the locked packages (core" + (" + desktop GUI" if gui else "") + ")")
+    run(cmd, check=True)
+    return py
+
+
+def write_launchers(root: str, model_id: str, gui: bool = True) -> list:
+    """Plain .cmd launchers. Fixed text, no user input in them; the API one
+    binds to 127.0.0.1 only, so nothing is reachable from the network until
+    the remote-access pack sets up Tailscale on purpose."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", model_id):
+        raise ValueError(f"refusing to write a launcher for model id {model_id!r}")
+    disk_root = os.path.abspath(root)
+    # cmd.exe expands %VAR% even inside quotes; double every % in the text
+    # (only in the text: the files themselves go in the real folder).
+    root = disk_root.replace("%", "%%")
+    py = os.path.join(root, "venv", "Scripts", "python.exe")
+    common = ["@echo off", "chcp 65001 >nul", f'cd /d "{root}"', "set ARTIFEX_BACKEND=llama_cpp"]
+    files = {
+        "Artifex CLI.cmd": common + [f'"{py}" main.py', "pause"],
+        "Artifex API (this PC only).cmd": common + [
+            f'"{py}" main_api.py --host 127.0.0.1 --port 8000 --backend llama_cpp '
+            f'--model {model_id}', "pause"],
+    }
+    if gui:
+        files["Artifex GUI.cmd"] = common + [f'start "" "{py[:-len("python.exe")]}pythonw.exe" main_gui_qt.py']
+    written = []
+    for name, lines in files.items():
+        path = os.path.join(disk_root, name)
+        with open(path, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write("\n".join(lines) + "\n")
+        written.append(path)
+    return written
 
 
 def install_core(pl: dict, catalog: dict, reuse_dirs=None, force=False, log=print,

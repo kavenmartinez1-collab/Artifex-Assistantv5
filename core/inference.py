@@ -8,8 +8,6 @@ import gc
 import logging
 import re
 
-import torch
-
 _log = logging.getLogger(__name__)
 
 
@@ -757,7 +755,13 @@ def vram_pressure_relief(engine, history, context_window, threshold=0.85):
     new_len = len(history)
 
     gc.collect()
-    if torch.cuda.is_available():
+    # torch only matters for the transformers backend; a chat-only install
+    # (llama.cpp) runs without it.
+    try:
+        import torch
+    except ImportError:
+        torch = None
+    if torch is not None and torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 

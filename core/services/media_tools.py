@@ -177,6 +177,13 @@ async def assist_prompt(tool: str, prompt: str,
 
 def unavailable_reason(tool: str) -> str | None:
     """Why `tool` can't run on this machine at all, or None."""
+    # Every Create pipeline runs on PyTorch, which a chat-only install
+    # (python -m installer) leaves out. Say so up front instead of listing
+    # models that would only fail once the job starts.
+    import importlib.util
+    if importlib.util.find_spec("torch") is None:
+        return ("Needs the Create pack (PyTorch and the image/music models), "
+                "which this install doesn't have yet.")
     if tool == "video":
         from core.device import gpu_info
         if not gpu_info.is_available or gpu_info.total_gb < 16:
