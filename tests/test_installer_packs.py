@@ -350,6 +350,18 @@ def test_node_and_game_are_pinned():
     assert "master" not in g["cmudict"]["base_url"]
 
 
+def test_game_ships_lfm3_with_its_licence():
+    g = recipes.load_catalog()["game"]
+    dests = {m["dest"] for m in g["models"]}
+    gguf = [d for d in dests if d.endswith(".gguf")]
+    assert gguf == ["models/LiquidAI--LFM3-1.7B-GGUF/LFM3-1.7B-Q4_K_M.gguf"]
+    folder = gguf[0].rsplit("/", 1)[0]
+    # The LFM Open License must accompany the weights (§4a), and the
+    # tokenizer must be local or the game would fetch one at runtime.
+    for f in ("LICENSE", "tokenizer.json", "tokenizer_config.json"):
+        assert f"{folder}/{f}" in dests
+
+
 # ── Artifex Web's model (webgpu pack) ───────────────────────────────────────
 
 def test_artifex_web_model_is_pinned_and_path_safe():

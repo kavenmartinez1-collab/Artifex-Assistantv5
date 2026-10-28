@@ -280,32 +280,40 @@
     "_comment": "A Tale of Yarn (the WebGPU game), cloned over https and checked out at this exact commit; git verifies the content by hash. Bump deliberately after reviewing the new commits.",
     "name": "A Tale of Yarn",
     "repo": "https://github.com/kavenmartinez1-collab/A_Tale_of_Yarn.git",
-    "commit": "8d91d5e94ea653b150e79909c3164daab805cbbb",
+    "commit": "440da2c6fd8dec8bcaa4c8d8bb3266be7b014a19",
     "dest": "games/a-tale-of-yarn",
     "models": [
       {
-        "dest": "models/unsloth--Qwen3-1.7B-GGUF/Qwen3-1.7B-Q4_K_M.gguf",
-        "repo": "unsloth/Qwen3-1.7B-GGUF",
-        "revision": "d7f544eead698dbd1f15126ef60b45a1e1933222",
-        "path": "Qwen3-1.7B-Q4_K_M.gguf",
-        "size": 1107409472,
-        "sha256": "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897"
+        "dest": "models/LiquidAI--LFM3-1.7B-GGUF/LFM3-1.7B-Q4_K_M.gguf",
+        "repo": "LiquidAI/LFM3-1.7B-GGUF",
+        "revision": "4b423c332fd97961416f2e8b69467758fd27370d",
+        "path": "LFM3-1.7B-Q4_K_M.gguf",
+        "size": 1099627808,
+        "sha256": "3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4"
       },
       {
-        "dest": "models/unsloth--Qwen3-1.7B-GGUF/tokenizer.json",
-        "repo": "Qwen/Qwen3-8B",
-        "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+        "dest": "models/LiquidAI--LFM3-1.7B-GGUF/tokenizer.json",
+        "repo": "LiquidAI/LFM3-1.7B",
+        "revision": "ac2586a34f1a1c03329dbdcdefabd8b6478ddaa7",
         "path": "tokenizer.json",
-        "size": 11422654,
-        "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+        "size": 17908635,
+        "sha256": "7e226e34bface23ccf6e495d157bf77186c1c30a7659880e1a8994db528c3701"
       },
       {
-        "dest": "models/unsloth--Qwen3-1.7B-GGUF/tokenizer_config.json",
-        "repo": "Qwen/Qwen3-8B",
-        "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+        "dest": "models/LiquidAI--LFM3-1.7B-GGUF/tokenizer_config.json",
+        "repo": "LiquidAI/LFM3-1.7B",
+        "revision": "ac2586a34f1a1c03329dbdcdefabd8b6478ddaa7",
         "path": "tokenizer_config.json",
-        "size": 9732,
-        "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+        "size": 1545,
+        "sha256": "bf028f813efc6137bc07ed045cafe71820df9a5e26a38e39954706ed1e30a457"
+      },
+      {
+        "dest": "models/LiquidAI--LFM3-1.7B-GGUF/LICENSE",
+        "repo": "LiquidAI/LFM3-1.7B-GGUF",
+        "revision": "4b423c332fd97961416f2e8b69467758fd27370d",
+        "path": "LICENSE",
+        "size": 10574,
+        "sha256": "4d28ca14dedc0b3d0fcc2b3339f0e79931faa33874f3d24f522183a8fc70068c"
       },
       {
         "dest": "models/Xenova--whisper-base.en/onnx/encoder_model_quantized.onnx",
@@ -396,7 +404,7 @@
         "sha256": "141d612cc0a95ed7efc1ca936b845c2364967f2e9217c5dbfcf69fc4d6c65860"
       }
     ],
-    "models_comment": "The game's ship set (scripts/fetch-weights.mts), each file pinned to a Hugging Face commit; all 14 matched the developer's own copies when pinned (2026-10-28).",
+    "models_comment": "The game's ship set (scripts/fetch-weights.mts at the pinned commit), each file pinned to a Hugging Face commit. Since 2026-10-28 the NPC + Director model is LiquidAI LFM3-1.7B (the game is free, so the LFM Open License v1.0 revenue cap does not apply; its LICENSE ships beside the weights): GGUF sha256 = the HF tree API lfs.oid; tokenizer_config.json and LICENSE are not LFS, so their sha256 were taken from files whose git blob ids matched the tree API at those commits. The other 11 are unchanged from the previous pin.",
     "cmudict": {
       "_comment": "Source for the pronunciation lexicon. Placed in build-lexicon.mts's cache so it never fetches master; the built output is then checked against expected_output.",
       "commit": "74790861f652b15e4ac49015a90074ad62a27690",

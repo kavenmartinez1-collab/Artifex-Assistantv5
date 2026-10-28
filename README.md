@@ -254,7 +254,7 @@ python -m installer pack voice         # install one (shows the plan, asks first
 | `create` | Image, photo edit/restore, music, 3D and video (NVIDIA, 8 GB+, CUDA 12.8 driver) | ~3.5 GB packages + 11.5 GB image model (32 GB download, once) |
 | `web-search` | Web search through a hardened gateway + SearXNG in Docker (Docker Desktop must already be installed) | ~0.5 GB |
 | `webgpu` | Artifex Web, the in-browser WebGPU engine in `webgpu/` (uses your Node.js 20+, or downloads a pinned portable Node), with LFM3 1.7B ready to load: its launcher opens with `local/lfm3-1.7b` filled in | ~0.3 GB + 1.1 GB model (reuses the core install's copy when it has one) |
-| `game` | A Tale of Yarn, the WebGPU game: cloned at a pinned commit into `games/`, with its NPC model and voices (Git for Windows required) | ~0.6 GB + 1.3 GB models |
+| `game` | A Tale of Yarn, the WebGPU game: cloned at a pinned commit into `games/`, with its NPC model (LFM3 1.7B, licence included) and voices (Git for Windows required) | ~0.6 GB + 1.3 GB models |
 | `ollama` | Use an Ollama you already have as the backend (checks it isn't open to your network) | nothing |
 
 Each pack tests itself at the end (Piper speaks and Whisper transcribes it

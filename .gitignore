@@ -135,3 +135,6 @@ purge_extra.txt
 
 # portable Python fetched by setup.cmd (installer/get-python.ps1)
 /python/
+
+# games installed by the game pack (python -m installer pack game)
+/games/
