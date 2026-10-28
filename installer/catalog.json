@@ -245,6 +245,27 @@
     "size": 37748064,
     "sha256": "d2046d28c2c3dcd211ac5145c0bf30e2047ef9dfb306693c8c6e2eccd8b95fa5"
   },
+  "webgpu": {
+    "_comment": "Artifex Web's model: the chat_models entry named by `model` (same pinned GGUF) plus the tokenizer from the base repo, which the GGUF repo doesn't ship. Placed in webgpu/models/<model_dir>, which the app lists as local/<model_dir>. tokenizer.json sha256 = the Hugging Face tree API's lfs.oid at this commit; tokenizer_config.json is not LFS, so its sha256 was taken from the file whose git blob id matched the tree API's oid (562b1ed0...) at this commit.",
+    "model": "lfm3-1.7b",
+    "model_dir": "lfm3-1.7b",
+    "tokenizer": {
+      "repo": "LiquidAI/LFM3-1.7B",
+      "revision": "ac2586a34f1a1c03329dbdcdefabd8b6478ddaa7",
+      "files": [
+        {
+          "file": "tokenizer.json",
+          "size": 17908635,
+          "sha256": "7e226e34bface23ccf6e495d157bf77186c1c30a7659880e1a8994db528c3701"
+        },
+        {
+          "file": "tokenizer_config.json",
+          "size": 1545,
+          "sha256": "bf028f813efc6137bc07ed045cafe71820df9a5e26a38e39954706ed1e30a457"
+        }
+      ]
+    }
+  },
   "game": {
     "_comment": "A Tale of Yarn (the WebGPU game), cloned over https and checked out at this exact commit; git verifies the content by hash. Bump deliberately after reviewing the new commits.",
     "name": "A Tale of Yarn",

@@ -348,3 +348,72 @@ def test_node_and_game_are_pinned():
         assert re.fullmatch(r"[0-9a-f]{64}", m["sha256"]) and re.fullmatch(r"[0-9a-f]{40}", m["revision"])
         assert not set(m["dest"].split("/")) & {"", ".", ".."}
     assert "master" not in g["cmudict"]["base_url"]
+
+
+# ── Artifex Web's model (webgpu pack) ───────────────────────────────────────
+
+def test_artifex_web_model_is_pinned_and_path_safe():
+    cat = recipes.load_catalog()
+    w = cat["webgpu"]
+    spec = packs._webgpu_spec(cat)  # must name a chat_models entry
+    assert re.fullmatch(r"[0-9a-f]{64}", spec["sha256"])
+    assert re.fullmatch(r"[A-Za-z0-9._-]+", w["model_dir"]) and w["model_dir"] not in (".", "..")
+    tok = w["tokenizer"]
+    assert re.fullmatch(r"[0-9a-f]{40}", tok["revision"])
+    for f in tok["files"]:
+        assert re.fullmatch(r"[0-9a-f]{64}", f["sha256"]) and f["size"] > 0
+        assert re.fullmatch(r"[A-Za-z0-9._-]+", f["file"])
+        assert fetch.host_allowed(recipes._HF.format(repo=tok["repo"], revision=tok["revision"],
+                                                     file=f["file"]), cat["allowed_hosts"])
+    # A config.json beside the GGUF would make the app take the safetensors path.
+    assert "config.json" not in {f["file"] for f in tok["files"]}
+
+
+def _web_catalog(tmp_path, content=b"gguf bytes"):
+    import hashlib
+    spec = {"id": "m", "label": "Model M (small)", "repo": "org/M-GGUF", "revision": "a" * 40,
+            "file": "M.gguf", "size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+    tok = {"repo": "org/M", "revision": "b" * 40,
+           "files": [{"file": "tokenizer.json", "size": 2, "sha256": "c" * 64}]}
+    return {"chat_models": [spec], "allowed_hosts": ["huggingface.co"],
+            "webgpu": {"model": "m", "model_dir": "m-dir", "tokenizer": tok}}
+
+
+def test_artifex_web_reuses_the_core_models_verified_copy(monkeypatch, tmp_path):
+    cat = _web_catalog(tmp_path)
+    core = tmp_path / "models" / "gguf" / "M.gguf"
+    core.parent.mkdir(parents=True)
+    core.write_bytes(b"gguf bytes")
+    calls = []
+
+    def fake_download(url, dest, size, sha256, hosts, **k):
+        calls.append(url)
+        if dest.endswith(".gguf"):  # already in place: download() returns without fetching
+            assert fetch.file_matches(dest, size, sha256)
+        return dest
+    monkeypatch.setattr(packs.fetch, "download", fake_download)
+    assert packs._webgpu_model(str(tmp_path), cat, log=lambda *a: None) == "local/m-dir"
+    placed = tmp_path / "webgpu" / "models" / "m-dir" / "M.gguf"
+    assert placed.read_bytes() == b"gguf bytes" and not (tmp_path / "webgpu/models/m-dir/M.gguf.part").exists()
+    assert calls == ["https://huggingface.co/org/M-GGUF/resolve/" + "a" * 40 + "/M.gguf",
+                     "https://huggingface.co/org/M/resolve/" + "b" * 40 + "/tokenizer.json"]
+
+
+def test_artifex_web_ignores_a_core_copy_that_fails_its_hash(monkeypatch, tmp_path):
+    cat = _web_catalog(tmp_path)
+    core = tmp_path / "models" / "gguf" / "M.gguf"
+    core.parent.mkdir(parents=True)
+    core.write_bytes(b"tampered!!")  # same size, wrong content
+    fetched = []
+    monkeypatch.setattr(packs.fetch, "download", lambda url, dest, *a, **k: fetched.append(dest) or dest)
+    packs._webgpu_model(str(tmp_path), cat, log=lambda *a: None)
+    assert not (tmp_path / "webgpu/models/m-dir/M.gguf").exists()   # not linked/copied
+    assert fetched[0].endswith("M.gguf")                              # the pinned download instead
+
+
+def test_artifex_web_launcher_opens_with_the_model_filled_in(tmp_path):
+    node = tmp_path / "node" / "node.exe"
+    path = packs._web_launcher(str(tmp_path), "Artifex Web.cmd", str(tmp_path / "webgpu"), str(node),
+                               "http://127.0.0.1:5173/?model=local/lfm3-1.7b")
+    text = open(path, encoding="utf-8").read()
+    assert 'start "" "http://127.0.0.1:5173/?model=local/lfm3-1.7b"' in text

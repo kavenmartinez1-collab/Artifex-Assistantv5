@@ -521,11 +521,57 @@ def _web_launcher(root, name, project_dir, node, url):
 
 
 def webgpu_plan(root, catalog):
+    w = catalog["webgpu"]
+    spec = _webgpu_spec(catalog)
     return ["use your Node.js 20+ (or download the pinned portable Node.js)",
             "check webgpu/package-lock.json: every package from the npm registry with a "
             "sha512 integrity hash",
             "npm ci --ignore-scripts (exact versions, hashes checked, no install scripts)",
-            "check its servers bind 127.0.0.1 only, build it as a test, write 'Artifex Web.cmd'"]
+            f"put {spec['label'].split(' (')[0]} in webgpu/models/{w['model_dir']}: the core "
+            f"install's verified copy when it has one, else a pinned download "
+            f"({spec['size'] // (1 << 20)} MB), plus its pinned tokenizer files",
+            "check its servers bind 127.0.0.1 only, build it as a test, write 'Artifex Web.cmd' "
+            f"(it opens with local/{w['model_dir']} filled in)"]
+
+
+def _webgpu_spec(catalog):
+    w = catalog["webgpu"]
+    return next(m for m in catalog["chat_models"] if m["id"] == w["model"])
+
+
+def _webgpu_model(root, catalog, log=print):
+    """Artifex Web's model: the pinned GGUF + tokenizer in webgpu/models/<dir>."""
+    w, spec, hosts = catalog["webgpu"], _webgpu_spec(catalog), catalog["allowed_hosts"]
+    dest_dir = os.path.join(root, "webgpu", "models", w["model_dir"])
+    os.makedirs(dest_dir, exist_ok=True)
+    gguf = os.path.join(dest_dir, spec["file"])
+    core = os.path.join(root, "models", "gguf", spec["file"])
+    if (not fetch.file_matches(gguf, spec["size"], spec["sha256"])
+            and fetch.file_matches(core, spec["size"], spec["sha256"])):
+        # Same verified file: hard-link it (no second copy on disk), else copy;
+        # either way it lands under a temporary name and is re-verified first.
+        tmp = gguf + ".part"
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        try:
+            os.link(core, tmp)
+            log(f"{spec['file']}: linked the core install's verified copy")
+        except OSError:
+            log(f"{spec['file']}: copying the core install's verified copy")
+            shutil.copyfile(core, tmp)
+        if not fetch.file_matches(tmp, spec["size"], spec["sha256"]):
+            os.remove(tmp)
+            raise fetch.VerifyError(f"{spec['file']}: the copy does not match its pinned hash")
+        os.replace(tmp, gguf)
+    if not fetch.file_matches(gguf, spec["size"], spec["sha256"]):
+        log(f"downloading {spec['file']} ({spec['size'] // (1 << 20)} MB) for Artifex Web")
+    fetch.download(recipes._HF.format(**spec), gguf, spec["size"], spec["sha256"], hosts)
+    tok = w["tokenizer"]
+    for f in tok["files"]:
+        fetch.download(recipes._HF.format(repo=tok["repo"], revision=tok["revision"], file=f["file"]),
+                       os.path.join(dest_dir, f["file"]), f["size"], f["sha256"], hosts)
+    log(f"Artifex Web model ready: local/{w['model_dir']}")
+    return "local/" + w["model_dir"]
 
 
 def install_webgpu(root, catalog, log=print, run=subprocess.run, prefer_portable=False):
@@ -539,7 +585,9 @@ def install_webgpu(root, catalog, log=print, run=subprocess.run, prefer_portable
     npm(node, cli, ["ci", "--ignore-scripts"], proj, run)
     log("building it as a test (tsc + vite build)")
     npm(node, cli, ["run", "build"], proj, run)
-    return [_web_launcher(root, "Artifex Web.cmd", proj, node, "http://127.0.0.1:5173/")]
+    model = _webgpu_model(root, catalog, log)
+    return [_web_launcher(root, "Artifex Web.cmd", proj, node,
+                          "http://127.0.0.1:5173/?model=" + model)]
 
 
 def game_plan(root, catalog):

@@ -21,6 +21,44 @@
 
 All glory to **Jesus Christ**, through whom all things were made and in whom all wisdom dwells.
 
+## Install in 4 steps (Windows)
+
+1. **Get Python.** Install Python 3.12 from
+   [python.org/downloads](https://www.python.org/downloads/). On the first
+   screen, tick **"Add python.exe to PATH"**, then click **Install Now**.
+2. **Get Artifex.** On this page click the green **Code** button →
+   **Download ZIP**, then unzip it (right-click → **Extract All**).
+3. **Run the installer.** Open the unzipped folder, click the address bar at
+   the top of the window, type `cmd` and press **Enter**. In the black window
+   that opens, type:
+
+   ```
+   python -m installer install
+   ```
+
+   It looks at your PC, shows exactly what it will install and asks before
+   doing anything. Type `y` and press **Enter**. It picks the right engine
+   for your graphics card and a chat model that fits it (a few minutes, plus
+   the model download).
+4. **Start Artifex.** Double-click **Artifex GUI.cmd** in the same folder
+   (or **Artifex CLI.cmd** for the terminal version).
+
+**Optional extras**, any time later, from the same black window:
+
+| Want to... | Type |
+|---|---|
+| See the extras | `python -m installer packs` |
+| Talk and listen (voice) | `python -m installer pack voice` |
+| Show it pictures | `python -m installer pack vision` |
+| Make images, music, 3D | `python -m installer pack create` |
+| Run AI in your web browser (Artifex Web, with LFM3) | `python -m installer pack webgpu` |
+| Use it from your phone, safely | `python -m installer remote setup` |
+| Check nothing is exposed to the internet | `python -m installer remote check` |
+
+Everything it downloads is pinned and checksum-verified, it needs no admin
+rights, and everything stays on 127.0.0.1 (your phone reaches it only over
+your private Tailscale network). Details: [Setup Guide](#setup-guide).
+
 ---
 
 Universal Local AI Hosting Platform. Run any AI model locally — text generation, image generation, 3D, vision, audio, music, video, and more. Supports three inference backends (HuggingFace Transformers, Ollama, and llama.cpp) with automatic VRAM management, plus an experimental WebGPU browser-based inference engine.
@@ -33,6 +71,7 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 
 ## Table of Contents
 
+- [Install in 4 steps (Windows)](#install-in-4-steps-windows)
 - [Features](#features)
 - [Verified Test Results](#verified-test-results-2026-03-22)
 - [Supported GPU Tiers](#supported-gpu-tiers)
@@ -125,6 +164,7 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 | WebGPU vision (Qwen3.6 GGUF) | PASS | 27B + mmproj reads fine print off a trading card (set code, serial, 1st-edition stamp) on a consumer GPU |
 | WebGPU multi-turn chat | PASS | Sliding-window context + compression + sessions, 29/29 byte-identical vs the Python reference implementations |
 | WebGPU TurboQuant on 27B | PASS | Greedy exact-f32 vs 3-bit compressed KV: 42/64 tokens identical, first divergence a top-2 near-tie (acceptable lossy KV) |
+| WebGPU LFM3 1.7B (2026-10-28) | PASS | Gated short-conv + sliding-window + global attention hybrid: tokenizer/template exact, 72/72 teacher-forced argmax vs llama.cpp b11945, top-5 probabilities inside llama.cpp's own CPU-vs-CUDA spread (`scripts/test-lfm3-parity.mts`); ~50 tok/s decode, ~220 tok/s prefill on an RDNA2 GPU |
 | Localhost binding | PASS | Confirmed NOT accessible on LAN IP |
 
 ## Supported GPU Tiers
@@ -198,7 +238,7 @@ python -m installer pack voice         # install one (shows the plan, asks first
 | `vision` | Image understanding for your chat model, plus a CPU vision helper (LFM3-VL) that lets Create's AI prompt see your photo | ~1.2-2.1 GB |
 | `create` | Image, photo edit/restore, music, 3D and video (NVIDIA, 8 GB+, CUDA 12.8 driver) | ~3.5 GB packages + 11.5 GB image model (32 GB download, once) |
 | `web-search` | Web search through a hardened gateway + SearXNG in Docker (Docker Desktop must already be installed) | ~0.5 GB |
-| `webgpu` | Artifex Web, the in-browser WebGPU engine in `webgpu/` (uses your Node.js 20+, or downloads a pinned portable Node) | ~0.3 GB |
+| `webgpu` | Artifex Web, the in-browser WebGPU engine in `webgpu/` (uses your Node.js 20+, or downloads a pinned portable Node), with LFM3 1.7B ready to load: its launcher opens with `local/lfm3-1.7b` filled in | ~0.3 GB + 1.1 GB model (reuses the core install's copy when it has one) |
 | `game` | A Tale of Yarn, the WebGPU game: cloned at a pinned commit into `games/`, with its NPC model and voices (Git for Windows required) | ~0.6 GB + 1.3 GB models |
 | `ollama` | Use an Ollama you already have as the backend (checks it isn't open to your network) | nothing |
 
