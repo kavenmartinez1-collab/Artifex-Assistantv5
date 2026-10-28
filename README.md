@@ -155,38 +155,123 @@ You do **not** need to install CUDA separately — PyTorch bundles the CUDA runt
 
 ## Setup Guide
 
-### Quick start: the installer (Windows, llama.cpp backend)
+### Quick start: the installer (Windows)
 
-The installer looks at your PC and installs a prebuilt llama.cpp server for
-your GPU plus a chat model that fits it. It needs only Python, makes no
-admin or PATH changes, and puts everything under this folder.
+The installer looks at your PC, then installs a working Artifex for it: a
+prebuilt llama.cpp server for your GPU, a chat model that fits it, a small
+Python environment (no PyTorch), and launchers. It needs only Python 3.11 to
+3.13 (from python.org), makes no admin or PATH changes, and puts everything
+under this folder. About a minute plus the model download.
 
 ```bash
+git clone <repo-url> && cd <repo>
 python -m installer probe      # what this PC has (no network)
 python -m installer plan       # what it would install, and why
 python -m installer install    # shows the plan, asks, then installs
-python -m installer install --reuse D:\models   # use model files you already have
 ```
 
-| Your PC | Backend | Model |
+Then double-click **Artifex CLI.cmd**, **Artifex GUI.cmd**, or
+**Artifex API (this PC only).cmd**.
+
+| Your PC | Backend | Chat model |
 |---|---|---|
-| NVIDIA, driver with CUDA 13 | llama.cpp CUDA 13 | by VRAM, below |
-| NVIDIA RTX 20/30/40, driver with CUDA 12.4+ | llama.cpp CUDA 12 | by VRAM |
-| AMD / Intel, or an older NVIDIA driver | llama.cpp Vulkan | by VRAM |
+| NVIDIA, driver with CUDA 13 | llama.cpp CUDA 13 | by video memory, below |
+| NVIDIA RTX 20/30/40, driver with CUDA 12.4+ | llama.cpp CUDA 12 | by video memory |
+| AMD / Intel, or an older NVIDIA driver | llama.cpp Vulkan | by video memory |
 | No GPU with 2 GB+ | llama.cpp CPU | LFM3 1.7B |
-| 16 GB+ / 8 GB+ / less VRAM | | Qwen3.8 27B / Qwen3.5 9B / LFM3 1.7B |
+| 16 GB+ / 8 GB+ / less | | Qwen3.8 27B / Qwen3.5 9B / LFM3 1.7B |
 
-Safety: every file the installer can download is listed in
-`installer/catalog.json` with a fixed version and a SHA-256 checksum stored in
-this repo. Downloads must be HTTPS from GitHub or Hugging Face (redirects
-included); a file that doesn't match its checksum is deleted and the install
-stops. Archives are checked before unpacking, so nothing can be written
-outside the install folder. Nothing downloaded is run during the install
-except the verified `llama-server --version` check. An existing
-`llama_cpp_config.json` is backed up and only added to; your entries are
-never changed.
+Useful options: `--reuse D:\models` (use model files you already have; they
+are recognised by checksum, not name), `--model <id>`, `--variant cpu|vulkan|cuda-12.4|cuda-13.4`,
+`--no-gui` (skip the desktop GUI, ~100 MB), `--yes` (don't ask).
 
-The Python environment for the API itself is still set up as below.
+#### Packs (optional extras)
+
+```bash
+python -m installer packs              # list them
+python -m installer pack voice         # install one (shows the plan, asks first)
+```
+
+| Pack | What it adds | Size |
+|---|---|---|
+| `voice` | Phone dictation (Whisper small.en) and read-aloud (Piper), on the CPU | ~0.75 GB |
+| `vision` | Image understanding for your chat model, plus a CPU vision helper (LFM3-VL) that lets Create's AI prompt see your photo | ~1.2-2.1 GB |
+| `create` | Image, photo edit/restore, music, 3D and video (NVIDIA, 8 GB+, CUDA 12.8 driver) | ~3.5 GB packages + 11.5 GB image model (32 GB download, once) |
+| `web-search` | Web search through a hardened gateway + SearXNG in Docker (Docker Desktop must already be installed) | ~0.5 GB |
+| `webgpu` | Artifex Web, the in-browser WebGPU engine in `webgpu/` (uses your Node.js 20+, or downloads a pinned portable Node) | ~0.3 GB |
+| `game` | A Tale of Yarn, the WebGPU game: cloned at a pinned commit into `games/`, with its NPC model and voices (Git for Windows required) | ~0.6 GB + 1.3 GB models |
+| `ollama` | Use an Ollama you already have as the backend (checks it isn't open to your network) | nothing |
+
+Each pack tests itself at the end (Piper speaks and Whisper transcribes it
+back; the vision helper describes a test picture; Create renders an image).
+
+#### Phone access (Tailscale) and the exposure check
+
+```bash
+python -m installer remote setup   # Tailscale + API key + tailnet-only forward
+python -m installer remote check   # any time: is anything reachable that shouldn't be?
+```
+
+`remote setup` installs Tailscale if needed (pinned version, checksum and
+Windows code signature from Tailscale Inc. checked; Windows asks you to
+approve it), creates a random API key in `artifex_api_key.txt`, and forwards
+your tailnet's port 8000 to `127.0.0.1:8000` with `tailscale serve`. Artifex
+itself keeps listening on 127.0.0.1 only, so it is reachable from your own
+tailnet devices and nothing else. It never uses Tailscale Funnel, which
+publishes to the internet.
+
+`remote check` changes nothing. It reports FAIL for any Artifex-related port
+(API, llama.cpp, Ollama, web gateway, vision helper) listening on your
+network, for Funnel being on, and for a tailnet-reachable API without a
+strong key; it warns about an outdated Tailscale and a missing Tailnet Lock.
+
+#### How the installer keeps you safe
+
+An installer downloads and runs code, which makes it a supply-chain target,
+so it is built to refuse anything it can't verify:
+
+- **Pinned files.** Every file it can fetch is listed in
+  `installer/catalog.json` (or `installer/qwen-image-manifest.json`) with a
+  fixed release or commit, its size and its SHA-256, stored in this repo, not
+  fetched from the server. A file that doesn't match is deleted and the
+  install stops.
+- **Pinned Python packages.** Every package, dependencies included, is in a
+  lock file (`installer/requirements-*.txt`) with its PyPI (or PyTorch) hash.
+  pip runs with `--require-hashes --only-binary=:all: --isolated`: a changed
+  file is refused, no package's setup code runs, and no pip config can add a
+  download source. One tampered hash and nothing at all is installed.
+- **npm without install scripts.** The web packs use `npm ci --ignore-scripts`:
+  exact lockfile versions, every package checked against its sha512
+  integrity hash, the lockfile audited first (registry packages only, plus
+  git dependencies pinned to a full commit), and no package's install code
+  runs. npm is started through `node`, never `npm.cmd`, so no `cmd.exe`
+  argument parsing is involved. Git runs over https only, without repo hooks.
+- **Allow-listed hosts only.** HTTPS to GitHub, Hugging Face, PyPI, the
+  PyTorch index, nodejs.org and pkgs.tailscale.com, checked again on every redirect.
+- **Safe unpacking.** Archives are checked before unpacking (no `..`,
+  absolute paths, drive letters or links), so nothing lands outside the
+  install folder.
+- **Nothing improvised.** No `shell=True`, no `eval`, no admin rights, no
+  PATH changes, services or autostart. Things that need admin or carry their
+  own licence (Docker Desktop, Ollama) are never installed for you.
+- **Your setup is left alone.** An existing `llama_cpp_config.json` is backed
+  up and only added to; an existing `venv` that the installer didn't create
+  is never modified.
+- **Local by default.** Every launcher and every Docker port binds to
+  127.0.0.1. Remote access goes through Tailscale on purpose, never through
+  `0.0.0.0` or a router port-forward.
+
+Models a Create tool downloads on first use (music, 3D, video) are loaded at
+a pinned commit (`_HUB_REVISIONS` in `core/services/media_tools.py`), and the
+photo-restore weights are checked against pinned hashes before loading.
+
+To change a pin (a new llama.cpp, model or package version), edit the pin and
+regenerate: `python -m installer.make_locks <name> <pins file>` for packages;
+release digests and Hugging Face commits for files. Never take a hash from the
+downloaded file itself.
+
+The manual setup below still works if you'd rather do it by hand, or need the
+full install with every backend.
 
 ### Step 1: Clone and Create Virtual Environment
 
@@ -412,7 +497,7 @@ python main_api.py --backend transformers --model qwen3.6-27b --gateway http://l
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--host` | `127.0.0.1` | Bind address (use `0.0.0.0` for network access) |
+| `--host` | `127.0.0.1` | Bind address. Keep `127.0.0.1`; for access from other devices use Tailscale (see below), not `0.0.0.0` |
 | `--port` | `8000` | Server port |
 | `--backend` | auto-detect | `ollama`, `transformers`, or `llama_cpp` |
 | `--model` | auto-detect | Model name (folder name for transformers, Ollama name for ollama, config key for llama_cpp) |
@@ -450,7 +535,7 @@ python main_api.py --backend transformers --model qwen3.6-27b --gateway http://l
 | DELETE | `/v1/files/{file_id}` | Delete a file |
 | GET | `/docs` | Interactive Swagger API documentation |
 
-**LAN access:** Use `--host 0.0.0.0` to bind to all interfaces. CORS is configured to accept `192.168.x.x` origins. Set `ARTIFEX_CORS_ORIGINS` env var for additional origins.
+**Access from other devices:** keep `--host 127.0.0.1` and use Tailscale (`python -m installer remote setup`, or [Remote Access](#remote-access-phone--tailnet)). Binding to `0.0.0.0` puts the API on every network interface: your whole LAN can reach it, and so can the internet if a router forwards the port. If you must use it on a trusted LAN, set an API key first and run `python -m installer remote check` afterwards. CORS accepts `192.168.x.x` origins; set `ARTIFEX_CORS_ORIGINS` for others.
 
 ### Example Requests
 
@@ -540,6 +625,12 @@ If `ARTIFEX_API_KEY` is not set, no authentication is required.
 ---
 
 ## Remote Access (Phone / Tailnet)
+
+> **Quickest safe setup:** `python -m installer remote setup` (Tailscale, an
+> API key, and a tailnet-only forward to 127.0.0.1), then
+> `python -m installer remote check` any time to confirm nothing is reachable
+> from your network or the internet. Details in the
+> [installer section](#quick-start-the-installer-windows).
 
 The API ships a self-contained phone client at **`/app`** — chat with web
 search, server-synced sessions, a file browser, and full agent runs
@@ -1109,6 +1200,18 @@ docker compose --profile full --profile ollama up
 # Custom environment
 ARTIFEX_API_KEY=your-key CUDA_VISIBLE_DEVICES=0 docker compose --profile full up
 ```
+
+### Docker security
+
+Every port in `docker-compose.yml` is published on `127.0.0.1` only, including
+the `full` (Artifex API) and `ollama` profiles, which earlier versions
+published on every interface. Ollama has no password and the gateway runs
+without auth, so neither should ever be reachable from the network; reach the
+API from other devices through Tailscale. Images are pinned by digest
+(SearXNG, Ollama, and the base images in both Dockerfiles), and the web
+gateway installs hash-locked packages (`web-gateway/requirements.lock.txt`).
+To update a pinned image, look up the new digest
+(`docker buildx imagetools inspect <image>:<tag>`) and change it deliberately.
 
 ### Docker Profiles
 
@@ -1710,6 +1813,8 @@ See [LEARNING.md](LEARNING.md) for a deep-dive walkthrough of the architecture, 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ARTIFEX_API_KEY` | *(none)* | API authentication key (optional) |
+| `ARTIFEX_TRUST_REMOTE_CODE` | *(off)* | `1` lets transformers run Python files from a model's own Hugging Face repo when it loads. Off by default: every model Artifex uses has a built-in class. Only turn it on for a model whose repo code you have read, pinned to a commit. |
+| `ARTIFEX_BACKEND` | *(auto)* | Backend for the CLI/GUI: `llama_cpp`, `ollama`, `transformers`… Default: `llama_cpp` when PyTorch isn't installed and llama.cpp models are configured, else `transformers`. |
 | `CUDA_VISIBLE_DEVICES` | `0` | GPU device index (for multi-GPU systems) |
 | `CUDA_MODULE_LOADING` | `LAZY` | Deferred CUDA kernel compilation (saves ~300-400 MB VRAM) |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True,garbage_collection_threshold:0.8` | CUDA memory allocation tuning |
