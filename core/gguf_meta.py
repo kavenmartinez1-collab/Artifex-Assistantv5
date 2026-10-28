@@ -47,6 +47,7 @@ class GGUFInfo:
     key_length: int = 0
     value_length: int = 0
     full_attention_interval: int = 1
+    kv_layer_count: int = 0              # from a per-layer head_count_kv array (0 = not per-layer)
     nextn_predict_layers: int = 0        # MTP draft head layers (0 = none)
     sliding_window: int = 0              # >0: some layers use sliding-window attention
     is_projector: bool = False           # a vision projector (mmproj), not a language model
@@ -59,6 +60,8 @@ class GGUFInfo:
         """Layers that hold a KV cache (hybrid models keep KV on every Nth layer)."""
         if not self.block_count:
             return 0
+        if self.kv_layer_count:          # LFM-style hybrid: conv layers carry no KV
+            return self.kv_layer_count
         # nextn (MTP) layers are counted in block_count but carry their own draft KV.
         base = self.block_count - self.nextn_predict_layers
         if self.full_attention_interval > 1:
@@ -173,6 +176,9 @@ def read_gguf(path: str, tensors: bool = True) -> GGUFInfo:
         info.context_length = int(a("context_length"))
         info.head_count = int(a("attention.head_count"))
         info.head_count_kv = int(a("attention.head_count_kv")) or info.head_count
+        kv_per_layer = meta.get(f"{arch}.attention.head_count_kv")
+        if isinstance(kv_per_layer, list):
+            info.kv_layer_count = sum(1 for h in kv_per_layer if h)
         info.key_length = int(a("attention.key_length"))
         info.value_length = int(a("attention.value_length"))
         info.full_attention_interval = int(a("full_attention_interval", 1)) or 1

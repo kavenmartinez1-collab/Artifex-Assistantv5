@@ -203,15 +203,34 @@ def read_gguf_kv_params(gguf_path: str) -> Optional[dict]:
     else:
         attn_layer_count = block_count
 
+    head_count_kv, attn_layer_count = per_layer_kv_heads(
+        found.get("attention.head_count_kv", hc), attn_layer_count)
+
     return {
         "head_count": hc,
-        "head_count_kv": found.get("attention.head_count_kv", hc),
+        "head_count_kv": head_count_kv,
         "key_dim": key_dim,
         "val_dim": found.get("attention.value_length", key_dim),
         "block_count": block_count,
         "full_attention_interval": full_attention_interval,
         "attn_layer_count": attn_layer_count,
     }
+
+
+def per_layer_kv_heads(head_count_kv, attn_layer_count: int) -> tuple:
+    """Normalise attention.head_count_kv to (kv_heads, attn_layers).
+
+    Hybrid models like LFM2/LFM3 store it per layer, with 0 on the layers
+    that are convolutions and hold no KV cache (LFM3-1.7B: 11 of 24 layers
+    are attention). The callers multiply attn_layers * kv_heads, which a
+    list cannot do, so count only the KV-holding layers.
+    """
+    if isinstance(head_count_kv, (list, tuple)):
+        kv_layers = [int(h) for h in head_count_kv if h]
+        if not kv_layers:
+            return 0, 0
+        return max(kv_layers), len(kv_layers)
+    return head_count_kv, attn_layer_count
 
 
 # ── GPU Pool Singleton ─────────────────────────────────────────────────

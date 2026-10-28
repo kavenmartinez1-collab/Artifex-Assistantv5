@@ -197,9 +197,13 @@ def _read_gguf_kv_params(gguf_path: str) -> dict | None:
     else:
         attn_layer_count = block_count
 
+    from core.gpu_pool import per_layer_kv_heads
+    head_count_kv, attn_layer_count = per_layer_kv_heads(
+        found.get("attention.head_count_kv", hc), attn_layer_count)
+
     return {
         "head_count": hc,
-        "head_count_kv": found.get("attention.head_count_kv", hc),
+        "head_count_kv": head_count_kv,
         "key_dim": key_dim,
         "val_dim": found.get("attention.value_length", key_dim),
         "block_count": block_count,
@@ -733,7 +737,10 @@ class LlamaCppEngine(BaseEngine):
         # can restore the previous tier and tell the user.
         exact_request = self._target_exact
         gate_timeout = DEFAULT_VRAM_WAIT_TIMEOUT
-        while True:
+        # -ngl 0 puts nothing on a GPU (a CPU-only helper such as LFM3), so
+        # there is no VRAM to gate. Charging it the GPU estimate would refuse
+        # or step down a model that never touches the card.
+        while self.num_gpu_layers:
             try:
                 self._vram_gate(pool, gpu_index, wait_timeout=gate_timeout)
                 break
@@ -890,7 +897,8 @@ class LlamaCppEngine(BaseEngine):
                         "llama-server ready: %s (port %d, ctx %d, ngl %d)",
                         self.model_name, self.port, self._num_ctx, self.num_gpu_layers,
                     )
-                    self._check_resident_after_load(pool)
+                    if self.num_gpu_layers:
+                        self._check_resident_after_load(pool)
                     if status_callback:
                         status_callback(
                             f"llama-server ready — {self.model_name} (ctx={self._num_ctx})"
