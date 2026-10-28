@@ -155,6 +155,39 @@ You do **not** need to install CUDA separately — PyTorch bundles the CUDA runt
 
 ## Setup Guide
 
+### Quick start: the installer (Windows, llama.cpp backend)
+
+The installer looks at your PC and installs a prebuilt llama.cpp server for
+your GPU plus a chat model that fits it. It needs only Python, makes no
+admin or PATH changes, and puts everything under this folder.
+
+```bash
+python -m installer probe      # what this PC has (no network)
+python -m installer plan       # what it would install, and why
+python -m installer install    # shows the plan, asks, then installs
+python -m installer install --reuse D:\models   # use model files you already have
+```
+
+| Your PC | Backend | Model |
+|---|---|---|
+| NVIDIA, driver with CUDA 13 | llama.cpp CUDA 13 | by VRAM, below |
+| NVIDIA RTX 20/30/40, driver with CUDA 12.4+ | llama.cpp CUDA 12 | by VRAM |
+| AMD / Intel, or an older NVIDIA driver | llama.cpp Vulkan | by VRAM |
+| No GPU with 2 GB+ | llama.cpp CPU | LFM3 1.7B |
+| 16 GB+ / 8 GB+ / less VRAM | | Qwen3.8 27B / Qwen3.5 9B / LFM3 1.7B |
+
+Safety: every file the installer can download is listed in
+`installer/catalog.json` with a fixed version and a SHA-256 checksum stored in
+this repo. Downloads must be HTTPS from GitHub or Hugging Face (redirects
+included); a file that doesn't match its checksum is deleted and the install
+stops. Archives are checked before unpacking, so nothing can be written
+outside the install folder. Nothing downloaded is run during the install
+except the verified `llama-server --version` check. An existing
+`llama_cpp_config.json` is backed up and only added to; your entries are
+never changed.
+
+The Python environment for the API itself is still set up as below.
+
 ### Step 1: Clone and Create Virtual Environment
 
 ```bash

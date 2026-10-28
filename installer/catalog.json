@@ -1,0 +1,89 @@
+{
+  "_comment": "Every file the installer may download. Pinned: a fixed release tag or a Hugging Face commit, the exact size and the SHA-256, all stored HERE in the repo, so a swapped file on the server is refused rather than run. To add or bump an entry, take the digest from the GitHub release API (asset.digest) or the Hugging Face tree API at a commit (lfs.oid), never from the download itself.",
+  "schema": 1,
+  "llama_cpp": {
+    "tag": "b11945",
+    "base_url": "https://github.com/ggml-org/llama.cpp/releases/download/b11945/",
+    "variants": {
+      "cuda-13.4": {
+        "label": "NVIDIA CUDA 13",
+        "files": [
+          {"name": "llama-b11945-bin-win-cuda-13.4-x64.zip", "size": 164817929,
+           "sha256": "590b7fd0a85ffea0ca09419a60d31fa5e38126a6a0eba42b12cd76a4f00f8761"},
+          {"name": "cudart-llama-bin-win-cuda-13.4-x64.zip", "size": 423535356,
+           "sha256": "738f8c251ac22b70c3ae6f83a10cf222725df0395246a2cf58f32bdb85fbe668"}
+        ]
+      },
+      "cuda-12.4": {
+        "label": "NVIDIA CUDA 12",
+        "files": [
+          {"name": "llama-b11945-bin-win-cuda-12.4-x64.zip", "size": 279503533,
+           "sha256": "1227c700c4f1687d85da15c83eb00df70e9219d30890d27f9543d2af082a12b2"},
+          {"name": "cudart-llama-bin-win-cuda-12.4-x64.zip", "size": 391443627,
+           "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"}
+        ]
+      },
+      "vulkan": {
+        "label": "Vulkan (AMD, Intel, or NVIDIA without a new enough driver)",
+        "files": [
+          {"name": "llama-b11945-bin-win-vulkan-x64.zip", "size": 37240393,
+           "sha256": "3b9ccbffb6b293860de1dfb9942eae48806166a12266708898021a8d2e34da67"}
+        ]
+      },
+      "cpu": {
+        "label": "CPU only",
+        "files": [
+          {"name": "llama-b11945-bin-win-cpu-x64.zip", "size": 24314391,
+           "sha256": "c420f05240e1af28c2194b9a4741ef797142a0cca783c6079be792de88e72d78"}
+        ]
+      }
+    }
+  },
+  "chat_models": [
+    {
+      "id": "lfm3-1.7b",
+      "label": "LFM3 1.7B (small and fast; runs on any PC)",
+      "repo": "LiquidAI/LFM3-1.7B-GGUF",
+      "revision": "4b423c332fd97961416f2e8b69467758fd27370d",
+      "file": "LFM3-1.7B-Q4_K_M.gguf",
+      "size": 1099627808,
+      "sha256": "3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4",
+      "license": "LFM Open License v1.0 (LiquidAI; check commercial terms)",
+      "min_vram_mb": 0,
+      "num_ctx": 32768,
+      "native_tools": true,
+      "extra_flags": ["-fa", "on", "-np", "1", "--jinja", "--metrics",
+                      "--reasoning-budget", "2048", "--reasoning-budget-message", "Time to answer."]
+    },
+    {
+      "id": "qwen3.5-9b-q4km",
+      "label": "Qwen3.5 9B (good all-rounder for 8-12 GB cards)",
+      "repo": "bartowski/Qwen_Qwen3.5-9B-GGUF",
+      "revision": "182be2fd6c7bc44887d88a91cb03ff009cc9f549",
+      "file": "Qwen_Qwen3.5-9B-Q4_K_M.gguf",
+      "size": 6169341984,
+      "sha256": "d784ce9eda1a5a7b51e8f705a9e6310844bf4f173654d115823c775fdea56d43",
+      "license": "Apache-2.0",
+      "min_vram_mb": 7500,
+      "num_ctx": 32768,
+      "extra_flags": ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "-np", "1", "--jinja",
+                      "--reasoning-format", "deepseek", "--metrics"]
+    },
+    {
+      "id": "qwen3.8-27b-q3km",
+      "label": "Qwen3.8 27B (strongest; needs a 16 GB+ card)",
+      "repo": "bartowski/Qwen3.8-27B-GGUF",
+      "revision": "87410e7b9a5c21e6ca70c0c9cc5237de909fe621",
+      "file": "Qwen3.8-27B-Q3_K_M.gguf",
+      "size": 13404051168,
+      "sha256": "14865aaef0b6c26a013538782d366443c7298b11d5df9f0fb829d34d1963f869",
+      "license": "Apache-2.0",
+      "min_vram_mb": 15500,
+      "num_ctx": 32768,
+      "extra_flags": ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "-np", "1", "--jinja",
+                      "--reasoning-format", "deepseek", "--metrics"]
+    }
+  ],
+  "allowed_hosts": ["github.com", ".githubusercontent.com",
+                    "huggingface.co", ".huggingface.co", ".hf.co"]
+}

@@ -123,3 +123,6 @@ vendor/
 agent_bench/workspace/
 agent_bench/results/
 purge_extra.txt
+
+# Installer downloads (prebuilt llama.cpp servers): python -m installer
+/runtime/
