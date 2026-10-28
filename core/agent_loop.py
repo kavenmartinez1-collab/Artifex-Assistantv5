@@ -22,6 +22,7 @@ ratchet, circuit breaker, and human gate apply at ALL levels.
 import logging
 import re
 import threading
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -292,6 +293,10 @@ class AgentRunner:
         self._done_holds = 0
         self._notes: List[str] = []
         self._repo_map = ""
+        # Native tool calling (core.native_agent_tools): the engine entry is
+        # marked native_tools and its generate_streaming takes `tools`.
+        self._native = self._engine_takes_tools()
+        self._last_calls: list = []
 
     # ── public ──────────────────────────────────────────────────────────────
 
@@ -358,13 +363,53 @@ class AgentRunner:
                 # Engine failure, not a model choice — don't report a clean
                 # "done" (empty resp with no actions would read as one).
                 return self._finish(f"stopped:error:{self._gen_error}", history)
-            history.append({"role": "assistant", "content": resp})
+            calls = self._last_calls if self._native else []
+            if calls:
+                call_ids = [c.get("id") or f"call_{rnd}_{i}" for i, c in enumerate(calls)]
+                history.append({"role": "assistant", "content": resp, "tool_calls": [
+                    {"id": call_ids[i], "type": "function",
+                     "function": {"name": c.get("name", ""),
+                                  "arguments": c.get("arguments") or "{}"}}
+                    for i, c in enumerate(calls)]})
+            else:
+                history.append({"role": "assistant", "content": resp})
             if self.km:
                 self._safe(lambda: self.km.add_from_ai_response(resp))
-            self.emit(AgentEvent("assistant_message", text=resp, round=rnd))
+            if resp.strip() or not calls:
+                self.emit(AgentEvent("assistant_message", text=resp, round=rnd))
 
-            done = detect_done(resp)
-            actions = extract_agent_actions(resp)
+            if calls:
+                # Each call becomes the AgentAction the text parser would
+                # have made (or an error / finish). call_slots keeps the
+                # call order so every call gets its own tool result.
+                from core.native_agent_tools import call_to_action
+                actions, call_slots, done = [], [], None
+                for c in calls:
+                    act, err, fin = call_to_action(c)
+                    if act is not None:
+                        call_slots.append(len(actions))
+                        actions.append(act)
+                    elif fin is not None:
+                        done = fin
+                        call_slots.append("finish")
+                    else:
+                        call_slots.append("[tool error] " + err)
+                if done is not None and not actions:
+                    hold = self._hold_done()
+                    if hold:
+                        self._native_feedback(history, call_ids, call_slots, [], hold)
+                        continue
+                    self.emit(AgentEvent("done", summary=done, round=rnd))
+                    return self._finish("done", history, done)
+                if not actions:
+                    # Every call was malformed: answer each one and retry.
+                    self.emit(AgentEvent("format_retry", round=rnd,
+                                         reason="tool call with bad arguments"))
+                    self._native_feedback(history, call_ids, call_slots, [], "")
+                    continue
+            else:
+                done = detect_done(resp)
+                actions = extract_agent_actions(resp)
             if done is None and not actions:
                 # No actions and no @done. Distinguish "model is finished and
                 # says so in prose" from "model TRIED to act but the call was
@@ -592,8 +637,11 @@ class AgentRunner:
                     return self._finish("stopped:gate", history)
                 self.gate.acknowledge_gate(rnd)
 
-            history.append({"role": "user",
-                            "content": self._fit_feedback(self._feedback(outputs))})
+            if calls:
+                self._native_feedback(history, call_ids, call_slots, outputs, "")
+            else:
+                history.append({"role": "user",
+                                "content": self._fit_feedback(self._feedback(outputs))})
 
             # @done arrived alongside the actions we just ran. Honor it only if
             # every action actually succeeded; otherwise drop back into the
@@ -643,8 +691,17 @@ class AgentRunner:
         except Exception as e:
             _log.warning("build_system_prompt failed: %s", e)
             base = ""
-        content = (build_autonomous_prompt(base, self.goal, repo_map=self._repo_map)
-                   if self.config.framing else base)
+        if self._native:
+            # The base prompt documents the @marker protocol at length; a
+            # model calling real tools only needs the loop rules, the
+            # machine facts and the goal.
+            from core.native_agent_tools import build_native_agent_prompt
+            from core.prompts import _environment_note
+            content = build_native_agent_prompt(
+                self._safe_env_note(_environment_note), os.getcwd(), self.goal)
+        else:
+            content = (build_autonomous_prompt(base, self.goal, repo_map=self._repo_map)
+                       if self.config.framing else base)
         if history and history[0].get("role") == "system":
             history[0]["content"] = content
         else:
@@ -685,6 +742,9 @@ class AgentRunner:
                     "compacted", round=self._round,
                     reason=f"hard-trimmed to ~{info['est']} tok "
                            f"(budget {info['budget']} of ctx {ctx})"))
+        if self._native:
+            from core.native_agent_tools import sanitize_tool_pairs
+            active = sanitize_tool_pairs(active)
         return active
 
     def _compact_trigger(self, engine_ctx: int) -> int:
@@ -962,11 +1022,16 @@ class AgentRunner:
                            and think_on)
         tf = ThinkFilter(on_response=on_resp, on_thinking=on_think,
                          starts_in_think=starts_in_think)
+        self._last_calls = []
+        gen_kwargs = self._engine_gen_kwargs(think_on)
+        if self._native:
+            from core.native_agent_tools import AGENT_NATIVE_TOOLS
+            gen_kwargs["tools"] = AGENT_NATIVE_TOOLS
         try:
             resp = self.engine.generate_streaming(
                 active, max_tokens=self.config.max_tokens,
                 temperature=self.config.temperature, on_token=tf.feed,
-                **self._engine_gen_kwargs(think_on))
+                **gen_kwargs)
         except GenerationAborted:
             # User stop, not a failure: return the partial text so the
             # transcript keeps what was said; the round loop's stop checks
@@ -980,6 +1045,9 @@ class AgentRunner:
             self._safe(tf.flush)
             return ""
         self._safe(tf.flush)
+        if self._native:
+            stats = getattr(self.engine, "_last_gen_stats", None) or {}
+            self._last_calls = list(stats.get("tool_calls") or [])
         return resp if isinstance(resp, str) and resp else "".join(parts)
 
     def _on_action_complete(self, action, ok, pending_edits):
@@ -1161,6 +1229,47 @@ class AgentRunner:
             "Do NOT write <tool_call> tags. Retry the intended action now, "
             'or emit @done("summary") if the GOAL is already complete.'
         )
+
+    def _engine_takes_tools(self) -> bool:
+        if not getattr(self.engine, "native_tools", False):
+            return False
+        import inspect
+        try:
+            params = inspect.signature(self.engine.generate_streaming).parameters
+        except (TypeError, ValueError):
+            return False
+        return "tools" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+    @staticmethod
+    def _safe_env_note(fn) -> str:
+        try:
+            return fn()
+        except Exception:
+            return ""
+
+    def _native_feedback(self, history, call_ids, call_slots, outputs, extra):
+        """One tool message per call, in call order, as the template expects.
+
+        outputs holds one entry per executed action (in action order) plus,
+        after them, round-level notes such as the edit verifier's report;
+        those and `extra` ride on the last tool message.
+        """
+        n_actions = sum(1 for s in call_slots if isinstance(s, int))
+        trailing = list(outputs[n_actions:])
+        if extra:
+            trailing.append(extra)
+        for i, slot in enumerate(call_slots):
+            if isinstance(slot, int):
+                body = outputs[slot] if slot < len(outputs) else "(not run)"
+            elif slot == "finish":
+                body = "(finish noted; it takes effect once the other calls succeed)"
+            else:
+                body = slot
+            if i == len(call_slots) - 1 and trailing:
+                body += "\n\n" + "\n\n".join(trailing)
+            history.append({"role": "tool", "tool_call_id": call_ids[i],
+                            "content": self._fit_feedback(body)})
 
     def _feedback(self, outputs: List[str]) -> str:
         body = "\n\n".join(outputs) if outputs else "(no output)"
