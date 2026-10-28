@@ -13,6 +13,14 @@ import pytest
 from core.services import media_tools
 
 
+@pytest.fixture(autouse=True)
+def _no_vision_helper(monkeypatch):
+    """These cover the chat-model assist; the box's real llama_cpp_config.json
+    may configure the CPU vision helper, which must not start under test."""
+    from core import vision_helper
+    monkeypatch.setattr(vision_helper, "config", lambda: None)
+
+
 @pytest.fixture
 def fake_llm():
     calls = []

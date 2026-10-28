@@ -129,8 +129,45 @@ def parse_assist_reply(reply: str, fallback: str) -> tuple[str, str]:
     return (prompt or fallback)[:2000], negative[:500]
 
 
-async def assist_prompt(tool: str, prompt: str) -> tuple[str, str]:
-    """Expand `prompt` for `tool` with the chat model -> (prompt, negative)."""
+def assist_available(tool: str) -> bool:
+    """The vision helper or the chat model can write this tool's prompt."""
+    if tool not in ASSIST_TOOLS:
+        return False
+    if _prompt_llm is not None:
+        return True
+    try:
+        from core import vision_helper
+        return vision_helper.handles_assist(tool)
+    except Exception:
+        return False
+
+
+async def assist_prompt(tool: str, prompt: str,
+                        image_path: str | None = None) -> tuple[str, str]:
+    """Expand `prompt` for `tool` -> (prompt, negative).
+
+    The CPU vision helper goes first when configured: it sees the photo an
+    edit starts from, and leaves the GPU alone. The chat model, which only
+    ever saw the words, is the fallback.
+    """
+    from core import vision_helper
+    if vision_helper.handles_assist(tool):
+        user = prompt
+        if image_path:
+            from tools.image_tools import encode_image
+            user = [{"type": "image_url",
+                     "image_url": {"url": encode_image(image_path, max_side=768)}},
+                    {"type": "text", "text": prompt}]
+        messages = [{"role": "system", "content": _ASSIST_SYSTEM[tool]},
+                    {"role": "user", "content": user}]
+        try:
+            reply = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: vision_helper.chat(messages, max_tokens=600))
+            return parse_assist_reply(reply, prompt)
+        except Exception as e:
+            if _prompt_llm is None:
+                raise
+            _log.warning("Vision helper assist failed (%s); using the chat model", e)
     reply = await _prompt_llm([
         {"role": "system", "content": _ASSIST_SYSTEM[tool]},
         {"role": "user", "content": prompt},
@@ -182,7 +219,7 @@ def catalog() -> dict:
             {"id": tid, "label": t["label"], "needs_image": bool(t.get("needs_image")),
              "models": list_models(tid), "unavailable": unavailable_reason(tid),
              "sizes": list(SIZES) if tid == "image" else [],
-             "assist": tid in ASSIST_TOOLS and _prompt_llm is not None}
+             "assist": assist_available(tid)}
             for tid, t in TOOLS.items()
         ],
         "voices": voice_io.list_voices(),
@@ -274,7 +311,7 @@ def start_job(tool: str, params: dict) -> dict:
     if tool != "restore" and not (params.get("prompt") or "").strip():
         raise ValueError("A prompt is required.")
     kwargs = _pipeline_kwargs(tool, model_path, params, image_path)
-    assist = bool(params.get("assist")) and tool in ASSIST_TOOLS and _prompt_llm is not None
+    assist = bool(params.get("assist")) and assist_available(tool)
 
     job = {
         "id": uuid.uuid4().hex[:12], "tool": tool, "status": "queued",
@@ -295,7 +332,8 @@ async def _assist(job: dict, kwargs: dict):
     prompt and says so on the job; the image still gets made."""
     job.update(status="running", started=time.time())
     try:
-        prompt, negative = await assist_prompt(job["tool"], kwargs["prompt"])
+        prompt, negative = await assist_prompt(job["tool"], kwargs["prompt"],
+                                               kwargs.get("image_path"))
         kwargs["prompt"] = job["assisted_prompt"] = prompt
         if job["tool"] == "edit" and negative:
             kwargs.update(negative_prompt=negative, true_cfg_scale=_ASSIST_CFG)

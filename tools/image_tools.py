@@ -187,6 +187,25 @@ def catalogued_names(catalog_path):
     return done
 
 
+def resolve_vision_url():
+    """(base_url, error). The run's own server when it can see; otherwise the
+    CPU vision helper (core.vision_helper), started on demand."""
+    if os.environ.get("ARTIFEX_VISION_URL"):
+        url = _vision_url()
+        ok, msg = check_vision_server(url)
+        return (url, "") if ok else (None, msg)
+    ok, msg = check_vision_server()
+    if ok:
+        return _vision_url(), ""
+    try:
+        from core import vision_helper
+        if vision_helper.config():
+            return vision_helper.ensure_url(), ""
+    except Exception as e:
+        return None, f"{msg} The CPU vision helper could not start either: {e}"
+    return None, msg
+
+
 def run_view_image(content):
     """content: "path" or "path|question". Returns (success, output)."""
     path, _, question = content.partition("|")
@@ -195,11 +214,11 @@ def run_view_image(content):
         "Describe this image: what it shows, any visible text, and notable details.")
     if not os.path.isfile(path):
         return False, f"Image not found: {path}"
-    ok, msg = check_vision_server()
-    if not ok:
+    url, msg = resolve_vision_url()
+    if not url:
         return False, msg
     try:
-        answer = ask_about_image(path, question, max_tokens=600)
+        answer = ask_about_image(path, question, max_tokens=600, base_url=url)
     except VisionServerError as e:
         return False, f"Vision server error: {e}"
     except Exception as e:
@@ -235,8 +254,8 @@ def run_describe_images(content, time_budget=None):
         return True, (f"All {len(images)} images in {folder} are already in {catalog}. "
                       "Nothing left to do.")
 
-    ok, msg = check_vision_server()
-    if not ok:
+    url, msg = resolve_vision_url()
+    if not url:
         return False, msg
 
     new_file = not os.path.exists(catalog)
@@ -255,7 +274,8 @@ def run_describe_images(content, time_budget=None):
                 stopped_by = "time budget"
                 break
             try:
-                desc = _one_line(ask_about_image(os.path.join(folder, rel), prompt))
+                desc = _one_line(ask_about_image(os.path.join(folder, rel), prompt,
+                                                 base_url=url))
                 described += 1
             except VisionServerError as e:
                 # Don't write a line: the image is fine, the server isn't, and
