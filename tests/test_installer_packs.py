@@ -106,10 +106,12 @@ def test_ollama_on_loopback_gets_launchers(monkeypatch, tmp_path):
 # ── Packages go only into the installer's own venv ──────────────────────────
 
 def _venv(tmp_path, marker=True):
-    scripts = tmp_path / "venv" / "Scripts"
-    scripts.mkdir(parents=True)
-    (scripts / "python.exe").write_text("")
-    (scripts / "python").write_text("")
+    # Both layouts: venv\Scripts\python.exe on Windows, venv/bin/python on
+    # Linux (CI), which is what recipes.venv_python() looks for there.
+    for sub, exe in (("Scripts", "python.exe"), ("bin", "python")):
+        d = tmp_path / "venv" / sub
+        d.mkdir(parents=True)
+        (d / exe).write_text("")
     if marker:
         (tmp_path / "venv" / recipes.INSTALLER_MARKER).write_text("x")
 

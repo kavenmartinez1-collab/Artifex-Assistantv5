@@ -19,11 +19,13 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      # Install CPU-only PyTorch first (much smaller than CUDA builds).
-      # Several core modules (core/inference.py, core/hardware.py) import
-      # torch at module level, so it must be present for tests to collect.
+      # Install the CPU builds of the SAME versions requirements.txt pins.
+      # torch 2.6.0+cpu satisfies its torch==2.6.0, so pip doesn't then pull
+      # the multi-GB CUDA build on top: unpinned, the two builds together
+      # filled the runner's disk ("No space left on device", 2026-10-28).
+      # Pipeline tests still import torch, so it must be present.
       - name: Install PyTorch (CPU-only)
-        run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+        run: pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu
 
       - name: Install dependencies
         run: pip install -r requirements.txt
