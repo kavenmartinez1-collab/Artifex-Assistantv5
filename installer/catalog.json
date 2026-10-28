@@ -157,7 +157,8 @@
     ".huggingface.co",
     ".hf.co",
     "pkgs.tailscale.com",
-    "nodejs.org"
+    "nodejs.org",
+    "api.nuget.org"
   ],
   "tailscale": {
     "_comment": "Official Windows MSI, latest stable when pinned (2026-10-28). size + sha256 from pkgs.tailscale.com/stable/<file>.sha256, cross-checked against the downloaded file; the installer also requires a valid Authenticode signature from O=Tailscale Inc. before opening it. The remote check warns when the installed Tailscale is older than min_version; bump both when Tailscale ships security fixes.",
@@ -235,6 +236,15 @@
     "num_ctx": 8192,
     "port": 8095,
     "idle_unload_s": 600
+  },
+  "bootstrap_python": {
+    "_comment": "Portable Python for setup.cmd when no Python 3.11-3.13 is installed: python.org's NuGet build (a plain zip; no installer, registry or PATH changes), unpacked into <root>/python. sha512 = NuGet's catalog packageHash for this version (base64-decoded), not taken from the download; get-python.ps1 also requires python.exe to be Authenticode-signed by the Python Software Foundation.",
+    "version": "3.13.17",
+    "url": "https://api.nuget.org/v3-flatcontainer/python/3.13.17/python.3.13.17.nupkg",
+    "size": 14826465,
+    "sha512": "0e667928bb4f19573c6cd88f65133b2e07b243a5c716f335b56aa66bb9ec6f82328256d22c3a29e23a0276ac5c6a6d786211feab524890ad1e56629196c6b29c",
+    "signer": "Python Software Foundation",
+    "dest": "python"
   },
   "node": {
     "_comment": "Portable Node.js for the webgpu/game packs when no Node 20+ is installed. sha256 from https://nodejs.org/dist/v24.22.1/SHASUMS256.txt.",

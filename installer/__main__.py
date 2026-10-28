@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 from installer import probe as probe_mod
-from installer import recipes
+from installer import hint, recipes
 from installer.fetch import VerifyError
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -81,10 +81,10 @@ def _packs(a) -> int:
     if a.cmd == "packs":
         for pid, p in packs.PACKS.items():
             print(f"  {pid:12} {p['label']}  ({p['size']})")
-        print("\nInstall one with: python -m installer pack <id>")
+        print("\nInstall one with: " + hint("pack <id>"))
         return 0
     if a.id not in packs.PACKS:
-        print(f"error: no pack {a.id!r}; see python -m installer packs")
+        print(f"error: no pack {a.id!r}; see {hint('packs')}")
         return 2
     p, root = packs.PACKS[a.id], os.path.abspath(a.root)
     print(f"{p['label']} ({p['size']}) will:\n" + "\n".join(
@@ -110,7 +110,7 @@ def _packs(a) -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="python -m installer")
+    ap = argparse.ArgumentParser(prog=hint("").strip())
     sub = ap.add_subparsers(dest="cmd", required=True)
     pr = sub.add_parser("probe", help="show what this PC has")
     pr.add_argument("--json", action="store_true")

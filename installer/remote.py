@@ -29,7 +29,7 @@ import shutil
 import subprocess
 import time
 
-from installer import fetch
+from installer import fetch, hint
 
 WATCHED_PORTS = {8000: "Artifex API", 8080: "web gateway", 8081: "llama.cpp server",
                  8095: "vision helper", 11434: "Ollama", 2222: "Kali SSH"}
@@ -127,7 +127,7 @@ def check_exposure(root: str, api_port: int = 8000, min_version: str = "",
     if not tailscale_exe():
         f.append(_finding(INFO, "Tailscale is not installed",
                           "remote access is off; Artifex is reachable from this PC only",
-                          "python -m installer remote setup"))
+                          hint("remote setup")))
         return f
     ver = _ts(["version"], run=run)
     version = (ver.stdout.splitlines() or [""])[0].strip() if ver else ""
@@ -165,10 +165,10 @@ def check_exposure(root: str, api_port: int = 8000, min_version: str = "",
                               "reachable from your own tailnet devices only"))
         else:
             f.append(_finding(WARN, f"Tailnet port {api_port} forwards to {fwd}",
-                              "expected 127.0.0.1", "python -m installer remote setup"))
+                              "expected 127.0.0.1", hint("remote setup")))
     else:
         f.append(_finding(INFO, "Phone access is not set up",
-                          fix="python -m installer remote setup"))
+                          fix=hint("remote setup")))
 
     # 4. An API key, since tailnet devices can reach the API.
     key = ""
@@ -178,7 +178,7 @@ def check_exposure(root: str, api_port: int = 8000, min_version: str = "",
         pass
     if fwd and len(key) < 32:
         f.append(_finding(FAIL, "The API is reachable from your tailnet without a strong key",
-                          fix="python -m installer remote setup (creates one)"))
+                          fix=hint("remote setup") + " (creates one)"))
     elif key:
         f.append(_finding(OK, "API key is set", f"{KEY_FILE}, {len(key)} characters"))
 

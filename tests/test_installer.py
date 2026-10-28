@@ -315,3 +315,54 @@ def test_launchers_stay_local_and_escape_the_path(tmp_path):
     assert len(paths) == 3
     with pytest.raises(ValueError):
         recipes.write_launchers(str(root), "x & calc.exe")
+
+
+# ── setup.cmd and its portable-Python fallback ─────────────────
+
+def _repo_file(*parts):
+    return open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), *parts),
+                encoding="utf-8").read()
+
+
+def test_bootstrap_python_is_pinned():
+    cat = recipes.load_catalog()
+    p = cat["bootstrap_python"]
+    assert re.fullmatch(r"[0-9a-f]{128}", p["sha512"]) and p["size"] > 0
+    assert p["url"] == (f"https://api.nuget.org/v3-flatcontainer/python/{p['version']}/"
+                        f"python.{p['version']}.nupkg")
+    assert fetch.host_allowed(p["url"], cat["allowed_hosts"])
+    major, minor = (int(x) for x in p["version"].split(".")[:2])
+    assert recipes.python_ok((major, minor))   # the locks have wheels for it
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", p["dest"]) and p["signer"] == "Python Software Foundation"
+
+
+def test_bootstrap_scripts_verify_and_never_pipe_to_a_shell():
+    cmd = _repo_file("setup.cmd")
+    ps1 = _repo_file("installer", "get-python.ps1")
+    for text in (cmd, ps1):
+        low = text.lower()
+        for bad in ("invoke-expression", "iex ", "| iex", "downloadstring", "curl ", "bitsadmin",
+                    "-encodedcommand", "start-process -verb runas"):
+            assert bad not in low, bad
+    assert "-m installer install" in cmd and "-m installer %*" in cmd and r'installer\get-python.ps1' in cmd
+    # The ps1 takes every pin from catalog.json and checks all three gates.
+    assert "bootstrap_python" in ps1
+    assert "Get-FileHash -Algorithm SHA512" in ps1 and "$pin.size" in ps1
+    assert "Get-AuthenticodeSignature" in ps1 and "'Valid'" in ps1
+    # An existing python folder is refused, never deleted.
+    assert "Remove-Item -Recurse -Force $dest" not in ps1
+
+
+def test_bootstrap_cmd_keeps_crlf_everywhere():
+    attrs = _repo_file(".gitattributes")
+    assert "*.cmd text eol=crlf" in attrs and "installer/*.ps1 text eol=crlf" in attrs
+    assert "/python/" in _repo_file(".gitignore").splitlines()
+
+
+def test_hints_follow_how_the_installer_was_started(monkeypatch):
+    import installer
+    monkeypatch.delenv("ARTIFEX_SETUP", raising=False)
+    assert installer.hint("pack voice") == "python -m installer pack voice"
+    monkeypatch.setenv("ARTIFEX_SETUP", "1")
+    assert installer.hint("pack voice") == "setup pack voice"
+    assert 'set "ARTIFEX_SETUP=1"' in _repo_file("setup.cmd")

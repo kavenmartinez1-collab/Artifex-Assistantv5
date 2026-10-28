@@ -1,0 +1,4 @@
+# Windows scripts keep CRLF in checkouts and in GitHub's "Download ZIP"
+# (cmd.exe misreads labels and goto in LF batch files).
+*.cmd text eol=crlf
+installer/*.ps1 text eol=crlf

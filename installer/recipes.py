@@ -12,7 +12,7 @@ import os
 import re
 import subprocess
 
-from installer import fetch
+from installer import fetch, hint
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CATALOG_PATH = os.path.join(HERE, "catalog.json")
@@ -180,7 +180,7 @@ def add_locked_packages(root: str, lock: str, needed_modules, log=print,
     py = venv_python(root)
     venv = os.path.dirname(os.path.dirname(py))
     if not os.path.isfile(py):
-        raise RuntimeError("no Python environment yet: run python -m installer install first")
+        raise RuntimeError(f"no Python environment yet: run {hint('install')} first")
     if os.path.isfile(os.path.join(venv, INSTALLER_MARKER)):
         log(f"installing the locked packages from {os.path.basename(lock)}")
         # An extra index (PyTorch's, for CUDA builds) only widens where pip
@@ -292,7 +292,7 @@ def write_phone_launcher(root: str, port: int = 8000, model_id: str = None) -> s
     model = f" --model {model_id}" if model_id else ""
     lines = ["@echo off", "chcp 65001 >nul", f'cd /d "{croot}"',
              "set ARTIFEX_BACKEND=llama_cpp",
-             'if not exist "artifex_api_key.txt" (echo Run: python -m installer remote setup & pause & exit /b 1)',
+             f'if not exist "artifex_api_key.txt" (echo Run: {hint("remote setup")} in this folder & pause & exit /b 1)',
              'set /p ARTIFEX_API_KEY=<"artifex_api_key.txt"',
              f"set WEB_GATEWAY_URL={GATEWAY_URL}",
              f'"{py}" main_api.py --host 127.0.0.1 --port {port} --backend llama_cpp --phone-app'

@@ -21,32 +21,44 @@
 
 All glory to **Jesus Christ**, through whom all things were made and in whom all wisdom dwells.
 
-## Install in 4 steps (Windows)
+## Install in 3 steps (Windows)
 
-1. **Get Python.** Install Python 3.12 from
-   [python.org/downloads](https://www.python.org/downloads/). On the first
-   screen, tick **"Add python.exe to PATH"**, then click **Install Now**.
-2. **Get Artifex.** On this page click the green **Code** button →
-   **Download ZIP**, then unzip it (right-click → **Extract All**).
-3. **Run the installer.** Open the unzipped folder, click the address bar at
-   the top of the window, type `cmd` and press **Enter**. In the black window
-   that opens, type:
-
-   ```
-   python -m installer install
-   ```
-
-   It looks at your PC, shows exactly what it will install and asks before
-   doing anything. Type `y` and press **Enter**. It picks the right engine
-   for your graphics card and a chat model that fits it (a few minutes, plus
-   the model download).
-4. **Start Artifex.** Double-click **Artifex GUI.cmd** in the same folder
+1. **Get Artifex.** On this page click the green **Code** button →
+   **Download ZIP**, then unzip it (right-click the ZIP → **Extract All**).
+2. **Double-click `setup.cmd`** in the unzipped folder.
+   - If Windows asks whether to run it, click **Run** (or **More info** →
+     **Run anyway**). It's a short text file; open it in Notepad to read it
+     first if you like.
+   - It looks at your PC, shows exactly what it will install, and asks first:
+     type `y` and press **Enter**. It picks the right engine for your
+     graphics card and a chat model that fits it (a few minutes, plus the
+     model download).
+   - No Python? It fetches python.org's portable Python into the folder
+     (checksum and signature verified), so you don't need to install anything
+     yourself.
+3. **Start Artifex.** Double-click **Artifex GUI.cmd** in the same folder
    (or **Artifex CLI.cmd** for the terminal version).
 
-**Optional extras**, any time later, from the same black window:
+**Optional extras**, any time later: in the Artifex folder, click the address
+bar at the top of the window, type `cmd`, press **Enter**, then type:
 
 | Want to... | Type |
 |---|---|
+| See the extras | `setup packs` |
+| Talk and listen (voice) | `setup pack voice` |
+| Show it pictures | `setup pack vision` |
+| Make images, music, 3D | `setup pack create` |
+| Run AI in your web browser (Artifex Web, with LFM3) | `setup pack webgpu` |
+| Use it from your phone, safely | `setup remote setup` |
+| Check nothing is exposed to the internet | `setup remote check` |
+
+Everything it downloads is pinned and checksum-verified, it needs no admin
+rights, and everything stays on 127.0.0.1 (your phone reaches it only over
+your private Tailscale network). Already have Python 3.11-3.13? `setup.cmd`
+uses it, and `python -m installer ...` works the same way. Details:
+[Setup Guide](#setup-guide).
+
+---|---|
 | See the extras | `python -m installer packs` |
 | Talk and listen (voice) | `python -m installer pack voice` |
 | Show it pictures | `python -m installer pack vision` |
@@ -71,7 +83,7 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 
 ## Table of Contents
 
-- [Install in 4 steps (Windows)](#install-in-4-steps-windows)
+- [Install in 3 steps (Windows)](#install-in-3-steps-windows)
 - [Features](#features)
 - [Verified Test Results](#verified-test-results-2026-03-22)
 - [Supported GPU Tiers](#supported-gpu-tiers)
@@ -202,6 +214,9 @@ prebuilt llama.cpp server for your GPU, a chat model that fits it, a small
 Python environment (no PyTorch), and launchers. It needs only Python 3.11 to
 3.13 (from python.org), makes no admin or PATH changes, and puts everything
 under this folder. About a minute plus the model download.
+
+Easiest: double-click **setup.cmd** (it finds your Python, or fetches a
+pinned portable one into `python\`, then runs `install`). Or by hand:
 
 ```bash
 git clone <repo-url> && cd <repo>

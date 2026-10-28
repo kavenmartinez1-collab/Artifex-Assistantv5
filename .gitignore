@@ -132,3 +132,6 @@ purge_extra.txt
 
 # API key written by python -m installer remote setup
 /artifex_api_key.txt
+
+# portable Python fetched by setup.cmd (installer/get-python.ps1)
+/python/

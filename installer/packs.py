@@ -15,7 +15,7 @@ import subprocess
 import time
 import urllib.request
 
-from installer import fetch, recipes, remote
+from installer import fetch, hint, recipes, remote
 
 GATEWAY_URL = "http://127.0.0.1:8080"
 
@@ -193,7 +193,7 @@ def install_voice(root, catalog, log=print, run=subprocess.run):
 def _config(root):
     path = os.path.join(root, "llama_cpp_config.json")
     if not os.path.isfile(path):
-        raise PackUnavailable("no llama_cpp_config.json yet: run python -m installer install first")
+        raise PackUnavailable(f"no llama_cpp_config.json yet: run {hint('install')} first")
     with open(path, encoding="utf-8") as f:
         return path, json.load(f)
 
