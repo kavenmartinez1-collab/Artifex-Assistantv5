@@ -326,17 +326,12 @@ class PhotoRestorePipeline(BasePipeline):
         try:
             if self._gfpgan is None:
                 from gfpgan import GFPGANer
-                from core.pipelines.sr_arch import download_weights
-                url = ("https://github.com/TencentARC/GFPGAN/releases/"
-                       "download/v1.3.0/GFPGANv1.4.pth")
-                os.makedirs(self._weights_dir, exist_ok=True)
-                dest = os.path.join(self._weights_dir, "GFPGANv1.4.pth")
-                if not os.path.isfile(dest):
-                    if status_callback:
-                        status_callback("Downloading GFPGAN weights...")
-                    import urllib.request
-                    urllib.request.urlretrieve(url, dest + ".part")
-                    os.replace(dest + ".part", dest)
+                from core.pipelines.sr_arch import fetch_verified
+                dest = fetch_verified(
+                    "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth",
+                    os.path.join(self._weights_dir, "GFPGANv1.4.pth"),
+                    "e2cd4703ab14f4d01fd1383a8a8b266f9a5833dacee8e6a79d3bf21a1b6be5ad",
+                    status_callback, "GFPGAN")
                 self._gfpgan = GFPGANer(model_path=dest, upscale=1,
                                         arch="clean", channel_multiplier=2)
             if status_callback:

@@ -33,6 +33,10 @@ import shutil
 import time
 from pathlib import Path
 
+# Off unless ARTIFEX_TRUST_REMOTE_CODE=1: with it on, loading a model runs
+# Python files from the model's own repo (see core/config.py).
+TRUST_REMOTE_CODE = os.environ.get("ARTIFEX_TRUST_REMOTE_CODE", "").strip() == "1"
+
 # Force unbuffered output so progress is visible in real-time
 os.environ['PYTHONUNBUFFERED'] = '1'
 
@@ -567,12 +571,12 @@ def profile_ssm_activations(
     from transformers import AutoModelForCausalLM, AutoConfig
 
     log("\n[Profile] Loading model...")
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=TRUST_REMOTE_CODE)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
         device_map="cpu",
-        trust_remote_code=True,
+        trust_remote_code=TRUST_REMOTE_CODE,
         low_cpu_mem_usage=True,
     )
     model.eval()
@@ -1092,7 +1096,7 @@ def load_calibration_data(
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_path, trust_remote_code=True
+        tokenizer_path, trust_remote_code=TRUST_REMOTE_CODE
     )
 
     if dataset_name == "wikitext":
@@ -1191,13 +1195,13 @@ def quantize_layer_by_layer(
     from transformers import AutoModelForCausalLM, AutoConfig
 
     log("\n[1/4] Loading model...")
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=TRUST_REMOTE_CODE)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
         device_map="cpu",
-        trust_remote_code=True,
+        trust_remote_code=TRUST_REMOTE_CODE,
         low_cpu_mem_usage=True,
     )
     model.eval()

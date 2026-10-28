@@ -3,6 +3,7 @@ Artifex Assistant V5 — Base pipeline interface.
 All model pipelines (text, image, 3D, audio) implement this contract.
 """
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -86,3 +87,14 @@ class BasePipeline(ABC):
             "display_name": self.display_name,
             "output_type": self.output_type,
         }
+
+
+def hub_revision(model_path):
+    """"org/repo@<40-hex commit>" -> ("org/repo", commit); anything else -> (model_path, None).
+
+    media_tools pins every Hugging Face model a Create tool downloads on first
+    use to an exact commit this way, so the hub can only serve that snapshot:
+    a later push to the repo (or a takeover of a renamed repo's old name)
+    changes nothing here."""
+    m = re.fullmatch(r"([\w.-]+/[\w.-]+)@([0-9a-f]{40})", model_path or "")
+    return (m.group(1), m.group(2)) if m else (model_path, None)

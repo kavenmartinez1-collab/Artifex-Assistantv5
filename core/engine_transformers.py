@@ -31,6 +31,7 @@ from transformers import (
 )
 
 from core.engine_base import BaseEngine
+from core.config import TRUST_REMOTE_CODE
 from core.config import (
     BNB_CONFIG, get_active_model_path,
     get_torch_compile, get_turboquant_kv,
@@ -367,7 +368,7 @@ class TransformersEngine(BaseEngine):
         try:
             from transformers import AutoProcessor
             self.processor = AutoProcessor.from_pretrained(
-                model_path, trust_remote_code=True
+                model_path, trust_remote_code=TRUST_REMOTE_CODE
             )
             logging.getLogger(__name__).info("Loaded AutoProcessor for %s", model_type)
         except Exception as e:
@@ -615,7 +616,7 @@ class TransformersEngine(BaseEngine):
                     quantized_path,
                     device_map={"": 0},
                     dtype=gpu["compute_dtype"],
-                    trust_remote_code=True,
+                    trust_remote_code=TRUST_REMOTE_CODE,
                     low_cpu_mem_usage=True,
                     attn_implementation="sdpa",
                 )
@@ -629,7 +630,7 @@ class TransformersEngine(BaseEngine):
                     device_map="auto",
                     max_memory=max_mem,
                     dtype=gpu["compute_dtype"],
-                    trust_remote_code=True,
+                    trust_remote_code=TRUST_REMOTE_CODE,
                     low_cpu_mem_usage=True,
                     attn_implementation="sdpa",
                 )
@@ -672,7 +673,7 @@ class TransformersEngine(BaseEngine):
             device_map={"": 0},
             quantization_config=bnb_config,
             dtype=gpu["compute_dtype"],
-            trust_remote_code=True,
+            trust_remote_code=TRUST_REMOTE_CODE,
             low_cpu_mem_usage=True,
             attn_implementation="sdpa",
         )
@@ -701,7 +702,7 @@ class TransformersEngine(BaseEngine):
                 device_map={"": 0},
                 quantization_config=bnb_config,
                 dtype=gpu["compute_dtype"],
-                trust_remote_code=True,
+                trust_remote_code=TRUST_REMOTE_CODE,
                 low_cpu_mem_usage=True,
                 attn_implementation="sdpa",
             )

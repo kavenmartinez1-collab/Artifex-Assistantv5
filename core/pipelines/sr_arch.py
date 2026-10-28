@@ -22,6 +22,7 @@ SR_MODELS = {
     "realesrgan-x4plus": {
         "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/"
                "v0.1.0/RealESRGAN_x4plus.pth",
+        "sha256": "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
         "arch": "rrdbnet",
         "scale": 4,
         "kwargs": {"num_feat": 64, "num_block": 23, "num_grow_ch": 32},
@@ -29,6 +30,7 @@ SR_MODELS = {
     "realesrgan-x2plus": {
         "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/"
                "v0.2.1/RealESRGAN_x2plus.pth",
+        "sha256": "49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb",
         "arch": "rrdbnet",
         "scale": 2,
         "kwargs": {"num_feat": 64, "num_block": 23, "num_grow_ch": 32},
@@ -36,6 +38,7 @@ SR_MODELS = {
     "realesr-general-x4v3": {
         "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/"
                "v0.2.5.0/realesr-general-x4v3.pth",
+        "sha256": "8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292",
         "arch": "srvgg",
         "scale": 4,
         "kwargs": {"num_feat": 64, "num_conv": 32, "act_type": "prelu"},
@@ -151,20 +154,49 @@ class SRVGGNetCompact(nn.Module):
         return out + base
 
 
+def sha256_of(path: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def fetch_verified(url: str, dest: str, sha256: str, status_callback=None,
+                   label: str = "") -> str:
+    """Download `url` to `dest` and keep it only if its SHA-256 matches.
+
+    The hashes were pinned on 2026-10-28 from a fresh download that matched
+    copies fetched months earlier (these old releases predate GitHub's
+    published digests). A cached file is re-checked too, so a swapped file
+    on disk is caught, not just a swapped download.
+    """
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.isfile(dest) and sha256_of(dest) == sha256:
+        return dest
+    if status_callback:
+        status_callback(f"Downloading {label or os.path.basename(dest)} weights...")
+    tmp = dest + ".part"
+    try:
+        urllib.request.urlretrieve(url, tmp)
+        got = sha256_of(tmp)
+        if got != sha256:
+            raise RuntimeError(f"{os.path.basename(dest)}: SHA-256 {got[:16]}... does not "
+                               f"match the pinned {sha256[:16]}...; refusing to load it")
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return dest
+
+
 def download_weights(model_name: str, weights_dir: str,
                      status_callback=None) -> str:
     """Download release weights for a named SR model if not already cached."""
     info = SR_MODELS[model_name]
-    os.makedirs(weights_dir, exist_ok=True)
     dest = os.path.join(weights_dir, os.path.basename(info["url"]))
-    if os.path.isfile(dest):
-        return dest
-    if status_callback:
-        status_callback(f"Downloading {model_name} weights...")
-    tmp = dest + ".part"
-    urllib.request.urlretrieve(info["url"], tmp)
-    os.replace(tmp, dest)
-    return dest
+    return fetch_verified(info["url"], dest, info["sha256"], status_callback, model_name)
 
 
 def load_sr_model(model_name: str, weights_dir: str, device="cuda",

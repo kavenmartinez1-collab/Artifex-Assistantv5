@@ -18,6 +18,10 @@ import sys
 import time
 from pathlib import Path
 
+# Off unless ARTIFEX_TRUST_REMOTE_CODE=1: with it on, loading a model runs
+# Python files from the model's own repo (see core/config.py).
+TRUST_REMOTE_CODE = os.environ.get("ARTIFEX_TRUST_REMOTE_CODE", "").strip() == "1"
+
 os.environ['PYTHONUNBUFFERED'] = '1'
 
 import torch
@@ -42,10 +46,10 @@ def validate_klt_rotation(model_path: str, device: str = "cuda"):
 
     # ── Load original model ──
     log("[1/5] Loading original model...")
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=TRUST_REMOTE_CODE)
     model_orig = AutoModelForCausalLM.from_pretrained(
         model_path, torch_dtype=torch.bfloat16, device_map="cpu",
-        trust_remote_code=True, low_cpu_mem_usage=True,
+        trust_remote_code=TRUST_REMOTE_CODE, low_cpu_mem_usage=True,
     )
     model_orig.eval()
 
@@ -53,7 +57,7 @@ def validate_klt_rotation(model_path: str, device: str = "cuda"):
     log("[2/5] Loading KLT model (will absorb norms + rotate)...")
     model_klt = AutoModelForCausalLM.from_pretrained(
         model_path, torch_dtype=torch.bfloat16, device_map="cpu",
-        trust_remote_code=True, low_cpu_mem_usage=True,
+        trust_remote_code=TRUST_REMOTE_CODE, low_cpu_mem_usage=True,
     )
     model_klt.eval()
 
@@ -67,7 +71,7 @@ def validate_klt_rotation(model_path: str, device: str = "cuda"):
     inner_orig = find_inner_model(model_orig)
 
     # Create test input
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=TRUST_REMOTE_CODE)
     test_text = "What is the equation of Newton's law of gravity?"
     tokens = tokenizer(test_text, return_tensors="pt")["input_ids"][:, :32]
     log(f"  Test input: {tokens.shape[1]} tokens")

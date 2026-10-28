@@ -27,6 +27,10 @@ import sys
 import time
 from pathlib import Path
 
+# Off unless ARTIFEX_TRUST_REMOTE_CODE=1: with it on, loading a model runs
+# Python files from the model's own repo (see core/config.py).
+TRUST_REMOTE_CODE = os.environ.get("ARTIFEX_TRUST_REMOTE_CODE", "").strip() == "1"
+
 os.environ['PYTHONUNBUFFERED'] = '1'
 
 import torch
@@ -113,10 +117,10 @@ def run_diagnostic(model_path: str, mode: str, device: str = "cuda",
 
     # ---- Load model ----
     log(f"\nLoading model ({mode} mode)...")
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=TRUST_REMOTE_CODE)
     model = AutoModelForCausalLM.from_pretrained(
         model_path, torch_dtype=torch.bfloat16, device_map="cpu",
-        trust_remote_code=True, low_cpu_mem_usage=True,
+        trust_remote_code=TRUST_REMOTE_CODE, low_cpu_mem_usage=True,
     )
     model.eval()
 

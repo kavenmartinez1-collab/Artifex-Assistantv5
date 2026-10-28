@@ -43,7 +43,9 @@ services:
   # via the Docker network at http://searxng:8080.
   # No port conflict with web-gateway (which also uses 8080 in its container).
   searxng:
-    image: searxng/searxng:latest
+    # Pinned by digest (the image running here on 2026-10-28) so an upstream
+    # re-push can't change it. Bump: docker buildx imagetools inspect searxng/searxng:latest
+    image: searxng/searxng:latest@sha256:5ed0323b5f5f8701264ef65e239a2bd83cb57098f2b971fa30bf79c06eeae271
     volumes:
       - ./web-gateway/searxng/settings.yml:/etc/searxng/settings.yml:ro
       - ./web-gateway/searxng/limiter.toml:/etc/searxng/limiter.toml:ro
@@ -65,7 +67,10 @@ services:
   artifex:
     build: .
     ports:
-      - "8000:8000"
+      # Loopback only: "8000:8000" would publish the API on every interface,
+      # i.e. to the LAN (and the internet behind a port-forward). Reach it from
+      # a phone with Tailscale serve (python -m installer remote setup).
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./models:/app/models
       - ./sessions:/app/sessions
@@ -95,9 +100,11 @@ services:
 
   # Ollama backend — only with 'ollama' profile
   ollama:
-    image: ollama/ollama:latest
+    # Pinned by digest (2026-10-28); Ollama itself has no authentication, so
+    # it is published on loopback only.
+    image: ollama/ollama:latest@sha256:20d1bbfbabe1c97ba4b16301f08a20d8484bcf77047742a3cb71c613d8e12d0b
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
       - ollama_data:/root/.ollama
     networks:

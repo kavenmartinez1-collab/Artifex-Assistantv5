@@ -58,9 +58,12 @@ class MusicPipeline(BasePipeline):
 
         dtype = kwargs.get("dtype", torch.float16)
 
-        self.processor = AutoProcessor.from_pretrained(model_path)
+        from core.pipelines.base import hub_revision
+        repo, revision = hub_revision(model_path)
+        self.processor = AutoProcessor.from_pretrained(repo, revision=revision)
         self.model = MusicgenForConditionalGeneration.from_pretrained(
-            model_path,
+            repo,
+            revision=revision,
             torch_dtype=dtype,
         )
 

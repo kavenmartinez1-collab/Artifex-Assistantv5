@@ -54,8 +54,11 @@ class Shape3DPipeline(BasePipeline):
 
         dtype = kwargs.get("dtype", torch.float16)
 
+        from core.pipelines.base import hub_revision
+        repo, revision = hub_revision(model_path)
         self.pipe = ShapEPipeline.from_pretrained(
-            model_path,
+            repo,
+            revision=revision,
             torch_dtype=dtype,
         )
 

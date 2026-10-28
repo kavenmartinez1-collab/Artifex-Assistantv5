@@ -19,7 +19,7 @@ class VideoGenerationPipeline(BasePipeline):
     display_name = "Video Generation"
     output_type = "video"
 
-    DEFAULT_MODEL = "damo-vilab/text-to-video-ms-1.7b"
+    DEFAULT_MODEL = "ali-vilab/text-to-video-ms-1.7b"
 
     def __init__(self):
         self.pipe = None
@@ -74,8 +74,11 @@ class VideoGenerationPipeline(BasePipeline):
 
         dtype = kwargs.get("dtype", torch.float16)
 
+        from core.pipelines.base import hub_revision
+        repo, revision = hub_revision(model_path)
         self.pipe = DiffusionPipeline.from_pretrained(
-            model_path,
+            repo,
+            revision=revision,
             torch_dtype=dtype,
         )
 

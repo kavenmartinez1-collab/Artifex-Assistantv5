@@ -52,6 +52,14 @@ for _models_dir in _model_dirs:
                     and not _name.startswith(".") and _name not in MODELS):
                 MODELS[_name] = _full
 
+# ===== REMOTE CODE =====
+# trust_remote_code lets transformers import Python files shipped inside a
+# model's Hugging Face repo when the model loads, i.e. it runs whatever code
+# that repo contains, with your permissions. Every model Artifex uses has a
+# built-in transformers class, so it stays off. Turn it on (=1) only for a
+# model whose repo code you have read, and pin that model to a commit.
+TRUST_REMOTE_CODE = os.environ.get("ARTIFEX_TRUST_REMOTE_CODE", "").strip() == "1"
+
 # ===== THREAD-SAFE MUTABLE STATE =====
 # All mutable runtime state is protected by this lock.
 # Reads are safe without the lock (Python GIL guarantees atomic reads of

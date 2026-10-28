@@ -48,8 +48,18 @@ TOOLS = {
 _HUB_MODELS = {
     "music": [("facebook/musicgen-small", "MusicGen small (~2 GB download)"),
               ("facebook/musicgen-medium", "MusicGen medium (~4 GB download)")],
-    "video": [("damo-vilab/text-to-video-ms-1.7b", "ModelScope 1.7B (download on first use)")],
+    "video": [("ali-vilab/text-to-video-ms-1.7b", "ModelScope 1.7B (download on first use)")],
     "3d":    [("openai/shap-e", "Shap-E (download on first use)")],
+}
+
+# The exact commit each hub model above is loaded at (pinned 2026-10-28). The
+# pipelines get "repo@commit" and pass revision= to from_pretrained, so the hub
+# can only ever serve this snapshot. Bump deliberately, after checking the repo.
+_HUB_REVISIONS = {
+    "facebook/musicgen-small": "4c8334b02c6ec4e8664a91979669a501ec497792",
+    "facebook/musicgen-medium": "d3bd7b00761b78ad7a8a05145ee31e7832e9916c",
+    "ali-vilab/text-to-video-ms-1.7b": "8227dddca75a8561bf858d604cc5dae52b954d01",
+    "openai/shap-e": "7bd337afdea1c17842e1c3cc45c4e268356dba40",
 }
 
 # Preferred defaults among local image models, best first
@@ -247,7 +257,8 @@ def _resolve_model(tool: str, requested: str | None) -> str:
             raise ValueError(f"No model installed that can do {tool}.")
         requested = models[0]["id"]
     if tool in _HUB_MODELS or requested == "":
-        return requested
+        rev = _HUB_REVISIONS.get(requested)
+        return f"{requested}@{rev}" if rev else requested
     return os.path.join(_models_dir(), requested)
 
 

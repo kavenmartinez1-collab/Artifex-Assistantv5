@@ -5,6 +5,7 @@ Sentence embeddings for semantic search and RAG using sentence-transformers.
 
 import gc
 import os
+from core.config import TRUST_REMOTE_CODE
 
 import numpy as np
 
@@ -59,9 +60,9 @@ class EmbeddingPipeline(BasePipeline):
         import torch
         from transformers import AutoModel, AutoTokenizer
 
-        self._tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self._tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=TRUST_REMOTE_CODE)
         self._base_model = AutoModel.from_pretrained(
-            model_path, trust_remote_code=True,
+            model_path, trust_remote_code=TRUST_REMOTE_CODE,
         )
         self._base_model.eval()
         self._use_sentence_transformers = False

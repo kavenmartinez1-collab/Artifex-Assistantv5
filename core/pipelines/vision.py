@@ -5,6 +5,7 @@ Image understanding using multimodal models (LLaVA, Qwen-VL, etc.)
 
 import gc
 import os
+from core.config import TRUST_REMOTE_CODE
 
 import torch
 
@@ -132,7 +133,7 @@ class VisionPipeline(BasePipeline):
         quantize = kwargs.get("quantize", True)
 
         load_kwargs = {
-            "trust_remote_code": True,
+            "trust_remote_code": TRUST_REMOTE_CODE,
             "torch_dtype": dtype,
         }
 
@@ -180,11 +181,11 @@ class VisionPipeline(BasePipeline):
             torch.cuda.empty_cache()
 
         try:
-            self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+            self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=TRUST_REMOTE_CODE)
         except Exception:
             self.processor = None
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=TRUST_REMOTE_CODE)
         self._model_path = model_path
 
         if status_callback:

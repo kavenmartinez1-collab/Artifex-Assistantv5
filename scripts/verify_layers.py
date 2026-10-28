@@ -16,6 +16,10 @@ import torch
 import torch.nn as nn
 from collections import OrderedDict
 
+# Off unless ARTIFEX_TRUST_REMOTE_CODE=1: with it on, loading a model runs
+# Python files from the model's own repo (see core/config.py).
+TRUST_REMOTE_CODE = os.environ.get("ARTIFEX_TRUST_REMOTE_CODE", "").strip() == "1"
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -349,7 +353,7 @@ def main():
     print("\nLoading tokenizer...")
     from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=TRUST_REMOTE_CODE)
 
     print("Loading model (float32, CPU) — this will use ~19 GB RAM...")
     # Try AutoModelForCausalLM first (may auto-detect the text sub-model)
@@ -358,7 +362,7 @@ def main():
             MODEL_PATH,
             dtype=torch.float32,
             device_map="cpu",
-            trust_remote_code=True,
+            trust_remote_code=TRUST_REMOTE_CODE,
             low_cpu_mem_usage=True,
         )
     except Exception as e:
@@ -367,7 +371,7 @@ def main():
             MODEL_PATH,
             dtype=torch.float32,
             device_map="cpu",
-            trust_remote_code=True,
+            trust_remote_code=TRUST_REMOTE_CODE,
             low_cpu_mem_usage=True,
         )
 
