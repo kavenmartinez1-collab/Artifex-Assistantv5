@@ -280,7 +280,7 @@
     "_comment": "A Tale of Yarn (the WebGPU game), cloned over https and checked out at this exact commit; git verifies the content by hash. Bump deliberately after reviewing the new commits.",
     "name": "A Tale of Yarn",
     "repo": "https://github.com/kavenmartinez1-collab/A_Tale_of_Yarn.git",
-    "commit": "440da2c6fd8dec8bcaa4c8d8bb3266be7b014a19",
+    "commit": "8b9e5e6cc9506ea54f6e2d8eac440f323e7a4923",
     "dest": "games/a-tale-of-yarn",
     "models": [
       {
