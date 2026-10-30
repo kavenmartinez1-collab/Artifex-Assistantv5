@@ -590,3 +590,51 @@ class TestAdoptedServerUnload(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExternalLauncher(unittest.TestCase):
+    """external_launcher entries (e.g. Strata): launched instead of llama-server,
+    loopback base URL, no GGUF check / VRAM gate, whole tree stopped on unload."""
+
+    def _engine(self):
+        from core.engine_llama_cpp import LlamaCppEngine
+        return LlamaCppEngine("flash", {
+            "path": "/does/not/exist.gguf", "port": 8085, "num_ctx": 32768,
+            "health_timeout": 30, "external_launcher": ["launcher.exe", "--x"],
+        })
+
+    def test_loopback_base_url(self):
+        self.assertEqual(self._engine()._base_url, "http://127.0.0.1:8085")
+
+    def test_load_launches_external_and_skips_gguf_and_gate(self):
+        e = self._engine()
+        proc = MagicMock(); proc.poll.return_value = None
+        with patch("core.engine_llama_cpp.subprocess.Popen", return_value=proc) as popen, \
+             patch.object(e, "_is_server_healthy", side_effect=[False, False, True]), \
+             patch.object(e, "_served_props", return_value=("x.gguf", 32768)), \
+             patch("core.engine_llama_cpp.time.sleep"), \
+             patch.object(e, "_vram_gate") as gate:
+            e.load()
+        self.assertEqual(popen.call_args[0][0], ["launcher.exe", "--x"])
+        gate.assert_not_called()
+        self.assertTrue(e._loaded)
+        self.assertFalse(e._adopted)
+        self.assertEqual(e.get_context_size(), 32768)
+
+    def test_takes_over_healthy_server_without_launching(self):
+        e = self._engine()
+        with patch("core.engine_llama_cpp.subprocess.Popen") as popen, \
+             patch.object(e, "_is_server_healthy", return_value=True), \
+             patch.object(e, "_served_props", return_value=(None, 16384)):
+            e.load()
+        popen.assert_not_called()
+        self.assertEqual(e.get_context_size(), 16384)
+
+    def test_unload_kills_tree_even_when_taken_over(self):
+        e = self._engine()
+        e._loaded = True
+        with patch.object(e, "_kill_external_tree") as kill, patch.object(e, "_kill_process") as kp:
+            e.unload()
+        kill.assert_called_once()
+        kp.assert_not_called()
+        self.assertFalse(e._loaded)

@@ -274,7 +274,17 @@ class LlamaCppEngine(BaseEngine):
         # that keeps a model warm).  Adopted servers are not ours to
         # terminate on unload.
         self._adopted = False
-        self._base_url = f"http://localhost:{self.port}"
+        # Entry key "external_launcher": a command (list) that starts an
+        # OpenAI-compatible server which is NOT llama-server but mimics its
+        # API (/health, /props, /v1/chat/completions with reasoning_content
+        # and tool_calls) - e.g. Strata for Qwen3.8-Flash-Next.  load() runs
+        # it instead of llama-server and skips the GGUF check and VRAM gate
+        # (the server plans its own memory); unload() stops its whole process
+        # tree, adopted or not, because the port is dedicated to this entry
+        # and the server holds a GPU the next model needs.
+        self._external_cmd = list(model_config.get("external_launcher") or [])
+        self._base_url = f"http://127.0.0.1:{self.port}" if self._external_cmd \
+            else f"http://localhost:{self.port}"
         self._last_gen_stats = {}
 
     def set_target_tier(self, tier: int, exact: bool = False) -> None:
@@ -659,6 +669,9 @@ class LlamaCppEngine(BaseEngine):
     def load(self, status_callback=None):
         if self._loaded and self._is_server_healthy():
             return
+        if self._external_cmd:
+            self._load_external(status_callback)
+            return
 
         # Another process (API server, GUI, or a machine-level scheduled
         # task that keeps a model warm) may already have a healthy server
@@ -1016,8 +1029,76 @@ class LlamaCppEngine(BaseEngine):
         # OS releasing the listening socket.
         time.sleep(0.5)
 
+    def _load_external(self, status_callback=None):
+        """Start (or take over) the external_launcher server on our port."""
+        if self._is_server_healthy():
+            _log.info("External server already healthy on port %d - taking it over", self.port)
+        else:
+            if status_callback:
+                status_callback(f"Starting {self.model_name} (external server, port {self.port})...")
+            log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(log_dir, f"external-server-port{self.port}.log")
+            with open(log_path, "wb") as fh:
+                self._process = subprocess.Popen(
+                    self._external_cmd, stdout=fh, stderr=subprocess.STDOUT,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            start = time.monotonic()
+            while not self._is_server_healthy():
+                if self._process.poll() is not None:
+                    raise RuntimeError(
+                        f"{self.model_name}: external server exited with code "
+                        f"{self._process.returncode} before it was ready (see {log_path})")
+                if time.monotonic() - start > self._health_timeout:
+                    self._kill_external_tree()
+                    raise RuntimeError(
+                        f"{self.model_name}: external server not ready after "
+                        f"{self._health_timeout}s (see {log_path})")
+                time.sleep(2)
+        _, served_ctx = self._served_props()
+        self._num_ctx = served_ctx or self._configured_num_ctx
+        self._adopted = False
+        self._loaded = True
+        if status_callback:
+            status_callback(f"{self.model_name} ready (ctx {self._num_ctx})")
+
+    def _kill_external_tree(self):
+        """Stop the external server: our Popen handle and whatever listens on
+        the port, each with all of its children (python -> engine exe)."""
+        import psutil
+        roots = []
+        if self._process is not None and self._process.poll() is None:
+            roots.append(self._process.pid)
+        for conn in psutil.net_connections(kind="tcp"):
+            if conn.laddr and conn.laddr.port == self.port and conn.status == psutil.CONN_LISTEN and conn.pid:
+                roots.append(conn.pid)
+        procs = []
+        for pid in set(roots):
+            try:
+                p = psutil.Process(pid)
+                procs.extend(p.children(recursive=True))
+                procs.append(p)
+            except psutil.NoSuchProcess:
+                continue
+        for p in procs:
+            try:
+                p.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        _, alive = psutil.wait_procs(procs, timeout=15)
+        for p in alive:
+            try:
+                p.kill()
+            except psutil.NoSuchProcess:
+                pass
+        self._process = None
+        time.sleep(1.0)
+
     def unload(self, status_callback=None):
-        self._kill_process()
+        if self._external_cmd:
+            self._kill_external_tree()
+        else:
+            self._kill_process()
         self._loaded = False
         if status_callback:
             status_callback("llama-server stopped.")
