@@ -1030,18 +1030,35 @@ class LlamaCppEngine(BaseEngine):
         time.sleep(0.5)
 
     def _load_external(self, status_callback=None):
-        """Start (or take over) the external_launcher server on our port."""
+        """Start (or take over) the external_launcher server on our port.
+
+        The launch ctx follows the same tier rules as llama-server: the
+        router's target tier (capped at the entry's num_ctx) or the cap.  A
+        "{ctx}" in the launcher command is replaced by it.  A running server
+        is taken over only when its ctx fits: at least the target, or exactly
+        the target for an explicit user reload; otherwise it is restarted.
+        """
+        target = self._target_ctx or self._configured_num_ctx
+        exact = self._target_exact
+        self._target_exact = False
         if self._is_server_healthy():
-            _log.info("External server already healthy on port %d - taking it over", self.port)
-        else:
+            _, served_ctx = self._served_props()
+            if target and served_ctx and (served_ctx != target if exact else served_ctx < target):
+                _log.info("External server on port %d serves ctx=%s, %s needed - restarting it",
+                          self.port, served_ctx, target)
+                self._kill_external_tree()
+            else:
+                _log.info("External server already healthy on port %d - taking it over", self.port)
+        if not self._is_server_healthy():
             if status_callback:
-                status_callback(f"Starting {self.model_name} (external server, port {self.port})...")
+                status_callback(f"Starting {self.model_name} (external server, port {self.port}, ctx {target})...")
+            cmd = [str(a).replace("{ctx}", str(target or "")) for a in self._external_cmd]
             log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
             os.makedirs(log_dir, exist_ok=True)
             log_path = os.path.join(log_dir, f"external-server-port{self.port}.log")
             with open(log_path, "wb") as fh:
                 self._process = subprocess.Popen(
-                    self._external_cmd, stdout=fh, stderr=subprocess.STDOUT,
+                    cmd, stdout=fh, stderr=subprocess.STDOUT,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             start = time.monotonic()
             while not self._is_server_healthy():
@@ -1056,7 +1073,7 @@ class LlamaCppEngine(BaseEngine):
                         f"{self._health_timeout}s (see {log_path})")
                 time.sleep(2)
         _, served_ctx = self._served_props()
-        self._num_ctx = served_ctx or self._configured_num_ctx
+        self._num_ctx = served_ctx or target
         self._adopted = False
         self._loaded = True
         if status_callback:

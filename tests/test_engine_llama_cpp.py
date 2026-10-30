@@ -625,9 +625,38 @@ class TestExternalLauncher(unittest.TestCase):
         e = self._engine()
         with patch("core.engine_llama_cpp.subprocess.Popen") as popen, \
              patch.object(e, "_is_server_healthy", return_value=True), \
-             patch.object(e, "_served_props", return_value=(None, 16384)):
+             patch.object(e, "_served_props", return_value=(None, 65536)):
             e.load()
         popen.assert_not_called()
+        self.assertEqual(e.get_context_size(), 65536)
+
+    def test_ctx_placeholder_and_restart_when_too_small(self):
+        from core.engine_llama_cpp import LlamaCppEngine
+        e = LlamaCppEngine("flash", {"path": "/x.gguf", "port": 8085, "num_ctx": 262144,
+                                     "external_launcher": ["l.exe", "-Context", "{ctx}"]})
+        e.set_target_tier(128000)
+        proc = MagicMock(); proc.poll.return_value = None
+        with patch("core.engine_llama_cpp.subprocess.Popen", return_value=proc) as popen, \
+             patch.object(e, "_is_server_healthy", side_effect=[True, False, True]), \
+             patch.object(e, "_served_props", side_effect=[(None, 32000), (None, 128000)]), \
+             patch.object(e, "_kill_external_tree") as kill, \
+             patch("core.engine_llama_cpp.time.sleep"):
+            e.load()
+        kill.assert_called_once()
+        self.assertEqual(popen.call_args[0][0], ["l.exe", "-Context", "128000"])
+        self.assertEqual(e.get_context_size(), 128000)
+
+    def test_exact_reload_restarts_bigger_server(self):
+        e = self._engine()
+        e.set_target_tier(16384, exact=True)
+        proc = MagicMock(); proc.poll.return_value = None
+        with patch("core.engine_llama_cpp.subprocess.Popen", return_value=proc), \
+             patch.object(e, "_is_server_healthy", side_effect=[True, False, True]), \
+             patch.object(e, "_served_props", side_effect=[(None, 32768), (None, 16384)]), \
+             patch.object(e, "_kill_external_tree") as kill, \
+             patch("core.engine_llama_cpp.time.sleep"):
+            e.load()
+        kill.assert_called_once()
         self.assertEqual(e.get_context_size(), 16384)
 
     def test_unload_kills_tree_even_when_taken_over(self):
