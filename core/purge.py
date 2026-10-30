@@ -123,9 +123,25 @@ def _is_artifex(proc, base: str) -> bool:
         return False
 
 
+def _external_ports() -> list[int]:
+    """The ports of the llama_cpp entries that run their own server
+    (external_launcher, e.g. Strata): neither llama-server nor an Artifex
+    script, so only the port finds them."""
+    try:
+        from core.config import get_llama_cpp_models
+        models = get_llama_cpp_models()
+    except Exception:
+        return []
+    ports = {e["port"] for e in models.values()
+             if isinstance(e, dict) and e.get("external_launcher") and isinstance(e.get("port"), int)}
+    return sorted(ports)
+
+
 def stop_artifex() -> int:
-    """Kill the API, GUIs, CLI and llama-server; returns how many."""
+    """Kill the API, GUIs, CLI and llama-server, then the external model
+    servers (external_launcher entries); returns how many processes."""
     import psutil
+    from core.proc_tree import stop_port_tree
     base = os.path.normcase(os.path.abspath(BASE_DIR))
     me = os.getpid()
     victims = [p for p in psutil.process_iter(["pid", "name", "cmdline"])
@@ -136,7 +152,8 @@ def stop_artifex() -> int:
         except psutil.Error:
             pass
     psutil.wait_procs(victims, timeout=10)
-    return len(victims)
+    # after the API is gone, so nothing relaunches them
+    return len(victims) + sum(stop_port_tree(port) for port in _external_ports())
 
 
 def delete_all(retries: int = 5) -> tuple[int, int, list[str]]:

@@ -95,3 +95,28 @@ class FakeProc:
 ])
 def test_is_artifex(proc, expected):
     assert purge._is_artifex(proc, os.path.normcase(APP)) is expected
+
+
+def test_external_ports_are_the_external_launcher_entries(monkeypatch):
+    import core.config
+    monkeypatch.setattr(core.config, "get_llama_cpp_models", lambda: {
+        "qwen-27b": {"path": "x.gguf", "port": 8081},                                # llama-server: by name
+        "flash-next": {"external_launcher": ["powershell", "-File", "s.ps1"], "port": 8085},
+        "no-port": {"external_launcher": ["x"]},
+        "bad-port": {"external_launcher": ["x"], "port": "8086"},
+    })
+    assert purge._external_ports() == [8085]
+
+
+def test_stop_artifex_stops_external_servers_after_artifex(monkeypatch):
+    """2026-10-30: a purge left the Strata server (python serve/server.py +
+    strata.exe) running - neither llama-server nor an Artifex script."""
+    import psutil
+    import core.proc_tree
+    order = []
+    monkeypatch.setattr(psutil, "process_iter", lambda attrs: order.append("artifex") or [])
+    monkeypatch.setattr(psutil, "wait_procs", lambda procs, timeout: ([], []))
+    monkeypatch.setattr(purge, "_external_ports", lambda: [8085])
+    monkeypatch.setattr(core.proc_tree, "stop_port_tree", lambda port, pids=(): order.append(port) or 2)
+    assert purge.stop_artifex() == 2
+    assert order == ["artifex", 8085]

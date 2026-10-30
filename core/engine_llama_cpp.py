@@ -1082,32 +1082,9 @@ class LlamaCppEngine(BaseEngine):
     def _kill_external_tree(self):
         """Stop the external server: our Popen handle and whatever listens on
         the port, each with all of its children (python -> engine exe)."""
-        import psutil
-        roots = []
-        if self._process is not None and self._process.poll() is None:
-            roots.append(self._process.pid)
-        for conn in psutil.net_connections(kind="tcp"):
-            if conn.laddr and conn.laddr.port == self.port and conn.status == psutil.CONN_LISTEN and conn.pid:
-                roots.append(conn.pid)
-        procs = []
-        for pid in set(roots):
-            try:
-                p = psutil.Process(pid)
-                procs.extend(p.children(recursive=True))
-                procs.append(p)
-            except psutil.NoSuchProcess:
-                continue
-        for p in procs:
-            try:
-                p.terminate()
-            except psutil.NoSuchProcess:
-                pass
-        _, alive = psutil.wait_procs(procs, timeout=15)
-        for p in alive:
-            try:
-                p.kill()
-            except psutil.NoSuchProcess:
-                pass
+        from core.proc_tree import stop_port_tree
+        own = self._process.pid if self._process is not None and self._process.poll() is None else None
+        stop_port_tree(self.port, [own] if own else [])
         self._process = None
         time.sleep(1.0)
 
