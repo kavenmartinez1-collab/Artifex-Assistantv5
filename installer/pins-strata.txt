@@ -1,0 +1,28 @@
+# Strata pack (Qwen3.8-Flash-Next on the Strata engine): the Python packages of Strata's own
+# venv, i.e. Strata v0.2.7's requirements.txt + requirements-monitor.txt and their dependencies,
+# resolved to exact pins. Deviations from Strata's pins: pillow 12.3.0 -> 13.0.0 (CVE fixes),
+# numpy 2.4.6 for every Python (wheels cover 3.11-3.13). OSV-checked 2026-10-29: no known vulns.
+certifi==2026.10.19
+charset-normalizer==3.5.1
+colorama==0.4.6
+idna==3.20
+Jinja2==3.1.6
+linkify-it-py==2.2.0
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+mdit-py-plugins==0.6.1
+mdurl==0.1.2
+numpy==2.4.6
+pillow==13.0.0
+platformdirs==4.14.0
+psutil==7.2.2
+Pygments==2.21.0
+PyYAML==6.0.3
+regex==2026.9.10
+requests==2.34.2
+rich==15.0.0
+textual==8.2.8
+tqdm==4.70.1
+truststore==0.10.5
+typing_extensions==4.16.0
+urllib3==2.8.0

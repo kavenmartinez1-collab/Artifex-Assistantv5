@@ -148,7 +148,7 @@ def test_a_hand_built_venv_is_never_changed(tmp_path):
     assert not any("install" in c for c in calls)
 
 
-@pytest.mark.parametrize("lock", ["voice", "create"])
+@pytest.mark.parametrize("lock", ["voice", "create", "strata"])
 def test_pack_locks_are_fully_hashed_and_index_free(lock):
     text = open(recipes.LOCKS[lock], encoding="utf-8").read()
     assert "--index-url" not in text and "--extra-index-url" not in text
@@ -429,3 +429,84 @@ def test_artifex_web_launcher_opens_with_the_model_filled_in(tmp_path):
                                "http://127.0.0.1:5173/?model=local/lfm3-1.7b")
     text = open(path, encoding="utf-8").read()
     assert 'start "" "http://127.0.0.1:5173/?model=local/lfm3-1.7b"' in text
+
+
+# ── Strata (Qwen3.8-Flash-Next) ─────────────────────────────────────────────
+
+def test_strata_is_pinned_end_to_end():
+    s = recipes.load_catalog()["strata"]
+    assert re.fullmatch(r"[0-9a-f]{40}", s["commit"]) and s["repo"].startswith("https://github.com/")
+    assert re.fullmatch(r"[0-9a-f]{40}", s["model"]["revision"])
+    pinned = s["model"]["files"] + list(s["engines"].values()) + s["feed"] + [s["llama_cpp_source"]]
+    for f in pinned:
+        assert re.fullmatch(r"[0-9a-f]{64}", f["sha256"]) and f["size"] > 0
+    for f in list(s["engines"].values()) + s["feed"]:
+        assert f["url"].startswith(f"https://github.com/Niko1221/Strata/releases/download/v{s['version']}/")
+    assert s["llama_cpp_source"]["url"].endswith(".zip") and "/archive/" in s["llama_cpp_source"]["url"]
+    for d in (s["dest"], s["models_dest"], s["data_dest"]):
+        assert not set(d.split("/")) & {"", ".", ".."}
+
+
+@pytest.mark.parametrize("probe, variant", [
+    ({"ram_mb": 32556, "gpus": [{"name": "NVIDIA GeForce RTX 5060 Ti", "vendor": "NVIDIA", "vram_mb": 8151},
+                                {"name": "AMD Radeon RX 6700 XT", "vendor": "AMD", "vram_mb": 12242}],
+      "nvidia": {"driver": "610.88"}}, "hip-rdna2"),
+    ({"ram_mb": 65536, "gpus": [{"name": "AMD Radeon RX 7900 XTX", "vendor": "AMD", "vram_mb": 24560}]}, "hip-rdna3"),
+    ({"ram_mb": 65536, "gpus": [{"name": "AMD Radeon RX 9070 XT", "vendor": "AMD", "vram_mb": 16304}]}, "hip-rx9070"),
+    ({"ram_mb": 32768, "gpus": [{"name": "NVIDIA GeForce RTX 3060", "vendor": "NVIDIA", "vram_mb": 12288,
+                                 "compute_cap": "8.6"}], "nvidia": {"driver": "590.10"}}, "cuda-cuda13"),
+    ({"ram_mb": 32768, "gpus": [{"name": "NVIDIA GeForce RTX 3060", "vendor": "NVIDIA", "vram_mb": 12288,
+                                 "compute_cap": "8.6"}], "nvidia": {"driver": "560.00"}}, "cuda-cuda12"),
+])
+def test_strata_picks_the_biggest_card_and_its_engine(probe, variant):
+    backend, got, g, _ = packs._strata_gpu(lambda: probe)
+    assert got == variant and got in recipes.load_catalog()["strata"]["engines"]
+    assert backend == ("hip" if got.startswith("hip") else "cuda")
+
+
+@pytest.mark.parametrize("probe, why", [
+    ({"ram_mb": 32768, "gpus": [{"name": "NVIDIA GeForce RTX 4060", "vendor": "NVIDIA", "vram_mb": 8188}]}, "12 GB"),
+    ({"ram_mb": 16384, "gpus": [{"name": "NVIDIA GeForce RTX 3060", "vendor": "NVIDIA", "vram_mb": 12288}]}, "32 GB of RAM"),
+    ({"ram_mb": 32768, "gpus": [{"name": "AMD Radeon RX 6650 XT 12GB", "vendor": "AMD", "vram_mb": 12288}]}, "no ready-made"),
+    ({"ram_mb": 32768, "gpus": [{"name": "NVIDIA GeForce GTX 1080 Ti", "vendor": "NVIDIA", "vram_mb": 11264,
+                                 "compute_cap": "6.1"}], "nvidia": {"driver": "590.10"}}, "older than RTX 20"),
+    ({"ram_mb": 32768, "gpus": []}, "graphics card"),
+])
+def test_strata_refuses_hardware_it_cant_run_on(probe, why):
+    with pytest.raises(packs.PackUnavailable, match=why):
+        packs._strata_gpu(lambda: probe)
+
+
+def test_strata_run_config_is_loopback_and_tuned():
+    s = recipes.load_catalog()["strata"]
+    setup_cfg = {"exe": "strata.exe", "port": 8080, "args": ["--pack", "p", "--spec", "4", "--mmap-experts",
+                                                             "--max-context", "32768"]}
+    cfg = packs._strata_artifex_config(setup_cfg, s, 31.8, "hip")
+    a = cfg["args"]
+    assert cfg["host"] == "127.0.0.1" and cfg["port"] == s["port"]
+    assert "--mmap-experts" not in a and "--resident-experts" in a
+    assert a[a.index("--resident-budget-gib") + 1] == "12.3"
+    assert a[a.index("--spec") + 1] == "3" and a[a.index("--vram-reserve-mib") + 1] == "700"
+    assert cfg["env"]["STRATA_ROUTE_PRIOR"] == "1.25" and cfg["env"]["STRATA_HIP_PROMPT_F16"] == "1"
+    big = packs._strata_artifex_config(dict(setup_cfg, args=["--pack", "p"]), s, 128, "cuda")
+    assert "--resident-budget-gib" not in big["args"] and "STRATA_HIP_PROMPT_F16" not in big["env"]
+
+
+def test_strata_stamp_lists_what_strata_setup_would_install(tmp_path):
+    (tmp_path / "requirements.txt").write_text("# c\nnumpy==2.4.6; python_version == \"3.11\"\npillow==12.3.0\n\n")
+    (tmp_path / "requirements-monitor.txt").write_text("# m\ntextual==8.2.8\n")
+    assert packs._strata_runtime_packages(str(tmp_path)) == [
+        'numpy==2.4.6; python_version == "3.11"', "pillow==12.3.0", "textual==8.2.8"]
+
+
+def test_strata_launcher_binds_loopback_only(tmp_path):
+    p = packs._strata_launcher(str(tmp_path), str(tmp_path / "S"), str(tmp_path / "py.exe"),
+                               str(tmp_path / "c.json"), 8085, 262144)
+    text = open(p, encoding="ascii").read()
+    assert "--host 127.0.0.1 --port 8085" in text and "$cfg.host = '127.0.0.1'" in text
+    assert "0.0.0.0" not in text
+
+
+def test_strata_lock_has_no_known_vulnerable_pillow():
+    text = open(recipes.LOCKS["strata"], encoding="utf-8").read()
+    assert "pillow==13.0.0" in text and "pillow==12." not in text

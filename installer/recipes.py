@@ -155,7 +155,7 @@ def write_config(pl: dict, force: bool = False) -> str:
 
 
 LOCKS = {name: os.path.join(HERE, f"requirements-{name}.txt")
-         for name in ("core", "gui", "voice", "create")}
+         for name in ("core", "gui", "voice", "create", "strata")}
 PYTORCH_INDEX = "https://download.pytorch.org/whl/cu128"
 ALLOWED_EXTRA_INDEXES = (PYTORCH_INDEX,)
 SUPPORTED_PYTHON = ((3, 11), (3, 13))   # wheels in the locks cover these

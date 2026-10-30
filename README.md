@@ -49,6 +49,7 @@ bar at the top of the window, type `cmd`, press **Enter**, then type:
 | Show it pictures | `setup pack vision` |
 | Make images, music, 3D | `setup pack create` |
 | Run AI in your web browser (Artifex Web, with LFM3) | `setup pack webgpu` |
+| A bigger, smarter model on one 12 GB+ card + 32 GB RAM (Qwen3.8-Flash-Next on Strata) | `setup pack strata` |
 | Use it from your phone, safely | `setup remote setup` |
 | Check nothing is exposed to the internet | `setup remote check` |
 
@@ -64,6 +65,7 @@ uses it, and `python -m installer ...` works the same way. Details:
 | Show it pictures | `python -m installer pack vision` |
 | Make images, music, 3D | `python -m installer pack create` |
 | Run AI in your web browser (Artifex Web, with LFM3) | `python -m installer pack webgpu` |
+| A bigger, smarter model on one 12 GB+ card + 32 GB RAM (Qwen3.8-Flash-Next on Strata) | `python -m installer pack strata` |
 | Use it from your phone, safely | `python -m installer remote setup` |
 | Check nothing is exposed to the internet | `python -m installer remote check` |
 
