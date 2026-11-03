@@ -69,23 +69,12 @@ class DropZone(QFrame):
         self.setAcceptDrops(True)
         self.setMinimumHeight(60)
         self.setMaximumHeight(80)
-        self.setStyleSheet("""
-            DropZone {
-                border: 2px dashed #444;
-                border-radius: 8px;
-                background-color: transparent;
-            }
-            DropZone[dragOver="true"] {
-                border-color: #00f0ff;
-                background-color: rgba(0, 240, 255, 0.05);
-            }
-        """)
+        # Styled by ui/qt_theme.py (DropZone / DropZone[dragOver="true"]).
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 5, 10, 5)
 
         self._label = QLabel("Drop files here or")
-        self._label.setStyleSheet("border: none; color: #666;")
         layout.addWidget(self._label)
 
         self._browse_btn = QPushButton("Browse")
@@ -94,7 +83,7 @@ class DropZone(QFrame):
         layout.addWidget(self._browse_btn)
 
         self._file_label = QLabel("")
-        self._file_label.setStyleSheet("border: none; color: #9efeff;")
+        self._file_label.setProperty("class", "file")
         self._file_label.setMaximumWidth(300)
         layout.addWidget(self._file_label, 1)
 
@@ -534,21 +523,20 @@ class ChatBubble(QFrame):
         self._stream_last_line_chars = 0
         self._last_height_update_at_chars = 0
 
-        # Role label
-        role_label = QLabel(role.upper())
-        role_label.setStyleSheet(
-            "font-weight: bold; font-size: 9pt; "
-            f"color: {'#00f0ff' if role == 'assistant' else '#9efeff'}; "
-            "background: transparent;"
-        )
-        self._layout.addWidget(role_label)
-
-        self.setStyleSheet("""
-            ChatBubble {
-                border-bottom: 1px solid #1e2340;
-                background-color: transparent;
-            }
-        """)
+        # Header: role tag + timestamp. Colours, the role bar and the tinted
+        # background come from ui/qt_theme.py via the "role" property.
+        self.setProperty("role", role)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        tag = {"assistant": "ARTIFEX", "user": "YOU"}.get(role, role.upper())
+        role_label = QLabel(f"◢ {tag}")
+        role_label.setProperty("class", "bubbleRole")
+        header.addWidget(role_label)
+        header.addStretch()
+        stamp = QLabel(time.strftime("%H:%M:%S"))
+        stamp.setProperty("class", "bubbleTime")
+        header.addWidget(stamp)
+        self._layout.addLayout(header)
 
     def add_text(self, text: str):
         """Add a text block to the bubble.
@@ -575,10 +563,7 @@ class ChatBubble(QFrame):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.MinimumExpanding,
         )
-        label.setStyleSheet(
-            "background: transparent; "
-            "font-family: Consolas; font-size: 10pt;"
-        )
+        label.setProperty("class", "bubbleText")
         self._layout.addWidget(label)
         return label
 
@@ -638,10 +623,7 @@ class ChatBubble(QFrame):
         edit.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        edit.setStyleSheet(
-            "background: transparent; border: none; "
-            "font-family: Consolas; font-size: 10pt;"
-        )
+        edit.setStyleSheet("background: transparent; border: none;")
         edit.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
@@ -750,14 +732,25 @@ class ChatView(QScrollArea):
         )
 
         self._container = QWidget()
+        # Transparent (ui/qt_theme.py) so paintEvent's HUD grid shows through.
+        self._container.setObjectName("chatContainer")
         self._container_layout = QVBoxLayout(self._container)
         self._container_layout.setContentsMargins(4, 4, 4, 4)
         self._container_layout.setSpacing(2)
-        self._container_layout.addStretch()
+        # Stretch factor 1 so spare height goes to the spacer, not to the
+        # bubbles' MinimumExpanding labels (which padded short messages).
+        self._container_layout.addStretch(1)
 
         self.setWidget(self._container)
         self._bubbles: list[ChatBubble] = []
         self._auto_scroll = True
+
+    def paintEvent(self, event):
+        # QAbstractScrollArea routes the viewport's paint here.
+        from ui.qt_cyber import paint_backdrop
+        painter = QPainter(self.viewport())
+        paint_backdrop(painter, self.viewport().rect())
+        painter.end()
 
     def add_bubble(self, role: str) -> ChatBubble:
         """Add a new chat bubble and return it for content population."""

@@ -31,6 +31,10 @@ from ui.qt_theme import (
     THEMES, get_theme_names, get_active_theme, set_active_theme,
     get_theme, generate_stylesheet, vram_color,
 )
+from ui.qt_cyber import (
+    NeonTitle, HudMeter, StatusLed, add_glow, style_native_titlebar,
+    make_app_icon,
+)
 from ui.qt_widgets import (
     DropZone, ImageViewer, AudioPlayer, VideoPlayer,
     MicrophoneRecorder, ChatView, ChatBubble,
@@ -408,10 +412,8 @@ class ArtifexMainWindow(QMainWindow):
         layout.setSpacing(8)
 
         # Title
-        title = QLabel("ARTIFEX V5")
-        title.setProperty("class", "title")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
+        self._title = NeonTitle()
+        layout.addWidget(self._title)
 
         # Theme selector
         theme_layout = QHBoxLayout()
@@ -423,7 +425,7 @@ class ArtifexMainWindow(QMainWindow):
         layout.addLayout(theme_layout)
 
         # Backend group
-        backend_group = QGroupBox("Backend")
+        backend_group = QGroupBox("BACKEND")
         bg_layout = QVBoxLayout(backend_group)
 
         be_layout = QHBoxLayout()
@@ -462,7 +464,7 @@ class ArtifexMainWindow(QMainWindow):
         layout.addWidget(backend_group)
 
         # Optimizations
-        opt_group = QGroupBox("Optimizations")
+        opt_group = QGroupBox("OPTIMIZATIONS")
         opt_layout = QVBoxLayout(opt_group)
         self._torch_compile_cb = QCheckBox("torch.compile()")
         self._torch_compile_cb.setChecked(get_torch_compile())
@@ -473,7 +475,7 @@ class ArtifexMainWindow(QMainWindow):
         layout.addWidget(opt_group)
 
         # Workspace
-        ws_group = QGroupBox("Workspace")
+        ws_group = QGroupBox("WORKSPACE")
         ws_layout = QVBoxLayout(ws_group)
         self._ws_path = QLineEdit()
         self._ws_path.setPlaceholderText("Workspace directory...")
@@ -487,7 +489,7 @@ class ArtifexMainWindow(QMainWindow):
         layout.addWidget(ws_group)
 
         # Session
-        session_group = QGroupBox("Session")
+        session_group = QGroupBox("SESSION")
         sess_layout = QHBoxLayout(session_group)
         self._save_btn = QPushButton("Save")
         self._load_btn = QPushButton("Load")
@@ -543,7 +545,7 @@ class ArtifexMainWindow(QMainWindow):
 
         # Chat tab — rich chat view
         self._chat_view = ChatView()
-        self._tabs.addTab(self._chat_view, "Chat")
+        self._tabs.addTab(self._chat_view, "CHAT")
 
         # Preview tab — image preview
         self._preview_viewer = ImageViewer(max_width=640, max_height=480)
@@ -554,7 +556,7 @@ class ArtifexMainWindow(QMainWindow):
         self._preview_label = QLabel("")
         self._preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         preview_layout.addWidget(self._preview_label)
-        self._tabs.addTab(preview_container, "Preview")
+        self._tabs.addTab(preview_container, "PREVIEW")
 
         # Audio tab
         self._audio_player = AudioPlayer()
@@ -562,7 +564,7 @@ class ArtifexMainWindow(QMainWindow):
         audio_layout = QVBoxLayout(audio_container)
         audio_layout.addWidget(self._audio_player)
         audio_layout.addStretch()
-        self._tabs.addTab(audio_container, "Audio")
+        self._tabs.addTab(audio_container, "AUDIO")
 
         # Video tab
         self._video_player = VideoPlayer()
@@ -570,24 +572,22 @@ class ArtifexMainWindow(QMainWindow):
         video_layout = QVBoxLayout(video_container)
         video_layout.addWidget(self._video_player)
         video_layout.addStretch()
-        self._tabs.addTab(video_container, "Video")
+        self._tabs.addTab(video_container, "VIDEO")
 
         # Logs tab — live log stream
         self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
         self._log_view.setMaximumBlockCount(2000)
-        self._log_view.setStyleSheet(
-            "font-family: Consolas; font-size: 9pt; background: #0a0a0a; color: #c8c8c8;"
-        )
-        self._tabs.addTab(self._log_view, "Logs")
+        self._log_view.setProperty("class", "log")
+        self._tabs.addTab(self._log_view, "LOGS")
         self._install_log_handler()
 
         # Forward Pass tab — live transformers forward-pass telemetry (3D)
         self._viz_panel = TelemetryPanel()
-        self._tabs.addTab(self._viz_panel, "Forward Pass")
+        self._tabs.addTab(self._viz_panel, "FORWARD PASS")
 
         # Agent tab — harness ingestion (absorb a folder's prior-agent context)
-        self._tabs.addTab(self._build_agent_tab(), "Agent")
+        self._tabs.addTab(self._build_agent_tab(), "AGENT")
 
         self._tabs.setMinimumHeight(400)
         layout.addWidget(self._tabs, 1)
@@ -649,6 +649,7 @@ class ArtifexMainWindow(QMainWindow):
         ctrl_layout.addStretch()
 
         self._execute_btn = QPushButton("EXECUTE")
+        self._execute_btn.setProperty("class", "primary")
         self._execute_btn.setMinimumWidth(120)
         self._execute_btn.setMinimumHeight(32)
         ctrl_layout.addWidget(self._execute_btn)
@@ -802,9 +803,7 @@ class ArtifexMainWindow(QMainWindow):
 
         # Mode hint bar — contextual instructions
         self._hint_label = QLabel("")
-        self._hint_label.setStyleSheet(
-            "font-family: Consolas; font-size: 9pt; color: #888; padding: 2px 4px;"
-        )
+        self._hint_label.setProperty("class", "hint")
         input_layout.addWidget(self._hint_label)
 
         layout.addWidget(input_frame)
@@ -824,11 +823,12 @@ class ArtifexMainWindow(QMainWindow):
         layout = QVBoxLayout(thinking)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        label = QLabel("Thinking")
-        label.setProperty("class", "accent")
+        label = QLabel("◢ THINKING // TRACE")
+        label.setProperty("class", "hud")
         layout.addWidget(label)
 
         self._thinking_output = QPlainTextEdit()
+        self._thinking_output.setObjectName("thinkingOutput")
         self._thinking_output.setReadOnly(True)
         self._thinking_output.setFont(QFont("Consolas", 9))
         layout.addWidget(self._thinking_output)
@@ -873,6 +873,8 @@ class ArtifexMainWindow(QMainWindow):
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
 
+        self._status_led = StatusLed(lambda: self._busy)
+        self._status_bar.addWidget(self._status_led)
         self._status_label = QLabel("STANDBY")
         self._status_label.setProperty("class", "status")
         self._status_bar.addWidget(self._status_label, 1)
@@ -882,9 +884,12 @@ class ArtifexMainWindow(QMainWindow):
         self._copy_btn.setProperty("class", "secondary")
         self._status_bar.addPermanentWidget(self._copy_btn)
 
-        self._resource_label = QLabel("")
-        self._resource_label.setProperty("class", "status")
-        self._status_bar.addPermanentWidget(self._resource_label)
+        # Segmented VRAM / RAM / CPU meters, fed by _update_resources
+        self._meters = {}
+        for key in ("VRAM", "RAM", "CPU"):
+            meter = HudMeter(key)
+            self._meters[key] = meter
+            self._status_bar.addPermanentWidget(meter)
 
     # ═══════════════════════════════════════════════════════════════════
     # SIGNAL CONNECTIONS
@@ -973,7 +978,24 @@ class ArtifexMainWindow(QMainWindow):
         if theme_name:
             set_active_theme(theme_name)
         qss = generate_stylesheet()
-        QApplication.instance().setStyleSheet(qss)
+        app = QApplication.instance()
+        app.setStyleSheet(qss)
+        # Painted pieces read the theme at paint time; glow + chrome + the
+        # fallback icon are baked, so redo them.
+        add_glow(self._execute_btn, "accent", blur=24, alpha=150)
+        add_glow(self._title, "accent", blur=18, alpha=110)
+        style_native_titlebar(self)
+        if not os.path.isfile(os.path.join(BASE_DIR, "assets", "icon.png")):
+            app.setWindowIcon(make_app_icon())
+        self._chat_view.viewport().update()
+        self.update()
+
+    def _set_recording_look(self, on: bool):
+        """Push-to-talk record button: themed 'recording' state (QSS)."""
+        btn = self._mic_recorder._record_btn
+        btn.setProperty("recording", on)
+        btn.style().unpolish(btn)
+        btn.style().polish(btn)
 
     def _on_theme_changed(self, name):
         self._apply_theme(name)
@@ -1963,7 +1985,7 @@ class ArtifexMainWindow(QMainWindow):
             "injects it, so this model absorbs the folder the way Claude Code does."
         )
         intro.setWordWrap(True)
-        intro.setStyleSheet("color:#aaa; font-size:9pt;")
+        intro.setProperty("class", "dim")
         outer.addWidget(intro)
 
         row = QHBoxLayout()
@@ -2010,7 +2032,7 @@ class ArtifexMainWindow(QMainWindow):
         outer.addWidget(split, 1)
 
         self._agent_status = QLabel("No folder absorbed yet.")
-        self._agent_status.setStyleSheet("color:#888; font-size:9pt;")
+        self._agent_status.setProperty("class", "dim")
         outer.addWidget(self._agent_status)
         vsplit.addWidget(harness_box)
 
@@ -2072,7 +2094,7 @@ class ArtifexMainWindow(QMainWindow):
         btn_row.addWidget(self._auto_stop_btn)
         btn_row.addStretch()
         self._auto_status = QLabel("Idle.")
-        self._auto_status.setStyleSheet("color:#888; font-size:9pt;")
+        self._auto_status.setProperty("class", "dim")
         btn_row.addWidget(self._auto_status)
         rb.addLayout(btn_row)
 
@@ -2105,8 +2127,7 @@ class ArtifexMainWindow(QMainWindow):
         self._auto_log = QPlainTextEdit()
         self._auto_log.setReadOnly(True)
         self._auto_log.setMaximumBlockCount(5000)
-        self._auto_log.setStyleSheet(
-            "font-family: Consolas; font-size: 9pt; background:#0a0a0a; color:#c8c8c8;")
+        self._auto_log.setProperty("class", "log")
         rb.addWidget(self._auto_log, 1)
         vsplit.addWidget(run_box)
 
@@ -2496,9 +2517,8 @@ class ArtifexMainWindow(QMainWindow):
                 alloc = torch.cuda.memory_allocated() / (1024**3)
                 total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
                 frac = alloc / total if total > 0 else 0
-                color = vram_color(frac)
                 parts.append(f"VRAM: {alloc:.1f}/{total:.1f}GB")
-                self._resource_label.setStyleSheet(f"color: {color};")
+                self._meters["VRAM"].set_value(frac, f"{alloc:.1f}/{total:.0f}G")
         except ImportError:
             pass
         except Exception as e:
@@ -2512,12 +2532,16 @@ class ArtifexMainWindow(QMainWindow):
             cpu = psutil.cpu_percent()
             parts.append(f"RAM: {ram_used:.1f}/{ram_total:.0f}GB")
             parts.append(f"CPU: {cpu:.0f}%")
+            self._meters["RAM"].set_value(ram.percent / 100, f"{ram_used:.1f}/{ram_total:.0f}G")
+            self._meters["CPU"].set_value(cpu / 100, f"{cpu:.0f}%")
         except ImportError:
             pass
         except Exception as e:
             _log.debug("System monitor error: %s", e)
 
-        self._resource_label.setText(" | ".join(parts) if parts else "")
+        tip = " | ".join(parts)
+        for meter in self._meters.values():
+            meter.setToolTip(tip)
 
     # ═══════════════════════════════════════════════════════════════════
     # PUSH-TO-TALK (hold Space in Voice Assistant mode)
@@ -2542,7 +2566,7 @@ class ArtifexMainWindow(QMainWindow):
                 )
                 self._ptt_stream.start()
                 self._set_status("Listening... (release Space to send)")
-                self._mic_recorder._record_btn.setStyleSheet("background-color: #ff4444;")
+                self._set_recording_look(True)
                 self._mic_recorder._status_label.setText("Recording...")
             except Exception as e:
                 self._ptt_active = False
@@ -2567,7 +2591,7 @@ class ArtifexMainWindow(QMainWindow):
                 self._ptt_stream.close()
                 self._ptt_stream = None
 
-            self._mic_recorder._record_btn.setStyleSheet("")
+            self._set_recording_look(False)
             self._mic_recorder._status_label.setText("Ready")
 
             if not self._ptt_audio_data:
