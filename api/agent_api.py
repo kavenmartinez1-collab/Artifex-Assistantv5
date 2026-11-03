@@ -70,6 +70,7 @@ from core.agent_loop import (
 )
 from core.sandbox.approvals import ApprovalMemory
 from core.logging_config import get_logger
+from tools.agent_tools import full_request
 
 _log = get_logger(__name__)
 
@@ -142,6 +143,16 @@ class RunMessageRequest(BaseModel):
 
 # ── Run state ────────────────────────────────────────────────────────────
 
+def _action_dict(action) -> dict:
+    # Never capped: the user always sees the whole request the model made
+    # (full command/script, both sides of an edit), not just the label.
+    return {
+        "type": getattr(action, "type", "?"),
+        "display": str(getattr(action, "display", "")),
+        "full": full_request(action),
+    }
+
+
 def _serialize_event(ev: AgentEvent) -> dict:
     d = {"kind": ev.kind, "round": ev.round, "ts": round(time.time(), 2)}
     for k in ("text", "output", "reason", "summary"):
@@ -151,10 +162,7 @@ def _serialize_event(ev: AgentEvent) -> dict:
     if ev.success is not None:
         d["success"] = ev.success
     if ev.action is not None:
-        d["action"] = {
-            "type": getattr(ev.action, "type", "?"),
-            "display": str(getattr(ev.action, "display", ""))[:300],
-        }
+        d["action"] = _action_dict(ev.action)
     if ev.decision is not None:
         risk = getattr(ev.decision, "risk_level", None)
         d["risk"] = getattr(risk, "name", str(risk)) if risk is not None else None
@@ -231,10 +239,7 @@ class AgentRun:
             # this fallback a snapshot-polling client (no SSE) renders an
             # approval prompt with no explanation at all.
             "reason": reason or (getattr(decision, "reason", "") if decision else ""),
-            "action": None if action is None else {
-                "type": getattr(action, "type", "?"),
-                "display": str(getattr(action, "display", ""))[:300],
-            },
+            "action": None if action is None else _action_dict(action),
             "risk": (getattr(getattr(decision, "risk_level", None), "name", None)
                      if decision is not None else None),
         }

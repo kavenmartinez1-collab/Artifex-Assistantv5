@@ -230,6 +230,31 @@ AgentAction = namedtuple("AgentAction", ["type", "content", "display"])
 # content: the raw code/query/path string
 # display: human-friendly summary for confirmation prompt
 
+
+def full_request(action) -> str:
+    """The complete tool request, untruncated, for the agent UIs.
+
+    `display` is a one-line label (it is also fed back to the model and used
+    in commit messages), so it stays short. This renders everything the model
+    actually asked for: the whole command or script, both sides of an edit,
+    every argument.
+    """
+    atype = str(getattr(action, "type", "") or "")
+    content = str(getattr(action, "content", "") or "")
+    display = str(getattr(action, "display", "") or "")
+    if atype in ("shell", "python"):
+        return content or display
+    if atype == "edit_file":
+        parts = content.split("\x00")
+        if len(parts) == 3:
+            path, old, new = parts
+            if not old:
+                return f"write_file: {path}\n{new}"
+            return f"edit_file: {path}\n--- OLD\n{old}\n+++ NEW\n{new}"
+    if content and content not in display:
+        return f"{display}\nargs: {content}" if display else content
+    return display or content
+
 # Per-tool output limits (chars fed back to the model).
 # Shared by CLI and GUI so they stay in sync.
 # These are the STANDARD baseline values — actual limits scale with the active

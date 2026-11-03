@@ -25,6 +25,7 @@ from core import harness
 from core.agent_loop import AgentRunner, RunConfig, AutonomyLevel, Decision
 from tools.agent_tools import (
     extract_agent_actions,
+    full_request,
     run_agent_action,
     get_assistant_tools_prompt,
     get_tool_output_limit,
@@ -282,6 +283,13 @@ class _ConsoleHost:
             sys.stdout.flush()
         elif k in ("assistant_message", "done"):
             self._end_stream()
+        elif k == "action_proposed":
+            # The whole request (full command/script, both sides of an edit),
+            # never cut; the approval prompt and "running:" below stay short.
+            self._end_stream()
+            print(f"{Fore.CYAN}  tool request: {Fore.WHITE}{ev.action.type}{Style.RESET_ALL}")
+            for line in (full_request(ev.action) or "").splitlines():
+                print(f"{Fore.WHITE}    {line}{Style.RESET_ALL}")
         elif k == "action_started":
             print(f"{Fore.CYAN}  running: {Fore.WHITE}{ev.action.display}{Style.RESET_ALL}")
         elif k == "action_result":

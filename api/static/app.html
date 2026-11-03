@@ -400,8 +400,8 @@
     font-size: 11px; letter-spacing: 1.5px; color: var(--warn); margin-bottom: 6px;
   }
   #approval .ap-what {
-    font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere;
-    max-height: 20dvh; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; white-space: pre-wrap;
+    max-height: 30dvh; overflow-y: auto; -webkit-overflow-scrolling: touch;
     margin-bottom: 3px;
   }
   #approval .ap-why {
@@ -484,6 +484,12 @@
   .chip.r-HIGH .risk { color: var(--orange); border-color: rgba(255,138,61,.45); }
   .chip.r-CRITICAL .risk { color: var(--err); border-color: rgba(255,59,92,.45); }
   .chip .cdisp { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+  .chip pre.cfull {
+    margin: 4px 0 0; padding: 6px 8px; border-radius: 6px; background: var(--panel2);
+    font-family: var(--mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere;
+    max-height: 40dvh; overflow: auto; -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+  }
   .chip .cwhy { font-size: 11.5px; color: var(--dim); margin-top: 3px; overflow-wrap: anywhere; }
   .chip .cstate {
     font-size: 15px; line-height: 1.2; flex: none; color: var(--dim);
@@ -4012,6 +4018,9 @@ function agentChip(ev) {
   if (risk) head.appendChild(el("span", "risk", risk));
   main.appendChild(head);
   main.appendChild(el("div", "cdisp", a.display || ""));
+  // The whole request (command, script, both sides of an edit), never cut.
+  // Scrolls inside the chip when long instead of being truncated.
+  if (a.full && a.full !== a.display) main.appendChild(el("pre", "cfull", a.full));
   if (ev.policy_reason) main.appendChild(el("div", "cwhy", ev.policy_reason));
   wrap.appendChild(main);
   wrap.appendChild(state);
@@ -4045,7 +4054,7 @@ function showApproval(payload, kind) {
   const a = (payload && payload.action) || null;
   const risk = payload && payload.risk ? payload.risk : "";
   $("ap-what").textContent = a
-    ? (a.type || "action") + "  " + (a.display || "")
+    ? (a.type || "action") + "  " + (a.full || a.display || "")
     : (payload && payload.reason ? payload.reason : "The run is waiting on you.");
   const why = [];
   if (risk) why.push("risk " + risk);

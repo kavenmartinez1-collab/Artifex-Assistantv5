@@ -53,7 +53,7 @@ from core.engine_factory import create_engine
 from core.services import get_service
 from core.knowledge import KnowledgeManager
 from tools.tool_cache import SessionMap, clear_cache, update_session_map, maybe_cache_output
-from tools.agent_tools import get_assistant_tools_prompt, get_tool_output_limit
+from tools.agent_tools import get_assistant_tools_prompt, get_tool_output_limit, full_request
 
 
 # Pipeline mode definitions
@@ -2103,8 +2103,11 @@ class ArtifexMainWindow(QMainWindow):
         self._auto_approval.setVisible(False)
         ab = QHBoxLayout(self._auto_approval)
         ab.setContentsMargins(0, 0, 0, 0)
-        self._auto_approval_label = QLabel("")
-        self._auto_approval_label.setWordWrap(True)
+        # Read-only text box, not a QLabel: it holds the FULL request (a whole
+        # script or both sides of an edit) as plain text and scrolls when long.
+        self._auto_approval_label = QPlainTextEdit()
+        self._auto_approval_label.setReadOnly(True)
+        self._auto_approval_label.setMaximumHeight(220)
         ab.addWidget(self._auto_approval_label, 1)
         self._auto_approve_btn = QPushButton("Approve")
         # Same rule memory as the phone's "Always" (core.sandbox.approvals):
@@ -2377,6 +2380,9 @@ class ArtifexMainWindow(QMainWindow):
             risk = getattr(ev.decision, "risk_level", None)
             risk = risk.name if risk is not None else "?"
             self._auto_append(f"  • {ev.action.type}: {ev.action.display}  [{risk}]")
+            full = full_request(ev.action)
+            if full and full != ev.action.display:
+                self._auto_append("\n".join("      " + line for line in full.splitlines()))
         elif k == "action_result":
             status = "ok" if ev.success else "FAIL"
             out = (ev.output or "").strip().replace("\n", " ")[:140]
@@ -2420,14 +2426,14 @@ class ArtifexMainWindow(QMainWindow):
         if action is not None:
             risk = getattr(decision, "risk_level", None)
             risk = risk.name if risk is not None else "?"
-            self._auto_approval_label.setText(
-                f"Approve {action.type} [{risk}]?  {action.display}")
+            self._auto_approval_label.setPlainText(
+                f"Approve {action.type} [{risk}]?\n{full_request(action)}")
             self._auto_approve_btn.setText("Approve")
             self._auto_always_btn.setVisible(True)
             self._auto_deny_btn.setVisible(True)
         else:
             # Gate / circuit-breaker pause: nothing to remember.
-            self._auto_approval_label.setText(f"Paused — {reason}. Continue?")
+            self._auto_approval_label.setPlainText(f"Paused — {reason}. Continue?")
             self._auto_approve_btn.setText("Continue")
             self._auto_always_btn.setVisible(False)
             self._auto_deny_btn.setVisible(False)
