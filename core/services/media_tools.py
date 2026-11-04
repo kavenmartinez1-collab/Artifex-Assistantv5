@@ -230,7 +230,7 @@ def list_models(tool: str) -> list[dict]:
 
 def catalog() -> dict:
     """Everything the phone needs to draw the Create screen."""
-    from core.services import voice_io
+    from core.services import orpheus_tts, voice_io
     return {
         "tools": [
             {"id": tid, "label": t["label"], "needs_image": bool(t.get("needs_image")),
@@ -240,6 +240,8 @@ def catalog() -> dict:
             for tid, t in TOOLS.items()
         ],
         "voices": voice_io.list_voices(),
+        # Streamed Orpheus speakers (/v1/voice/tts/stream), when configured
+        "orpheus_voices": orpheus_tts.VOICES if orpheus_tts.configured() else [],
         "stt_models": voice_io.STT_MODELS,
     }
 

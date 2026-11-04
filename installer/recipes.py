@@ -155,7 +155,7 @@ def write_config(pl: dict, force: bool = False) -> str:
 
 
 LOCKS = {name: os.path.join(HERE, f"requirements-{name}.txt")
-         for name in ("core", "gui", "voice", "create", "strata")}
+         for name in ("core", "gui", "voice", "create", "strata", "holo", "holo-torch")}
 PYTORCH_INDEX = "https://download.pytorch.org/whl/cu128"
 ALLOWED_EXTRA_INDEXES = (PYTORCH_INDEX,)
 SUPPORTED_PYTHON = ((3, 11), (3, 13))   # wheels in the locks cover these
@@ -170,12 +170,16 @@ def venv_python(root: str) -> str:
 
 
 def add_locked_packages(root: str, lock: str, needed_modules, log=print,
-                        run=subprocess.run, extra_index: str = "") -> str:
+                        run=subprocess.run, extra_index: str = "", no_deps: bool = False) -> str:
     """Install a pack's hash-locked packages into the installer's venv.
 
     A venv the installer didn't create (a hand-built full install) is left
     alone: if it already has the modules, fine; if not, say what's missing
     instead of changing someone's environment behind their back.
+
+    no_deps: install exactly the lock's packages and nothing they declare
+    (the lock must then list every package the pack really imports; the
+    hashes are still required).
     """
     py = venv_python(root)
     venv = os.path.dirname(os.path.dirname(py))
@@ -189,6 +193,7 @@ def add_locked_packages(root: str, lock: str, needed_modules, log=print,
             raise ValueError(f"refusing package index {extra_index!r}")
         run([py, "-m", "pip", "install", "--isolated", "--require-hashes",
              "--only-binary=:all:", "--no-input", "--disable-pip-version-check"]
+            + (["--no-deps"] if no_deps else [])
             + (["--extra-index-url", extra_index] if extra_index else [])
             + ["-r", LOCKS["core"], "-r", lock], check=True)
         return py

@@ -148,7 +148,7 @@ def test_a_hand_built_venv_is_never_changed(tmp_path):
     assert not any("install" in c for c in calls)
 
 
-@pytest.mark.parametrize("lock", ["voice", "create", "strata"])
+@pytest.mark.parametrize("lock", ["voice", "create", "strata", "holo", "holo-torch"])
 def test_pack_locks_are_fully_hashed_and_index_free(lock):
     text = open(recipes.LOCKS[lock], encoding="utf-8").read()
     assert "--index-url" not in text and "--extra-index-url" not in text
@@ -166,6 +166,22 @@ def test_create_and_voice_locks_agree_on_shared_packages():
     v, c = pins("voice"), pins("create")
     clash = {k: (v[k], c[k]) for k in v.keys() & c.keys() if v[k] != c[k]}
     assert not clash, f"the voice and create packs would fight over {clash}"
+
+
+def test_holo_lock_agrees_with_voice_create_and_core():
+    def pins(lock):
+        return {k.lower().replace("_", "-"): v for k, v in re.findall(
+            r"^([A-Za-z0-9_.\-]+)==(\S+) \\$", open(recipes.LOCKS[lock], encoding="utf-8").read(), re.M)}
+    h = {**pins("holo"), **pins("holo-torch")}
+    for other in ("voice", "create", "core"):
+        o = pins(other)
+        clash = {k: (h[k], o[k]) for k in h.keys() & o.keys()
+                 if h[k] != o[k] and not (k == "torch" and o[k].startswith(h[k] + "+"))}
+        assert not clash, f"the holo and {other} locks would fight over {clash}"
+    # installed together with the core lock: no package may be pinned twice
+    assert not (pins("holo").keys() & pins("core").keys())
+    # MediaPipe's contrib OpenCV (clobbers Create's headless cv2) and audio extras stay out
+    assert not {"opencv-contrib-python", "sounddevice", "torch"} & pins("holo").keys()
 
 
 # ── Vision ──────────────────────────────────────────────────────────────────
@@ -510,3 +526,64 @@ def test_strata_launcher_binds_loopback_only(tmp_path):
 def test_strata_lock_has_no_known_vulnerable_pillow():
     text = open(recipes.LOCKS["strata"], encoding="utf-8").read()
     assert "pillow==13.0.0" in text and "pillow==12." not in text
+
+
+# ── Holo ────────────────────────────────────────────────────────────────────
+
+def test_holo_downloads_are_pinned_and_path_safe():
+    cat = recipes.load_catalog()
+    h = cat["holo"]
+    for key in ("piper", "orpheus", "snac", "depth"):
+        spec = h[key]
+        assert re.fullmatch(r"[0-9a-f]{40}", spec["revision"])
+        parts = spec["dest"].split("/")
+        assert parts[0] == "models" and not set(parts) & {"", ".", ".."}
+        for f in spec["files"]:
+            assert re.fullmatch(r"[0-9a-f]{64}", f["sha256"]) and f["size"] > 0
+    f = h["face"]
+    assert re.fullmatch(r"[0-9a-f]{64}", f["sha256"]) and f["dest"].startswith("models/")
+    assert fetch.host_allowed(f["url"], cat["allowed_hosts"]) and f["url"].startswith("https://")
+    assert h["orpheus_server"]["port"] == 8082
+
+
+def _holo_root(tmp_path, cfg):
+    _venv(tmp_path)
+    (tmp_path / "llama_cpp_config.json").write_text(json.dumps(cfg))
+    vk = tmp_path / "runtime" / "llama.cpp" / ("%s-vulkan" % recipes.load_catalog()["llama_cpp"]["tag"])
+    vk.mkdir(parents=True)
+    (vk / "llama-server.exe").write_text("")
+
+
+def test_holo_pack_registers_orpheus_and_marks_models_that_fit(monkeypatch, tmp_path):
+    cfg = {"models": {"brain": {"path": "brain.gguf", "extra_flags": ["-fa", "on"]},
+                      "split": {"path": "big.gguf", "extra_flags": ["-ts", "5,11", "--device", "CUDA0,ROCm0"]},
+                      "mine": {"path": "x.gguf", "coexists_with_orpheus": False}}}
+    _holo_root(tmp_path, cfg)
+    monkeypatch.setattr(packs, "_fetch_hf_files", lambda *a, **k: None)
+    monkeypatch.setattr(fetch, "download", lambda *a, **k: None)
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        return _ok("avatar ok guess\norpheus ok 48000")
+    two = {"gpus": [{"name": "RTX", "vendor": "NVIDIA", "vram_mb": 8151},
+                    {"name": "RX", "vendor": "AMD", "vram_mb": 12242}]}
+    packs.install_holo(str(tmp_path), recipes.load_catalog(), log=lambda *a: None, run=run,
+                       probe_fn=lambda: two)
+    new = json.loads((tmp_path / "llama_cpp_config.json").read_text())
+    o = new["orpheus"]
+    assert o["device"] == "Vulkan1" and o["port"] == 8082 and o["model"].endswith("orpheus-3b-0.1-ft-q4_k_m.gguf")
+    assert new["models"]["brain"]["coexists_with_orpheus"] is True
+    assert "coexists_with_orpheus" not in new["models"]["split"]
+    assert new["models"]["mine"] == {"path": "x.gguf", "coexists_with_orpheus": False}   # yours kept
+    pip = [c for c in calls if "pip" in c]
+    assert pip and all("--no-deps" in c and "--require-hashes" in c for c in pip)
+
+
+def test_holo_self_test_failure_stops_the_pack(monkeypatch, tmp_path):
+    _holo_root(tmp_path, {"models": {}})
+    monkeypatch.setattr(packs, "_fetch_hf_files", lambda *a, **k: None)
+    monkeypatch.setattr(fetch, "download", lambda *a, **k: None)
+    with pytest.raises(RuntimeError, match="holo self-test failed"):
+        packs.install_holo(str(tmp_path), recipes.load_catalog(), log=lambda *a: None,
+                           run=lambda cmd, **kw: _ok("something else"), probe_fn=lambda: {"gpus": []})

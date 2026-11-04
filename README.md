@@ -50,6 +50,7 @@ bar at the top of the window, type `cmd`, press **Enter**, then type:
 | Make images, music, 3D | `setup pack create` |
 | Run AI in your web browser (Artifex Web, with LFM3) | `setup pack webgpu` |
 | A bigger, smarter model on one 12 GB+ card + 32 GB RAM (Qwen3.8-Flash-Next on Strata) | `setup pack strata` |
+| A talking hologram avatar on your phone (Holo tab, Orpheus + Piper voices, avatars from any photo) | `setup pack holo` |
 | Use it from your phone, safely | `setup remote setup` |
 | Check nothing is exposed to the internet | `setup remote check` |
 
@@ -59,13 +60,15 @@ your private Tailscale network). Already have Python 3.11-3.13? `setup.cmd`
 uses it, and `python -m installer ...` works the same way. Details:
 [Setup Guide](#setup-guide).
 
----|---|
+| Want to... | Type |
+|---|---|
 | See the extras | `python -m installer packs` |
 | Talk and listen (voice) | `python -m installer pack voice` |
 | Show it pictures | `python -m installer pack vision` |
 | Make images, music, 3D | `python -m installer pack create` |
 | Run AI in your web browser (Artifex Web, with LFM3) | `python -m installer pack webgpu` |
 | A bigger, smarter model on one 12 GB+ card + 32 GB RAM (Qwen3.8-Flash-Next on Strata) | `python -m installer pack strata` |
+| A talking hologram avatar on your phone (Holo tab, Orpheus + Piper voices, avatars from any photo) | `python -m installer pack holo` |
 | Use it from your phone, safely | `python -m installer remote setup` |
 | Check nothing is exposed to the internet | `python -m installer remote check` |
 
@@ -257,10 +260,14 @@ python -m installer pack voice         # install one (shows the plan, asks first
 | `web-search` | Web search through a hardened gateway + SearXNG in Docker (Docker Desktop must already be installed) | ~0.5 GB |
 | `webgpu` | Artifex Web, the in-browser WebGPU engine in `webgpu/` (uses your Node.js 20+, or downloads a pinned portable Node), with LFM3 1.7B ready to load: its launcher opens with `local/lfm3-1.7b` filled in | ~0.3 GB + 1.1 GB model (reuses the core install's copy when it has one) |
 | `game` | A Tale of Yarn, the WebGPU game: cloned at a pinned commit into `games/`, with its NPC model (LFM3 1.7B, licence included) and voices (Git for Windows required) | ~0.6 GB + 1.3 GB models |
+| `strata` | Qwen3.8-Flash-Next (MoE) on the Strata engine: one 12 GB+ NVIDIA or AMD card and 32 GB of RAM | ~68 GB model + ~35 GB expert pack + ~6 GB |
+| `holo` | The phone app's **Holo** tab: a talking 3D hologram avatar. Four female Piper voices, the streamed Orpheus 3B voices (tara & co.) on their own Vulkan llama.cpp server (127.0.0.1:8082, on demand; the second card when you have two), and avatars from any photo (depth map + face points on the CPU) | ~2.9 GB (+0.2 GB CPU PyTorch if you have none) |
 | `ollama` | Use an Ollama you already have as the backend (checks it isn't open to your network) | nothing |
 
 Each pack tests itself at the end (Piper speaks and Whisper transcribes it
-back; the vision helper describes a test picture; Create renders an image).
+back; the vision helper describes a test picture; Create renders an image;
+Holo makes a depth map and face points for a test picture, then Orpheus
+speaks a line).
 
 #### Phone access (Tailscale) and the exposure check
 
@@ -304,7 +311,8 @@ so it is built to refuse anything it can't verify:
   runs. npm is started through `node`, never `npm.cmd`, so no `cmd.exe`
   argument parsing is involved. Git runs over https only, without repo hooks.
 - **Allow-listed hosts only.** HTTPS to GitHub, Hugging Face, PyPI, the
-  PyTorch index, nodejs.org and pkgs.tailscale.com, checked again on every redirect.
+  PyTorch index, nodejs.org, pkgs.tailscale.com and (for the holo pack's
+  face landmarker) storage.googleapis.com, checked again on every redirect.
 - **Safe unpacking.** Archives are checked before unpacking (no `..`,
   absolute paths, drive letters or links), so nothing lands outside the
   install folder.

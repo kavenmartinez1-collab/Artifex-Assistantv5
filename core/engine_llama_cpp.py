@@ -227,6 +227,9 @@ class LlamaCppEngine(BaseEngine):
         self.num_gpu_layers = model_config.get("num_gpu_layers", 99)
         self.extra_flags = list(model_config.get("extra_flags", []))
         self.server_path = model_config.get("server_path", "llama-server")
+        # Fits beside Holo's Orpheus voice server (e.g. a 5060 Ti-only model);
+        # a CPU-only server (-ngl 0, the vision helper) never needs its card.
+        self._coexists_with_orpheus = bool(model_config.get("coexists_with_orpheus"))             or self.num_gpu_layers == 0
         # Extra DLL/shared-lib dirs prepended to the child's PATH (per-model
         # override > global). A CUDA+ROCm build needs the ROCm runtime here:
         # without it ggml-hip.dll fails to load SILENTLY and "--device ROCm0"
@@ -283,8 +286,9 @@ class LlamaCppEngine(BaseEngine):
         # tree, adopted or not, because the port is dedicated to this entry
         # and the server holds a GPU the next model needs.
         self._external_cmd = list(model_config.get("external_launcher") or [])
-        self._base_url = f"http://127.0.0.1:{self.port}" if self._external_cmd \
-            else f"http://localhost:{self.port}"
+        # 127.0.0.1, not localhost: on Windows "localhost" tries ::1 first
+        # and each new connection paid ~2 s before falling back to IPv4.
+        self._base_url = f"http://127.0.0.1:{self.port}"
         self._last_gen_stats = {}
 
     def set_target_tier(self, tier: int, exact: bool = False) -> None:
@@ -669,6 +673,10 @@ class LlamaCppEngine(BaseEngine):
     def load(self, status_callback=None):
         if self._loaded and self._is_server_healthy():
             return
+        # Orpheus (Holo's "tara" voice) borrows the 6700 XT; a model that may
+        # need that card gets it back before it loads (and keeps it).
+        from core.services import orpheus_tts
+        orpheus_tts.gpu_claimed(self.model_name, self._coexists_with_orpheus)
         if self._external_cmd:
             self._load_external(status_callback)
             return
@@ -1094,6 +1102,8 @@ class LlamaCppEngine(BaseEngine):
         else:
             self._kill_process()
         self._loaded = False
+        from core.services import orpheus_tts
+        orpheus_tts.gpu_released(self.model_name)
         if status_callback:
             status_callback("llama-server stopped.")
 

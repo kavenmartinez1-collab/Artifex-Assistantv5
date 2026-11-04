@@ -25,7 +25,7 @@ from threading import Lock
 
 _log = logging.getLogger(__name__)
 
-OLLAMA_BASE = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_BASE = os.environ.get("ARTIFEX_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 
 # ── Idle shrink ────────────────────────────────────────────────────────
 # Auto-release the loaded engine after this many seconds of inactivity so

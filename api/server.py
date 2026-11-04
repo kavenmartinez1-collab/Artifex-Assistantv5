@@ -1576,6 +1576,21 @@ def create_app():
                 media_type="text/html",
             )
 
+        # Holo tab assets (proof of concept): the avatar, its depth map and
+        # holo.js. Public like /app itself; a bare filename with a known
+        # type, so nothing outside static/holo can be named.
+        _holo_types = {"js": "text/javascript", "jpg": "image/jpeg", "png": "image/png"}
+
+        @app.get("/app/holo/{name}", include_in_schema=False)
+        async def phone_app_holo(name: str):
+            from fastapi.responses import FileResponse
+            m = re.fullmatch(r"[a-z0-9_]+\.(js|jpg|png)", name)
+            path = os.path.join(os.path.dirname(__file__), "static", "holo", name)
+            if not m or not os.path.isfile(path):
+                raise HTTPException(status_code=404, detail="Not found")
+            return FileResponse(path, media_type=_holo_types[m.group(1)],
+                                headers={"Cache-Control": "no-cache"})
+
         # ─── Engine control ──────────────────────────────────────────────
         # Remote ops for the phone: see what's loaded and force a relaunch
         # at a chosen ctx. Tier upgrades happen automatically per request;
@@ -1784,6 +1799,12 @@ def create_app():
         return strip_think_blocks(text or "")
 
     register_media_routes(app, check_auth=_check_auth, prompt_llm=_media_prompt_llm)
+
+    # Holo tab avatars: upload a picture -> depth + face + persona (CPU).
+    # Part of the phone app; off with it.
+    if phone_app_on:
+        from api.holo_api import register_holo_routes
+        register_holo_routes(app, check_auth=_check_auth)
 
     if phone_full_tools:
         # ─── Purge ───────────────────────────────────────────────────────

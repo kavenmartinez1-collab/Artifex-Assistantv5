@@ -1,0 +1,10 @@
+# CPU PyTorch for the Holo pack, only when the environment has no torch yet
+# (the Create pack brings the CUDA build of the same 2.7.1). The SNAC decoder
+# and the depth model both run on the CPU. filelock / fsspec /
+# typing_extensions come from pins-holo.txt and pins-core.txt. Exact pins.
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+mpmath==1.3.0
+networkx==3.6.1
+sympy==1.14.0
+torch==2.7.1

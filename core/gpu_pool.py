@@ -99,7 +99,28 @@ class GPUDevice:
 
 # ── GGUF Header Reading ────────────────────────────────────────────────
 
+_GGUF_KV_CACHE: dict = {}
+
+
 def read_gguf_kv_params(gguf_path: str) -> Optional[dict]:
+    """read_gguf_kv_params_uncached(), memoized per (path, size, mtime).
+
+    Every chat request estimates its KV size from this, and walking the
+    header means reading the whole tokenizer vocab first (Gemma 4: 262k
+    strings, ~0.4 s per request), so the parse is done once per file.
+    """
+    try:
+        st = os.stat(gguf_path)
+    except OSError:
+        return read_gguf_kv_params_uncached(gguf_path)
+    key = (os.path.abspath(gguf_path), st.st_size, st.st_mtime_ns)
+    if key not in _GGUF_KV_CACHE:
+        _GGUF_KV_CACHE[key] = read_gguf_kv_params_uncached(gguf_path)
+    hit = _GGUF_KV_CACHE[key]
+    return dict(hit) if hit is not None else None
+
+
+def read_gguf_kv_params_uncached(gguf_path: str) -> Optional[dict]:
     """Read KV-cache-relevant architecture params from a GGUF file header.
 
     Returns dict with:

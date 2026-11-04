@@ -589,6 +589,9 @@ class ArtifexMainWindow(QMainWindow):
         # Agent tab — harness ingestion (absorb a folder's prior-agent context)
         self._tabs.addTab(self._build_agent_tab(), "AGENT")
 
+        # Holo tab — the phone app's talking hologram, opened in the browser
+        self._tabs.addTab(self._build_holo_tab(), "HOLO")
+
         self._tabs.setMinimumHeight(400)
         layout.addWidget(self._tabs, 1)
 
@@ -1829,14 +1832,17 @@ class ArtifexMainWindow(QMainWindow):
         breakdown = "\n".join(
             f"  • {r['label']}: {r['files']} files, {purge.fmt_bytes(r['bytes'])}"
             for r in rows)
+        n_av = purge.kept_avatars()
+        avatars = (f"Holo avatars ({n_av}) are kept; type PURGE ALL to erase them too.\n"
+                   if n_av else "")
         text, ok = QInputDialog.getText(
             self, "Purge Artifex",
             "This shuts Artifex down (API, this window, CLI, llama-server) and "
             "permanently deletes:\n\n" + breakdown + "\n\n"
-            "Models and settings stay. Type PURGE to confirm:")
-        if not ok or text.strip() != "PURGE":
+            "Models and settings stay. " + avatars + "Type PURGE to confirm:")
+        if not ok or text.strip() not in ("PURGE", "PURGE ALL"):
             return
-        purge.spawn(delay=1.0)
+        purge.spawn(delay=1.0, erase_avatars=text.strip() == "PURGE ALL")
         QApplication.quit()
 
     def _on_vram_relief(self):
@@ -1965,6 +1971,48 @@ class ArtifexMainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════
     # AGENT / HARNESS MODE  (absorb a folder's prior-agent context)
     # ═══════════════════════════════════════════════════════════════════
+
+    HOLO_URL = "http://127.0.0.1:8000/app#holo"
+
+    def _build_holo_tab(self) -> QWidget:
+        """The Holo tab lives in the phone web app (WebGL + Web Audio); this
+        tab opens it in the default browser on this PC. No web engine is
+        bundled with the GUI, so it is not embedded."""
+        w = QWidget()
+        root = QVBoxLayout(w)
+        root.setContentsMargins(12, 12, 12, 12)
+        intro = QLabel(
+            "<b>Holo</b> is the talking hologram avatar: a 3D, animated picture that "
+            "speaks the replies (Piper or Orpheus voices), with avatars made from any "
+            "photo. It runs in the Artifex web app, served by the API on this PC.<br><br>"
+            "Mouse: drag to turn it, shift- or right-drag to pan, wheel to zoom, "
+            "shift+wheel to twist, double-click to reset. The first time, paste your "
+            "API key in the web app's Settings (the gear).")
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+        btn = QPushButton("Open Holo in your browser")
+        status = QLabel("")
+        status.setProperty("class", "dim")
+        status.setWordWrap(True)
+
+        def open_holo():
+            import urllib.request
+            from PyQt6.QtCore import QUrl
+            from PyQt6.QtGui import QDesktopServices
+            try:
+                urllib.request.urlopen(self.HOLO_URL.split("#")[0], timeout=3).close()
+            except Exception:
+                status.setText("The API isn't answering on 127.0.0.1:8000 with the phone app "
+                               "turned on. Start it with start-artifex (ARTIFEX_PHONE_APP=1) first.")
+                return
+            QDesktopServices.openUrl(QUrl(self.HOLO_URL))
+            status.setText("Opened " + self.HOLO_URL)
+
+        btn.clicked.connect(open_holo)
+        root.addWidget(btn)
+        root.addWidget(status)
+        root.addStretch(1)
+        return w
 
     def _build_agent_tab(self) -> QWidget:
         w = QWidget()

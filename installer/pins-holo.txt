@@ -1,0 +1,44 @@
+# Holo pack (talking hologram avatars): the Orpheus voices' SNAC decoder,
+# the depth map (transformers), and MediaPipe's face landmarker, on top of
+# pins-core.txt. Versions match pins-create.txt / pins-voice.txt wherever
+# they share a package, so the packs can live in one environment.
+# Installed with --no-deps: mediapipe's metadata wants opencv-contrib-python,
+# which overwrites the opencv-python-headless cv2 of the Create pack. Its
+# vision module only needs *a* cv2 (and matplotlib) at import, so the
+# headless build at the Create pack's version is listed instead; sounddevice
+# is imported only by its audio tasks and stays out. Every package the holo
+# code imports, directly or through these, is listed here (verified by a
+# clean-venv install + import). Torch is in
+# pins-holo-torch.txt, applied only when torch is missing (never over the
+# Create pack's CUDA build). Exact pins.
+absl-py==2.5.1
+contourpy==1.3.3
+cycler==0.12.1
+einops==0.8.2
+filelock==3.20.3
+flatbuffers==25.12.19
+fonttools==4.68.0
+fsspec==2026.9.0
+hf-xet==1.7.0
+huggingface_hub==1.33.0
+kiwisolver==1.5.1
+markdown-it-py==4.2.0
+matplotlib==3.11.2
+mdurl==0.1.2
+mediapipe==1.2.2
+numpy==2.3.5
+opencv-python-headless==5.0.0.93
+Pygments==2.21.0
+pyparsing==3.3.3
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+regex==2026.9.29
+rich==15.0.0
+safetensors==0.8.0
+shellingham==1.5.4
+six==1.17.0
+snac==1.2.1
+tokenizers==0.22.2
+tqdm==4.70.1
+transformers==5.10.4
+typer==0.27.3

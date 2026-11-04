@@ -34,7 +34,7 @@ import urllib.error
 
 _log = logging.getLogger(__name__)
 
-OLLAMA_BASE = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_BASE = os.environ.get("ARTIFEX_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 STANDARD_BUCKETS = [4096, 8192, 16384, 32768, 65536, 131072]
 MIN_CTX = 4096
 MODEL_OVERHEAD_FACTOR = 1.1

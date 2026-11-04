@@ -131,7 +131,7 @@ def _get_transformers_context_length(model_path: str) -> int:
 
 def _discover_ollama() -> list[dict]:
     try:
-        _ollama_url = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+        _ollama_url = os.environ.get("ARTIFEX_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
         req = urllib.request.Request(f"{_ollama_url}/api/tags")
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read())

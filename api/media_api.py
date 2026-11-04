@@ -7,6 +7,7 @@ Artifex Assistant V5 — Media tools and voice over the REST API (phone app).
     GET  /v1/media/jobs[/{id}]        job status / result file_id
     GET  /v1/media/file/{file_id}     a stored input or output
     POST /v1/voice/tts                {text, voice?} -> audio/wav
+    POST /v1/voice/tts/stream         {text, voice?} -> streamed PCM (Orpheus)
     POST /v1/voice/stt?model=         raw recorded audio -> {text}
 
 Uploads take the raw request body (name in the query) like files_api, so
@@ -22,7 +23,7 @@ import os
 from typing import Optional
 
 from fastapi import HTTPException, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 _MAX_UPLOAD = 30 * 1024 * 1024
@@ -116,6 +117,41 @@ def register_media_routes(app, check_auth, prompt_llm=None):
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))
         return Response(content=wav, media_type="audio/wav")
+
+    @app.post("/v1/voice/tts/stream")
+    async def voice_tts_stream(request: Request, body: TTSRequest, warm: bool = False):
+        """Orpheus voices, streamed: raw int16 mono PCM at X-Sample-Rate as it
+        is generated (first bytes ~0.5 s), so speech starts mid-synthesis.
+        ?warm=1 only starts the server and the decoder (no speech)."""
+        _auth(request)
+        from core.services import orpheus_tts
+        loop = asyncio.get_event_loop()
+        if warm:
+            try:
+                await loop.run_in_executor(None, orpheus_tts.warm)
+            except Exception as e:
+                raise HTTPException(status_code=503, detail=str(e)[:200])
+            return Response(status_code=204)
+        # Pull the first chunk before answering: a failure (Orpheus blocked,
+        # not starting, the decoder's first download) becomes a 503 the phone
+        # falls back to Piper on, instead of a 200 with no audio.
+        gen = orpheus_tts.stream(body.text, body.voice or "tara")
+        try:
+            first = await loop.run_in_executor(None, next, gen, None)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=str(e)[:200])
+        if first is None:
+            raise HTTPException(status_code=503, detail="Orpheus produced no audio")
+
+        def rest():
+            yield first
+            yield from gen
+
+        return StreamingResponse(
+            rest(),
+            media_type="application/octet-stream",
+            headers={"X-Sample-Rate": str(orpheus_tts.SAMPLE_RATE), "Cache-Control": "no-store",
+                     "Access-Control-Expose-Headers": "X-Sample-Rate"})
 
     @app.post("/v1/voice/stt")
     async def voice_stt(request: Request, model: Optional[str] = None):

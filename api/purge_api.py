@@ -1,8 +1,10 @@
 """
 Artifex Assistant V5 — Purge over the REST API (phone app, full tools).
 
-    GET  /v1/admin/purge        what a purge would delete (labels, counts, sizes)
-    POST /v1/admin/purge        {"confirm": "PURGE"} -> shut Artifex down and purge
+    GET  /v1/admin/purge?erase_avatars=  what a purge would delete (labels, counts, sizes)
+    POST /v1/admin/purge        {"confirm": "PURGE", "erase_avatars"?: bool} -> shut down and purge
+
+Holo avatars are kept unless erase_avatars is true.
 
 The purge runs as a detached process (core.purge) that stops this API, so
 the POST answers first and the server goes away a couple of seconds
@@ -23,6 +25,7 @@ _log = get_logger(__name__)
 
 class PurgeRequest(BaseModel):
     confirm: str = ""
+    erase_avatars: bool = False
 
 
 def register_purge_routes(app, check_auth):
@@ -33,9 +36,9 @@ def register_purge_routes(app, check_auth):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
     @app.get("/v1/admin/purge")
-    async def purge_preview(request: Request):
+    async def purge_preview(request: Request, erase_avatars: bool = False):
         _auth(request)
-        rows = await asyncio.get_event_loop().run_in_executor(None, purge.preview)
+        rows = await asyncio.get_event_loop().run_in_executor(None, purge.preview, erase_avatars)
         return {"targets": rows,
                 "total_files": sum(r["files"] for r in rows),
                 "total_bytes": sum(r["bytes"] for r in rows)}
@@ -47,6 +50,6 @@ def register_purge_routes(app, check_auth):
             raise HTTPException(status_code=400, detail='Type PURGE to confirm.')
         _log.warning("Purge requested from %s; shutting down",
                      request.client.host if request.client else "?")
-        pid = purge.spawn(delay=2.0)
+        pid = purge.spawn(delay=2.0, erase_avatars=body.erase_avatars)
         return {"purging": True, "pid": pid,
                 "note": "Artifex is shutting down. Start it again on the PC."}

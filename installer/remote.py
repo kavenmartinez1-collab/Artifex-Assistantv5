@@ -32,7 +32,8 @@ import time
 from installer import fetch, hint
 
 WATCHED_PORTS = {8000: "Artifex API", 8080: "web gateway", 8081: "llama.cpp server",
-                 8095: "vision helper", 11434: "Ollama", 2222: "Kali SSH"}
+                 8095: "vision helper", 11434: "Ollama", 2222: "Kali SSH",
+                 8082: "Orpheus voice server"}
 _TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
 _TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
 KEY_FILE = "artifex_api_key.txt"

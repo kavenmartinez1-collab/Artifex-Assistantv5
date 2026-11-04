@@ -136,6 +136,7 @@
     border-bottom: 2px solid transparent; position: relative;
   }
   #tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
+  @media (max-width: 400px) { #tabs button { padding: 0 3px; min-width: 0; } }
   #tabs button .pip {
     display: none; width: 6px; height: 6px; border-radius: 50%;
     background: var(--accent); margin-left: 6px; vertical-align: 1px;
@@ -843,6 +844,9 @@
   #tabs button {
     font-family: var(--hud); font-size: 12.5px; letter-spacing: 1.6px; text-transform: uppercase;
   }
+  /* six tabs (with Holo) on a narrow phone: tighter labels, so none run together */
+  @media (max-width: 400px) { #tabs button { letter-spacing: .8px; } }
+  @media (max-width: 350px) { #tabs button { font-size: 11px; letter-spacing: .3px; padding: 0 1px; } }
   #tabs button.on {
     color: var(--accent); border-bottom-color: var(--accent);
     text-shadow: 0 0 10px rgba(0,240,255,.55);
@@ -1005,6 +1009,7 @@
     <button id="tab-create" onclick="showTab('create')">Create<span class="pip"></span></button>
     <button id="tab-agent" onclick="showTab('agent')">Agent<span class="pip"></span></button>
     <button id="tab-files" onclick="showTab('files')">Files</button>
+    <button id="tab-holo" onclick="showTab('holo')">Holo</button>
   </div>
 </header>
 
@@ -1197,6 +1202,9 @@
   </div>
 </div>
 
+<!-- Holo tab (proof of concept): built entirely by /app/holo/holo.js -->
+<div id="holo-view" class="view hidden"></div>
+
 <div id="backdrop" onclick="toggleDrawer()"></div>
 <div id="drawer">
   <div class="panel">
@@ -1319,6 +1327,8 @@
         Models and settings stay. Start it again on the PC afterwards.</div>
       <button class="btn danger" style="margin-top:8px" onclick="purgePreview()">Purge Artifex...</button>
       <div id="purge-confirm" class="hidden">
+        <label class="hint" style="display:flex;gap:8px;align-items:center;margin:6px 0">
+          <input type="checkbox" id="purge-avatars" onchange="purgePreview()"> Also erase Holo avatars (kept if unchecked)</label>
         <div id="purge-list"></div>
         <input type="text" id="purge-type" placeholder="Type PURGE to confirm" autocomplete="off"
           autocapitalize="characters" autocorrect="off" spellcheck="false">
@@ -1459,6 +1469,10 @@ const COMPACT_REQUEST =
 // a smaller window than the cap). The next send compacts client-side once,
 // instead of the server re-compacting (and re-reading the window) every send.
 let compactNext = false;
+// The Holo tab's choices for the turn being sent (model, prompt, avatar),
+// captured when the message is sent so a tab switch mid-send changes nothing.
+// null = an ordinary chat turn.
+let turnHolo = null;
 // Real context use of the last exchange (prompt + completion tokens), with
 // the conversation length and session it belongs to. Chars/4 under-counts
 // code and dense text; this lets compactCut() see the real number.
@@ -1470,14 +1484,15 @@ let lastCtxUse = { tok: 0, len: -1, sid: null };
 // grows, so budgeting against the loaded tier compacted the chat to fit 64k
 // and it never grew into the rest of a 73k/114k window.
 function windowTokens() {
-  return selectedCtxCap() || engineCtx || 0;
+  const hm = turnHolo && turnHolo.model;
+  return (hm && modelCtxCaps[hm]) || selectedCtxCap() || engineCtx || 0;
 }
 // Input tokens a send may use: window minus the completion reservation minus
 // a template margin (mirrors context_input_budget() in core/inference.py).
 function tokenBudget() {
   const ctx = windowTokens();
   if (!ctx) return 0;
-  const maxTok = parseInt($("max-tokens").value, 10) || 12288;
+  const maxTok = turnHolo ? HOLO_MAX_TOKENS : (parseInt($("max-tokens").value, 10) || 12288);
   const margin = Math.max(512, ctx >> 5);
   return Math.max(ctx - maxTok - margin, ctx >> 2);
 }
@@ -1721,6 +1736,9 @@ function showTab(name) {
   $("tab-chat").classList.toggle("on", name === "chat");
   $("tab-agent").classList.toggle("on", name === "agent");
   $("tab-files").classList.toggle("on", name === "files");
+  $("holo-view").classList.toggle("hidden", name !== "holo");
+  $("tab-holo").classList.toggle("on", name === "holo");
+  if (window.Holo) Holo.visible(name === "holo");
   if (name === "agent") {
     $("tab-agent").classList.remove("unread");
     scrollAgentToBottom();
@@ -2325,6 +2343,7 @@ async function loadSession(id) {
     conversation = (s.messages || []).filter(m => m && m.role !== "system");
     clearAttachments();
     renderTranscript();
+    if (window.Holo) Holo.hush(true);
     showTab("chat");
     // Follow the model the session was recorded with, when we still have it.
     if (s.model) {
@@ -2375,6 +2394,7 @@ async function deleteSession(id) {
 
 function newChat() {
   if (isStreaming && aborter) aborter.abort();
+  if (window.Holo) Holo.hush(true);
   // Detach from any running job without stopping it: it keeps generating and
   // still lands in its own session, it just isn't this conversation anymore.
   localStorage.removeItem(CHAT_JOB_KEY);
@@ -2562,6 +2582,7 @@ function compactDue() {
 
 // How many of the oldest messages to fold away, or 0 for "don't".
 function compactCut() {
+  if (turnHolo) return 0;      // Holo turns trim to their small window instead
   const n = conversation.length;
   if (n < 4) return 0;                                  // nothing worth folding
   if (!compactDue()) return 0;
@@ -2832,6 +2853,7 @@ function sendOrStop() {
 // Delivery stops at once; the engine drains its current round server-side,
 // so this is treated as ended locally without waiting for confirmation.
 function stopChat() {
+  if (window.Holo) Holo.hush();
   if (chatJobId) {
     fetch("/v1/chat/jobs/" + chatJobId + "/stop",
       { method: "POST", headers: authHeaders() }).catch(() => {});
@@ -2848,9 +2870,12 @@ function ensureSessionId() {
   return activeSessionId;
 }
 
-async function sendMessage() {
-  const text = inputEl.value.trim();
-  const imgs = pendingImages.slice();
+async function sendMessage(holoText) {
+  // From the Holo tab: its own text, no photos staged on the Chat tab, and
+  // the Chat composer's draft left alone.
+  const fromHolo = typeof holoText === "string";
+  const text = fromHolo ? holoText.trim() : inputEl.value.trim();
+  const imgs = fromHolo ? [] : pendingImages.slice();
   if ((!text && !imgs.length) || isStreaming) return;
   if (!store.k) { toggleDrawer(); return; }
   unlockAudio();   // this tap is what lets the reply be read aloud later
@@ -2880,15 +2905,22 @@ async function sendMessage() {
   ensureSessionId();
   appendMessage("user", content);
   conversation.push({ role: "user", content: content });
-  inputEl.value = "";
-  inputEl.style.height = "auto";
-  clearAttachments();
+  if (!fromHolo) {
+    inputEl.value = "";
+    inputEl.style.height = "auto";
+    clearAttachments();
+  }
   // Write the user turn out now, so a reload mid-job shows the question
   // above the answer that streams back in. syncableMessages() flattens the
   // image to a marker, so no base64 reaches the store.
   syncSession(false);
 
-  await runAssistantTurn({});
+  turnHolo = window.Holo ? Holo.capture() : null;
+  try {
+    await runAssistantTurn({});
+  } finally {
+    turnHolo = null;
+  }
 }
 
 // Reattach to a job that is still running on the server.
@@ -2913,31 +2945,41 @@ function scheduleChatReattach(delay) {
 
 // The chat system prompt. autoCompact() sends this exact string too, so its
 // request shares the cached prefix of the conversation it summarizes.
-function chatSystemPrompt() {
+// `identity` replaces the user's / default prompt text (the Holo tab's
+// "persona only" mode); `model` is the one that will answer, when that is
+// not the dropdown's (Holo's own brain).
+function chatSystemPrompt(identity, model) {
   const webOn = $("web-toggle").checked;
-  let sys = $("system-prompt").value.trim() || DEFAULT_SYSTEM_PROMPT;
+  let sys = identity || $("system-prompt").value.trim() || DEFAULT_SYSTEM_PROMPT;
   sys += "\n\nTODAY'S DATE: " + new Date().toDateString();
   sys += capabilitiesNote(webOn);
   // A native-tools model gets real tool definitions from the server; the
   // @search marker instructions would only contradict them (LFM3 copied
   // the placeholders literally).
-  if (webOn && !modelNativeTools[$("model-select").value]) sys += TOOL_PROMPT;
+  if (webOn && !modelNativeTools[model || $("model-select").value]) sys += TOOL_PROMPT;
   return sys;
 }
 
 function buildChatPayload() {
   const webOn = $("web-toggle").checked;
-  const sys = chatSystemPrompt();
-  const msgs = trimmedHistory();
+  // The Holo tab talks through its own fast model (dropdown untouched) and
+  // chooses the prompt: the Artifex one, the avatar's persona, or both.
+  const H = turnHolo;
+  const holo = H && H.model;
+  const sys = H ? H.system(id => chatSystemPrompt(id, holo)) + HOLO_PROMPT : chatSystemPrompt();
+  let msgs = trimmedHistory();
+  // Holo brains are text-only: earlier photos go as their text marker
+  // instead of pulling the big vision model into a voice chat.
+  if (H) msgs = msgs.map(m => (m && contentHasImage(m.content)) ? Object.assign({}, m, { content: flattenContent(m.content) }) : m);
   // Any kept message may carry real images now: trimmedHistory preserves the
   // current turn AND the most recent image turn (see IMAGE_RECALL_TURNS), so
   // checking only the last message would miss a follow-up question about a
   // photo sent a turn or two ago and hand it to a text-only model.
   const outgoingHasImage = msgs.some(m => m && contentHasImage(m.content));
-  const selected = $("model-select").value || undefined;
+  const selected = holo || $("model-select").value || undefined;
   let model = selected;
   let visionOverride = false;
-  if (outgoingHasImage && !isVisionModel(selected)) {
+  if (outgoingHasImage && !isVisionModel(selected) && !H) {
     // Non-vision models can't see images — force the vision model for this
     // one request without touching the user's dropdown.
     model = visionFallbackModel() || selected;
@@ -2948,11 +2990,17 @@ function buildChatPayload() {
     messages: [{ role: "system", content: sys }].concat(msgs),
     web_tools: webOn,
     temperature: Math.max(0, Math.min(2, parseFloat($("temperature").value) || 0.7)),
-    max_tokens: Math.max(64, Math.min(32768, parseInt($("max-tokens").value) || 12288)),
-    reasoning_effort: currentEffort(),
+    max_tokens: H ? HOLO_MAX_TOKENS : Math.max(64, Math.min(32768, parseInt($("max-tokens").value) || 12288)),
+    // thinking would eat the short spoken budget before any answer
+    reasoning_effort: H ? "low" : currentEffort(),
+    // the conversation stays recorded under the Chat tab's model
+    session_model: H ? ($("model-select").value || undefined) : undefined,
     visionOverride: visionOverride,   // internal — not sent in the body
   };
 }
+const HOLO_MAX_TOKENS = 1024;
+const HOLO_PROMPT = "\n\nYou are speaking through a holographic avatar and your words may be read " +
+  "aloud: answer conversationally and keep it short unless asked for detail.";
 
 // -> {jobId} | {jobId, attached:true} | {fallback:true}, or throws.
 async function startChatJob(base, signal) {
@@ -2970,6 +3018,7 @@ async function startChatJob(base, signal) {
       temperature: base.temperature,
       max_tokens: base.max_tokens,
       reasoning_effort: base.reasoning_effort,
+      session_model: base.session_model,
     }),
   });
   // An API that predates persistent jobs — use the old direct stream.
@@ -3055,6 +3104,7 @@ async function runAssistantTurn(opts) {
   const turnSession = activeSessionId;
 
   isStreaming = true;
+  if (window.Holo) Holo.turnStart();
   sendBtn.textContent = "Stop";
   sendBtn.classList.add("stop");
   aborter = new AbortController();
@@ -3146,6 +3196,7 @@ async function runAssistantTurn(opts) {
       segText = s.text;
       sawContent = true;
       flushRender();                     // paint now, not on the next timer
+      if (window.Holo) Holo.resume(s.text);
     }
     if (s.usage && Object.keys(s.usage).length) usage = s.usage;
     if (s.error) addError(s.error);
@@ -3214,6 +3265,7 @@ async function runAssistantTurn(opts) {
       collapseThinking();
       segText += delta.content;
       sawContent = true;
+      if (window.Holo) Holo.feed(delta.content, autoReadOn());
       scheduleRender();
     }
   };
@@ -3314,7 +3366,8 @@ async function runAssistantTurn(opts) {
     // turn whose chat was left (New chat) must not land in the new one.
     const keep = !dropped && activeSessionId === turnSession;
     if (segText && keep) conversation.push({ role: "assistant", content: segText });
-    if (segText && keep && endStatus !== "stopped" && !aborter.signal.aborted && autoReadOn()) {
+    if (segText && keep && endStatus !== "stopped" && !aborter.signal.aborted &&
+        autoReadOn() && !(window.Holo && Holo.speaksLive())) {
       speakBubble(body, bubble.querySelector(".speak-btn"));
     }
     // The server already wrote a completed exchange into the session; this
@@ -3337,6 +3390,7 @@ async function runAssistantTurn(opts) {
     pendingTurnText = dropped ? segText : "";
     chatJobId = null;
     isStreaming = false;
+    if (window.Holo) Holo.turnEnd({ dropped: dropped, stopped: endStatus === "stopped" || !!(aborter && aborter.signal.aborted) });
     refreshModelBadge();          // this reply may have switched the model
     aborter = null;
     releaseWakeLock();
@@ -3367,6 +3421,7 @@ async function reloadActiveSession(sessionId) {
     localStorage.setItem(SESSION_KEY, id);
     conversation = (s.messages || []).filter(m => m && m.role !== "system");
     renderTranscript();
+    if (window.Holo) Holo.historyChanged();
     return true;
   } catch (e) { return false; }
 }
@@ -5006,6 +5061,7 @@ function stopSpeaking() {
 ttsAudio.addEventListener("ended", stopSpeaking);
 
 async function speakBubble(body, btn) {
+  if (window.Holo) Holo.hush();
   if (btn && speakingBtn === btn) { stopSpeaking(); return; }   // tap again = stop
   stopSpeaking();
   unlockAudio();
@@ -5016,13 +5072,14 @@ async function speakBubble(body, btn) {
   try {
     const r = await fetch("/v1/voice/tts", {
       method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ text, voice: localStorage.getItem("ax_voice") || null }),
+      body: JSON.stringify({ text, voice: (window.Holo && Holo.voice()) || localStorage.getItem("ax_voice") || null }),
     });
     if (!r.ok) throw new Error(await errText(r));
     const url = URL.createObjectURL(await r.blob());
     if (speakingBtn !== (btn || null)) { URL.revokeObjectURL(url); return; }   // superseded
     ttsAudio.onloadeddata = () => URL.revokeObjectURL(url);
     ttsAudio.src = url;
+    if (window.Holo) Holo.say(text);
     await ttsAudio.play();
   } catch (e) {
     stopSpeaking();
@@ -5114,15 +5171,19 @@ async function transcribe(blob) {
 // ── Purge ────────────────────────────────────────────────
 // Two steps on purpose: the first tap only lists what would go; deleting
 // needs PURGE typed. The server answers, then shuts itself down.
+let purgeSeq = 0;
 async function purgePreview() {
+  const seq = ++purgeSeq;
   const box = $("purge-list");
   $("purge-msg").textContent = "";
   box.textContent = "Checking...";
   $("purge-confirm").classList.remove("hidden");
   try {
-    const r = await fetch("/v1/admin/purge", { headers: authHeaders() });
+    const r = await fetch("/v1/admin/purge?erase_avatars=" + ($("purge-avatars").checked ? "true" : "false"),
+      { headers: authHeaders() });
     if (!r.ok) throw new Error(await errText(r));
     const d = await r.json();
+    if (seq !== purgeSeq) return;        // the box was toggled again meanwhile
     box.innerHTML = "";
     for (const t of d.targets) {
       const row = document.createElement("div");
@@ -5148,7 +5209,7 @@ async function purgeGo() {
   try {
     const r = await fetch("/v1/admin/purge", {
       method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ confirm: "PURGE" }),
+      body: JSON.stringify({ confirm: "PURGE", erase_avatars: $("purge-avatars").checked }),
     });
     if (!r.ok) throw new Error(await errText(r));
     // Forget this phone's pointers to what's being deleted; keep the key
@@ -5158,6 +5219,7 @@ async function purgeGo() {
     renderTranscript();
     $("purge-confirm").classList.add("hidden");
     $("purge-type").value = "";
+    $("purge-avatars").checked = false;
     $("purge-msg").textContent = "Purging. Artifex is shutting down; start it again on the PC (start-artifex.ps1).";
     $("status-dot").className = "err";
   } catch (e) {
@@ -5226,6 +5288,11 @@ bootSession().then(bootChatJob);
 agentBoot();
 mediaBoot();
 if (store.k) loadCatalog().catch(() => {});   // fills the voice pickers
+</script>
+<script src="/app/holo/holo.js"></script>
+<script>
+// /app#holo opens straight on the Holo tab (the desktop GUI's HOLO button)
+if (location.hash === "#holo" && window.Holo) showTab("holo");
 </script>
 </body>
 </html>

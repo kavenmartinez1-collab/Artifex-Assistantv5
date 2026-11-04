@@ -980,6 +980,141 @@ def install_strata(root, catalog, log=print, run=subprocess.run, probe_fn=None):
     return launcher
 
 
+# ── Holo ────────────────────────────────────────────────────────────────────
+# The phone app's Holo tab: a talking hologram avatar. Its voices are Piper
+# (four female voices on top of the voice pack's) and Orpheus 3B, streamed
+# from its own Vulkan llama.cpp server on 127.0.0.1:8082 (the second card when
+# there are two, so the chat model keeps the first). Avatars from any photo:
+# a depth map (Depth-Anything-V2) and face points (MediaPipe, or the vision
+# helper for drawings) made on the CPU. Everything pinned in catalog.json /
+# requirements-holo*.txt.
+
+def holo_plan(root, catalog):
+    h = catalog["holo"]
+    mb = lambda keys: sum(f["size"] for k in keys for f in h[k]["files"]) // (1 << 20)
+    return ["add the hash-locked Holo packages (SNAC decoder, transformers, MediaPipe; "
+            "CPU PyTorch only if there is none) to the installer's Python environment",
+            f"download 4 female Piper voices ({mb(['piper'])} MB), the Orpheus 3B voice model "
+            f"({mb(['orpheus'])} MB), its SNAC decoder, the Depth-Anything-V2 depth model and "
+            "MediaPipe's face landmarker (all pinned and checksum-verified) into models/",
+            "download the Vulkan llama.cpp build for the Orpheus server if missing, and register "
+            "it in llama_cpp_config.json (127.0.0.1:8082 only, started on demand, stopped when idle)",
+            "mark the chat models that fit beside it, so the Tara voice stays on while they run",
+            "test it: depth + face points on a test picture, then Orpheus speaks a line"]
+
+
+def _orpheus_device(gpus):
+    """Vulkan device for Orpheus: the second card when there are two or more
+    (the chat model keeps the first), else the only one."""
+    return "Vulkan1" if len(gpus) >= 2 else "Vulkan0"
+
+
+def _coexists(entry, gpus, voice_mb):
+    """Can this chat model run while Orpheus holds its card? Multi-card: a
+    model that stays on one card. One card: a model small enough to share."""
+    if entry.get("external_launcher"):
+        return False
+    flags = [str(f) for f in entry.get("extra_flags") or []]
+    if len(gpus) >= 2:
+        if any(f in ("-ts", "--tensor-split", "-sm", "--split-mode") for f in flags):
+            return False
+        for i, f in enumerate(flags):              # --device CUDA0,ROCm0 / Vulkan1: not just card 0
+            if f in ("--device", "-dev") and i + 1 < len(flags):
+                dev = flags[i + 1]
+                if "," in dev or not dev.endswith("0"):
+                    return False
+        return True
+    if not gpus:
+        return False
+    try:
+        size_mb = os.path.getsize(entry["path"]) / (1 << 20)
+    except (OSError, KeyError, TypeError):
+        return False
+    return size_mb + 1500 + voice_mb <= (gpus[0].get("vram_mb") or 0)
+
+
+def install_holo(root, catalog, log=print, run=subprocess.run, probe_fn=None):
+    h, hosts = catalog["holo"], catalog["allowed_hosts"]
+    path, cfg = _config(root)
+    # 1. packages (exactly the lock: --no-deps keeps MediaPipe's unused
+    #    opencv-contrib / matplotlib / sounddevice out of the environment)
+    py = recipes.add_locked_packages(root, recipes.LOCKS["holo"], ["snac", "mediapipe", "transformers"],
+                                     log=log, run=run, no_deps=True)
+    probe_torch = "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('torch') else 1)"
+    if run([py, "-c", probe_torch]).returncode != 0:
+        log("no PyTorch yet: adding the CPU build (the Create pack would bring CUDA)")
+        recipes.add_locked_packages(root, recipes.LOCKS["holo-torch"], ["torch"], log=log, run=run,
+                                    no_deps=True)
+    # 2. pinned files
+    for key in ("piper", "snac", "depth", "orpheus"):
+        _fetch_hf_files(h[key], root, hosts, log)
+    face = h["face"]
+    face_dest = os.path.join(root, face["dest"])
+    if not fetch.file_matches(face_dest, face["size"], face["sha256"]):
+        log("downloading face_landmarker.task (4 MB)")
+    fetch.download(face["url"], face_dest, face["size"], face["sha256"], hosts)
+    # 3. the Vulkan llama.cpp build for the Orpheus server
+    srv = h["orpheus_server"]
+    vk = recipes.plan({"gpus": []}, catalog, root, variant=srv["variant"],
+                      model_id=catalog["chat_models"][0]["id"])
+    if not os.path.isfile(vk["server_exe"]):
+        for f in vk["backend_files"]:
+            dest = os.path.join(vk["download_dir"], f["name"])
+            log(f"downloading {f['name']} (Vulkan llama.cpp for the Orpheus voice)")
+            fetch.download(f["url"], dest, f["size"], f["sha256"], hosts)
+            fetch.safe_unzip(dest, vk["server_dir"])
+            os.remove(dest)
+    # 4. config: the Orpheus block, and which chat models can share the GPUs
+    from installer import probe as probe_mod
+    gpus = [g for g in ((probe_fn or probe_mod.probe)().get("gpus") or [])
+            if g.get("vendor") in ("NVIDIA", "AMD", "Intel")]
+    changed = []
+    model_file = os.path.join(root, h["orpheus"]["dest"], os.path.basename(h["orpheus"]["files"][0]["path"]))
+    if "orpheus" not in cfg:
+        cfg["orpheus"] = {
+            "_comment": ("Added by the installer's holo pack: the Orpheus voices (tara & co.) of the "
+                         f"Holo tab. {h['orpheus']['license']}. Started on first use on 127.0.0.1 only, "
+                         "stopped after 10 idle minutes or when a model that needs this card loads. "
+                         "device: the Vulkan device index (llama-server --list-devices)."),
+            "server_path": vk["server_exe"].replace("\\", "/"),
+            "model": model_file.replace("\\", "/"),
+            "device": _orpheus_device(gpus), "port": srv["port"], "min_free_mb": srv["min_free_mb"]}
+        changed.append("orpheus")
+    for mid, entry in (cfg.get("models") or {}).items():
+        if isinstance(entry, dict) and "coexists_with_orpheus" not in entry and _coexists(entry, gpus, srv["voice_mb"]):
+            entry["coexists_with_orpheus"] = True
+            changed.append(mid)
+    if changed:
+        _save_config(path, cfg)
+        log("llama_cpp_config.json: " + ", ".join(changed))
+    if not gpus:
+        log("no graphics card found: the Orpheus voices need one (Vulkan); the Piper voices work anyway")
+    # 5. test: an avatar's depth + face points, then Orpheus says a line
+    log("testing: depth + face points on a test picture, then Orpheus speaks")
+    test = ("from PIL import Image, ImageDraw\n"
+            "from core.services import holo_avatars as ha, orpheus_tts as ot\n"
+            "im = Image.new('RGB', (320, 400), (200, 170, 150)); d = ImageDraw.Draw(im)\n"
+            "d.ellipse([90, 80, 230, 260], fill=(230, 200, 180))\n"
+            "dm = ha._depth(im); lm, src = ha._landmarks_mediapipe(im); lm = lm or ha._landmarks_guess(im)\n"
+            "assert dm.size == im.size and lm['mouth']['hw'] > 0\n"
+            "print('avatar ok', src or 'guess')\n"
+            "try:\n"
+            "    n = sum(len(c) for c in ot.stream('The hologram voice works.', 'tara'))\n"
+            "    print('orpheus ok', n)\n"
+            "except Exception as e:\n"
+            "    print('orpheus unavailable:', str(e)[:200])\n"
+            "finally:\n"
+            "    ot.stop('installer test')\n")
+    r = run([py, "-c", test], cwd=root, capture_output=True, text=True, timeout=900)
+    out = (r.stdout or "").strip().splitlines()
+    if r.returncode != 0 or not any(l.startswith("avatar ok") for l in out):
+        raise RuntimeError("holo self-test failed: " + ((r.stderr or r.stdout) or "")[-600:])
+    for line in out:
+        if line.startswith(("avatar ok", "orpheus")):
+            log(line)
+    return None      # (a list return is printed as launcher paths)
+
+
 PACKS = {
     "web-search": {"label": "Web search (Docker: hardened gateway + SearXNG)",
                    "size": "~0.5 GB of Docker images",
@@ -1002,6 +1137,9 @@ PACKS = {
     "strata": {"label": "Qwen3.8-Flash-Next on Strata (one 12 GB+ GPU + 32 GB RAM)",
                "size": "~68 GB model + ~35 GB expert pack + ~6 GB draft layer and engine",
                "plan": strata_plan, "install": install_strata},
+    "holo": {"label": "Holo: talking hologram avatars (Orpheus + Piper voices, photo avatars)",
+             "size": "~2.9 GB (+0.2 GB CPU PyTorch if you have none)",
+             "plan": holo_plan, "install": install_holo},
     "ollama": {"label": "Use an existing Ollama install as a backend",
                "size": "nothing to download",
                "plan": ollama_plan, "install": install_ollama},

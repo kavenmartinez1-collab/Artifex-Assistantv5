@@ -18,6 +18,9 @@ Deleted:
 
 Never touched: models, configs, the venv, and tracked placeholder files
 (.gitkeep), so the folders keep working after a purge.
+
+Holo avatars (output/holo_avatars) stay unless erase_avatars is asked for:
+the user's own pictures are kept by default, wiped only on request.
 """
 
 from __future__ import annotations
@@ -37,7 +40,10 @@ EXTRA_FILE = os.path.join(BASE_DIR, "purge_extra.txt")
 _ENTRY_SCRIPTS = ("main_api.py", "main_gui_qt.py", "main_gui.py", "main.py")
 
 
-def targets() -> list[tuple[str, str]]:
+AVATAR_DIR = os.path.join(BASE_DIR, "output", "holo_avatars")
+
+
+def targets(erase_avatars: bool = False) -> list[tuple[str, str]]:
     """(label, path-or-glob) for everything a purge deletes."""
     from tools.tool_cache import CACHE_DIR
     t = [
@@ -53,24 +59,32 @@ def targets() -> list[tuple[str, str]]:
                 line = line.strip()
                 if line and not line.startswith("#"):
                     t.append(("Extra: " + line, line))
+    if erase_avatars:
+        t.append(("Holo avatars", AVATAR_DIR))
     return t
 
 
-def _files(path: str) -> list[str]:
-    """Every deletable file under a target (keeps .gitkeep & co.)."""
+def _files(path: str, erase_avatars: bool = True) -> list[str]:
+    """Every deletable file under a target (keeps .gitkeep & co.; skips the
+    Holo avatars unless they are being erased)."""
     if os.path.isdir(path):
+        keep = os.path.normcase(os.path.abspath(AVATAR_DIR))
         out = []
-        for root, _, names in os.walk(path):
+        for root, dirs, names in os.walk(path):
+            if not erase_avatars:
+                dirs[:] = [d for d in dirs
+                           if os.path.normcase(os.path.abspath(os.path.join(root, d))) != keep]
             out += [os.path.join(root, n) for n in names if not n.startswith(".git")]
         return out
     return [p for p in glob.glob(path) if os.path.isfile(p)]
 
 
-def preview() -> list[dict]:
+def preview(erase_avatars: bool = False) -> list[dict]:
     """What a purge would delete right now: label, path, file count, bytes."""
     rows = []
-    for label, path in targets():
-        files = _files(path)
+    for label, path in targets(erase_avatars):
+        # avatars are counted once, on their own row
+        files = _files(path, erase_avatars=os.path.normcase(path) == os.path.normcase(AVATAR_DIR))
         size = 0
         for p in files:
             try:
@@ -81,6 +95,13 @@ def preview() -> list[dict]:
     return rows
 
 
+def kept_avatars() -> int:
+    """How many Holo avatars a default purge keeps (for the PC prompts)."""
+    if not os.path.isdir(AVATAR_DIR):
+        return 0
+    return sum(1 for d in os.listdir(AVATAR_DIR) if os.path.isdir(os.path.join(AVATAR_DIR, d)))
+
+
 def fmt_bytes(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024 or unit == "GB":
@@ -88,7 +109,7 @@ def fmt_bytes(n: float) -> str:
         n /= 1024
 
 
-def spawn(delay: float = 2.0) -> int:
+def spawn(delay: float = 2.0, erase_avatars: bool = False) -> int:
     """Start the purge as a detached process; returns its pid.
 
     `delay` lets the caller finish (answer the HTTP request, close the
@@ -99,7 +120,8 @@ def spawn(delay: float = 2.0) -> int:
         flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
                  | subprocess.CREATE_NO_WINDOW)
     proc = subprocess.Popen(
-        [sys.executable, "-m", "core.purge", "--run", "--delay", str(delay)],
+        [sys.executable, "-m", "core.purge", "--run", "--delay", str(delay)]
+        + (["--erase-avatars"] if erase_avatars else []),
         cwd=BASE_DIR, creationflags=flags, close_fds=True,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
@@ -156,15 +178,15 @@ def stop_artifex() -> int:
     return len(victims) + sum(stop_port_tree(port) for port in _external_ports())
 
 
-def delete_all(retries: int = 5) -> tuple[int, int, list[str]]:
+def delete_all(retries: int = 5, erase_avatars: bool = False) -> tuple[int, int, list[str]]:
     """Delete every target's files, then its empty subfolders.
 
     Returns (files deleted, bytes reclaimed, files that stayed locked).
     """
     count = size = 0
     locked: list[str] = []
-    for _, path in targets():
-        for p in _files(path):
+    for _, path in targets(erase_avatars):
+        for p in _files(path, erase_avatars):
             for attempt in range(retries):
                 try:
                     n = os.path.getsize(p)
@@ -191,17 +213,17 @@ def delete_all(retries: int = 5) -> tuple[int, int, list[str]]:
             for root, dirs, _ in os.walk(path, topdown=False):
                 for d in dirs:
                     try:
-                        os.rmdir(os.path.join(root, d))   # only succeeds when empty
+                        os.rmdir(os.path.join(root, d))   # only succeeds when empty (kept avatars stay)
                     except OSError:
                         pass
     return count, size, locked
 
 
-def run(delay: float = 0.0) -> None:
+def run(delay: float = 0.0, erase_avatars: bool = False) -> None:
     time.sleep(delay)
     stopped = stop_artifex()
     time.sleep(1)   # let Windows release the killed processes' file handles
-    count, size, locked = delete_all()
+    count, size, locked = delete_all(erase_avatars=erase_avatars)
     print(f"Stopped {stopped} Artifex process(es). Deleted {count} files "
           f"({fmt_bytes(size)}).")
     for p in locked:
@@ -213,9 +235,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Shut Artifex down and purge its data.")
     ap.add_argument("--run", action="store_true", help="actually purge (otherwise preview)")
     ap.add_argument("--delay", type=float, default=0.0)
+    ap.add_argument("--erase-avatars", action="store_true", help="also delete the Holo avatars")
     a = ap.parse_args()
     if a.run:
-        run(a.delay)
+        run(a.delay, a.erase_avatars)
     else:
-        for r in preview():
+        for r in preview(a.erase_avatars):
             print(f"{r['label']}: {r['files']} files, {fmt_bytes(r['bytes'])}  ({r['path']})")

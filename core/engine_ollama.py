@@ -16,7 +16,7 @@ from core.inference import STOP_STRINGS, _clean_response, strip_think_blocks
 
 
 _log = logging.getLogger(__name__)
-OLLAMA_BASE_URL = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_BASE_URL = os.environ.get("ARTIFEX_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 
 
 def _detect_safe_num_gpu(model_size_gb=None):

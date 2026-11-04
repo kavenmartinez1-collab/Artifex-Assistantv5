@@ -257,7 +257,9 @@ def _discover_ollama_models():
         (dict, error_str or None) — model_name -> {name, size, ...}
     """
     try:
-        _ollama_url = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+        # 127.0.0.1, not localhost: on Windows "localhost" tries ::1 first and
+        # costs ~2 s per call before falling back (Ollama binds IPv4).
+        _ollama_url = os.environ.get("ARTIFEX_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
         req = urllib.request.Request(f"{_ollama_url}/api/tags")
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read())
@@ -287,7 +289,9 @@ def refresh_ollama_models(retries=3, delay=1.0):
     global OLLAMA_MODELS
     for attempt in range(retries):
         discovered, err = _discover_ollama_models()
-        if discovered:
+        # Reachable is done, even with no models: retrying an empty-but-up
+        # Ollama added ~8 s to every chat request (this runs per request).
+        if err is None:
             OLLAMA_MODELS.update(discovered)
             return True, None
         if attempt < retries - 1:

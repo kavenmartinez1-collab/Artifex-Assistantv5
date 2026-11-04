@@ -73,6 +73,9 @@ class ChatJobRequest(BaseModel):
     max_tokens: Optional[int] = Field(12288, ge=64, le=32768)
     temperature: Optional[float] = Field(0.7, ge=0.0, le=2.0)
     reasoning_effort: Optional[str] = None
+    # The model the session is recorded under, when the turn ran on another
+    # (the phone's Holo tab talks through its own small brain).
+    session_model: Optional[str] = None
 
 
 def _flatten_image_content(m: dict) -> dict:
@@ -213,7 +216,7 @@ def _worker(job: ChatJob, stream_factory, model: str, session_dir: str):
                        if isinstance(m, dict) and m.get("role") != "system"]
             history = history + [{"role": "assistant", "content": job.text}]
             ok = write_session(session_dir, job.req.session_id, history,
-                               model=job.req.model)
+                               model=job.req.session_model or job.req.model)
             _log.info("Chat job %s: session %s write %s",
                       job.id, job.req.session_id, "ok" if ok else "FAILED")
         except Exception:

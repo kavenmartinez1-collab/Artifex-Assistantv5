@@ -23,11 +23,39 @@ def tree(tmp_path, monkeypatch):
     (extra / "artifex-api.log").write_text("chat")
     (extra / "artifex-api.log.1").write_text("chat")
     (extra / "llama-server.log").write_text("keep")
-    monkeypatch.setattr(purge, "targets", lambda: [
+    monkeypatch.setattr(purge, "AVATAR_DIR", str(out / "holo_avatars"))
+    monkeypatch.setattr(purge, "targets", lambda erase_avatars=False: [
         ("Output", str(out)), ("Logs", str(logs)),
         ("Extra", str(extra / "artifex-api.log*")),
-    ])
+    ] + ([("Holo avatars", str(out / "holo_avatars"))] if erase_avatars else []))
     return tmp_path
+
+
+def _avatar(tree):
+    a = tree / "output" / "holo_avatars" / "0123456789ab"
+    a.mkdir(parents=True)
+    (a / "avatar.jpg").write_bytes(b"jpg")
+    (a / "manifest.json").write_text("{}")
+    return a
+
+
+def test_purge_keeps_holo_avatars_unless_asked(tree):
+    a = _avatar(tree)
+    rows = {r["label"]: r for r in purge.preview()}
+    assert rows["Output"]["files"] == 2 and "Holo avatars" not in rows
+    count, _, locked = purge.delete_all(retries=1)
+    assert (count, locked) == (5, [])
+    assert sorted(os.listdir(a)) == ["avatar.jpg", "manifest.json"]
+    assert not (tree / "output" / "uploads").exists()
+
+
+def test_purge_erases_holo_avatars_when_asked(tree):
+    a = _avatar(tree)
+    rows = {r["label"]: r for r in purge.preview(erase_avatars=True)}
+    assert rows["Holo avatars"]["files"] == 2 and rows["Output"]["files"] == 2
+    count, _, locked = purge.delete_all(retries=1, erase_avatars=True)
+    assert (count, locked) == (7, [])
+    assert not a.exists()
 
 
 def test_preview_counts_without_deleting(tree):

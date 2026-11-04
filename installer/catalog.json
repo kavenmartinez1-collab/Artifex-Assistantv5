@@ -159,7 +159,8 @@
     ".hf.co",
     "pkgs.tailscale.com",
     "nodejs.org",
-    "api.nuget.org"
+    "api.nuget.org",
+    "storage.googleapis.com"
   ],
   "tailscale": {
     "_comment": "Official Windows MSI, latest stable when pinned (2026-10-28). size + sha256 from pkgs.tailscale.com/stable/<file>.sha256, cross-checked against the downloaded file; the installer also requires a valid Authenticode signature from O=Tailscale Inc. before opening it. The remote check warns when the installed Tailscale is older than min_version; bump both when Tailscale ships security fixes.",
@@ -510,6 +511,124 @@
       "min_resident_budget_gib": 8,
       "default_ctx": 32768,
       "max_ctx": 262144
+    }
+  },
+  "holo": {
+    "_comment": "Holo pack (talking hologram avatars on the phone app's Holo tab). Revisions, sizes and SHA-256 from the HF tree API at the commit (LFS oid); the small non-LFS files (.onnx.json, config.json) were downloaded at that commit and hashed. face_landmarker.task: MediaPipe's model bucket, hashed from the download and pinned here (the path carries its version, float16/1). Orpheus Q4_K_M was benchmarked locally (WER 0.000, 1.35x realtime on an RX 6700 XT).",
+    "piper": {
+      "repo": "rhasspy/piper-voices",
+      "revision": "e7229f7d33a10e145e109b886d661984201ac3c4",
+      "license": "MIT (rhasspy/piper-voices); see each voice's MODEL_CARD",
+      "dest": "models/piper-voices",
+      "files": [
+        {
+          "path": "en/en_GB/jenny_dioco/medium/en_GB-jenny_dioco-medium.onnx",
+          "size": 63201294,
+          "sha256": "469c630d209e139dd392a66bf4abde4ab86390a0269c1e47b4e5d7ce81526b01"
+        },
+        {
+          "path": "en/en_GB/jenny_dioco/medium/en_GB-jenny_dioco-medium.onnx.json",
+          "size": 4895,
+          "sha256": "a9a7a93a317c9a3cb6563e37eb057df9ef09c06188a8a4341b0fcb58cba54dd4"
+        },
+        {
+          "path": "en/en_US/amy/medium/en_US-amy-medium.onnx",
+          "size": 63201294,
+          "sha256": "b3a6e47b57b8c7fbe6a0ce2518161a50f59a9cdd8a50835c02cb02bdd6206c18"
+        },
+        {
+          "path": "en/en_US/amy/medium/en_US-amy-medium.onnx.json",
+          "size": 4882,
+          "sha256": "95a23eb4d42909d38df73bb9ac7f45f597dbfcde2d1bf9526fdeaf5466977d77"
+        },
+        {
+          "path": "en/en_US/kristin/medium/en_US-kristin-medium.onnx",
+          "size": 63531379,
+          "sha256": "5849957f929cbf720c258f8458692d6103fff2f0e3d3b19c8259474bb06a18d4"
+        },
+        {
+          "path": "en/en_US/kristin/medium/en_US-kristin-medium.onnx.json",
+          "size": 4968,
+          "sha256": "5681426d4aead22195de70531eeeeddb46493cfaffc5764b2ea3db73428b651c"
+        },
+        {
+          "path": "en/en_US/hfc_female/medium/en_US-hfc_female-medium.onnx",
+          "size": 63201294,
+          "sha256": "914c473788fc1fa8b63ace1cdcdb44588f4ae523d3ab37df1536616835a140b7"
+        },
+        {
+          "path": "en/en_US/hfc_female/medium/en_US-hfc_female-medium.onnx.json",
+          "size": 5033,
+          "sha256": "03f1fa0622b80463283592d97aca9f6e89aec345a5c56b7257723e0093c58b6c"
+        }
+      ]
+    },
+    "orpheus": {
+      "repo": "isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF",
+      "revision": "af161b11022b996f8ae2f54d79b8ff71c5a3fb58",
+      "license": "Apache-2.0 (Orpheus 3B by Canopy Labs, on Llama 3.2 3B: Llama 3.2 Community License)",
+      "dest": "models/.holo/orpheus",
+      "files": [
+        {
+          "path": "orpheus-3b-0.1-ft-q4_k_m.gguf",
+          "size": 2363760768,
+          "sha256": "18284d3efd9831d0a8409f5f5877c84bff69009df7c3db818e904dccea6b6c55"
+        }
+      ]
+    },
+    "snac": {
+      "repo": "hubertsiuzdak/snac_24khz",
+      "revision": "d73ad176a12188fcf4f360ba3bf2c2fbbe8f58ec",
+      "license": "MIT",
+      "dest": "models/.holo/snac_24khz",
+      "files": [
+        {
+          "path": "config.json",
+          "size": 300,
+          "sha256": "e119b9366d4f5e73c6ca5f31137c4ff361578bbb132953a5203afe037c4012be"
+        },
+        {
+          "path": "pytorch_model.bin",
+          "size": 79488254,
+          "sha256": "4b8164cc6606bfa627f1a784734c1e539891518f1191ed9194fe1e3b9b4bff40"
+        }
+      ]
+    },
+    "depth": {
+      "repo": "depth-anything/Depth-Anything-V2-Small-hf",
+      "revision": "5426e4f0f36572d16453bbda7a8389317b1bef99",
+      "license": "Apache-2.0",
+      "dest": "models/.holo/depth-anything-v2-small",
+      "files": [
+        {
+          "path": "config.json",
+          "size": 950,
+          "sha256": "c56698d3643dde1f83ea2212759e6b31a22b8f827246a36dd007ee8a22b3ff75"
+        },
+        {
+          "path": "preprocessor_config.json",
+          "size": 775,
+          "sha256": "d41175c0d889477ca8fc67191e540faef14baf6275157b3fdecf78469e6bbf84"
+        },
+        {
+          "path": "model.safetensors",
+          "size": 99173660,
+          "sha256": "3152477ce0d8d6978d76b995120de97cb5b928701fd0f817769f59e249a16b70"
+        }
+      ]
+    },
+    "face": {
+      "url": "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+      "size": 3758596,
+      "sha256": "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff",
+      "license": "Apache-2.0 (MediaPipe)",
+      "dest": "models/.holo/face_landmarker.task"
+    },
+    "orpheus_server": {
+      "variant": "vulkan",
+      "port": 8082,
+      "min_free_mb": 3000,
+      "voice_mb": 3000
     }
   }
 }

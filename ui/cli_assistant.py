@@ -631,11 +631,14 @@ def run_assistant():
                 for r in purge.preview():
                     print(f"    - {r['label']}: {r['files']} files, {purge.fmt_bytes(r['bytes'])}")
                 print(f"  Models and settings stay.{Style.RESET_ALL}")
+                n_av = purge.kept_avatars()
+                if n_av:
+                    print(f"{Fore.YELLOW}  Holo avatars ({n_av}) are kept; type PURGE ALL to erase them too.{Style.RESET_ALL}")
                 confirm = input(f"{Fore.RED}  Type PURGE to confirm: {Style.RESET_ALL}").strip()
-                if confirm != "PURGE":
+                if confirm not in ("PURGE", "PURGE ALL"):
                     print(f"{Fore.CYAN}  Purge cancelled.{Style.RESET_ALL}\n")
                     continue
-                purge.spawn(delay=1.0)
+                purge.spawn(delay=1.0, erase_avatars=confirm == "PURGE ALL")
                 print(f"{Fore.CYAN}  Purging. Artifex is shutting down.{Style.RESET_ALL}")
                 break
 
