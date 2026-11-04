@@ -81,6 +81,10 @@ def main():
 
     install_crash_logging()
 
+    # Model servers the GUI starts die with it, however it is closed.
+    from core.proc_tree import tie_children_to_this_process
+    tie_children_to_this_process()
+
     app = QApplication(sys.argv)
     app.setApplicationName("Artifex Assistant V5")
     app.setOrganizationName("Artifex")

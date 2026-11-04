@@ -19,6 +19,7 @@ import urllib.request
 import urllib.error
 
 from core.engine_base import BaseEngine
+from core.proc_tree import spawn
 from core.inference import _clean_response, strip_think_blocks
 
 _log = logging.getLogger(__name__)
@@ -762,6 +763,7 @@ class LlamaCppEngine(BaseEngine):
         # can restore the previous tier and tell the user.
         exact_request = self._target_exact
         gate_timeout = DEFAULT_VRAM_WAIT_TIMEOUT
+        reclaimed = False
         # -ngl 0 puts nothing on a GPU (a CPU-only helper such as LFM3), so
         # there is no VRAM to gate. Charging it the GPU estimate would refuse
         # or step down a model that never touches the card.
@@ -770,6 +772,14 @@ class LlamaCppEngine(BaseEngine):
                 self._vram_gate(pool, gpu_index, wait_timeout=gate_timeout)
                 break
             except RuntimeError as e:
+                # A model server nobody owns any more (left by a closed CLI or
+                # GUI, or a crashed API run) is not a reason to step down:
+                # stop it and gate the same tier again, once.
+                if not reclaimed:
+                    reclaimed = True
+                    if self._reclaim_orphan_servers(status_callback):
+                        pool.wait_for_vram_settled()
+                        continue
                 lower = max((t for t in CTX_TIERS if t < (self._num_ctx or 0)),
                             default=None)
                 # No lower RUNG is not the same as no lower CTX.  A model
@@ -867,7 +877,7 @@ class LlamaCppEngine(BaseEngine):
         for attempt in range(max_launch_attempts):
             launch_log_fh = open(launch_log_path, "wb")
             try:
-                self._process = subprocess.Popen(
+                self._process = spawn(
                     cmd, stdout=launch_log_fh, stderr=subprocess.STDOUT,
                     env=launch_env,
                 )
@@ -1065,7 +1075,7 @@ class LlamaCppEngine(BaseEngine):
             os.makedirs(log_dir, exist_ok=True)
             log_path = os.path.join(log_dir, f"external-server-port{self.port}.log")
             with open(log_path, "wb") as fh:
-                self._process = subprocess.Popen(
+                self._process = spawn(
                     cmd, stdout=fh, stderr=subprocess.STDOUT,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             start = time.monotonic()
@@ -1095,6 +1105,27 @@ class LlamaCppEngine(BaseEngine):
         stop_port_tree(self.port, [own] if own else [])
         self._process = None
         time.sleep(1.0)
+
+    def _reclaim_orphan_servers(self, status_callback=None) -> int:
+        """Stop servers on other configured model ports that no live Artifex
+        process owns (see proc_tree.orphan_listeners). Returns how many."""
+        from core.config import get_llama_cpp_models
+        from core.proc_tree import orphan_listeners, stop_port_tree
+        try:
+            ports = {int(cfg.get("port", 8081))
+                     for cfg in get_llama_cpp_models().values()} - {self.port}
+            orphans = orphan_listeners(
+                ports, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        except Exception as e:
+            _log.warning("Orphan server scan failed: %s", e)
+            return 0
+        for port, pid in orphans:
+            _log.warning("VRAM gate: stopping orphaned model server on port %d "
+                         "(pid %d, no live Artifex process owns it)", port, pid)
+            if status_callback:
+                status_callback(f"Stopping a leftover model server on port {port}...")
+            stop_port_tree(port)
+        return len(orphans)
 
     def unload(self, status_callback=None):
         if self._external_cmd:

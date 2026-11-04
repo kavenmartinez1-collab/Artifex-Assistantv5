@@ -667,3 +667,63 @@ class TestExternalLauncher(unittest.TestCase):
         kill.assert_called_once()
         kp.assert_not_called()
         self.assertFalse(e._loaded)
+
+
+class TestOrphanReclaimOnGateRefusal(unittest.TestCase):
+    """A VRAM refusal first stops orphaned model servers (a leftover Strata
+    held the 5060 Ti until the 27B load was refused) and gates the SAME tier
+    again; only when nothing was reclaimed does the tier step down."""
+
+    def _load(self, gate_effects, reclaimed):
+        from core.engine_llama_cpp import LlamaCppEngine
+        e = LlamaCppEngine("27b", {"path": "/m.gguf", "port": 8081, "num_ctx": 73728,
+                                   "num_gpu_layers": 99})
+        e.set_target_tier(32000)
+        ctxs = []
+
+        def gate(pool, idx, wait_timeout):
+            ctxs.append(e._num_ctx)
+            effect = gate_effects.pop(0)
+            if effect:
+                raise effect
+
+        with patch("core.engine_llama_cpp.os.path.isfile", return_value=True), \
+             patch.object(e, "_is_server_healthy", return_value=False), \
+             patch("core.gpu_pool.get_pool", return_value=MagicMock()), \
+             patch.object(e, "_resolve_gpu_index", return_value=0), \
+             patch.object(e, "_vram_gate", side_effect=gate), \
+             patch.object(e, "_reclaim_orphan_servers", return_value=reclaimed) as reclaim, \
+             patch("core.services.orpheus_tts.gpu_claimed"), \
+             patch("core.engine_llama_cpp.subprocess.Popen", side_effect=FileNotFoundError):
+            with self.assertRaises(FileNotFoundError):    # stop right after the gate
+                e.load()
+        return ctxs, reclaim
+
+    def test_reclaims_then_retries_same_tier(self):
+        ctxs, reclaim = self._load([RuntimeError("refused"), None], reclaimed=1)
+        self.assertEqual(ctxs, [32000, 32000])
+        reclaim.assert_called_once()
+
+    def test_steps_down_when_nothing_was_orphaned(self):
+        ctxs, reclaim = self._load([RuntimeError("refused"), None], reclaimed=0)
+        self.assertEqual(ctxs[0], 32000)
+        self.assertLess(ctxs[1], 32000)
+        reclaim.assert_called_once()
+
+    def test_reclaims_only_once(self):
+        ctxs, reclaim = self._load(
+            [RuntimeError("refused"), RuntimeError("still"), None], reclaimed=1)
+        self.assertEqual(ctxs[:2], [32000, 32000])
+        self.assertLess(ctxs[2], 32000)
+        reclaim.assert_called_once()
+
+    def test_reclaim_stops_only_orphans_on_other_model_ports(self):
+        from core.engine_llama_cpp import LlamaCppEngine
+        e = LlamaCppEngine("27b", {"path": "/m.gguf", "port": 8081})
+        models = {"a": {}, "b": {"port": 8086}, "c": {"port": 8085}}
+        with patch("core.config.get_llama_cpp_models", return_value=models), \
+             patch("core.proc_tree.orphan_listeners", return_value=[(8086, 20)]) as scan, \
+             patch("core.proc_tree.stop_port_tree") as stop:
+            self.assertEqual(e._reclaim_orphan_servers(), 1)
+        self.assertEqual(scan.call_args[0][0], {8085, 8086})   # never our own port
+        stop.assert_called_once_with(8086)

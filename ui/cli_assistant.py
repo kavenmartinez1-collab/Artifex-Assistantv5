@@ -493,6 +493,10 @@ def run_assistant():
 
     _adopt_harness(workspace, announce=True)
 
+    # Model servers this CLI starts die with it, however it is closed.
+    from core.proc_tree import tie_children_to_this_process
+    tie_children_to_this_process()
+
     # Load engine (Transformers or Ollama based on config)
     engine = create_engine()
     engine.load(status_callback=lambda msg: print(f"{Fore.CYAN}  {msg}{Style.RESET_ALL}"))
