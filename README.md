@@ -21,6 +21,42 @@
 
 All glory to **Jesus Christ**, through whom all things were made and in whom all wisdom dwells.
 
+## What it looks like
+
+Captured from a real session on the author's PC (local paths and addresses blurred).
+
+**Phone / web app** — chat, agent runs, image tools, settings, and **Holo**, a
+talking hologram avatar (Victoria, an original character) that answers out loud:
+
+<p align="center">
+  <img src="docs/screenshots/holo.webp" width="300" alt="Holo: Victoria answering out loud while the view sways">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/app-chat.jpg" width="190" alt="Chat">
+  <img src="docs/screenshots/app-agent-done.jpg" width="190" alt="Agent run, finished">
+  <img src="docs/screenshots/app-create.jpg" width="190" alt="Create: image, music, video, 3D">
+  <img src="docs/screenshots/app-settings.jpg" width="190" alt="Settings">
+</p>
+<p align="center">
+  <img src="docs/screenshots/app-holo.jpg" width="190" alt="Holo speaking">
+  <img src="docs/screenshots/app-holo-setup.jpg" width="190" alt="Holo setup: voice, brain, prompt, avatar">
+  <img src="docs/screenshots/app-holo-editor.jpg" width="190" alt="Holo face and persona editor">
+</p>
+
+**Desktop app (Qt)**
+
+<p align="center">
+  <img src="docs/screenshots/gui-chat.jpg" width="49%" alt="Desktop app: chat">
+  <img src="docs/screenshots/gui-agent.jpg" width="49%" alt="Desktop app: agent tab">
+</p>
+
+**CLI** — the model calls tools and asks before each one runs:
+
+<p align="center">
+  <img src="docs/screenshots/cli.png" width="600" alt="CLI session running fizzbuzz.py">
+</p>
+
 ## Install in 3 steps (Windows)
 
 1. **Get Artifex.** On this page click the green **Code** button →

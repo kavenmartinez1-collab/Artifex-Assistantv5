@@ -779,8 +779,8 @@ void main(){
     const fem = femaleVoices();
     let v = null; try { v = localStorage.getItem(voiceKey()); } catch (e) {}
     if (v && fem.includes(v)) return v;
-    // defaults: Tara (the user's pick) / Leo when Orpheus is there, else Jenny / Joe
-    return fem.find(x => /orpheus:(tara|leo)/.test(x)) || fem.find(x => /jenny|joe/i.test(x)) || fem[0] || null;
+    // defaults: Piper Jenny / Joe (instant, no GPU); Orpheus voices are opt-in
+    return fem.find(x => /jenny|joe/i.test(x)) || fem.find(x => !isStreamVoice(x)) || fem[0] || null;
   }
   function updateVoiceLabel() {
     const n = H.el && H.el.querySelector("#holo-vname"); if (!n) return;

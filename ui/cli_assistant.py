@@ -266,6 +266,7 @@ class _ConsoleHost:
 
     def __init__(self):
         self._streaming = False
+        self._shown = False      # this round's reply is already on screen
 
     def _end_stream(self):
         if self._streaming:
@@ -275,14 +276,24 @@ class _ConsoleHost:
 
     def emit(self, ev):
         k = ev.kind
-        if k == "assistant_chunk":
+        if k == "round_start":
+            self._shown = False
+        elif k == "assistant_chunk":
             if not self._streaming:
                 sys.stdout.write(f"\n{Fore.CYAN}  assistant > {Fore.WHITE}")
                 self._streaming = True
             sys.stdout.write(ev.text)
             sys.stdout.flush()
+            self._shown = True
         elif k in ("assistant_message", "done"):
             self._end_stream()
+            # An answer given through the native finish tool arrives only as
+            # the done summary, never as chunks; it used to vanish (saved in
+            # the session, never shown). Print whatever wasn't streamed.
+            text = ((ev.text if k == "assistant_message" else ev.summary) or "").strip()
+            if text and not self._shown:
+                print(f"\n{Fore.CYAN}  assistant > {Fore.WHITE}{text}{Style.RESET_ALL}")
+                self._shown = True
         elif k == "action_proposed":
             # The whole request (full command/script, both sides of an edit),
             # never cut; the approval prompt and "running:" below stay short.
