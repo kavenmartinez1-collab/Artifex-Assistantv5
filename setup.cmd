@@ -34,11 +34,13 @@ if not defined PY (
   set "PY=python\tools\python.exe"
 )
 
-if not "%~1"=="" (
-  %PY% -m installer %*
-  exit /b %errorlevel%
-)
+rem Not inside a ( ) block: cmd expands %errorlevel% when it reads a block,
+rem before the installer has run, and would hand back a stale 0.
+if "%~1"=="" goto :menu
+%PY% -m installer %*
+exit /b %errorlevel%
 
+:menu
 title Artifex setup
 echo Using: %PY%
 echo.

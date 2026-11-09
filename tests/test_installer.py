@@ -517,6 +517,18 @@ def test_bootstrap_scripts_verify_and_never_pipe_to_a_shell():
     assert "Remove-Item -Recurse -Force $dest" not in ps1
 
 
+def test_setup_cmd_hands_back_the_installers_exit_code():
+    """cmd expands %errorlevel% when it READS a ( ) block, before anything in
+    it has run: `exit /b %errorlevel%` inside one always returned the stale 0,
+    so `setup pack x` and every script built on it reported success on failure."""
+    text = _repo_file("setup.cmd").replace("\r\n", "\n")
+    # Blocks in this file are indented; the line that returns the code is not.
+    for line in text.splitlines():
+        if "%errorlevel%" in line.lower() and not line.lstrip().lower().startswith("rem"):
+            assert line == line.lstrip(), f"%errorlevel% inside a block: {line!r}"
+    assert '\nif "%~1"=="" goto :menu\n%PY% -m installer %*\nexit /b %errorlevel%\n' in text
+
+
 def test_bootstrap_cmd_keeps_crlf_everywhere():
     attrs = _repo_file(".gitattributes")
     assert "*.cmd text eol=crlf" in attrs and "installer/*.ps1 text eol=crlf" in attrs
