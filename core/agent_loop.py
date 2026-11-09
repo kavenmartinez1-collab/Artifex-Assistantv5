@@ -234,6 +234,11 @@ class RunControl:
     def reset(self):
         self._stop.clear()
         self._pause.clear()
+        # A follow-up queued in a run's last round was never drained. Left in
+        # the queue it came back in round 1 of the revived run, AFTER the new
+        # goal, and read as the newest instruction.
+        with self._msg_lock:
+            self._messages[:] = []
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -297,6 +302,7 @@ class AgentRunner:
         # marked native_tools and its generate_streaming takes `tools`.
         self._native = self._engine_takes_tools()
         self._last_calls: list = []
+        self._native_prompt = None   # ((cwd, goal), text): built once, not per round
 
     # ── public ──────────────────────────────────────────────────────────────
 
@@ -485,8 +491,22 @@ class AgentRunner:
             pending_edits: List[str] = []
             round_edits: List[str] = []
             deferred_done_ok = True
+
+            def flush_outputs():
+                # A run that ends mid-round still records what the round's
+                # actions returned. The early returns below used to drop it:
+                # the edits and failures of the last round were missing from
+                # history, so a revived run could not see them (and a native
+                # run was left with tool calls that had no results).
+                if calls:
+                    self._native_feedback(history, call_ids, call_slots, outputs, "")
+                elif outputs:
+                    history.append({"role": "user", "content":
+                                    self._fit_feedback(self._feedback(outputs))})
+
             for action in actions:
                 if self.control.stop_requested:
+                    flush_outputs()
                     return self._finish("stopped:user", history)
                 self.control.wait_if_paused()
 
@@ -531,6 +551,7 @@ class AgentRunner:
                                          decision=decision, round=rnd))
                     dec = self.request_approval(action, decision, "")
                     if dec == Decision.STOP:
+                        flush_outputs()
                         return self._finish("stopped:user", history)
                     if dec == Decision.DENY:
                         outputs.append(f"[skipped by user] {action.display}")
@@ -545,8 +566,12 @@ class AgentRunner:
                 if trip:
                     self.emit(AgentEvent("breaker_tripped", reason=trip, round=rnd))
                     if self.request_approval(None, None, f"circuit breaker: {trip}") == Decision.STOP:
+                        flush_outputs()
                         return self._finish("stopped:breaker", history)
-                    self.breaker.acknowledge()
+                    # reset(), not acknowledge(): acknowledge keeps the
+                    # window that tripped, so the very next action tripped
+                    # again (100%, then 90%, 80% ...) with a prompt each time.
+                    self.breaker.reset()
 
                 if not sandbox_approved and self._needs_approval(action, decision):
                     remembered = self.approvals.covers(action, decision)
@@ -560,6 +585,7 @@ class AgentRunner:
                                              decision=decision, round=rnd))
                         dec = self.request_approval(action, decision, "")
                         if dec == Decision.STOP:
+                            flush_outputs()
                             return self._finish("stopped:user", history)
                         if dec == Decision.DENY:
                             outputs.append(f"[skipped by user] {action.display}")
@@ -603,16 +629,22 @@ class AgentRunner:
                 if self.session_map is not None:
                     self._safe(lambda: update_session_map(
                         self.session_map, action.type, action.display, out))
-                self._on_action_complete(action, ok, pending_edits)
+                revert_note = self._on_action_complete(action, ok, pending_edits)
                 if action.type == "edit_file" and ok:
                     round_edits.append(action.content.split("\x00", 1)[0].strip())
 
                 cached = out
                 if out:
                     try:
-                        cached = maybe_cache_output(action.type, action.display, out)
+                        cached = maybe_cache_output(
+                            action.type, action.display, out,
+                            session_map=self.session_map is not None)
                     except Exception:
                         cached = out
+                if revert_note:
+                    # The model has to be told: it otherwise goes on as if
+                    # its edits were still in the files.
+                    cached = f"{cached}\n\n{revert_note}" if cached else revert_note
                 self.emit(AgentEvent("action_result", action=action,
                                      success=ok, output=out, round=rnd))
                 outputs.append(f"[{action.type}] `{action.display}`:\n{cached}")
@@ -620,6 +652,7 @@ class AgentRunner:
                 if consecutive_failures >= self.config.max_consecutive_failures:
                     self.emit(AgentEvent("stopped", reason="too many consecutive failures",
                                          round=rnd))
+                    flush_outputs()
                     return self._finish("stopped:failures", history)
 
             if round_edits:
@@ -634,6 +667,7 @@ class AgentRunner:
             if greason:
                 self.emit(AgentEvent("gate_pause", reason=greason, round=rnd))
                 if self.request_approval(None, None, f"human gate: {greason}") == Decision.STOP:
+                    flush_outputs()
                     return self._finish("stopped:gate", history)
                 self.gate.acknowledge_gate(rnd)
 
@@ -686,20 +720,25 @@ class AgentRunner:
         return risk > ceiling   # RiskLevel is an IntEnum
 
     def _set_system_prompt(self, history):
-        try:
-            base = self.build_system_prompt()
-        except Exception as e:
-            _log.warning("build_system_prompt failed: %s", e)
-            base = ""
         if self._native:
             # The base prompt documents the @marker protocol at length; a
             # model calling real tools only needs the loop rules, the
-            # machine facts and the goal.
-            from core.native_agent_tools import build_native_agent_prompt
-            from core.prompts import _environment_note
-            content = build_native_agent_prompt(
-                self._safe_env_note(_environment_note), os.getcwd(), self.goal)
+            # machine facts and the goal. The host's base prompt is not
+            # built at all here (it was built every round and thrown away),
+            # and the native prompt is built once per goal, not per round.
+            key = (os.getcwd(), self.goal)
+            if self._native_prompt is None or self._native_prompt[0] != key:
+                from core.native_agent_tools import build_native_agent_prompt
+                from core.prompts import _environment_note
+                self._native_prompt = (key, build_native_agent_prompt(
+                    self._safe_env_note(_environment_note), key[0], self.goal))
+            content = self._native_prompt[1]
         else:
+            try:
+                base = self.build_system_prompt()
+            except Exception as e:
+                _log.warning("build_system_prompt failed: %s", e)
+                base = ""
             content = (build_autonomous_prompt(base, self.goal, repo_map=self._repo_map)
                        if self.config.framing else base)
         if history and history[0].get("role") == "system":
@@ -1061,12 +1100,35 @@ class AgentRunner:
                     pending_edits.append(path)
                 self.emit(AgentEvent("git", text=msg, round=self._round))
         elif action.type in ("python", "shell") and not ok and pending_edits:
-            for path in reversed(pending_edits):
-                rok, msg = git_revert_last(path)
-                self.emit(AgentEvent("git", text=msg, round=self._round))
-                if not rok:
-                    break
-            pending_edits.clear()
+            return self._revert_pending(pending_edits, "the command above failed")
+        return ""
+
+    def _revert_pending(self, pending_edits, why: str) -> str:
+        """Roll back this round's committed edits, newest first. Returns the
+        note for the model: which files were REVERTED and which were not."""
+        reverted, kept = [], []
+        for path in reversed(pending_edits):
+            rok, msg = git_revert_last(path)
+            self.emit(AgentEvent("git", text=msg, round=self._round))
+            if rok:
+                reverted.append(path)
+            else:
+                kept.append(f"{path} ({msg})")
+        pending_edits.clear()
+        reverted = list(dict.fromkeys(reverted))
+        kept = list(dict.fromkeys(kept))
+        parts = []
+        if reverted:
+            parts.append(
+                f"[AUTO-REVERT — automated] Because {why}, this round's edits "
+                f"were REVERTED: {', '.join(reverted)}. Those files are back "
+                "to what they were before this round. Re-read them before "
+                "editing again.")
+        if kept:
+            parts.append(
+                "[AUTO-REVERT — automated] NOT reverted, the edit is still "
+                f"in place: {'; '.join(kept)}.")
+        return "\n".join(parts)
 
     # ── automatic checks (core/verify.py) ───────────────────────────────────
 
@@ -1111,14 +1173,9 @@ class AgentRunner:
             return ""
         text = rep.render()
         if rep.broken_imports and pending_edits:
-            for path in reversed(pending_edits):
-                rok, msg = git_revert_last(path)
-                self.emit(AgentEvent("git", text=msg, round=self._round))
-                if not rok:
-                    break
-            pending_edits.clear()
-            text += ("\nThis round's edits were REVERTED because they broke the "
-                     "import. Re-read the file and make the change again correctly.")
+            note = self._revert_pending(pending_edits, "they broke the import")
+            if note:
+                text += "\n" + note + "\nMake the change again correctly."
         self.emit(AgentEvent("verify", text=text, success=rep.clean, round=self._round))
         return ("[AUTO-CHECK — the harness ran these checks after your edits]\n"
                 + text)
@@ -1155,7 +1212,7 @@ class AgentRunner:
         """
         if not resp:
             return False
-        if "<tool_call" in resp:
+        if "<tool_call" in resp or "<|tool_call>" in resp:
             return True
         # Caller only reaches here when ZERO actions parsed — so any fenced
         # tool block in the text is by definition a failed invocation

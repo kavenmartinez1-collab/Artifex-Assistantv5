@@ -85,10 +85,16 @@ class GateState:
         return None
 
     def acknowledge_gate(self, current_round: int):
-        """Mark that the human acknowledged the gate. Resets interval counter."""
+        """Mark that the human acknowledged the gate. Resets interval counter.
+
+        The action count restarts too: max_actions means "pause after every
+        N actions". Left alone, the count stayed above the limit and the gate
+        fired again after every later round.
+        """
         with self._lock:
             self._last_gate_round = current_round
             self._risk_accumulated = 0
+            self._action_count = 0
 
     def reset(self):
         """Reset all counters."""

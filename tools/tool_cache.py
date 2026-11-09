@@ -201,7 +201,7 @@ def _detect_skeleton(output):
 
 # ===== PUBLIC API =====
 
-def maybe_cache_output(tool_type, display, output):
+def maybe_cache_output(tool_type, display, output, session_map=True):
     """Cache large tool output to disk and return a summary.
 
     If the output is small enough, returns it unchanged.
@@ -212,6 +212,11 @@ def maybe_cache_output(tool_type, display, output):
         tool_type: action type string (e.g., "architecture", "grep")
         display: action display string (for labeling)
         output: the full tool output string
+        session_map: False when the host shows the model NO session map
+            (API agent runs). A large skeleton is then returned whole and a
+            large architecture map keeps its cache path — the "[Symbols
+            captured in SESSION MAP]" stub pointed at something that was not
+            there, leaving two summary lines and no way to the rest.
 
     Returns:
         The output string — either original or replaced with summary + path.
@@ -237,6 +242,9 @@ def maybe_cache_output(tool_type, display, output):
     if tool_type == "read_file" and not _detect_skeleton(output):
         return output
 
+    if not session_map and _detect_skeleton(output):
+        return output
+
     # Pick the right summarizer.
     # architecture and skeleton views are now cached because the SessionMap
     # captures their structural data (files, symbols, line numbers).
@@ -258,7 +266,7 @@ def maybe_cache_output(tool_type, display, output):
     # (files, symbols, line numbers). The model should use @read_function() to drill
     # into specific code, NOT re-read the cached skeleton.
     rel_path = os.path.relpath(cache_path)
-    if _detect_skeleton(output) or tool_type == "architecture":
+    if session_map and (_detect_skeleton(output) or tool_type == "architecture"):
         return (
             f"{summary}\n"
             f"[Symbols captured in SESSION MAP — use @read_function() to drill into specific code]"
@@ -356,6 +364,13 @@ class SessionMap:
 
             # Detect directory context from indented lines like "  core/"
             indent = len(line) - len(line.lstrip())
+            # architecture_map() prints a nested directory as its full path
+            # ("core/sandbox/"). The single-name pattern below did not match
+            # it, so its files were filed under the directory printed before.
+            full_m = re.match(r"((?:[\w.-]+/){2,})$", stripped)
+            if full_m:
+                current_dir = full_m.group(1)
+                continue
             dir_m = re.match(r"(\w[\w.-]*)/$", stripped)
             if dir_m:
                 if indent <= 2:

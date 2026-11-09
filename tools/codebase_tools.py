@@ -89,20 +89,21 @@ def _extract_python_symbols(filepath: str, rel_path: str) -> List[SymbolDef]:
     except (SyntaxError, ValueError, OSError):
         return []
 
+    # Enclosing class of every method, found in ONE pass. Each function used
+    # to re-walk the whole tree looking for its class: 0.5 s for a 2800-line
+    # file, on every skeleton read and every index build.
+    class_of = {}
+    for cls in ast.walk(tree):
+        if isinstance(cls, ast.ClassDef):
+            for child in ast.iter_child_nodes(cls):
+                class_of[id(child)] = cls.name
+
     symbols = []
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
             # Determine if it's a method (inside a class) or a function
-            parent = ""
-            kind = "function"
-            # Walk parents to find enclosing class
-            for parent_node in ast.walk(tree):
-                if isinstance(parent_node, ast.ClassDef):
-                    for child in ast.iter_child_nodes(parent_node):
-                        if child is node:
-                            parent = parent_node.name
-                            kind = "method"
-                            break
+            parent = class_of.get(id(node), "")
+            kind = "method" if parent else "function"
 
             # Build signature
             args = []
@@ -166,6 +167,9 @@ def _extract_python_imports(filepath: str) -> Tuple[List[Dict], List[str]]:
             imports.append({
                 "module": module,
                 "names": names,
+                # What was imported, before any `as` alias — trace_imports
+                # matches `from pkg import module` against these.
+                "imported": [alias.name for alias in (node.names or [])],
                 "line": node.lineno,
             })
         elif isinstance(node, ast.Assign):
@@ -435,14 +439,25 @@ class CodebaseIndex:
         if module_name.endswith(".py"):
             module_name = module_name[:-3]
         basename = os.path.splitext(os.path.basename(rel_path))[0]
+        parent_pkg = module_name.rpartition(".")[0]
 
         for other_path, other_imports in self._imports.items():
             if other_path == rel_path:
                 continue
             for imp in other_imports:
                 mod = imp.get("module", "")
+                # `from pkg import module` / `from . import module`: the file
+                # is named in the imported names, not in the module path.
+                bare = mod.lstrip(".")
+                from_pkg = (
+                    basename in imp.get("imported", ())
+                    and (mod == parent_pkg
+                         or (mod.startswith(".")
+                             and (not bare or parent_pkg == bare
+                                  or parent_pkg.endswith("." + bare))))
+                )
                 # Check if this import refers to our file
-                if mod == module_name or mod.endswith("." + basename):
+                if from_pkg or mod == module_name or mod.endswith("." + basename):
                     imported_by.append({
                         "file": other_path,
                         "line": imp.get("line", 0),
@@ -643,14 +658,21 @@ class SafeEditor:
 # used by agent_tools.py
 
 _index_cache: Dict[str, CodebaseIndex] = {}
+_INDEX_CACHE_MAX = 4   # roots kept; every agent workspace is a new root
 
 
 def _get_index(root: str = ".") -> CodebaseIndex:
-    """Get or create a cached CodebaseIndex for a root directory."""
+    """Get or create a cached CodebaseIndex for a root directory.
+
+    run_agent_action() drops the entry (invalidate_index) whenever an action
+    may have changed files, so lookups after an edit see the edit.
+    """
     root = os.path.abspath(root)
     if root not in _index_cache:
         idx = CodebaseIndex(root)
         idx.index()
+        while len(_index_cache) >= _INDEX_CACHE_MAX:
+            _index_cache.pop(next(iter(_index_cache)))
         _index_cache[root] = idx
     return _index_cache[root]
 

@@ -63,6 +63,16 @@ _WEB_READ_PATTERN = re.compile(
     r'@web_read\(\s*["\u201c\u201d]?([^"\u201c\u201d)]+)["\u201c\u201d]?\s*\)'
 )
 
+# Quoted arguments are read up to the CLOSING QUOTE. The two patterns above
+# stop at the first ")", which cut @web_read("https://en.wikipedia.org/wiki/
+# Python_(programming_language)") down to a URL that does not exist and
+# @search("llama.cpp (server) flags") down to `llama.cpp (server`. These run
+# first; the ones above stay as the fallback for unquoted arguments.
+_SEARCH_QUOTED = re.compile(
+    r'@search\(\s*["“”]([^"“”\n]+)["“”]\s*\)')
+_WEB_READ_QUOTED = re.compile(
+    r'@web_read\(\s*["“”]([^"“”\n]+)["“”]\s*\)')
+
 # Native function-calling format emitted by Qwen3.x and similar models:
 #   <tool_call>{"name": "search", "arguments": {"query": "..."}}</tool_call>
 # When llama-server is launched with --jinja, the model's own chat template
@@ -178,9 +188,18 @@ def extract_web_tools(text: str) -> list[dict]:
     envelope that Qwen3.x and other function-calling models emit.
     """
     tools = []
-    for m in _SEARCH_PATTERN.finditer(text):
+
+    def _matches(quoted, fallback):
+        # (start, match) in written order; a call the quoted pattern read is
+        # not read a second time (shorter) by the fallback.
+        found = {m.start(): m for m in quoted.finditer(text)}
+        for m in fallback.finditer(text):
+            found.setdefault(m.start(), m)
+        return [found[k] for k in sorted(found)]
+
+    for m in _matches(_SEARCH_QUOTED, _SEARCH_PATTERN):
         tools.append({"type": "search", "query": m.group(1), "raw": m.group(0)})
-    for m in _WEB_READ_PATTERN.finditer(text):
+    for m in _matches(_WEB_READ_QUOTED, _WEB_READ_PATTERN):
         tools.append({"type": "web_read", "ref": m.group(1).strip(), "raw": m.group(0)})
     tools.extend(_extract_native_tool_calls(text))
     return tools
@@ -266,6 +285,7 @@ def _run_search(tool: dict, search_cache: list[dict]) -> str:
     else:
         _log.warning("Search FAILED for '%s': %s", tool["query"], data)
         result = f"Search failed: {data}"
+    tool["_ok"] = bool(ok)   # read by execute_web_tools: only successes are cached
     return f"[Search results for: {tool['query']}]\n{result}"
 
 
@@ -281,12 +301,15 @@ def _resolve_read_url(ref: str, search_cache: list[dict]) -> tuple[str, str | No
     return ref, None
 
 
+_FETCH_FAILED_PREFIX = "[Web page content]\nFetch failed: "
+
+
 def _run_web_read(url: str, max_chars: int = WEB_READ_MAX_CHARS) -> str:
     """Fetch one page through the gateway, cut to max_chars."""
     ok, data = gateway_post("/fetch", {"url": url})
     if not ok:
         _log.warning("web_read FAILED for %s: %s", url, data)
-        return f"[Web page content]\nFetch failed: {data}"
+        return f"{_FETCH_FAILED_PREFIX}{data}"
 
     text = data.get("text", "")
     title = data.get("title") or url
@@ -400,9 +423,13 @@ def execute_web_tools(tools: list[dict], search_cache: list[dict],
                                "Answer with what you have and say what is missing.]")
                 continue
             state["search_uses"] += 1
-            state["searched"][key[1]] = state["round"]
             ran += 1
             out = _run_search(tool, search_cache)
+            # Remembered only when it worked: a search that failed (timeout,
+            # 429) used to be answered on retry with "already run; its
+            # results are earlier in this conversation" — they were not.
+            if tool.get("_ok", True):
+                state["searched"][key[1]] = state["round"]
         elif tool["type"] == "web_read":
             _log.info("Executing web_read: ref='%s'", tool["ref"])
             url, err = _resolve_read_url(tool["ref"], search_cache)
@@ -430,9 +457,11 @@ def execute_web_tools(tools: list[dict], search_cache: list[dict],
                 notes.append(label)
                 continue
             state["read_uses"] += 1
-            state["fetched"][url] = state["round"]
             ran += 1
             out = _run_web_read(url, max_chars=room)
+            # As for searches: a failed fetch is not "already read".
+            if not out.startswith(_FETCH_FAILED_PREFIX):
+                state["fetched"][url] = state["round"]
         else:
             continue
         used_chars += len(out)

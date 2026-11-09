@@ -143,7 +143,10 @@ def call_to_action(call):
             end = end or start + 199
             return AgentAction("read_file", f"{path}|L{start}-{end}",
                                f'read_file: "{path}" (lines {start}-{end})'), None, None
-        return AgentAction("read_file", f"{path}|1", f'read_file: "{path}"'), None, None
+        # "c1": the raw first chunk. Plain "1" answers a large .py with the
+        # skeleton view, whose hints (@read_function, @read_file markers) name
+        # tools this protocol does not have.
+        return AgentAction("read_file", f"{path}|c1", f'read_file: "{path}"'), None, None
     if name == "write_file":
         err = need("path")
         if err:

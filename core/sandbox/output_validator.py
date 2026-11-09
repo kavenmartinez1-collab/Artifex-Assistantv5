@@ -29,7 +29,12 @@ _INJECTION_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"ignore\s+(previous|all|above)\s+(instructions|prompts?)", re.IGNORECASE),
      "prompt injection: ignore instructions"),
 
-    (re.compile(r"you\s+are\s+now\s+", re.IGNORECASE),
+    # A role or mode has to follow. Bare "you are now " also blocked edits
+    # whose text said "you are now ready to run it".
+    (re.compile(r"you\s+are\s+now\s+(?:a|an|the|my|our|no\s+longer|not|free"
+                r"|unrestricted|unfiltered|uncensored|jailbroken|dan"
+                r"|in\s+[\w-]+\s+mode|acting|operating|playing|called|named"
+                r"|known\s+as)\b", re.IGNORECASE),
      "prompt injection: role reassignment"),
 
     (re.compile(r"system\s*:\s*you\s+are", re.IGNORECASE),

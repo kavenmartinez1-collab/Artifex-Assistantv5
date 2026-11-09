@@ -12,12 +12,15 @@ import shutil
 import tempfile
 import subprocess
 import math
+import signal
+import socket
+import ipaddress
 import time
 import random
 
 _log = logging.getLogger(__name__)
 from collections import namedtuple
-from urllib.request import urlopen, Request
+from urllib.request import urlopen, Request, HTTPRedirectHandler, build_opener
 from urllib.error import URLError, HTTPError
 from urllib.parse import urlencode
 
@@ -28,6 +31,7 @@ from core.sandbox.proc_sandbox import (
     MAX_PYTHON_TIMEOUT,
     scrub_env,
 )
+from core.sandbox.fs_sandbox import path_is_sensitive, split_grep_content
 
 # HTML parsing: lxml for quality, stdlib HTMLParser always available as fallback
 from html.parser import HTMLParser
@@ -359,6 +363,30 @@ def _extract_fenced_blocks(text, languages, validate=None):
     Returns (offset, content) pairs; offset is where the fence starts, so
     callers can run actions in the order they were written.
     """
+    return [(start, content) for start, _end, content
+            in _extract_fenced_spans(text, languages, validate=validate)]
+
+
+def _is_bare_fence(text, idx):
+    """True if the ``` at idx sits alone on its line (a closing fence)."""
+    line_start = text.rfind("\n", 0, idx) + 1
+    if text[line_start:idx].strip():
+        return False
+    line_end = text.find("\n", idx)
+    rest = text[idx + 3: line_end if line_end != -1 else len(text)]
+    return not rest.strip()
+
+
+def _extract_fenced_spans(text, languages, validate=None, bare_close=False):
+    """_extract_fenced_blocks, returning (start, end, content) triples.
+
+    end is the offset just past the closing fence, so callers can tell what
+    was written INSIDE a block (text, not an action of its own).
+
+    bare_close: only a ``` alone on its line may close the block (any ```
+    when there is none). An ```edit``` block that writes a markdown file has
+    ```bash openers in its NEW text; those are content, not the end.
+    """
     blocks = []
     pos = 0
     while pos < len(text):
@@ -384,6 +412,9 @@ def _extract_fenced_blocks(text, languages, validate=None):
             search = c + 3
         if not candidates:
             break
+        if bare_close:
+            bare = [c for c in candidates if _is_bare_fence(text, c)]
+            candidates = bare or candidates
 
         close = None
         if validate is not None:
@@ -397,9 +428,41 @@ def _extract_fenced_blocks(text, languages, validate=None):
         if close is None:
             close = candidates[0]
 
-        blocks.append((fence_start, text[content_start:close]))
+        blocks.append((fence_start, close + 3, text[content_start:close]))
         pos = close + 3
     return blocks
+
+
+def _fences_balanced(content):
+    """True if every ``` line inside an ```edit``` block's text is paired.
+
+    Picks the edit block's real closing fence: at the inner close of a
+    ```bash example the text so far holds one fence line (odd); at the
+    block's own close it holds the pair (even).
+    """
+    n = sum(1 for line in content.split("\n") if line.lstrip().startswith("```"))
+    return n % 2 == 0
+
+
+def _drop_nested_actions(found, containers):
+    """Drop actions written INSIDE another block's content.
+
+    containers: (start, end) spans of ```python``` blocks that parse and of
+    ```edit``` blocks. A ```bash fence or an @tool(...) line inside the file
+    an edit writes, or inside a python string literal, is that block's text.
+    It used to be extracted as an action of its own and run: a python block
+    writing a README with "```bash / pip install x" in it also ran
+    `pip install x`. A container nested in an earlier one is content too.
+    """
+    kept = []
+    for start, end in sorted(containers):
+        if kept and start < kept[-1][1]:
+            continue
+        kept.append((start, end))
+    if not kept:
+        return found
+    return [(off, action) for off, action in found
+            if not any(start < off < end for start, end in kept)]
 
 
 def _python_parses(code):
@@ -766,12 +829,15 @@ def extract_agent_actions(response):
         found.append((start, AgentAction("shell", script, display)))
 
     # --- Python code blocks (AST-validated close: content may embed ```) ---
-    python_blocks = _extract_fenced_blocks(response, {"python", "py"},
-                                           validate=_python_parses)
-    for start, block in python_blocks:
+    containers = []   # spans whose inside is text, not actions
+    python_blocks = _extract_fenced_spans(response, {"python", "py"},
+                                          validate=_python_parses)
+    for start, end, block in python_blocks:
         code = block.strip()
         if not code:
             continue
+        if _python_parses(block):
+            containers.append((start, end))
         lines = code.split("\n")
         if len(lines) == 1:
             display = code[:80]
@@ -797,7 +863,9 @@ def extract_agent_actions(response):
             content = f"{filepath}|L{start}-{end}"
             display = f'read_file: "{filepath}" (lines {start}-{end})'
         else:
-            chunk_num = chunk if chunk else "1"
+            # "c1" = chunk 1 asked for by number: the raw text, not the
+            # skeleton view a large .py otherwise answers a first read with.
+            chunk_num = ("c1" if chunk == "1" else chunk) if chunk else "1"
             content = f"{filepath}|{chunk_num}"
             display = f'read_file: "{filepath}"'
             if chunk:
@@ -853,8 +921,11 @@ def extract_agent_actions(response):
     #   exact text to replace
     #   NEW:
     #   replacement text
-    edit_blocks = _extract_fenced_blocks(response, {"edit"})
-    for start, block in edit_blocks:
+    edit_blocks = _extract_fenced_spans(response, {"edit"},
+                                        validate=_fences_balanced,
+                                        bare_close=True)
+    for start, end, block in edit_blocks:
+        containers.append((start, end))
         file_m = re.search(r"^FILE:[ \t]*(.+)$", block, re.MULTILINE)
         # \n? before NEW: — an empty OLD (create-file form) is written as
         # "OLD:\nNEW:" with no blank line between them.
@@ -951,10 +1022,13 @@ def extract_agent_actions(response):
         elif func_name == "read_file" and "path" in args:
             action = AgentAction("read_file", args["path"], f'read_file: "{args["path"]}"')
         else:
-            # Generic tool call — display as-is
-            display = f'{func_name}({", ".join(f"{k}={v}" for k, v in args.items())})'
-            action = AgentAction("shell", f"# Gemma tool: {display}", f"tool: {display}")
-        found.append((m.start(), action))
+            # Any other tool goes through the mapper the JSON/XML dialects
+            # use. A name with no executor yields NO action: it used to
+            # become a shell action whose whole script was a "# Gemma tool:"
+            # comment, which ran, did nothing and was reported as a success.
+            action = _action_from_call(func_name.lower(), args)
+        if action:
+            found.append((m.start(), action))
 
     # --- Pinned notes: @note("text") (kept by the agent loop across compaction) ---
     for m in re.finditer(r'(?m)^\s*@note\(\s*(["\'])(.+?)\1\s*\)\s*$', marker_text, re.S):
@@ -967,6 +1041,8 @@ def extract_agent_actions(response):
 
     # --- Native XML tool calls: <function=name>...</function> ---
     found.extend(_extract_xml_tool_calls(response))
+
+    found = _drop_nested_actions(found, containers)
 
     # Stable sort: actions at the same offset keep their extraction order.
     found.sort(key=lambda pa: pa[0])
@@ -1043,6 +1119,51 @@ def _get_clean_env():
     return env
 
 
+def _kill_process_tree(proc):
+    """Kill a child and everything it started."""
+    try:
+        if IS_WINDOWS:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=15,
+                           stdin=subprocess.DEVNULL)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception as e:
+        _log.debug("process tree kill failed for pid %s: %s", proc.pid, e)
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _run_capture(args, timeout, **kwargs):
+    """subprocess.run(capture_output=True) whose timeout ends the WHOLE tree.
+
+    subprocess.run kills only the direct child (the shell) and then waits
+    for the output pipes to close. A grandchild still holding them — the
+    `python server.py` or `npm run dev` the shell started — kept the wait
+    going: a 2 s timeout returned after 12 s behind a 12 s sleep, and never
+    behind a server. The tree is killed first, and the drain is bounded.
+    """
+    if not IS_WINDOWS:
+        kwargs.setdefault("start_new_session", True)   # own group, for killpg
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, **kwargs)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass   # something detached still holds the pipe; stop waiting
+        raise
+    except BaseException:
+        _kill_process_tree(proc)
+        raise
+    return subprocess.CompletedProcess(args, proc.returncode, out, err)
+
+
 def run_shell_command(command, timeout=300, cwd=None):
     """
     Execute a shell command.
@@ -1071,9 +1192,9 @@ def run_shell_command(command, timeout=300, cwd=None):
 
             if use_bash and _GIT_BASH:
                 # Route bash-style commands through Git Bash
-                result = subprocess.run(
+                result = _run_capture(
                     [_GIT_BASH, "-c", command],
-                    capture_output=True, text=True, timeout=timeout,
+                    text=True, timeout=timeout,
                     cwd=cwd, env=_get_clean_env(), stdin=subprocess.DEVNULL,
                     encoding="utf-8", errors="replace",
                 )
@@ -1115,24 +1236,24 @@ def run_shell_command(command, timeout=300, cwd=None):
                             f.write(script)
                         ps_args = [ps_bin, "-NoProfile", "-NonInteractive",
                                    "-ExecutionPolicy", "Bypass", "-File", ps_file]
-                    result = subprocess.run(
+                    result = _run_capture(
                         ps_args,
-                        capture_output=True, text=True, timeout=timeout,
+                        text=True, timeout=timeout,
                         cwd=cwd, env=_get_clean_env(), stdin=subprocess.DEVNULL,
                         encoding="utf-8", errors="replace",
                     )
                 else:
                     # Fallback to cmd.exe
-                    result = subprocess.run(
+                    result = _run_capture(
                         ps_cmd, shell=True,
-                        capture_output=True, text=True, timeout=timeout,
+                        text=True, timeout=timeout,
                         cwd=cwd, env=_get_clean_env(), stdin=subprocess.DEVNULL,
                         encoding="utf-8", errors="replace",
                     )
         else:
-            result = subprocess.run(
+            result = _run_capture(
                 command, shell=True,
-                capture_output=True, text=True, timeout=timeout,
+                text=True, timeout=timeout,
                 cwd=cwd, env=_get_clean_env(), stdin=subprocess.DEVNULL,
                 encoding="utf-8", errors="replace",
             )
@@ -1183,10 +1304,10 @@ def run_python_snippet(code, timeout=30, cwd=None):
         lines = code.strip().split("\n")
 
         if len(lines) == 1:
-            result = subprocess.run(
+            result = _run_capture(
                 [_PYTHON_BIN, "-c", code],
-                capture_output=True, text=True, timeout=timeout,
-                env=_get_clean_env(), cwd=cwd,
+                text=True, timeout=timeout,
+                env=_get_clean_env(), cwd=cwd, stdin=subprocess.DEVNULL,
                 encoding="utf-8", errors="replace",
             )
         else:
@@ -1196,10 +1317,10 @@ def run_python_snippet(code, timeout=30, cwd=None):
                 f.write(code)
                 tmp_path = f.name
             try:
-                result = subprocess.run(
+                result = _run_capture(
                     [_PYTHON_BIN, tmp_path],
-                    capture_output=True, text=True, timeout=timeout,
-                    env=_get_clean_env(), cwd=cwd,
+                    text=True, timeout=timeout,
+                    env=_get_clean_env(), cwd=cwd, stdin=subprocess.DEVNULL,
                     encoding="utf-8", errors="replace",
                 )
             finally:
@@ -1379,11 +1500,16 @@ def run_read_file(content):
     filepath = parts[0].strip()
     spec = parts[1].strip() if len(parts) > 1 else "1"
     line_range = None
+    explicit_chunk = False   # "cN": the raw chunk, even where a skeleton applies
     m = re.fullmatch(r"L(\d+)-(\d+)", spec)
     if m:
         line_range = (int(m.group(1)), int(m.group(2)))
         chunk_num = 1
     else:
+        mc = re.fullmatch(r"[cC](\d+)", spec)
+        if mc:
+            explicit_chunk = True
+            spec = mc.group(1)
         try:
             chunk_num = int(spec)
         except ValueError:
@@ -1461,7 +1587,8 @@ def run_read_file(content):
                       f"{body}\n---")
 
     # Smart skeleton for large Python files (chunk 1 only)
-    if filepath.endswith(".py") and total_lines > 200 and chunk_num == 1:
+    if (filepath.endswith(".py") and total_lines > 200 and chunk_num == 1
+            and not explicit_chunk):
         skeleton = _python_file_skeleton(filepath, text, lines)
         if skeleton is not None:
             return True, skeleton
@@ -1534,7 +1661,10 @@ def _python_file_skeleton(filepath, text, lines):
     except ImportError:
         return None
 
-    rel_path = os.path.relpath(filepath)
+    try:
+        rel_path = os.path.relpath(filepath)
+    except ValueError:   # Windows: the file is on another drive than the cwd
+        rel_path = filepath
     try:
         symbols = _extract_python_symbols(filepath, rel_path)
     except Exception:
@@ -1588,7 +1718,7 @@ def _python_file_skeleton(filepath, text, lines):
         "\n".join(sym_lines) if sym_lines else "  (no symbols found)",
         "---",
         f'Drill into a function: @read_function("{rel_path}", "function_name")',
-        f'Read raw chunks: @read_file("{rel_path}|N") (1-{total_chunks})',
+        f'Read raw chunks: @read_file("{rel_path}", chunk=N) (N = 1 to about {total_chunks})',
     ]
     return "\n".join(result)
 
@@ -1849,6 +1979,55 @@ def _extract_page_text_stdlib(html_bytes, encoding="utf-8"):
     return parser.get_text()
 
 
+def _private_address_reason(url):
+    """Why `url` must not be fetched directly, or None.
+
+    The web gateway refuses private, loopback and link-local targets; the
+    direct fallback fetched anything, so a page the model read could send it
+    to http://127.0.0.1:<port>/ or a cloud metadata address and get the
+    answer back as "page text". Every address the host resolves to is
+    checked. A name that does not resolve is left to the fetch to report.
+    ARTIFEX_WEB_READ_ALLOW_PRIVATE=1 turns the check off (local dev servers).
+    """
+    if os.environ.get("ARTIFEX_WEB_READ_ALLOW_PRIVATE", "").strip().lower() in (
+            "1", "true", "yes", "on"):
+        return None
+    from urllib.parse import urlparse
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return "unparseable URL"
+    if not host:
+        return "no host in URL"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (OSError, UnicodeError):
+        return None
+    for info in infos:
+        addr = info[4][0].split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None:
+            ip = mapped
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return f"{host} resolves to a private or local address ({ip})"
+    return None
+
+
+class _PublicOnlyRedirects(HTTPRedirectHandler):
+    """Apply the private-address check to every redirect hop as well."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        reason = _private_address_reason(newurl)
+        if reason:
+            raise URLError(f"redirect blocked: {reason}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def run_web_read(ref):
     """
     Fetch a web page and extract its main text content.
@@ -1907,13 +2086,19 @@ def run_web_read(ref):
 
     # --- Direct fallback (non-Docker use) ---
 
+    blocked = _private_address_reason(url)
+    if blocked:
+        return False, (f"Blocked: {blocked}. Pages on this machine or the "
+                       "local network are not fetched.")
+
     # Detect if this is a PDF URL
     is_pdf = _is_pdf_url(url)
 
     # Fetch
     try:
         req = Request(url, headers={"User-Agent": _USER_AGENT})
-        with urlopen(req, timeout=_WEB_READ_TIMEOUT) as resp:
+        with build_opener(_PublicOnlyRedirects).open(
+                req, timeout=_WEB_READ_TIMEOUT) as resp:
             # Check content length if available
             cl = resp.headers.get("Content-Length")
             if cl and int(cl) > _WEB_READ_MAX_BODY:
@@ -2158,10 +2343,13 @@ def run_grep(content):
     """
     import glob as _glob
 
-    parts = content.split("|", 2)
-    pattern = parts[0].strip()
-    path = parts[1].strip() if len(parts) > 1 else os.getcwd()
-    flags_str = parts[2].strip().lower() if len(parts) > 2 else ""
+    # Split from the RIGHT: the pattern is a regex and `a|b` is its commonest
+    # construct. Split from the left, "foo|bar|src|" searched for "foo" in a
+    # path called "bar" and reported "no matches in 0 files".
+    pattern, path, flags_str = split_grep_content(content)
+    pattern = pattern.strip()
+    path = path.strip() or os.getcwd()
+    flags_str = flags_str.strip().lower()
 
     re_flags = re.IGNORECASE if "i" in flags_str else 0
 
@@ -2197,8 +2385,15 @@ def run_grep(content):
 
     results = []
     files_searched = 0
+    sensitive_skipped = 0
     for filepath in files[:200]:
         if not os.path.isfile(filepath):
+            continue
+        # The policy hook sees only the path as written. A glob ("./.en*")
+        # or a directory walk reaches key material it would have refused by
+        # name, so every file is checked again here.
+        if path_is_sensitive(filepath):
+            sensitive_skipped += 1
             continue
         files_searched += 1
         try:
@@ -2218,10 +2413,13 @@ def run_grep(content):
             results.append("... (limit reached — refine your pattern)")
             break
 
+    skipped_note = (f" ({sensitive_skipped} protected file(s) such as .env or "
+                    "credentials were not searched.)" if sensitive_skipped else "")
     if not results:
-        return True, f"No matches for '{pattern}' in {files_searched} file(s) searched."
+        return True, (f"No matches for '{pattern}' in {files_searched} file(s) "
+                      f"searched.{skipped_note}")
 
-    header = f"Found {len(results)} match(es) for '{pattern}':\n"
+    header = f"Found {len(results)} match(es) for '{pattern}':{skipped_note}\n"
     return True, header + "\n".join(results)
 
 
@@ -2264,12 +2462,16 @@ def run_edit_file(content):
             return True, f"Created {os.path.basename(path)} ({n_lines} lines)"
         return False, f"File not found: {path}"
 
-    # Read with encoding fallback
+    # Read with encoding fallback. newline="" keeps the file's own line
+    # endings visible: the edit used to read in universal-newline mode and
+    # write in the platform's, so one changed character turned every line of
+    # an LF file into CRLF on Windows (a whole-file diff in the auto-commit),
+    # and a UTF-8 BOM was silently dropped.
     original = None
     used_encoding = "utf-8"
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
-            with open(path, "r", encoding=enc) as f:
+            with open(path, "r", encoding=enc, newline="") as f:
                 original = f.read()
             used_encoding = "utf-8" if enc == "utf-8-sig" else enc
             break
@@ -2278,6 +2480,19 @@ def run_edit_file(content):
 
     if original is None:
         return False, "Cannot decode file — unsupported encoding."
+
+    try:
+        with open(path, "rb") as f:
+            had_bom = f.read(3) == b"\xef\xbb\xbf"
+    except OSError:
+        had_bom = False
+    if had_bom and used_encoding == "utf-8":
+        used_encoding = "utf-8-sig"
+    crlf = "\r\n" in original
+    if crlf:
+        original = original.replace("\r\n", "\n")
+    old_str = old_str.replace("\r\n", "\n")
+    new_str = new_str.replace("\r\n", "\n")
 
     if not old_str.strip():
         # "".count() is len+1, which used to surface as a baffling
@@ -2315,7 +2530,9 @@ def run_edit_file(content):
                 "Fix the NEW text and try again."
             )
 
-    with open(path, "w", encoding=used_encoding) as f:
+    if crlf:
+        new_content = new_content.replace("\n", "\r\n")
+    with open(path, "w", encoding=used_encoding, newline="") as f:
         f.write(new_content)
 
     fname = os.path.basename(path)
@@ -2410,7 +2627,10 @@ def git_commit_edit(file_path: str, summary: str) -> tuple[bool, str]:
             cwd=repo, capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
-            short_sha = result.stdout.strip().split()[1] if result.stdout else "?"
+            # "[branch (root-commit) abc1234] msg" — the sha is the last word
+            # inside the brackets, not the second word of the line.
+            m = re.match(r"\[[^\]]*?([0-9a-f]{4,40})\]", result.stdout.strip())
+            short_sha = m.group(1) if m else "?"
             return True, f"Committed: {short_sha}"
         return False, result.stderr.strip() or "git commit failed"
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
@@ -2418,25 +2638,55 @@ def git_commit_edit(file_path: str, summary: str) -> tuple[bool, str]:
 
 
 def git_revert_last(file_path: str) -> tuple[bool, str]:
-    """Revert the last commit if it was an agent edit. Safety check: only
-    reverts commits with [agent] prefix in the message."""
+    """Revert the newest agent edit of `file_path`. Safety check: only
+    reverts commits with [agent] prefix in the message.
+
+    The commit is found through the FILE's history, not HEAD. A round that
+    edits a.txt and b.txt and is then rolled back calls this once per file:
+    after the first revert HEAD is 'Revert "[agent] ..."', and looking at
+    HEAD alone refused every further file ("not an agent edit") — only the
+    last edit of a round was ever undone. Agent commits that a revert has
+    already undone are skipped, so a file edited twice in a round unwinds
+    both edits.
+    """
     repo = _find_git_root(file_path)
     if not repo:
         return False, "Not inside a git repository."
+    abs_path = os.path.abspath(file_path)
     try:
         log = subprocess.run(
-            ["git", "log", "-1", "--format=%s"],
+            ["git", "log", "-n", "50", "--format=%H%x1f%s", "--", abs_path],
             cwd=repo, capture_output=True, text=True, timeout=10,
+            encoding="utf-8", errors="replace",
         )
-        msg = log.stdout.strip()
-        if not msg.startswith("[agent]"):
-            return False, f"Last commit is not an agent edit: {msg!r}"
+        target = None
+        undone: dict[str, int] = {}
+        last_subject = ""
+        for line in log.stdout.splitlines():
+            sha, _, subject = line.partition("\x1f")
+            last_subject = last_subject or subject
+            m = re.fullmatch(r'Revert "(.*)"', subject)
+            if m:
+                undone[m.group(1)] = undone.get(m.group(1), 0) + 1
+                continue
+            if not subject.startswith("[agent]"):
+                break
+            if undone.get(subject, 0) > 0:
+                undone[subject] -= 1
+                continue
+            target = sha
+            break
+        if target is None:
+            return False, f"Last commit is not an agent edit: {last_subject!r}"
         result = subprocess.run(
-            ["git", "revert", "--no-edit", "HEAD"],
+            ["git", "revert", "--no-edit", target],
             cwd=repo, capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
             return True, "Reverted last agent commit."
+        # A revert that stops on a conflict leaves the repo mid-revert.
+        subprocess.run(["git", "revert", "--abort"],
+                       cwd=repo, capture_output=True, timeout=10)
         return False, result.stderr.strip() or "git revert failed"
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         return False, str(e)
@@ -2604,7 +2854,10 @@ def rebase_action_paths(action_type, content, cwd):
         # omitted root has to be FILLED IN, not just left alone — otherwise
         # the commonest form, @glob("*.py"), silently searches the API's
         # process directory instead of the caller's workspace.
-        parts = content.split("|")
+        # grep's pattern is a regex that may itself contain "|", so its
+        # fields are counted from the right (see run_grep).
+        parts = (content.rsplit("|", 2) if action_type == "grep"
+                 else content.split("|"))
         if len(parts) > 1 and parts[1].strip():
             parts[1] = _rebase_one(parts[1], cwd)
         elif len(parts) > 1:
@@ -2692,6 +2945,20 @@ def run_agent_action(action, confirm_cb=None, policy_check=True, cwd=None):
                 )
             if not confirm_cb(action, decision):
                 return False, "[NOT RUN — confirmation declined]"
+
+    if action.type in ("edit_file", "shell", "python"):
+        # These change files. The symbol index behind @find_symbol /
+        # @find_references / @architecture was built once per process and
+        # never refreshed, so it kept reporting pre-edit line numbers and
+        # missed new files. Dropped here; the next lookup rebuilds it.
+        _ct = sys.modules.get("tools.codebase_tools")
+        if _ct is not None:
+            try:
+                _ct.invalidate_index(".")
+                if cwd:
+                    _ct.invalidate_index(cwd)
+            except Exception:
+                pass
 
     content = action.content
     if cwd:

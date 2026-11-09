@@ -305,14 +305,23 @@ def _read_text(path: str, cap: int = _MAX_INJECT_BYTES) -> Optional[str]:
         return None  # binary
     truncated = len(raw) > cap
     raw = raw[:cap]
-    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+    # utf-8-sig first: it reads plain UTF-8 too and drops a BOM, which
+    # "utf-8" kept as a leading U+FEFF (the frontmatter and template checks
+    # then never matched). A cap that lands inside a multi-byte character is
+    # trimmed back to the character boundary — otherwise the whole file fell
+    # through to latin-1 and every non-ASCII character came out as mojibake.
+    text = None
+    for trim in ((0, 1, 2, 3) if truncated else (0,)):
         try:
-            text = raw.decode(enc)
+            text = raw[:len(raw) - trim].decode("utf-8-sig")
             break
         except UnicodeDecodeError:
             continue
-    else:
-        return None
+    if text is None:
+        try:
+            text = raw.decode("latin-1")
+        except UnicodeDecodeError:
+            return None
     if truncated:
         text += "\n\n[...truncated by Artifex harness ingest...]"
     return text
@@ -598,7 +607,9 @@ def adopt(folder: str, include: Optional[set] = None,
 
 
 def _safe_write(path: str, content: str):
-    with open(path, "w", encoding="utf-8") as f:
+    # newline="\n": written in text mode, the bundle got CRLF on Windows,
+    # and the byte-for-byte template check in load_injection never matched.
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(content)
 
 
@@ -648,7 +659,7 @@ def load_injection(folder: str, token_budget: int = 2000,
         if local:
             # Inject only the user's delta beyond the boilerplate template, so
             # an *appended* note is picked up but an untouched file adds nothing.
-            extra = local
+            extra = local.replace("\r\n", "\n")   # bundles written before the fix
             if extra.startswith(_LOCAL_TEMPLATE):
                 extra = extra[len(_LOCAL_TEMPLATE):]
             extra = extra.strip()

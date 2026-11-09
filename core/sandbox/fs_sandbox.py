@@ -97,6 +97,57 @@ def is_path_denied(path: str) -> str | None:
     return None
 
 
+def path_is_sensitive(path: str) -> bool:
+    """True if `path`, as written or once resolved, is on the deny list.
+
+    For tools that reach files the policy hook never saw by name — the files
+    a glob expands to, the files a directory walk finds. Scope is not checked
+    here, only the key-material deny list.
+    """
+    if is_path_denied(path):
+        return True
+    resolved = _resolve_path(path)
+    return bool(resolved and resolved != path and is_path_denied(resolved))
+
+
+def split_grep_content(content: str) -> tuple[str, str, str]:
+    """(pattern, path, flags) from a grep action's "pattern|path|flags".
+
+    Counted from the RIGHT. The pattern is a regex, `a|b` is its commonest
+    construct, and every producer writes all three fields; counted from the
+    left, "foo|bar|src|" made "bar" the path. The executor and the sandbox
+    check must agree on which field is the path, so both use this.
+    """
+    parts = content.rsplit("|", 2)
+    if len(parts) == 3:
+        return parts[0], parts[1], parts[2]
+    if len(parts) == 2:
+        return parts[0], parts[1], ""
+    return content, "", ""
+
+
+_GLOB_MAGIC = re.compile(r"[*?\[]")
+
+
+def _glob_static_prefix(pattern: str) -> str:
+    """The directory part of a glob pattern that names a fixed location.
+
+    "../../*" -> "../..", "/srv/data/*.csv" -> "/srv/data", "**/*.py" -> "".
+    The last component is the file-name part and is never included.
+    """
+    comps = re.split(r"[/\\]", pattern)
+    lead = []
+    for comp in comps[:-1]:
+        if _GLOB_MAGIC.search(comp):
+            break
+        lead.append(comp)
+    if not lead:
+        return ""
+    if lead == [""]:
+        return "/"
+    return "/".join(lead)
+
+
 # ── Allowed root directories ─────────────────────────────────────────────────
 
 OPEN_ROOTS_SENTINEL = "*"
@@ -208,10 +259,42 @@ def check_path(path: str) -> str | None:
 
 # ── Path extraction from action content ──────────────────────────────────────
 
+# A candidate starts at the START of a token. The pattern used to take any
+# "/" wherever it stood, so `hits/total` gave "/total", `src/app.py` gave
+# "/app.py" and an https URL gave "s://host/..." (a path on drive S:) — all
+# "outside the sandbox", which blocked ordinary code in full-auto and
+# prompted for it in guided. A relative `name/rest` is now kept whole and
+# resolved against the cwd like any relative path; rooted forms are found
+# as before, including after `=`, quotes and brackets.
 _PATH_LIKE = re.compile(
-    r'(?:[A-Za-z]:[/\\]|[/\\]|\.{1,2}[/\\])'
+    r'(?:(?<![A-Za-z0-9_])[A-Za-z]:[/\\]'       # C:\ ...
+    r'|(?<!\w)[/\\]'                             # /rooted, \rooted
+    r'|(?<![\w.])\.{1,2}[/\\]'                   # ./  ../
+    r'|(?<![\w.\-~$%{}])[\w.\-~$%{}]+[/\\])'    # name/rest (relative)
     r'[^\s:*?"<>|\x00-\x1f]+'
 )
+
+# Remote URLs are not local paths (file: URLs are, and are left in).
+_REMOTE_URL = re.compile(r"\b(?:https?|ftp|wss?)://[^\s'\"<>]+", re.IGNORECASE)
+_CLOSING_TAG = re.compile(r"/[A-Za-z][\w:-]*")
+
+
+def _path_candidates(content: str) -> list[str]:
+    """Path-like tokens in shell/python text, in order, without repeats."""
+    text = _REMOTE_URL.sub(" ", content)
+    out, seen = [], set()
+    for m in _PATH_LIKE.finditer(text):
+        cand = m.group(0)
+        # "</div>" is markup, not the path /div. A redirect such as
+        # `cat </etc/passwd` has no ">" right after and is kept.
+        if (m.start() > 0 and text[m.start() - 1] == "<"
+                and text[m.end():m.end() + 1] == ">"
+                and _CLOSING_TAG.fullmatch(cand)):
+            continue
+        if cand not in seen:
+            seen.add(cand)
+            out.append(cand)
+    return out
 
 # Leading escape sequences in shell/python string literals ("hi\n") produce
 # bogus candidates: `printf 'hi\n' > out.txt` extracts "\n'" as a path, which
@@ -266,16 +349,22 @@ def extract_paths_from_content(action_type: str, content: str) -> list[str]:
 
     elif action_type == "glob":
         parts = content.split("|")
-        if len(parts) > 1 and parts[1].strip():
-            paths.append(parts[1].strip())
+        base = parts[1].strip() if len(parts) > 1 else ""
+        if base:
+            paths.append(base)
+        # The pattern can leave the base on its own ("../../*", an absolute
+        # "/srv/*"); only the base used to be checked.
+        prefix = _glob_static_prefix(parts[0].strip())
+        if prefix:
+            paths.append(os.path.join(base, prefix) if base else prefix)
 
     elif action_type == "grep":
-        parts = content.split("|", 2)
-        if len(parts) > 1:
-            paths.append(parts[1].strip())
+        _pattern, path, _flags = split_grep_content(content)
+        if "|" in content:
+            paths.append(path.strip())
 
     elif action_type in ("shell", "python"):
-        paths.extend(_filter_escape_candidates(_PATH_LIKE.findall(content)))
+        paths.extend(_filter_escape_candidates(_path_candidates(content)))
 
     elif action_type == "download":
         parts = content.split("|", 1)

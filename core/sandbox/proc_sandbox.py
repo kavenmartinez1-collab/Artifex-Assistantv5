@@ -63,7 +63,11 @@ _BLOCKED_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bcrontab\b", re.IGNORECASE),
      "crontab modification"),
 
-    (re.compile(r"\bat\s+\d", re.IGNORECASE),
+    # Only where a command can start (line start, after ; | & ( ` or a
+    # quote, after cmd /c or -c). As a bare `\bat\s+\d` it also blocked
+    # ordinary text: echo "failed at 3 places".
+    (re.compile(r"(?:^|[;&|(`\"']|/[ck]\s|\s-(?:c|command)\s)\s*at(?:\.exe)?\s+\d",
+                re.IGNORECASE | re.MULTILINE),
      "at job scheduling"),
 
     (re.compile(r">\s*/etc/", re.IGNORECASE),

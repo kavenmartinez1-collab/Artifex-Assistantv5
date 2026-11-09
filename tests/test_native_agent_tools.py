@@ -34,7 +34,7 @@ def _call(name, **args):
 @pytest.mark.parametrize("call, kind, content", [
     (_call("run_shell", command="Get-ChildItem"), "shell", "Get-ChildItem"),
     (_call("run_python", code="print(1)"), "python", "print(1)"),
-    (_call("read_file", path="a.txt"), "read_file", "a.txt|1"),
+    (_call("read_file", path="a.txt"), "read_file", "a.txt|c1"),
     (_call("read_file", path="a.txt", start_line=10, end_line=20), "read_file", "a.txt|L10-20"),
     (_call("write_file", path="new.txt", content="hi"), "edit_file", "new.txt\x00\x00hi"),
     (_call("edit_file", path="a.py", old_text="x = 1", new_text="x = 2"),

@@ -411,20 +411,29 @@ def _worker(run: AgentRun, get_engine, goal: str | None = None):
         seeing = {True: "can see images", False: "text only"}.get(run.vision, "vision unknown")
         run.emit(AgentEvent("model", text=f"Model: {run.model} ({seeing}, ctx {resolved_ctx})"))
 
+        prompt_cache: dict = {}
+
         def build_system_prompt() -> str:
             # Same prompt stack the Qt GUI uses — the full tool catalog
             # (@read_file/@glob/@sysinfo/edit blocks/...) plus the sensed
             # environment. The earlier 4-line stub documented NO tools, so
             # phone-started runs guessed at their own capabilities.
+            # Built once per run: nothing it is made from changes between
+            # rounds, and sensing the environment (some 45 PATH lookups and
+            # a socket) was repeated every round.
+            cwd = os.getcwd()
+            if cwd in prompt_cache:
+                return prompt_cache[cwd]
             from core.prompts import build_assistant_prompt
             from tools.agent_tools import get_assistant_tools_prompt
             try:
-                return build_assistant_prompt(
+                prompt_cache[cwd] = build_assistant_prompt(
                     get_assistant_tools_prompt(),
-                    os.getcwd(),
+                    cwd,
                     workspace_text=run.folder,
                     model_text=run.model_info,
                 )
+                return prompt_cache[cwd]
             except Exception:
                 _log.exception("full prompt build failed; using minimal prompt")
                 return (

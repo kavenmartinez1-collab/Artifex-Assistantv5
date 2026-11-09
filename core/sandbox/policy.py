@@ -173,9 +173,14 @@ _UNSAFE_READ_CMDLETS = re.compile(r"^\s*get-credential\b", re.IGNORECASE)
 # A lone `&` is PowerShell's call operator (`& $cmd`, `& "app.exe"`) or
 # bash's background operator: either way it runs something, so it
 # disqualifies; `&&` only chains and is split like `;`.
+# Also options that make a "read" command WRITE a file: `git diff
+# --output=x`, `sort -o x`, `find -fprint x` / `-fls x`; and bash process
+# substitution `<(cmd)`, which runs cmd.
 _SAFE_DISQUALIFIERS = re.compile(
     r"[`>]|\$\(|::|\.[A-Za-z_]\w*\s*\(|\s-(exec|execdir|ok|delete)\b"
-    r"|(?<!&)&(?!&)",
+    r"|(?<!&)&(?!&)"
+    r"|\s--output(?:=|\s|$)|\s-(?:fprint\w*|fls)\b|<\("
+    r"|\bsort\b[^|;&\n]*\s-o",
     re.IGNORECASE)
 # Dot-sourcing (`. .\x.ps1`, `. $script`) at the start of a PowerShell
 # statement runs a script in the current scope.
@@ -242,25 +247,126 @@ def split_shell_segments(command: str) -> list[str]:
             if s.strip() and not s.strip().startswith("#")]
 
 
+# Words that may START a statement inside a block without being a command.
+_REGION_KEYWORDS = frozenset({
+    "if", "else", "elseif", "switch", "default", "return", "break",
+    "continue", "do", "while", "until", "for", "try", "catch", "finally",
+    "begin", "process", "end", "param", "in", "not", "and", "or",
+})
+# Loop heads whose own { block } is a region of its own, checked separately.
+_BARE_LOOP_HEADS = frozenset({"%", "foreach", "foreach-object"})
+_REGION_IN_RE = re.compile(r"^\$[A-Za-z_][\w:]*\s+in\s+", re.IGNORECASE)
+_REGION_WORD_RE = re.compile(r"^[A-Za-z%?][\w-]*")
+
+
+def _region_text(segment: str) -> tuple[list[tuple[str, bool]], str]:
+    """Statements written inside the segment's {...} / (...), any depth.
+
+    Returns ([(statement, in_hashtable)], all_inner_text). A statement ends
+    at `;`, `|`, `&`, a newline, or any opening / closing brace or paren.
+    Text that follows a `)` continues the statement the parenthesis was part
+    of (`(gi x).Name`, `if ($a) {`), so it is not the start of a command and
+    is returned as an empty statement.
+    """
+    stmts: list[tuple[str, bool]] = []
+    inner: list[str] = []
+    buf: list[str] = []
+    stack: list[bool] = []        # per open region: is it a @{ hashtable }?
+    continuation = False
+    prev = ""
+
+    def push():
+        nonlocal buf, continuation
+        if stack:
+            text = "".join(buf)
+            stmts.append(("" if continuation else text, stack[-1]))
+        buf = []
+        continuation = False
+
+    for ch in segment:
+        if ch in "{(":
+            push()
+            stack.append(ch == "{" and prev == "@")
+        elif ch in "})":
+            push()
+            if stack:
+                stack.pop()
+            continuation = (ch == ")")
+        elif stack and ch in ";|&\n":
+            push()
+        elif stack:
+            buf.append(ch)
+            inner.append(ch)
+        if stack and ch in "{}();|&\n":
+            inner.append(" ")
+        prev = ch
+    push()
+    return stmts, "".join(inner)
+
+
+def _safe_statement_head(stmt: str) -> bool:
+    """Does a statement inside a block start with a known read command?"""
+    if _UNSAFE_READ_CMDLETS.match(stmt):
+        return False
+    return any(pat.search(stmt) for pat in _SAFE_SHELL_PATTERNS
+               if pat is not _PS_LOOP_HEAD)
+
+
+def _region_statement_ok(stmt: str, in_hashtable: bool = False) -> bool:
+    s = stmt.strip()
+    for _ in range(8):
+        if not s:
+            return True
+        if in_hashtable:
+            # @{ key = value }: only the value can run something.
+            in_hashtable = False
+            _key, eq, rest = s.partition("=")
+            if not eq:
+                return True
+            s = rest.strip()
+            continue
+        m = _PS_ASSIGN_RE.match(s) or _REGION_IN_RE.match(s)
+        if m:                      # `$x = <command>`, `$f in <command>`
+            s = s[m.end():].strip()
+            continue
+        m = _REGION_WORD_RE.match(s)
+        if not m:
+            return True            # an expression ($_.Name, 1, -not ...)
+        word, rest = m.group(0).lower(), s[m.end():].strip()
+        if word in _REGION_KEYWORDS:
+            s = rest
+            continue
+        if word in _BARE_LOOP_HEADS and not rest:
+            return True
+        if "," in s and not re.search(r"\s", s):
+            return True            # {a,b} brace expansion, not a command
+        return _safe_statement_head(s)
+    return False
+
+
 def inner_regions_safe(segment: str) -> bool:
     """True if nothing inside the segment's {...} / (...) runs or writes.
 
-    Every Verb-Noun cmdlet in there must itself be a safe read, and no
-    destructive alias may appear as a bare word. Quoted strings are ignored
-    (text, not commands).
+    An ALLOWLIST: every statement in there that starts with a bare word must
+    start with a known read command (the same heads that make a top-level
+    command safe). It used to be a denylist of destructive aliases, so any
+    program not on it ran unprompted from inside a block:
+    `Get-Date | % { npm install x }`, `Measure-Command { robocopy a b /MIR }`,
+    `Get-Content (msiexec /i x.msi)` all classified SAFE. The denylist still
+    applies on top. Quoted strings are ignored (text, not commands).
     """
     if "{" not in segment and "(" not in segment:
         return True
     text = _QUOTED_RE.sub(" ", segment)
-    for region in re.findall(r"[{(]([^{}()]*)", text):
-        for tok in re.findall(r"(?<![\w$.\-:\\/])([A-Za-z%][\w-]*)", region):
-            if _VERB_NOUN_RE.match(tok):
-                if (not _PS_SAFE_HEAD.match(tok)
-                        or _UNSAFE_READ_CMDLETS.match(tok)):
-                    return False
-            elif tok.lower() in _DESTRUCTIVE_WORDS:
+    stmts, inner = _region_text(text)
+    for tok in re.findall(r"(?<![\w$.\-:\\/])([A-Za-z%][\w-]*)", inner):
+        if _VERB_NOUN_RE.match(tok):
+            if (not _PS_SAFE_HEAD.match(tok)
+                    or _UNSAFE_READ_CMDLETS.match(tok)):
                 return False
-    return True
+        elif tok.lower() in _DESTRUCTIVE_WORDS:
+            return False
+    return all(_region_statement_ok(s, ht) for s, ht in stmts)
 
 
 # `$files = Get-ChildItem`: a variable assignment is as safe as what it
