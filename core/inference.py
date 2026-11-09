@@ -147,29 +147,42 @@ def _truncate_repetition(text, min_phrase_len=80):
         gap_threshold = phrase_len // 4
         for start in range(0, len(text) - phrase_len * 3):
             phrase = text[start:start + phrase_len]
-            second = text.find(phrase, start + phrase_len)
+            # Each search is bounded to where a qualifying copy can START
+            # (within gap_threshold of the previous copy's end).  Same
+            # verdicts as searching the whole remainder - a first match
+            # beyond the gap was rejected anyway - without the whole-text
+            # scan per start position that made this quadratic: 3 s on a
+            # 40K-char answer, 22 s on 120K, after every generation.
+            after_first = start + phrase_len
+            second = text.find(phrase, after_first,
+                               after_first + gap_threshold + phrase_len)
             if second == -1:
                 continue
             # Real loop: phrase ends and immediately the next copy
             # begins (or with very few chars between).  Structured
             # repetition: significant data between copies.
-            if second - (start + phrase_len) > gap_threshold:
-                continue
-            third = text.find(phrase, second + phrase_len)
+            after_second = second + phrase_len
+            third = text.find(phrase, after_second,
+                              after_second + gap_threshold + phrase_len)
             if third == -1:
-                continue
-            if third - (second + phrase_len) > gap_threshold:
                 continue
             return text[:second].rstrip()
 
     return text
 
 
-def _clean_response(text):
-    """Strip thinking blocks, trailing fake user turns, and repetition loops."""
+def _clean_response(text, stop_strings=True):
+    """Strip thinking blocks, trailing fake user turns, and repetition loops.
+
+    stop_strings=False skips the STOP_STRINGS cut.  That cut is for backends
+    that generate from a raw prompt and can run on into a faked next turn;
+    a server that applies the chat template's own stop tokens (llama.cpp)
+    never does, so there a "\nUser:" line is part of the answer and cutting
+    at it loses the rest.
+    """
     clean = strip_think_blocks(text)
 
-    for marker in STOP_STRINGS:
+    for marker in (STOP_STRINGS if stop_strings else ()):
         idx = clean.find(marker)
         if idx != -1:
             clean = clean[:idx]

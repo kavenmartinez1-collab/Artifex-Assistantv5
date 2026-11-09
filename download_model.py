@@ -26,21 +26,29 @@ def download_hf_model(repo, output):
 
     # Preserve patched config.json if it already exists
     config_path = os.path.join(output, "config.json")
-    has_patched_config = os.path.exists(config_path)
+    backup_path = config_path + ".dl_backup"
+    # A backup still on disk is from a download that did not finish: IT is
+    # the patched config, and config.json may already be the freshly
+    # downloaded (unpatched) one.  Never overwrite it with that.
+    has_patched_config = os.path.exists(backup_path)
     if has_patched_config:
-        backup_path = config_path + ".dl_backup"
+        print(f"Found config.json backup from an interrupted download")
+    elif os.path.exists(config_path):
         shutil.copy2(config_path, backup_path)
+        has_patched_config = True
         print(f"Backed up patched config.json")
 
     print(f"Downloading {repo} -> {output}")
     print("This may take a while for large models...\n")
-    snapshot_download(repo_id=repo, local_dir=output)
-
-    # Restore patched config.json
-    if has_patched_config:
-        shutil.copy2(backup_path, config_path)
-        os.remove(backup_path)
-        print(f"Restored patched config.json")
+    try:
+        snapshot_download(repo_id=repo, local_dir=output)
+    finally:
+        # Restore patched config.json - also when the download failed or was
+        # interrupted, so the patch survives a retry.
+        if has_patched_config:
+            shutil.copy2(backup_path, config_path)
+            os.remove(backup_path)
+            print(f"Restored patched config.json")
 
     # Auto-detect model type
     try:

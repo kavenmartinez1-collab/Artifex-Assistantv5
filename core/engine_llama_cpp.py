@@ -82,6 +82,26 @@ SPILL_TOLERANCE_MB = 256
 # carrying a session's worth of context that may itself grow.
 ACTIVE_TIER_PRESSURE_TOK = 12_000
 
+# Seconds the VRAM gate waits for free memory to appear once it is known to
+# be stable (settle check passed, or a step-down retry).  The long
+# DEFAULT_VRAM_WAIT_TIMEOUT is only for memory that is still being reclaimed.
+SETTLED_GATE_TIMEOUT = 5
+
+# How long a positive /health answer from a server we did NOT spawn is
+# trusted by is_loaded().  The API asks is_loaded() five or six times per
+# chat request; for an adopted server each one was an HTTP round trip.
+HEALTH_CACHE_S = 1.0
+
+
+class _TokenCallbackError(Exception):
+    """Carries an exception raised by the caller's on_token out of the SSE
+    read loop, so it can be re-raised untouched instead of being mistaken
+    for a transport failure (InterruptedError and friends are OSErrors)."""
+
+    def __init__(self, original: BaseException):
+        super().__init__(str(original))
+        self.original = original
+
 
 def pick_ctx_tier(needed_tokens: int, max_cap: int | None = None) -> int:
     """Pick the smallest CTX_TIERS bucket that fits needed_tokens with
@@ -291,6 +311,14 @@ class LlamaCppEngine(BaseEngine):
         # and each new connection paid ~2 s before falling back to IPv4.
         self._base_url = f"http://127.0.0.1:{self.port}"
         self._last_gen_stats = {}
+        # GPU-pool device list for the load in progress: the split gate asks
+        # for it on every tier it tries, and one enumeration (nvidia-smi +
+        # DXGI) per load() is enough.  None = no load in progress (always
+        # ask the pool); False = load in progress, not fetched yet.
+        self._device_snapshot = None
+        # monotonic time of the last positive /health from a server we did
+        # not spawn (see HEALTH_CACHE_S).
+        self._health_ok_at = float("-inf")
 
     def set_target_tier(self, tier: int, exact: bool = False) -> None:
         """Set the launch ctx for the next load(), capped at the configured cap.
@@ -374,10 +402,11 @@ class LlamaCppEngine(BaseEngine):
         return None if value in ("", "none") else value
 
     def _get_kv_quant_str(self) -> str:
-        """KV quant type name from -ctk in extra_flags. Defaults to 'f16'."""
+        """KV quant type name from -ctk / --cache-type-k in extra_flags.
+        Defaults to 'f16'."""
         flags = self.extra_flags
         for i, flag in enumerate(flags):
-            if flag == "-ctk" and i + 1 < len(flags):
+            if flag in ("-ctk", "--cache-type-k") and i + 1 < len(flags):
                 return flags[i + 1]
         return "f16"
 
@@ -454,7 +483,15 @@ class LlamaCppEngine(BaseEngine):
         total = sum(shares)
         if total <= 0:
             return None
-        devices = pool.get_device_status()
+        # One enumeration per load(): the step-down loop calls the gate once
+        # per tier, and the device LIST does not change between tiers (free
+        # VRAM is refreshed per device by the gate itself).
+        devices = getattr(self, "_device_snapshot", None)
+        if devices is None or devices is False:
+            in_load = devices is False
+            devices = pool.get_device_status()
+            if in_load:
+                self._device_snapshot = devices
         if len(devices) < len(shares):
             _log.warning(
                 "Split gate: %d -ts shares but only %d known device(s) — "
@@ -559,6 +596,19 @@ class LlamaCppEngine(BaseEngine):
         self._gate_requirements = requirements
         self._resident_floors = floors
         self._pre_launch_used_mb = baseline
+        # Not part of the verdict (see the docstring: tightening one term
+        # alone trades false accepts for false refusals on configs that are
+        # measured to run), but a refused or spilled load is much easier to
+        # read with the number in the log.
+        try:
+            from core.gpu_pool import mmproj_offload_mb
+            mmproj_mb = mmproj_offload_mb(self.extra_flags)
+        except Exception:
+            mmproj_mb = 0.0
+        if mmproj_mb:
+            _log.info("VRAM gate: --mmproj is offloaded (~%.0f MB on the "
+                      "first device) and is NOT included in the figures below",
+                      mmproj_mb)
         for dev_idx, needed_mb in requirements:
             _log.info("VRAM gate: need %.0f MB free on GPU %d (ctx=%d)",
                       needed_mb, dev_idx, self._num_ctx)
@@ -672,7 +722,12 @@ class LlamaCppEngine(BaseEngine):
         return MIN_CTX
 
     def load(self, status_callback=None):
-        if self._loaded and self._is_server_healthy():
+        # Our own child that is still running counts as loaded without asking
+        # it: generate_streaming calls load() before every request, and one
+        # /health answer slower than 3 s used to send a busy server down the
+        # relaunch path below - gating against VRAM its own child held and
+        # spawning a second server onto the bound port.
+        if self._loaded and self.is_loaded():
             return
         # Orpheus (Holo's "tara" voice) borrows the 6700 XT; a model that may
         # need that card gets it back before it loads (and keeps it).
@@ -689,17 +744,22 @@ class LlamaCppEngine(BaseEngine):
         # config answers /health just as happily, and adopting it blindly
         # would turn a model switch into a no-op that returns wrong-model
         # completions.
+        # One-shot: exact matching must not leak into later implicit loads,
+        # where adopting a bigger server is correct.  Captured ONCE here for
+        # both the adoption check and the VRAM gate: the gate used to re-read
+        # the attribute after the adoption block had already cleared it, so
+        # an explicit reload that found a server on the port was gated as an
+        # implicit one and stepped down silently instead of refusing.
+        exact_request = self._target_exact
+        self._target_exact = False
         if self._is_server_healthy():
             served, served_ctx = self._served_props()
             ours = os.path.basename(self.model_path).casefold()
-            if self._target_ctx and served_ctx and self._target_exact:
+            if self._target_ctx and served_ctx and exact_request:
                 ctx_ok = served_ctx == self._target_ctx
             else:
                 ctx_ok = not (self._target_ctx and served_ctx
                               and served_ctx < self._target_ctx)
-            # One-shot: exact matching must not leak into later implicit
-            # loads, where adopting a bigger server is correct.
-            self._target_exact = False
             if served and os.path.basename(served).casefold() == ours and ctx_ok:
                 self._loaded = True
                 self._adopted = True
@@ -721,7 +781,7 @@ class LlamaCppEngine(BaseEngine):
                     "needed — terminating it and relaunching bigger",
                     self.port, served_ctx, self._target_ctx,
                 )
-                self._kill_listener_on_port()
+                self._reclaim_port_or_raise()
             else:
                 # Wrong model, or a build too old to report one (served is
                 # None): reclaim the port and launch our own.  This is the
@@ -732,7 +792,7 @@ class LlamaCppEngine(BaseEngine):
                     "terminating it and launching our own",
                     self.port, served, os.path.basename(self.model_path),
                 )
-                self._kill_listener_on_port()
+                self._reclaim_port_or_raise()
 
         if not os.path.isfile(self.model_path):
             raise FileNotFoundError(f"Model GGUF not found: {self.model_path}")
@@ -752,8 +812,8 @@ class LlamaCppEngine(BaseEngine):
         # new model in shared system memory — the load succeeds, the model
         # answers, and decode runs ~3x slow.  Free MB alone cannot see that
         # (it reads plentiful immediately), so this waits on the derivative
-        # instead.  Costs one poll on an idle box.
-        pool.wait_for_vram_settled()
+        # instead.  Costs two poll intervals (3 s) on an idle box.
+        settled = pool.wait_for_vram_settled()
 
         # Gate the planned tier on EVERY device the launch touches.  On
         # refusal, implicit loads walk DOWN the tier ladder until a tier
@@ -761,12 +821,18 @@ class LlamaCppEngine(BaseEngine):
         # session into whatever loads — instead of launching into an OOM.
         # Explicit user reloads (exact tier) refuse outright so the caller
         # can restore the previous tier and tell the user.
-        exact_request = self._target_exact
-        gate_timeout = DEFAULT_VRAM_WAIT_TIMEOUT
+        #
+        # The long first-pass wait exists for WDDM reclaim lag.  When the
+        # settle check above has just shown free VRAM is no longer moving,
+        # there is no reclaim left to wait out: a tier that does not fit now
+        # will not fit in 30 s either, so a refusal only needs a quick look.
+        gate_timeout = (SETTLED_GATE_TIMEOUT if settled is True
+                        else DEFAULT_VRAM_WAIT_TIMEOUT)
         reclaimed = False
         # -ngl 0 puts nothing on a GPU (a CPU-only helper such as LFM3), so
         # there is no VRAM to gate. Charging it the GPU estimate would refuse
         # or step down a model that never touches the card.
+        self._device_snapshot = False
         while self.num_gpu_layers:
             try:
                 self._vram_gate(pool, gpu_index, wait_timeout=gate_timeout)
@@ -803,7 +869,8 @@ class LlamaCppEngine(BaseEngine):
                 self._num_ctx = lower
                 # The first pass already waited out any WDDM reclaim lag;
                 # retries only need a quick look.
-                gate_timeout = 5
+                gate_timeout = SETTLED_GATE_TIMEOUT
+        self._device_snapshot = None
 
         if status_callback:
             status_callback(
@@ -873,6 +940,13 @@ class LlamaCppEngine(BaseEngine):
 
         max_launch_attempts = 2
         launch_retry_delay = 5.0
+
+        # What we are about to start is OURS, whatever this engine object held
+        # before.  A front-end that keeps one engine (GUI, CLI, the vision
+        # helper) can have adopted a server that has since died; without this
+        # the stale flag made unload() "release" our own child unterminated,
+        # leaving it and its VRAM behind.
+        self._adopted = False
 
         for attempt in range(max_launch_attempts):
             launch_log_fh = open(launch_log_path, "wb")
@@ -987,8 +1061,28 @@ class LlamaCppEngine(BaseEngine):
         self._process = None
         self._adopted = False
 
+    def _reclaim_port_or_raise(self):
+        """Stop the server on our port, or refuse to launch next to it.
+
+        Launching anyway ends one of two ways, both worse than an error: our
+        llama-server fails to bind and the real cause is buried in a crash
+        log, or the health loop sees the OLD server's "ok" first and marks
+        this engine loaded on a model it does not serve.
+        """
+        if self._kill_listener_on_port() is False and self._is_server_healthy():
+            raise RuntimeError(
+                f"Port {self.port} is held by a healthy server that is not a "
+                f"llama-server process Artifex can stop, and it does not "
+                f"serve {os.path.basename(self.model_path)} at the context "
+                f"needed. Stop it, or give this model entry a different "
+                f"\"port\" in llama_cpp_config.json."
+            )
+
     def _kill_listener_on_port(self):
         """Find and terminate a llama-server listening on self.port.
+
+        Returns False when no matching process was found (nothing was
+        stopped), True otherwise.
 
         Used when the port must be reclaimed from a server we did not
         spawn and cannot adopt: a wrong-model orphan found at adoption
@@ -1023,7 +1117,7 @@ class LlamaCppEngine(BaseEngine):
                 "process found to terminate; orphan may persist",
                 self.port,
             )
-            return
+            return False
 
         for proc in matches:
             try:
@@ -1046,6 +1140,7 @@ class LlamaCppEngine(BaseEngine):
         # Brief settle so the next load()'s health check doesn't race the
         # OS releasing the listening socket.
         time.sleep(0.5)
+        return True
 
     def _load_external(self, status_callback=None):
         """Start (or take over) the external_launcher server on our port.
@@ -1109,10 +1204,14 @@ class LlamaCppEngine(BaseEngine):
     def _reclaim_orphan_servers(self, status_callback=None) -> int:
         """Stop servers on other configured model ports that no live Artifex
         process owns (see proc_tree.orphan_listeners). Returns how many."""
-        from core.config import get_llama_cpp_models
+        from core.config import get_llama_cpp_models, _load_llama_cpp_config
         from core.proc_tree import orphan_listeners, stop_port_tree
         try:
-            ports = {int(cfg.get("port", 8081))
+            # An entry without its own "port" runs on the config's
+            # default_port (get_llama_cpp_model_config), not on a hardcoded
+            # 8081: scan the port its engine actually launched on.
+            default_port = (_load_llama_cpp_config() or {}).get("default_port", 8081)
+            ports = {int(cfg.get("port", default_port))
                      for cfg in get_llama_cpp_models().values()} - {self.port}
             orphans = orphan_listeners(
                 ports, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1133,6 +1232,7 @@ class LlamaCppEngine(BaseEngine):
         else:
             self._kill_process()
         self._loaded = False
+        self._health_ok_at = float("-inf")
         from core.services import orpheus_tts
         orpheus_tts.gpu_released(self.model_name)
         if status_callback:
@@ -1143,7 +1243,16 @@ class LlamaCppEngine(BaseEngine):
             return False
         if self._process is not None:
             return self._process.poll() is None
-        return self._is_server_healthy()
+        # A server we did not spawn can only be asked.  A positive answer is
+        # trusted briefly so one request's worth of is_loaded() calls costs
+        # one round trip; a negative one is never cached.
+        now = time.monotonic()
+        if now - getattr(self, "_health_ok_at", float("-inf")) < HEALTH_CACHE_S:
+            return True
+        healthy = self._is_server_healthy()
+        if healthy:
+            self._health_ok_at = now
+        return healthy
 
     def get_context_size(self) -> int:
         return self._num_ctx or self._configured_num_ctx or 0
@@ -1288,6 +1397,22 @@ class LlamaCppEngine(BaseEngine):
         full_text = ""
         in_thinking = False
         tool_calls: dict = {}   # stream index -> {id, name, arguments}
+        delivered = False       # has the caller's on_token seen anything yet?
+
+        def emit(text):
+            # The ONLY way tokens reach the caller.  Whatever on_token raises
+            # (a Stop: the GUI's InterruptedError, the agent's
+            # GenerationAborted, the API's abandoned-stream signal) leaves
+            # the read loop wrapped, so the transport handler below cannot
+            # take it for a dropped connection and re-send the request.
+            nonlocal delivered
+            if not on_token:
+                return
+            delivered = True
+            try:
+                on_token(text)
+            except Exception as cb_err:
+                raise _TokenCallbackError(cb_err) from cb_err
 
         max_retries = 2
         for attempt in range(max_retries):
@@ -1330,11 +1455,9 @@ class LlamaCppEngine(BaseEngine):
                             if not in_thinking:
                                 in_thinking = True
                                 full_text += "<think>"
-                                if on_token:
-                                    on_token("<think>")
+                                emit("<think>")
                             full_text += reasoning
-                            if on_token:
-                                on_token(reasoning)
+                            emit(reasoning)
                             continue
 
                         content = delta.get("content", "")
@@ -1342,11 +1465,9 @@ class LlamaCppEngine(BaseEngine):
                             if in_thinking:
                                 in_thinking = False
                                 full_text += "</think>"
-                                if on_token:
-                                    on_token("</think>")
+                                emit("</think>")
                             full_text += content
-                            if on_token:
-                                on_token(content)
+                            emit(content)
 
                         # Streamed tool calls: the name and id arrive once,
                         # the arguments JSON in fragments, keyed by index.
@@ -1369,18 +1490,28 @@ class LlamaCppEngine(BaseEngine):
 
                 break  # success — exit retry loop
 
+            except _TokenCallbackError as cb:
+                # The "with" above has already closed the HTTP response, which
+                # is what makes llama-server stop generating.  Hand the
+                # caller back exactly what its callback raised.
+                raise cb.original from None
             except urllib.error.HTTPError as e:
                 error_body = e.read().decode("utf-8", errors="replace")
                 raise RuntimeError(f"llama-server error ({e.code}): {error_body}")
             except (urllib.error.URLError, ConnectionResetError, OSError) as e:
-                if attempt < max_retries - 1 and self._is_server_healthy():
+                healthy = self._is_server_healthy()
+                # Retry only while the caller has seen nothing: a re-sent
+                # request starts the answer over, and tokens already handed
+                # to on_token cannot be taken back (the stream would carry
+                # the opening twice, with a second "<think>").
+                if not delivered and attempt < max_retries - 1 and healthy:
                     _log.warning("Connection lost mid-request, retrying: %s", e)
                     time.sleep(2)
                     full_text = ""
                     in_thinking = False
                     tool_calls = {}
                     continue
-                if self._is_server_healthy():
+                if healthy:
                     raise ConnectionError(f"Lost connection to llama-server: {e}")
                 raise ConnectionError(
                     "llama-server is not responding — it may have crashed (OOM). "
@@ -1396,7 +1527,12 @@ class LlamaCppEngine(BaseEngine):
         if raw_output:
             clean = strip_think_blocks(full_text)
         else:
-            clean = _clean_response(full_text)
+            # No STOP_STRINGS pass: llama-server applies the chat template's
+            # own stop tokens, so a "\nUser:" in the text is part of the
+            # answer (a transcript, a dialogue), not a faked turn - cutting
+            # there dropped the tail of answers the user had already seen
+            # streamed.
+            clean = _clean_response(full_text, stop_strings=False)
         if on_complete:
             on_complete(clean)
         return clean

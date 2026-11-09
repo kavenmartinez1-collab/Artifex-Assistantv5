@@ -133,20 +133,44 @@ _ollama_model_config: dict = {}
 _ollama_config_mtime: float = 0.0
 
 
+def _report_config_error(path: str, err: Exception, have_previous: bool) -> None:
+    """Say WHY a config file was not loaded, and what is in effect instead.
+
+    A stray comma in a hand-edited llama_cpp_config.json used to empty the
+    model list without a word: every model vanished and the only message
+    anywhere was "No llama.cpp models configured".  The last version that
+    parsed stays in effect now, and the parse error (with its line and
+    column) is logged.
+    """
+    where = ""
+    if isinstance(err, json.JSONDecodeError):
+        where = f" at line {err.lineno}, column {err.colno}"
+    _log.error(
+        "%s could not be read%s: %s. %s", os.path.basename(path), where, err,
+        "Keeping the last version that loaded; fix the file and save it again."
+        if have_previous else
+        "Nothing from it is loaded; fix the file and save it again.")
+
+
 def _load_ollama_config():
     """Load per-model Ollama config from disk.  Re-reads when file mtime changes."""
     global _ollama_model_config, _ollama_config_mtime
     if not os.path.isfile(OLLAMA_CONFIG_PATH):
         return _ollama_model_config
     try:
-        mtime = os.path.getmtime(OLLAMA_CONFIG_PATH)
-        if mtime == _ollama_config_mtime and _ollama_model_config:
+        # Path AND mtime: the path can be repointed (tests, a moved install)
+        # at a file that happens to carry the same timestamp.
+        mtime = (OLLAMA_CONFIG_PATH, os.path.getmtime(OLLAMA_CONFIG_PATH))
+        if mtime == _ollama_config_mtime:
             return _ollama_model_config
+        # Recorded BEFORE parsing: a file that fails to parse is reported
+        # once and not re-read (and re-reported) on every call until it is
+        # saved again.
+        _ollama_config_mtime = mtime
         with open(OLLAMA_CONFIG_PATH, "r", encoding="utf-8") as f:
             _ollama_model_config = json.load(f)
-        _ollama_config_mtime = mtime
-    except (json.JSONDecodeError, OSError):
-        _ollama_model_config = {}
+    except (json.JSONDecodeError, OSError) as e:
+        _report_config_error(OLLAMA_CONFIG_PATH, e, bool(_ollama_model_config))
     return _ollama_model_config
 
 
@@ -174,7 +198,7 @@ def _estimate_default_ctx(model_size_gb: float, gpu_tier: str = None) -> int:
     Returns:
         Recommended num_ctx value
     """
-    tier = gpu_tier or GPU_TIER
+    tier = gpu_tier or get_gpu_tier()
 
     # Tier-based caps (based on Ollama's VRAM-based defaults)
     tier_caps = {
@@ -331,14 +355,19 @@ def _load_llama_cpp_config():
     if not os.path.isfile(LLAMA_CPP_CONFIG_PATH):
         return _llama_cpp_config
     try:
-        mtime = os.path.getmtime(LLAMA_CPP_CONFIG_PATH)
-        if mtime == _llama_cpp_config_mtime and _llama_cpp_config:
+        # Path AND mtime: the path can be repointed (tests, a moved install)
+        # at a file that happens to carry the same timestamp.
+        mtime = (LLAMA_CPP_CONFIG_PATH, os.path.getmtime(LLAMA_CPP_CONFIG_PATH))
+        if mtime == _llama_cpp_config_mtime:
             return _llama_cpp_config
+        # Recorded BEFORE parsing: a file that fails to parse is reported
+        # once and not re-read (and re-reported) on every call until it is
+        # saved again.
+        _llama_cpp_config_mtime = mtime
         with open(LLAMA_CPP_CONFIG_PATH, "r", encoding="utf-8") as f:
             _llama_cpp_config = json.load(f)
-        _llama_cpp_config_mtime = mtime
-    except (json.JSONDecodeError, OSError):
-        _llama_cpp_config = {}
+    except (json.JSONDecodeError, OSError) as e:
+        _report_config_error(LLAMA_CPP_CONFIG_PATH, e, bool(_llama_cpp_config))
     return _llama_cpp_config
 
 
@@ -376,14 +405,19 @@ def _load_claude_cli_config():
     if not os.path.isfile(CLAUDE_CLI_CONFIG_PATH):
         return _claude_cli_config
     try:
-        mtime = os.path.getmtime(CLAUDE_CLI_CONFIG_PATH)
-        if mtime == _claude_cli_config_mtime and _claude_cli_config:
+        # Path AND mtime: the path can be repointed (tests, a moved install)
+        # at a file that happens to carry the same timestamp.
+        mtime = (CLAUDE_CLI_CONFIG_PATH, os.path.getmtime(CLAUDE_CLI_CONFIG_PATH))
+        if mtime == _claude_cli_config_mtime:
             return _claude_cli_config
+        # Recorded BEFORE parsing: a file that fails to parse is reported
+        # once and not re-read (and re-reported) on every call until it is
+        # saved again.
+        _claude_cli_config_mtime = mtime
         with open(CLAUDE_CLI_CONFIG_PATH, "r", encoding="utf-8") as f:
             _claude_cli_config = json.load(f)
-        _claude_cli_config_mtime = mtime
-    except (json.JSONDecodeError, OSError):
-        _claude_cli_config = {}
+    except (json.JSONDecodeError, OSError) as e:
+        _report_config_error(CLAUDE_CLI_CONFIG_PATH, e, bool(_claude_cli_config))
     return _claude_cli_config
 
 
@@ -595,7 +629,22 @@ def _detect_gpu_tier() -> str:
         return "TIGHT"
 
 
-GPU_TIER = _detect_gpu_tier()
+# GPU_TIER (and MODES / the default context profile, which are derived from
+# it) are resolved on FIRST USE, not at import: detecting the tier imports
+# torch, which cost every CLI/GUI/API start about 1.5 s whether or not the
+# session ever needed the value (a llama.cpp chat does not).
+# `from core.config import GPU_TIER` and `core.config.GPU_TIER` keep working
+# through the module-level __getattr__ at the bottom of this file.
+_gpu_tier_value = None
+
+
+def get_gpu_tier() -> str:
+    """The GPU tier ("TIGHT" / "COMFORTABLE" / "ABUNDANT"), detected once."""
+    global _gpu_tier_value
+    if _gpu_tier_value is None:
+        _gpu_tier_value = _detect_gpu_tier()
+    return _gpu_tier_value
+
 
 # ===== MULTI-GPU SUPPORT =====
 _active_device = 0
@@ -644,22 +693,24 @@ _TIER_LIMITS = {
     "ABUNDANT":    {"mt": 4096,     "cw": 15},
 }
 
-_L = _TIER_LIMITS[GPU_TIER]
 
-MODES = {
-    "ASSISTANT": ModeConfig(
-        max_tokens=_L["mt"],
-        temperature=0.7,
-        context_window=_L["cw"],
-        enable_thinking=True,
-    ),
-    "CODE": ModeConfig(
-        max_tokens=min(_L["mt"] * 2, 8192),
-        temperature=0.2,
-        context_window=_L["cw"],
-        enable_thinking=True,
-    ),
-}
+def _build_modes() -> dict:
+    """MODES for the detected tier (see the lazy __getattr__ below)."""
+    _L = _TIER_LIMITS[get_gpu_tier()]
+    return {
+        "ASSISTANT": ModeConfig(
+            max_tokens=_L["mt"],
+            temperature=0.7,
+            context_window=_L["cw"],
+            enable_thinking=True,
+        ),
+        "CODE": ModeConfig(
+            max_tokens=min(_L["mt"] * 2, 8192),
+            temperature=0.2,
+            context_window=_L["cw"],
+            enable_thinking=True,
+        ),
+    }
 
 
 # ===== CONTEXT PROFILES =====
@@ -704,12 +755,14 @@ CONTEXT_PROFILES = {
 
 # Map GPU tier to default context profile
 _DEFAULT_PROFILES = {"TIGHT": "STANDARD", "COMFORTABLE": "STANDARD", "ABUNDANT": "HIGH"}
-_active_profile = _DEFAULT_PROFILES.get(GPU_TIER, "STANDARD")
+# None until chosen: the default then follows the GPU tier, resolved on
+# first use (see get_gpu_tier).
+_active_profile = None
 
 
 def get_context_profile():
     """Get the currently active context profile."""
-    return CONTEXT_PROFILES[_active_profile]
+    return CONTEXT_PROFILES[get_context_profile_name()]
 
 
 def set_context_profile(name):
@@ -724,6 +777,8 @@ def set_context_profile(name):
 
 def get_context_profile_name():
     """Get the name of the currently active context profile."""
+    if _active_profile is None:
+        return _DEFAULT_PROFILES.get(get_gpu_tier(), "STANDARD")
     return _active_profile
 
 
@@ -768,3 +823,23 @@ ASSISTANT_DANGEROUS_PATTERNS = DANGEROUS_PATTERNS + [
 
 # ===== PHASES (used by knowledge.py) =====
 PHASES = ["recon", "enum", "exploit", "privesc", "post"]
+
+
+# ===== LAZY TIER-DERIVED ATTRIBUTES =====
+def __getattr__(name):
+    """GPU_TIER, MODES and _L, computed on first access (PEP 562).
+
+    Kept out of the module namespace until asked for so that importing
+    core.config does not import torch.  MODES is cached once built (it is a
+    dict callers index into); GPU_TIER and _L are cheap lookups after the
+    first detection.
+    """
+    if name == "GPU_TIER":
+        return get_gpu_tier()
+    if name == "MODES":
+        modes = _build_modes()
+        globals()["MODES"] = modes
+        return modes
+    if name == "_L":
+        return _TIER_LIMITS[get_gpu_tier()]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

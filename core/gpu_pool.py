@@ -19,6 +19,7 @@ Design:
 
 import logging
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -254,6 +255,134 @@ def per_layer_kv_heads(head_count_kv, attn_layer_count: int) -> tuple:
     return head_count_kv, attn_layer_count
 
 
+# ── Model file sizing ──────────────────────────────────────────────────
+
+_GGUF_SHARD = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.I)
+
+
+def gguf_total_bytes(model_path: str) -> int:
+    """Size on disk of a GGUF model, all shards included.
+
+    A split GGUF is configured by its FIRST shard
+    (name-00001-of-00003.gguf); llama.cpp then loads every shard.  Sizing
+    the weights from that one file made the VRAM gate count a third of a
+    three-shard model and wave in a load that could not fit.  Shards that
+    are missing are skipped (the launch will report them); a path that is
+    not a shard is just its own size.  Raises OSError when the path itself
+    cannot be stat'ed, like os.path.getsize.
+    """
+    first = os.path.getsize(model_path)
+    m = _GGUF_SHARD.search(model_path)
+    if not m:
+        return first
+    total, n = 0, int(m.group(2))
+    for i in range(1, n + 1):
+        try:
+            total += os.path.getsize(
+                _GGUF_SHARD.sub(f"-{i:05d}-of-{n:05d}.gguf", model_path))
+        except OSError:
+            pass
+    return max(total, first)
+
+
+def mmproj_offload_mb(extra_flags: Optional[list]) -> float:
+    """MB of a vision projector that llama-server will put on the GPU.
+
+    0 when there is no --mmproj, when --no-mmproj-offload keeps it on the
+    CPU, or when the file cannot be stat'ed.  Informational: the gate logs
+    it but does not charge it (see LlamaCppEngine._vram_gate).
+    """
+    flags = list(extra_flags or [])
+    if "--no-mmproj-offload" in flags:
+        return 0.0
+    for i, f in enumerate(flags):
+        if f in ("--mmproj", "-mm") and i + 1 < len(flags):
+            try:
+                return os.path.getsize(flags[i + 1]) / (1024 * 1024)
+            except OSError:
+                return 0.0
+    return 0.0
+
+
+def stop_gpu_model_servers() -> int:
+    """Stop the model servers Artifex's config can put on a GPU.
+
+    Used when a media job (image, video, ...) takes the cards: the chat
+    engine has been unloaded already, and this catches what a plain unload
+    leaves running - a pre-warmed or adopted llama-server, a leftover from
+    an earlier run - on the ports the model entries in
+    llama_cpp_config.json use.
+
+    It replaces a machine-wide "taskkill /IM llama-server.exe", which also
+    killed servers that hold no VRAM or are not Artifex's at all: the CPU
+    vision helper seconds after the Create tab had started it, and any
+    other project's llama-server.  Left alone here:
+
+      - entries with num_gpu_layers == 0 (CPU only);
+      - the vision_helper port, even when a model entry shares it;
+      - anything listening on a port no model entry names;
+      - on a llama-server entry's port, a process that is not llama-server.
+
+    Returns how many processes were stopped.  Never raises.
+    """
+    try:
+        import psutil
+        from core.config import (
+            _load_llama_cpp_config, get_llama_cpp_models,
+            get_llama_cpp_model_config,
+        )
+        from core.proc_tree import stop_port_tree
+
+        cfg = _load_llama_cpp_config() or {}
+        helper = cfg.get("vision_helper")
+        helper_port = None
+        if isinstance(helper, dict) and helper.get("path"):
+            helper_port = int(helper.get("port") or 8095)
+
+        # port -> True when ANY process there may be stopped (an
+        # external_launcher entry: the port is dedicated to it and its
+        # server is not called llama-server), False when only llama-server.
+        ports: dict = {}
+        for name in get_llama_cpp_models():
+            entry = get_llama_cpp_model_config(name)
+            if not entry:
+                continue
+            external = bool(entry.get("external_launcher"))
+            if not external and entry.get("num_gpu_layers", 99) == 0:
+                continue
+            port = int(entry.get("port", 8081))
+            if port == helper_port:
+                continue
+            ports[port] = ports.get(port, False) or external
+        if not ports:
+            return 0
+
+        pids = set()
+        for conn in psutil.net_connections(kind="tcp"):
+            if not (conn.laddr and conn.laddr.port in ports and conn.pid
+                    and conn.status == psutil.CONN_LISTEN):
+                continue
+            if not ports[conn.laddr.port]:
+                try:
+                    proc = psutil.Process(conn.pid)
+                    ident = ((proc.name() or "") + " " + (proc.exe() or "")).lower()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+                if "llama-server" not in ident:
+                    continue
+            pids.add(conn.pid)
+        if not pids:
+            return 0
+        _log.info("Stopping %d model server(s) on configured GPU model "
+                  "ports: pids %s", len(pids), sorted(pids))
+        stopped = stop_port_tree(None, sorted(pids))
+        time.sleep(1)
+        return stopped
+    except Exception as e:
+        _log.warning("Could not stop GPU model servers: %s", e)
+        return 0
+
+
 # ── GPU Pool Singleton ─────────────────────────────────────────────────
 
 class GPUPool:
@@ -353,6 +482,21 @@ class GPUPool:
                 except (ValueError, IndexError) as e:
                     _log.warning("Failed to parse GPU line '%s': %s", line, e)
                     continue
+        elif self._nvidia_smi_available is not False:
+            # nvidia-smi exists but did not answer THIS time (it can time
+            # out while a card is busy allocating).  Keep the NVIDIA devices
+            # we already know, with their last readings, instead of letting
+            # the DXGI pass below re-add the same cards under new indices
+            # and source "dxgi": a load in progress holds the old indices,
+            # and find_best_device would hand a DXGI index to
+            # CUDA_VISIBLE_DEVICES.
+            with self._lock:
+                devices = [d for d in self._devices if d.source == "cuda"]
+            if devices:
+                _log.warning("nvidia-smi did not answer; keeping the %d known "
+                             "NVIDIA device(s) with their last readings",
+                             len(devices))
+        nvidia_covered = bool(devices)
 
         # DXGI+PDH: all vendors. NVIDIA adapters are skipped whenever
         # nvidia-smi answered (already covered above, richer data there);
@@ -361,7 +505,7 @@ class GPUPool:
             from core.dxgi_vram import probe_adapters
             next_index = max((d.index for d in devices), default=-1) + 1
             for a in probe_adapters():
-                if devices and output is not None and a["vendor_id"] == 0x10DE:
+                if nvidia_covered and a["vendor_id"] == 0x10DE:
                     continue
                 devices.append(GPUDevice(
                     index=next_index,
@@ -669,9 +813,12 @@ class GPUPool:
         longer pause.  Free MB read as plentiful the whole time (12119 of
         12242), so nothing upstream could see the problem.
 
-        "Settled" = two consecutive polls where free VRAM moved less than
-        VRAM_SETTLE_DELTA_MB on every device.  An already-idle box clears
-        that on the first two polls, so a cold load pays one poll interval.
+        "Settled" = two consecutive poll-to-poll comparisons where free
+        VRAM moved less than VRAM_SETTLE_DELTA_MB on every device.  That is
+        three polls, so even an already-idle box pays two poll intervals
+        (3 s) per load.  Deliberately not one: the spill above happened
+        with free VRAM reading almost flat, so it is the elapsed time as
+        much as the derivative that protects the load.
 
         Returns True once settled, False on timeout (callers proceed
         anyway — a slow load beats refusing to load).
@@ -794,7 +941,7 @@ class GPUPool:
         # Model weight from file size
         model_weight_mb = 0.0
         try:
-            file_size_bytes = os.path.getsize(model_path)
+            file_size_bytes = gguf_total_bytes(model_path)
             model_weight_mb = (file_size_bytes / (1024 * 1024)) * MODEL_OVERHEAD_FACTOR
         except OSError as e:
             _log.warning("Cannot stat model file %s: %s — using 0 for weight", model_path, e)
@@ -886,7 +1033,14 @@ class GPUPool:
 
         if arch is not None:
             bpe_k = KV_QUANT_BPE.get(kv_quant, KV_QUANT_BPE["f16"])
-            bpe_v = KV_QUANT_BPE.get(kv_quant, KV_QUANT_BPE["f16"])
+            # Values follow -ctv when the flags set it apart from -ctk
+            # (kv_quant is the KEY type); they used to be sized as keys.
+            v_quant = kv_quant
+            for i, f in enumerate(extra_flags or []):
+                if f in ("-ctv", "--cache-type-v") and i + 1 < len(extra_flags):
+                    v_quant = extra_flags[i + 1]
+                    break
+            bpe_v = KV_QUANT_BPE.get(v_quant, KV_QUANT_BPE["f16"])
 
             attn_layers = arch["attn_layer_count"]
             head_count_kv = arch["head_count_kv"]

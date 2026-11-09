@@ -8,8 +8,8 @@ import os
 import shutil
 
 from core.config import (
-    BASE_DIR, GPU_TIER, MODELS, OLLAMA_MODELS,
-    get_active_backend, get_active_model_name,
+    BASE_DIR, MODELS, OLLAMA_MODELS,
+    get_active_backend, get_active_model_name, get_gpu_tier,
 )
 from core.logging_config import get_logger
 
@@ -33,7 +33,7 @@ def _check_cuda():
             "vram_allocated_gb": round(gpu_info.allocated_gb, 2),
             "vram_free_gb": round(gpu_info.free_gb, 2),
             "compute_capability": gpu_info.compute_cap_str,
-            "gpu_tier": GPU_TIER,
+            "gpu_tier": get_gpu_tier(),
         }
         # The figures above come from torch's allocator, which only sees THIS
         # process — llama-server runs out-of-process, so a fully-loaded 8 GB

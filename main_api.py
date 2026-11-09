@@ -13,6 +13,42 @@ import os
 
 from core.logging_config import setup_logging
 
+# Addresses that only this machine can reach.  "localhost" and "::1" are as
+# local as 127.0.0.1 and must not trip the "network bind needs a key" check.
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _available_model_names() -> list:
+    """Model names for the ACTIVE backend, for the "not found" warning."""
+    try:
+        from core.config import get_model_names
+        return list(get_model_names() or [])
+    except Exception:
+        return []
+
+
+def _run_server(uvicorn, args):
+    """Start uvicorn; --reload needs an import string, not an app object.
+
+    uvicorn ignores reload=True for an app instance (it logs a warning and
+    exits), so --reload never worked.  With --reload the app is built by the
+    reloader's worker process from api.server.create_app, which means
+    choices made in THIS process have to travel in the environment.
+    """
+    if not args.reload:
+        from api.server import create_app
+        uvicorn.run(create_app(), host=args.host, port=args.port)
+        return
+    if args.backend:
+        os.environ["ARTIFEX_BACKEND"] = args.backend
+    if args.gateway:
+        os.environ["WEB_GATEWAY_URL"] = args.gateway
+    if args.model:
+        print("NOTE: --model is not applied with --reload (the worker "
+              "process starts on the backend's default model).")
+    uvicorn.run("api.server:create_app", factory=True,
+                host=args.host, port=args.port, reload=True)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Artifex Assistant V5 API Server")
@@ -42,9 +78,9 @@ def main():
         set_active_backend(args.backend)
 
     if args.model:
-        from core.config import set_active_model, MODELS, OLLAMA_MODELS
+        from core.config import set_active_model
         if not set_active_model(args.model):
-            available = list(MODELS.keys()) or list(OLLAMA_MODELS.keys()) or ["(none found)"]
+            available = _available_model_names() or ["(none found)"]
             print(f"WARNING: Model '{args.model}' not found in registry.")
             print(f"Available models: {', '.join(available)}")
             print(f"Using default model instead.")
@@ -54,7 +90,7 @@ def main():
         wt.WEB_GATEWAY_URL = args.gateway
 
     # Refuse to expose the API on the network without authentication
-    if args.host != "127.0.0.1" and not os.environ.get("ARTIFEX_API_KEY"):
+    if args.host not in LOOPBACK_HOSTS and not os.environ.get("ARTIFEX_API_KEY"):
         print("ERROR: Binding to a non-localhost address requires ARTIFEX_API_KEY.")
         print(f"  You requested --host {args.host}, which exposes the API on the network.")
         print("  Set ARTIFEX_API_KEY=<your-secret> or use --host 127.0.0.1 (default).")
@@ -80,9 +116,6 @@ def main():
         print("Install with: pip install uvicorn fastapi")
         return
 
-    from api.server import create_app
-    app = create_app()
-
     print(f"Artifex Assistant V5 API Server")
     print(f"Listening on http://{args.host}:{args.port}")
     print(f"Docs: http://{args.host}:{args.port}/docs")
@@ -95,7 +128,7 @@ def main():
     else:
         print("Phone app: disabled (start with --phone-app to serve /app)")
 
-    uvicorn.run(app, host=args.host, port=args.port, reload=args.reload)
+    _run_server(uvicorn, args)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ import json
 import os
 import logging
 import warnings
-from threading import Thread
+from threading import Event, Thread
 
 import torch
 from transformers import (
@@ -27,6 +27,7 @@ from transformers import (
     BitsAndBytesConfig,
     TextIteratorStreamer,
     StopStringCriteria,
+    StoppingCriteria,
     StoppingCriteriaList,
 )
 
@@ -46,6 +47,53 @@ _MULTIMODAL_MODEL_TYPES = {
     "gemma3n", "gemma3n_text", "gemma3n_vision", "gemma3n_audio",
 }
 _MULTIMODAL_MODEL_PREFIXES = ("gemma3n", "gemma4", "gemma_4")
+
+
+class _StopOnEvent(StoppingCriteria):
+    """Ends model.generate() at the next token once `event` is set.
+
+    generate() runs in its own thread; the caller's on_token runs in the
+    thread that reads the streamer.  When on_token raises (a Stop), this is
+    the only thing that reaches the generating thread.
+    """
+
+    def __init__(self, event):
+        self._event = event
+
+    def __call__(self, input_ids, scores, **kwargs):
+        stop = self._event.is_set()
+        try:
+            return torch.full((input_ids.shape[0],), stop, dtype=torch.bool,
+                              device=input_ids.device)
+        except Exception:
+            return stop
+
+
+def _nf4_cache_incomplete(quantized_path: str, files: list) -> bool:
+    """True when a -nf4-cached folder shows evidence of an interrupted save.
+
+    _save_quantized_cache writes the weights first and _quant_meta.json
+    last, so the meta file marks a finished save.  Caches written before
+    the meta file existed have none and must keep loading, so its absence
+    alone proves nothing; what does is a sharded save
+    (model-00001-of-0000N.safetensors) with shards missing, or without the
+    index that is written after the last shard.
+    """
+    if os.path.isfile(os.path.join(quantized_path, "_quant_meta.json")):
+        return False
+    import re
+    shard = re.compile(r"-(\d{5})-of-(\d{5})\.(safetensors|bin)$")
+    seen, expected = set(), 0
+    for f in files:
+        m = shard.search(f)
+        if m:
+            seen.add(int(m.group(1)))
+            expected = max(expected, int(m.group(2)))
+    if not expected:
+        return False
+    if len(seen) < expected:
+        return True
+    return not any(f.endswith(".index.json") for f in files)
 
 
 def _detect_model_type_from_config(model_path: str):
@@ -433,10 +481,20 @@ class TransformersEngine(BaseEngine):
         if not os.path.isfile(os.path.join(quantized_path, "config.json")):
             return False
         # Must have actual model weights, not just config stubs
+        files = os.listdir(quantized_path)
         has_weights = any(
-            f for f in os.listdir(quantized_path)
+            f for f in files
             if f.endswith((".safetensors", ".bin"))
         )
+        if has_weights and _nf4_cache_incomplete(quantized_path, files):
+            # A first-run save that was interrupted (app closed during
+            # "Caching quantized weights") used to be taken for a finished
+            # cache, so every later load took the fast path and failed on
+            # it.  Fall back to the slow path, which rewrites the cache.
+            logging.getLogger(__name__).warning(
+                "Ignoring incomplete NF4 cache at %s (interrupted save); "
+                "re-quantizing from the source weights", quantized_path)
+            return False
         return has_weights
 
     def _get_vram_constraints(self, allow_cpu_staging=False):
@@ -576,7 +634,9 @@ class TransformersEngine(BaseEngine):
 
         # ── Resolve model path ─────────────────────────────────────────
         model_path = get_active_model_path()
-        if not os.path.isdir(model_path):
+        # None when no model folder exists at all: os.path.isdir(None) is a
+        # TypeError, which hid the "no local model" help text below.
+        if not model_path or not os.path.isdir(model_path):
             raise FileNotFoundError(
                 f"\n\n"
                 f"Model not found: {model_path}\n\n"
@@ -1025,6 +1085,12 @@ class TransformersEngine(BaseEngine):
             self.model = None
 
         if self.tokenizer is not None:
+            # Token budgeting (core.inference._count_tokens) borrows this
+            # tokenizer; it must not keep counting with - and keeping alive -
+            # the tokenizer of a model that is no longer loaded.
+            from core import inference as _inf
+            if _inf._tokenizer is self.tokenizer:
+                _inf._tokenizer = None
             del self.tokenizer
             self.tokenizer = None
 
@@ -1167,9 +1233,10 @@ class TransformersEngine(BaseEngine):
         model = self.model
 
         # Expose tokenizer for accurate token counting in build_active_messages
+        # Always the LOADED model's: "set once" left the first model's
+        # tokenizer in place across model switches.
         from core import inference as _inf
-        if _inf._tokenizer is None:
-            _inf._tokenizer = tokenizer
+        _inf._tokenizer = tokenizer
 
         inputs = self._build_inputs_for_messages(
             messages, enable_thinking
@@ -1186,6 +1253,8 @@ class TransformersEngine(BaseEngine):
         )
 
         stop_criteria = StopStringCriteria(tokenizer=tokenizer, stop_strings=STOP_STRINGS)
+        # Set when the stream consumer below bails out (on_token raised).
+        abort_event = Event()
 
         # Build EOS token list
         eos_ids = set()
@@ -1294,7 +1363,8 @@ class TransformersEngine(BaseEngine):
             repetition_penalty=samp.get("repeat_penalty", 1.15),
             eos_token_id=list(eos_ids) if eos_ids else tokenizer.eos_token_id,
             pad_token_id=pad_id,
-            stopping_criteria=StoppingCriteriaList([stop_criteria]),
+            stopping_criteria=StoppingCriteriaList(
+                [stop_criteria, _StopOnEvent(abort_event)]),
         )
         if do_sample:
             gen_kwargs["temperature"] = effective_temp
@@ -1336,6 +1406,12 @@ class TransformersEngine(BaseEngine):
         token_count = 0
         t_first = None
         t_start = _time.perf_counter()
+        # What on_token raised, if it did (a Stop from the GUI or the agent).
+        # Held until generate() has actually stopped and VRAM is cleaned up:
+        # letting it propagate straight out of the loop left the generating
+        # thread running to max_new_tokens with nothing reading it, and the
+        # next request started a second generate() on the same model.
+        callback_error = None
 
         try:
             for new_text in streamer:
@@ -1353,9 +1429,12 @@ class TransformersEngine(BaseEngine):
                             on_telemetry(_frame)
                         except Exception:
                             pass
+        except BaseException as e:
+            callback_error = e
+            abort_event.set()
         finally:
             if _tele is not None:
-                if on_telemetry is not None:
+                if on_telemetry is not None and callback_error is None:
                     try:
                         for _frame in _tele.drain():
                             on_telemetry(_frame)
@@ -1423,6 +1502,8 @@ class TransformersEngine(BaseEngine):
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
+        if callback_error is not None:
+            raise callback_error
         if gen_error[0] is not None:
             raise gen_error[0]
 

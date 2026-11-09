@@ -303,10 +303,18 @@ class OllamaEngine(BaseEngine):
             error_body = e.read().decode("utf-8", errors="replace")
             if e.code == 400 and "does not support thinking" in error_body:
                 self._thinking_supported = False
+                # Same request, thinking off - every other argument rides
+                # along (the retry used to drop raw_output, sampling, grammar
+                # and response_format, so e.g. a raw caller got the cleaned
+                # text and a preset caller got the default sampler).
                 return self.generate_streaming(
                     messages, max_tokens=max_tokens, temperature=temperature,
                     on_token=on_token, on_complete=on_complete,
                     enable_thinking=False,
+                    grammar=grammar, response_format=response_format,
+                    raw_output=raw_output, web_tools=web_tools,
+                    reasoning_effort=reasoning_effort,
+                    on_telemetry=on_telemetry, sampling=sampling,
                 )
             raise RuntimeError(
                 f"Ollama API error ({e.code}): {error_body}"

@@ -127,9 +127,25 @@ class ModelQueue:
             self._current_model = None
             self._current_backend = None
             self._current_ctx_tier = None
-            from core.gpu_pool import get_pool
+            # Only the servers our own config can put on a GPU - not every
+            # llama-server.exe on the machine (the CPU vision helper, other
+            # projects' servers).
+            from core.gpu_pool import stop_gpu_model_servers
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, get_pool()._kill_stale_servers)
+            await loop.run_in_executor(None, stop_gpu_model_servers)
+
+            # The Holo voice server (Orpheus) holds a few GB of VRAM on its
+            # own port; it went with the old machine-wide kill, and on a
+            # one-card PC the image model needs that room. It starts again
+            # on the next spoken line.
+            def _stop_voice_server():
+                try:
+                    from core.services import orpheus_tts
+                    if orpheus_tts.configured():
+                        orpheus_tts.stop("GPU handed to " + what)
+                except Exception as e:
+                    _log.debug("Queue: voice server stop skipped: %s", e)
+            await loop.run_in_executor(None, _stop_voice_server)
             self._media_loaded = True
             _log.info("Queue: GPU handed to %s", what)
             yield
@@ -154,6 +170,18 @@ class ModelQueue:
             if reason:
                 return reason
         return None
+
+    def note_activity(self) -> None:
+        """Restart the idle-shrink countdown from now.
+
+        switch_if_needed stamps the START of a request.  Call this when work
+        that used the engine ends (a stream finishing) so the countdown runs
+        from the end of the work instead.  Optional for callers that hold
+        the queue lock or report through a busy check - the idle loop sees
+        both on its own - and a no-op when nothing is loaded.
+        """
+        if self._last_request_at is not None:
+            self._last_request_at = time.time()
 
     @property
     def current_model(self) -> str | None:
@@ -320,6 +348,16 @@ class ModelQueue:
         while True:
             try:
                 await asyncio.sleep(IDLE_SHRINK_CHECK_INTERVAL)
+                if self._lock.locked():
+                    # A request holds the queue right now (the API's
+                    # streaming path keeps it for the whole stream): that is
+                    # activity.  _last_request_at is only stamped when a
+                    # request STARTS, so without this a stream that outlasted
+                    # IDLE_SHRINK_SEC was unloaded the moment it finished -
+                    # this loop was already waiting on the lock with a stale
+                    # timestamp - and the follow-up paid a cold load.
+                    self.note_activity()
+                    continue
                 async with self._lock:
                     if self._last_request_at is not None and self.busy_reason():
                         # In use outside the queue: count it as activity, so
