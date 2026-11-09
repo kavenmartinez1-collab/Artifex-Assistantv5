@@ -125,7 +125,7 @@ class TelemetryPanel(QWidget):
             "color:#7fd3ff; background:transparent; font:9pt 'Consolas';")
         self._hud.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._hud.move(8, 6)
-        self._hud.setText("forward-pass · idle — run a prompt on the transformers backend")
+        self._hud.setText("forward-pass · idle — with this tab open, run a prompt on the transformers backend")
         self._hud.adjustSize()
 
         # Next-token distribution overlay (top-k logits, read out at the head)
@@ -407,7 +407,7 @@ class TelemetryPanel(QWidget):
                                       pxMode=True)
                 self._edges.setData(pos=np.zeros((0, 3), dtype=np.float32))
             self._hud.setText(
-                "forward-pass · idle — run a prompt on the transformers backend")
+                "forward-pass · idle — with this tab open, run a prompt on the transformers backend")
             self._hud.adjustSize()
             if self._logits_hud.text():
                 self._logits_hud.setText("")

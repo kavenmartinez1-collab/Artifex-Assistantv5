@@ -19,7 +19,9 @@ import time
 import urllib.request
 import urllib.error
 
-OLLAMA_URL = os.environ.get("ARTIFEX_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+# 127.0.0.1, not localhost: on Windows "localhost" tries ::1 first and costs
+# ~2 s per call before falling back (Ollama binds IPv4). Same as core/config.py.
+OLLAMA_URL = os.environ.get("ARTIFEX_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 
 
 def find_ollama_binary():

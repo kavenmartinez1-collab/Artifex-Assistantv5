@@ -642,6 +642,18 @@ class ChatBubble(QFrame):
         self._track_appended(text)
         self._maybe_update_stream_height()
 
+    def finalize_stream(self):
+        """Size the stream widget to its final content.
+
+        Height updates are throttled to every 500 chars while streaming, so
+        without this the tail of a reply was never sized (clipped: the widget
+        has no scrollbars) and a reply under 500 chars never left the
+        default 192 px size hint.
+        """
+        if self._stream_widget is not None:
+            self._update_stream_height()
+            self._last_height_update_at_chars = self._stream_text_len
+
     def _track_appended(self, text: str):
         """Maintain incremental counters so we can size the stream widget
         without rescanning the full document on every append (was O(n²) and
@@ -743,7 +755,18 @@ class ChatView(QScrollArea):
 
         self.setWidget(self._container)
         self._bubbles: list[ChatBubble] = []
+        # Follow new output only while the view is at the bottom: scrolling
+        # up to read turns it off, returning to the bottom turns it back on.
         self._auto_scroll = True
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll_value)
+
+    @staticmethod
+    def at_bottom(value: int, maximum: int, slack: int = 24) -> bool:
+        """True when a scrollbar at `value` of `maximum` is (nearly) at the end."""
+        return value >= maximum - slack
+
+    def _on_scroll_value(self, value: int):
+        self._auto_scroll = self.at_bottom(value, self.verticalScrollBar().maximum())
 
     def paintEvent(self, event):
         # QAbstractScrollArea routes the viewport's paint here.
@@ -761,6 +784,9 @@ class ChatView(QScrollArea):
         self._bubbles.append(bubble)
         self._trim_bubbles()
 
+        # The user's own message always brings the view back to the bottom.
+        if role == "user":
+            self._auto_scroll = True
         if self._auto_scroll:
             self._scroll_to_bottom()
 
@@ -790,15 +816,26 @@ class ChatView(QScrollArea):
             bubble.deleteLater()
         self._bubbles.clear()
 
-    def scroll_to_bottom(self):
-        """Scroll to the bottom of the chat."""
-        self._scroll_to_bottom()
+    def scroll_to_bottom(self, force: bool = False):
+        """Follow new output to the bottom of the chat.
+
+        A no-op while the user has scrolled up to read (it used to yank the
+        view back down on every streamed batch); force=True overrides.
+        """
+        if force:
+            self._auto_scroll = True
+        if self._auto_scroll:
+            self._scroll_to_bottom()
 
     def _scroll_to_bottom(self):
         from PyQt6.QtCore import QTimer
-        QTimer.singleShot(10, lambda: self.verticalScrollBar().setValue(
-            self.verticalScrollBar().maximum()
-        ))
+
+        def _go():
+            if self._auto_scroll:   # the user may have scrolled up meanwhile
+                self.verticalScrollBar().setValue(
+                    self.verticalScrollBar().maximum())
+
+        QTimer.singleShot(10, _go)
 
     def get_last_bubble(self) -> ChatBubble | None:
         return self._bubbles[-1] if self._bubbles else None

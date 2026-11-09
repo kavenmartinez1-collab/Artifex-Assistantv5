@@ -33,7 +33,7 @@ def _ensure_session_dir(session_dir=None):
 
 
 def save_session(name, messages, session_map=None, metadata=None,
-                 session_dir=None):
+                 session_dir=None, filename=None):
     """Save a conversation session to disk.
 
     Args:
@@ -42,6 +42,10 @@ def save_session(name, messages, session_map=None, metadata=None,
         session_map: Optional SessionMap data (serialized dict)
         metadata: Optional dict with model name, backend, workspace, etc.
         session_dir: Override session directory
+        filename: Exact file name to write inside the session directory
+            (overwrites it). Default: "<name>_<timestamp>.json". Used by
+            auto_save (its rotation needs stable names) and by the GUI's
+            Save dialog (the user picked the name).
 
     Returns:
         Path to saved session file
@@ -52,7 +56,12 @@ def save_session(name, messages, session_map=None, metadata=None,
     safe_name = "".join(c if c.isalnum() or c in "-_ " else "" for c in name)[:60].strip()
     safe_name = safe_name.replace(" ", "_") or "session"
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"{safe_name}_{timestamp}.json"
+    if filename:
+        filename = os.path.basename(filename)  # never outside the directory
+        if not filename.lower().endswith(".json"):
+            filename += ".json"
+    else:
+        filename = f"{safe_name}_{timestamp}.json"
     path = os.path.join(d, filename)
 
     # Strip system messages from saved history (they contain runtime state)
@@ -95,7 +104,10 @@ def auto_save(messages, session_map=None, metadata=None, session_dir=None):
             except OSError:
                 pass
 
-    return save_session("_autosave_1", messages, session_map, metadata, d)
+    # Exact name: the default "<name>_<timestamp>.json" never matched the
+    # names rotated above, so every autosave used to stay on disk forever.
+    return save_session("_autosave_1", messages, session_map, metadata, d,
+                        filename="_autosave_1.json")
 
 
 def load_session(path):

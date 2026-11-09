@@ -128,6 +128,33 @@ class TestAutoSave:
             auto_save([{"role": "user", "content": f"Msg {i}"}],
                      session_dir=session_dir)
         # Should have _autosave_1, _autosave_2, _autosave_3
-        files = os.listdir(session_dir)
-        autosaves = [f for f in files if "autosave" in f]
-        assert len(autosaves) >= 1
+        # Exactly the three rotating names: never one new file per save.
+        assert sorted(os.listdir(session_dir)) == [
+            "_autosave_1.json", "_autosave_2.json", "_autosave_3.json"]
+        newest = load_session(os.path.join(session_dir, "_autosave_1.json"))
+        oldest = load_session(os.path.join(session_dir, "_autosave_3.json"))
+        assert newest.messages[0]["content"] == "Msg 3"
+        assert oldest.messages[0]["content"] == "Msg 1"
+
+    def test_auto_save_returns_stable_path(self, session_dir):
+        p1 = auto_save([{"role": "user", "content": "a"}], session_dir=session_dir)
+        p2 = auto_save([{"role": "user", "content": "b"}], session_dir=session_dir)
+        assert p1 == p2 == os.path.join(session_dir, "_autosave_1.json")
+
+
+class TestExactFilename:
+    """save_session(filename=...) writes that file, inside the directory."""
+
+    def test_exact_filename_is_used_and_overwritten(self, session_dir):
+        p1 = save_session("x", [{"role": "user", "content": "one"}],
+                          session_dir=session_dir, filename="mine.json")
+        p2 = save_session("x", [{"role": "user", "content": "two"}],
+                          session_dir=session_dir, filename="mine")
+        assert p1 == p2 == os.path.join(session_dir, "mine.json")
+        assert os.listdir(session_dir) == ["mine.json"]
+        assert load_session(p1).messages[0]["content"] == "two"
+
+    def test_filename_cannot_leave_the_directory(self, session_dir):
+        p = save_session("x", [], session_dir=session_dir,
+                         filename=os.path.join("..", "escape.json"))
+        assert os.path.dirname(p) == session_dir

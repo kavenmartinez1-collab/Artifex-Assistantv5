@@ -8,6 +8,7 @@ import os
 import gc
 import platform
 import subprocess
+import time
 
 from colorama import Fore, Style
 
@@ -422,6 +423,44 @@ def _models_command(args: str):
     _last_inventory = []
 
 
+_HELP_LINES = (
+    "  Commands: /workspace <path>|scan, /harness <detect|adopt|on|off>, /refresh, /clear, /cleanup, /purge",
+    "  Knowledge: /kb search|add|list|show|remove|export|import|prune, /index [path]",
+    "  Agent:    /run <goal>  (autonomous loop),  /autonomy manual|guided|full,  /plan on|off",
+    "  Session:  /save [name], /load [name|#], /sessions, /export [path]",
+    "  Pipeline: /mode <mode>, /attach <file>, /output <dir>, /open <file>",
+    "  System:   /backend transformers|ollama|llama_cpp, /context STANDARD|HIGH, /ctx <num>, /health, /compile, /turboquant",
+    "  Models:   /models (inventory), /models add <#> [name] [ctx]  (add an unconfigured GGUF)",
+    "  Type /help to see this list again, 'exit' to quit.",
+)
+
+_CLI_BACKENDS = ("transformers", "ollama", "llama_cpp")
+
+
+def _print_help():
+    """The command list: shown in the banner and by /help."""
+    print(f"{Fore.WHITE}" + "\n".join(_HELP_LINES) + f"{Style.RESET_ALL}\n")
+
+
+def _settle_history(history, engine, context_window):
+    """History to carry into the next turn.
+
+    When the engine reports its context size, AgentRunner already compacts
+    by TOKENS (model synopsis at ~85% of the input budget), so the history
+    is left alone: squashing everything past `context_window` MESSAGES after
+    every turn threw away context on large-window models and changed the
+    prompt prefix each turn, so the server re-read the whole prompt. Only an
+    engine with no known context size still gets the message-count fold.
+    """
+    try:
+        ctx = int(engine.get_context_size() or 0)
+    except Exception:
+        ctx = 0
+    if ctx > 0:
+        return history
+    return compress_history(history, context_window)
+
+
 def run_assistant():
     """Main ASSISTANT agent CLI loop."""
     install_all_hooks()
@@ -441,13 +480,7 @@ def run_assistant():
     print(f" Artifex-Assistant-v5{Style.RESET_ALL}")
     print()
     print(f"{Fore.WHITE}  Type your questions. The AI can run shell commands, Python, and web searches.")
-    print(f"  Commands: /workspace <path>, /harness <detect|adopt|on|off>, /kb search|add|list, /refresh, /clear, /purge")
-    print(f"  Agent:    /run <goal>  (autonomous loop),  /autonomy manual|guided|full,  /plan on|off")
-    print(f"  Session:  /save [name], /load [name|#], /sessions, /export [path]")
-    print(f"  Pipeline: /mode <mode>, /attach <file>, /output <dir>")
-    print(f"  System:   /backend transformers|ollama|llama_cpp, /ctx <num>, /health, /compile, /turboquant")
-    print(f"  Models:   /models (inventory), /models add <#> [name] [ctx]  (add an unconfigured GGUF)")
-    print(f"  Type 'exit' to quit.{Style.RESET_ALL}\n")
+    _print_help()
 
     # Knowledge manager + workspace setup
     km = KnowledgeManager()
@@ -547,6 +580,7 @@ def run_assistant():
     host = _ConsoleHost()
     cli_autonomy = AutonomyLevel.GUIDED  # level used by /run
     cli_plan = "off"                      # /plan on|off — plan-first mode for /run
+    _recent_failures = []                 # times of recent command failures
 
     while True:
         try:
@@ -581,6 +615,10 @@ def run_assistant():
 
             if user_input.lower() in ("exit", "quit"):
                 break
+
+            if user_input.lower() in ("/help", "/?"):
+                _print_help()
+                continue
 
             if user_input.lower() == "/refresh":
                 history = compress_history(history, mode_cfg.context_window)
@@ -660,7 +698,7 @@ def run_assistant():
             # /backend command
             if user_input.lower().startswith("/backend"):
                 arg = user_input[8:].strip().lower()
-                if arg in ("transformers", "ollama"):
+                if arg in _CLI_BACKENDS:
                     engine.unload()
                     set_active_backend(arg)
                     engine = create_engine()
@@ -820,6 +858,10 @@ def run_assistant():
                 # Autonomous runs use the bench-tuned agent preset (see
                 # core/sampling.py + agent_bench/TUNING_REPORT.md).
                 run_cfg.sampler_preset = "agent"
+                # Same default as the API's agent runs (api/agent_api.py): a
+                # template default of xhigh can think past the whole
+                # completion budget and return nothing.
+                run_cfg.reasoning_effort = "medium"
                 run_cfg.plan = cli_plan
                 if cli_autonomy == AutonomyLevel.FULL_AUTO:
                     print(f"{Fore.YELLOW}  Full-auto — all policy-allowed actions run unattended; "
@@ -831,7 +873,7 @@ def run_assistant():
                 ).run(goal, history)
                 print(f"\n{Fore.CYAN}  ■ {result.status} "
                       f"({result.rounds} rounds, {result.actions_run} actions){Style.RESET_ALL}\n")
-                history = compress_history(history, mode_cfg.context_window)
+                history = _settle_history(history, engine, mode_cfg.context_window)
                 continue
 
             # /health command
@@ -1030,6 +1072,12 @@ def run_assistant():
                     print(f"{Fore.YELLOW}  File not found: {path}{Style.RESET_ALL}\n")
                 continue
 
+            # /kb command (before the pipeline block: in a non-chat /mode it
+            # used to be sent to the pipeline as a prompt)
+            if user_input.lower().startswith("/kb"):
+                _handle_kb_command(user_input[3:].strip(), km)
+                continue
+
             # Pipeline execution for non-chat modes
             if _cli_pipeline_mode not in ("chat", "code") and _CLI_MODE_MAP.get(_cli_pipeline_mode):
                 pipeline_type = _CLI_MODE_MAP[_cli_pipeline_mode]
@@ -1106,11 +1154,6 @@ def run_assistant():
                 _cli_attached_files.clear()
                 continue
 
-            # /kb command
-            if user_input.lower().startswith("/kb"):
-                _handle_kb_command(user_input[3:].strip(), km)
-                continue
-
             # Set task from first user message
             if _first_message:
                 session_map.set_task(user_input)
@@ -1128,8 +1171,8 @@ def run_assistant():
                 km=km, session_map=session_map, config=turn_cfg,
             ).run(user_input, history)
 
-            # Compress, cleanup, and auto-save
-            history = compress_history(history, mode_cfg.context_window)
+            # Settle the history (see _settle_history), cleanup, and auto-save
+            history = _settle_history(history, engine, mode_cfg.context_window)
             if len(history) % 6 == 0:
                 engine.periodic_cleanup()
             try:
@@ -1145,6 +1188,21 @@ def run_assistant():
             print(f"\n{Fore.CYAN}  Knowledge: {kb_count} entries saved to workspace store.")
             print(f"{Fore.YELLOW}  Goodbye.{Style.RESET_ALL}")
             break
+        except Exception as e:
+            # One failed command (a backend that is not running, a bad path,
+            # a pipeline error) must not end the session and lose the chat.
+            _log.exception("CLI command failed")
+            print(f"\n{Fore.RED}  Error: {type(e).__name__}: {e}{Style.RESET_ALL}")
+            # A failure that repeats without waiting for input (a broken
+            # terminal, say) would spin forever: stop after 5 within 2 s.
+            _now = time.monotonic()
+            _recent_failures[:] = [t for t in _recent_failures if _now - t < 2.0] + [_now]
+            if len(_recent_failures) >= 5:
+                print(f"{Fore.RED}  Repeated errors; exiting.{Style.RESET_ALL}")
+                break
+            print(f"{Fore.YELLOW}  That did not finish; the session is still open "
+                  f"(details in logs/artifex.log).{Style.RESET_ALL}\n")
+            continue
 
 
 if __name__ == "__main__":

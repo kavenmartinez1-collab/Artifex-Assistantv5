@@ -39,7 +39,13 @@ from ui.qt_widgets import (
     DropZone, ImageViewer, AudioPlayer, VideoPlayer,
     MicrophoneRecorder, ChatView, ChatBubble,
 )
-from ui.qt_workers import GenerationWorker, PipelineWorker, ActionWorker, TokenBatcher
+from ui.qt_workers import (
+    GenerationWorker, PipelineWorker, ActionWorker, TokenBatcher,
+    BackendSwitchWorker, ResourceMonitor,
+)
+from ui.gui_logic import (
+    parse_max_tokens, restored_messages, history_after_cancel, wait_for_workers,
+)
 from ui.qt_telemetry_panel import TelemetryPanel
 
 from core.config import (
@@ -368,6 +374,16 @@ class ArtifexMainWindow(QMainWindow):
         self._auto_running = False
         self._auto_armed_full = False  # one-time Full-auto confirmation per session
 
+        # Backend switch in progress (BackendSwitchWorker): no generation
+        # may start until the new backend and its model list are in place.
+        self._backend_worker = None
+        self._backend_switching = False
+        # Workers replaced while their thread was still winding down. A
+        # QThread whose last Python reference goes away while it is running
+        # aborts the process, so they are parked here until they finish.
+        self._retired_workers = []
+        self._shutting_down = False
+
         # Build UI
         self._build_ui()
         self._connect_signals()
@@ -376,6 +392,12 @@ class ArtifexMainWindow(QMainWindow):
 
         # Apply theme
         self._apply_theme()
+
+        # Quit paths that never close the window (Purge calls
+        # QApplication.quit()) still stop the workers.
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._shutdown)
 
     # ═══════════════════════════════════════════════════════════════════
     # UI CONSTRUCTION
@@ -431,7 +453,8 @@ class ArtifexMainWindow(QMainWindow):
         be_layout = QHBoxLayout()
         be_layout.addWidget(QLabel("Engine:"))
         self._backend_combo = QComboBox()
-        self._backend_combo.addItems(["transformers", "ollama", "llama_cpp", "webgpu"])
+        self._backend_combo.addItems(
+            ["transformers", "ollama", "llama_cpp", "claude_cli", "webgpu"])
         self._backend_combo.setCurrentText(get_active_backend())
         be_layout.addWidget(self._backend_combo)
         bg_layout.addLayout(be_layout)
@@ -887,7 +910,7 @@ class ArtifexMainWindow(QMainWindow):
         self._copy_btn.setProperty("class", "secondary")
         self._status_bar.addPermanentWidget(self._copy_btn)
 
-        # Segmented VRAM / RAM / CPU meters, fed by _update_resources
+        # Segmented VRAM / RAM / CPU meters, fed by _on_resource_sample
         self._meters = {}
         for key in ("VRAM", "RAM", "CPU"):
             meter = HudMeter(key)
@@ -969,6 +992,14 @@ class ArtifexMainWindow(QMainWindow):
         self._response_batcher.batch_ready.connect(self._on_response_batch)
         self._thinking_batcher = TokenBatcher(flush_interval_ms=50)
         self._thinking_batcher.batch_ready.connect(self._on_thinking_batch)
+        # Same batching for the autonomous run's stream (it used to insert
+        # into the log once per token, straight from a queued signal).
+        self._auto_log_batcher = TokenBatcher(flush_interval_ms=50)
+        self._auto_log_batcher.batch_ready.connect(
+            lambda t: self._auto_insert(self._auto_log, t))
+        self._auto_think_batcher = TokenBatcher(flush_interval_ms=50)
+        self._auto_think_batcher.batch_ready.connect(
+            lambda t: self._auto_insert(self._thinking_output, t))
 
         # Push-to-talk state
         self._ptt_active = False
@@ -1007,21 +1038,84 @@ class ArtifexMainWindow(QMainWindow):
     # BACKEND / MODEL
     # ═══════════════════════════════════════════════════════════════════
 
+    def _engine_in_use(self) -> bool:
+        """A worker is (or is about to be) generating with self.engine."""
+        return bool(self._busy or self._auto_running
+                    or self._current_action_worker is not None)
+
+    def _drop_engine(self):
+        """Unload and forget the engine. Engines bind their model when they
+        are created, so a new backend/model always needs a new engine, even
+        when the old one never finished loading."""
+        engine, self.engine = self.engine, None
+        if engine is not None:
+            try:
+                engine.unload()
+            except Exception as e:
+                _log.warning("Engine unload failed: %s", e)
+
+    @staticmethod
+    def _set_combo_quietly(combo, text):
+        if text and combo.findText(text) >= 0:
+            combo.blockSignals(True)
+            combo.setCurrentText(text)
+            combo.blockSignals(False)
+
     def _on_backend_changed(self, backend):
-        if self.engine:
-            self.engine.unload()
-            self.engine = None
-        set_active_backend(backend)
+        if not backend:
+            return
+        if self._engine_in_use() or self._backend_switching:
+            # Unloading under a running generation pulls the model out from
+            # under its worker thread: put the selection back instead.
+            self._set_combo_quietly(self._backend_combo, get_active_backend())
+            self._set_status("Busy: cancel or wait before switching backend")
+            return
+        self._drop_engine()
+        # set_active_backend("ollama") and get_model_names() probe the Ollama
+        # server with retries; with Ollama not running that froze the window
+        # for seconds, so both run on a worker thread.
+        self._backend_switching = True
+        self._backend_combo.setEnabled(False)
+        self._model_combo.setEnabled(False)
+        self._set_status(f"Switching backend to {backend}...")
+        worker = BackendSwitchWorker(backend)
+        worker.switched.connect(self._on_backend_switched)
+        worker.finished.connect(self._on_backend_worker_done)
+        self._backend_worker = worker
+        worker.start()
+
+    def _on_backend_switched(self, backend, names):
+        self._model_combo.blockSignals(True)
         self._model_combo.clear()
-        self._model_combo.addItems(get_model_names())
-        self._set_status(f"Backend: {backend}")
+        self._model_combo.addItems(names)
+        self._model_combo.blockSignals(False)
+        self._backend_switching = False
+        self._backend_combo.setEnabled(True)
+        self._model_combo.setEnabled(True)
+        # As before the switch moved off this thread: the first listed model
+        # becomes the active one.
+        if names:
+            self._on_model_changed(self._model_combo.currentText())
+        self._set_status(f"Backend: {backend}"
+                         + ("" if names else " (no models found)"))
+
+    def _on_backend_worker_done(self):
+        worker, self._backend_worker = self._backend_worker, None
+        if worker is not None:
+            worker.deleteLater()
 
     def _on_model_changed(self, model_name):
-        if model_name:
-            set_active_model(model_name)
-            if self.engine and self.engine.is_loaded():
-                self.engine.unload()
-                self.engine = None
+        if not model_name:
+            return
+        if self._engine_in_use():
+            self._set_combo_quietly(self._model_combo, get_active_model_name())
+            self._set_status("Busy: cancel or wait before switching model")
+            return
+        set_active_model(model_name)
+        # Drop the engine whether or not it finished loading: it was built
+        # for the previous model, and keeping an unloaded one made the next
+        # EXECUTE retry the old model (e.g. after the VRAM gate refused it).
+        self._drop_engine()
 
     def _on_ctx_toggle(self):
         name = get_context_profile_name()
@@ -1112,6 +1206,17 @@ class ArtifexMainWindow(QMainWindow):
             self._execute_btn.setText("EXECUTE")
             self._set_status("Cancelling...")
             return
+        # One user of the engine at a time: the autonomous run, a backend
+        # switch and the action runner each own it until they finish.
+        if self._auto_running:
+            self._set_status("An autonomous run is active: stop it first (AGENT tab)")
+            return
+        if self._backend_switching:
+            self._set_status("Switching backend: one moment")
+            return
+        if self._current_action_worker is not None:
+            self._set_status("Actions are still running: one moment")
+            return
 
         mode = self._mode_combo.currentText()
         prompt = self._prompt_input.toPlainText().strip()
@@ -1126,8 +1231,12 @@ class ArtifexMainWindow(QMainWindow):
                 self._set_status("Enter a prompt first")
             return
 
-        _tok_text = self._tokens_input.text().strip().lower()
-        max_tokens = -1 if _tok_text in ("max", "") else int(_tok_text)
+        max_tokens = parse_max_tokens(self._tokens_input.text())
+        if max_tokens is None:
+            # int() used to raise here, inside the slot: the click did nothing.
+            self._set_status("Tokens must be a whole number or 'max'")
+            self._tokens_input.setFocus()
+            return
         temperature = self._temp_slider.value() / 10.0
 
         # Voice Assistant with recording but no text — transcribe first
@@ -1187,9 +1296,13 @@ class ArtifexMainWindow(QMainWindow):
         worker.status_changed.connect(self._set_status)
         worker.finished.connect(self._on_generation_finished)
         worker.error.connect(self._on_generation_error)
-        worker.telemetry_received.connect(self._viz_panel.push_frame)
+        # Forward-pass telemetry hooks every layer for every token, so it is
+        # only requested while the FORWARD PASS tab is the one showing.
+        worker.want_telemetry = self._tabs.currentWidget() is self._viz_panel
+        if worker.want_telemetry:
+            worker.telemetry_received.connect(self._viz_panel.push_frame)
         self._viz_panel.reset()
-        self._current_worker = worker
+        self._set_current_worker(worker)
         worker.start()
 
     def _history_for_send(self, ctx, max_tokens, context_window):
@@ -1263,7 +1376,7 @@ class ArtifexMainWindow(QMainWindow):
             worker.result_ready.connect(self._on_pipeline_result)
         worker.error.connect(self._on_generation_error)
         worker.status_changed.connect(self._set_status)
-        self._current_worker = worker
+        self._set_current_worker(worker)
         worker.start()
 
     def _build_pipeline_kwargs(self, mode: str, prompt: str) -> dict:
@@ -1383,8 +1496,22 @@ class ArtifexMainWindow(QMainWindow):
         # thinking/analysis channel rather than the visible response. We
         # need both halves to find every tool call the model intended.
         thinking_text = ""
+        cancelled = False
         if self._current_worker is not None:
             thinking_text = getattr(self._current_worker, "_thinking_text", "") or ""
+            cancelled = bool(getattr(self._current_worker, "cancelled", False))
+
+        if cancelled:
+            # Keep what the user saw as the assistant turn (it used to be
+            # replaced by a "[Generation cancelled]" placeholder the model
+            # then read as its own reply). No knowledge extraction and no
+            # suggested actions from a half-written answer.
+            history_after_cancel(self.messages, response)
+            if self._current_bubble:
+                self._current_bubble.append_text(
+                    "\n[cancelled]" if (response or "").strip() else "[cancelled]")
+            self._finish_busy("Generation cancelled")
+            return
 
         self.messages.append({"role": "assistant", "content": response})
 
@@ -1560,7 +1687,8 @@ class ArtifexMainWindow(QMainWindow):
 
         # Voice Assistant mode: auto-transcribe and send to LLM
         mode = self._mode_combo.currentText()
-        if mode == "Voice Assistant" and not self._busy:
+        if (mode == "Voice Assistant" and not self._engine_in_use()
+                and not self._backend_switching):
             self._run_voice_from_recording(path)
 
     def _run_voice_from_recording(self, wav_path: str):
@@ -1588,6 +1716,14 @@ class ArtifexMainWindow(QMainWindow):
 
     def _run_voice_from_audio(self, audio):
         """Voice Assistant: transcribe audio first, show text, then send to LLM."""
+        if self._engine_in_use() or self._backend_switching:
+            self._set_status("Busy: wait for the current task to finish")
+            return
+        # Transcription is a running worker like any other: without the busy
+        # flag a second push-to-talk or EXECUTE replaced it mid-run.
+        self._busy = True
+        self._cancel_event.clear()
+        self._execute_btn.setText("CANCEL")
         self._set_status("Transcribing speech...")
         self._pending_voice_audio = audio
 
@@ -1601,13 +1737,16 @@ class ArtifexMainWindow(QMainWindow):
         worker.result_ready.connect(self._on_stt_result)
         worker.error.connect(self._on_generation_error)
         worker.status_changed.connect(self._set_status)
-        self._current_worker = worker
+        self._set_current_worker(worker)
         worker.start()
 
     def _on_stt_result(self, result):
         """STT finished — show transcription then auto-send to LLM → TTS."""
         if not result.success or not result.content or not result.content.strip():
-            self._set_status("No speech detected — try again")
+            self._finish_busy("No speech detected — try again")
+            return
+        if self._cancel_event.is_set():
+            self._finish_busy("Cancelled")
             return
 
         transcribed = result.content.strip()
@@ -1636,7 +1775,7 @@ class ArtifexMainWindow(QMainWindow):
         worker.result_ready.connect(self._on_voice_result)
         worker.error.connect(self._on_generation_error)
         worker.status_changed.connect(self._set_status)
-        self._current_worker = worker
+        self._set_current_worker(worker)
         worker.start()
 
     def _on_voice_result(self, result):
@@ -1723,6 +1862,13 @@ class ArtifexMainWindow(QMainWindow):
         outputs = self._pending_tool_outputs
         self._pending_tool_outputs = []
 
+        if self._shutting_down:
+            return
+        if self._engine_in_use() or self._backend_switching:
+            # Something else owns the engine: never start a second
+            # generation on it. The outputs ride along with the next batch.
+            self._pending_tool_outputs = outputs
+            return
         if not outputs or not self.engine or not self.engine.is_loaded():
             return
 
@@ -1760,7 +1906,7 @@ class ArtifexMainWindow(QMainWindow):
         worker.status_changed.connect(self._set_status)
         worker.finished.connect(self._on_generation_finished)
         worker.error.connect(self._on_generation_error)
-        self._current_worker = worker
+        self._set_current_worker(worker)
         self._busy = True
         self._execute_btn.setText("CANCEL")
         worker.start()
@@ -1783,11 +1929,28 @@ class ArtifexMainWindow(QMainWindow):
     # UTILITY
     # ═══════════════════════════════════════════════════════════════════
 
+    def _set_current_worker(self, worker):
+        """Swap the tracked worker, parking the previous one while its thread
+        is still winding down (its result signal arrives before run() has
+        fully returned) instead of dropping the last reference to it."""
+        old, self._current_worker = self._current_worker, worker
+        self._retired_workers = [w for w in self._retired_workers if w.isRunning()]
+        if old is not None and old is not worker and old.isRunning():
+            self._retired_workers.append(old)
+
     def _finish_busy(self, status_msg: str):
         self._busy = False
         self._execute_btn.setText("EXECUTE")
-        self._current_worker = None
+        self._set_current_worker(None)
+        if self._current_bubble is not None:
+            # Size the streamed text to its final length (throttled while
+            # streaming, so the tail was never sized).
+            self._current_bubble.finalize_stream()
+            self._chat_view.scroll_to_bottom()
         self._current_bubble = None
+        # Every way a run ends lands here, errors included: a pipeline that
+        # raised used to leave the indeterminate bar animating forever.
+        self._progress_bar.setVisible(False)
         self._set_status(status_msg)
 
     def _set_status(self, msg: str):
@@ -1803,9 +1966,11 @@ class ArtifexMainWindow(QMainWindow):
         gc.collect()
 
     def _on_clear(self):
-        if self.engine:
-            self.engine.unload()
-            self.engine = None
+        if self._engine_in_use():
+            self._cancel_event.set()
+            self._set_status("Busy: cancelling. Press Clear again when it stops")
+            return
+        self._drop_engine()
         self.messages = [{"role": "system", "content": "You are a helpful AI assistant."}]
         self._chat_view.clear_chat()
         self._thinking_output.clear()
@@ -1846,9 +2011,10 @@ class ArtifexMainWindow(QMainWindow):
         QApplication.quit()
 
     def _on_vram_relief(self):
-        if self.engine:
-            self.engine.unload()
-            self.engine = None
+        if self._engine_in_use():
+            self._set_status("Busy: cancel or wait before releasing VRAM")
+            return
+        self._drop_engine()
         svc = get_service()
         svc.unload_all()
         gc.collect()
@@ -1884,32 +2050,46 @@ class ArtifexMainWindow(QMainWindow):
             }
             smap_data = self.session_map.to_dict() if hasattr(
                 self.session_map, "to_dict") else {}
-            # Use the full chosen path's basename as session name,
-            # but save_session will store it in the sessions directory
+            # Write exactly the file the dialog returned: the folder and the
+            # name the user chose (it used to go to sessions/ under a
+            # timestamped name whatever was picked).
             session_name = os.path.splitext(os.path.basename(path))[0]
-            save_session(session_name, self.messages, smap_data, metadata)
-            self._set_status(f"Session saved: {session_name}")
+            try:
+                saved = save_session(
+                    session_name, self.messages, smap_data, metadata,
+                    session_dir=os.path.dirname(os.path.abspath(path)),
+                    filename=os.path.basename(path))
+            except OSError as e:
+                self._set_status(f"Could not save session: {e}")
+                return
+            self._set_status(f"Session saved: {saved}")
 
     def _on_load_session(self):
-        from core.session import list_sessions, load_session
-        sessions = list_sessions()
-        if not sessions:
-            self._set_status("No saved sessions")
+        from core.session import load_session
+        if self._engine_in_use():
+            self._set_status("Busy: cancel or wait before loading a session")
             return
+        sessions_dir = os.path.join(BASE_DIR, "sessions")
+        os.makedirs(sessions_dir, exist_ok=True)
         path, ok = QFileDialog.getOpenFileName(
-            self, "Load Session", os.path.join(BASE_DIR, "sessions"),
+            self, "Load Session", sessions_dir,
             "JSON Files (*.json)"
         )
         if ok and path:
             session_name = os.path.splitext(os.path.basename(path))[0]
-            data = load_session(session_name)
-            if data:
-                self.messages = data.get("messages", self.messages)
+            # load_session takes the file's PATH and returns a SessionState
+            # (it was called with the bare name and read like a dict, so no
+            # session ever loaded).
+            state = load_session(path)
+            if state is not None:
+                self.messages = restored_messages(self.messages[0], state.messages)
                 self._chat_view.clear_chat()
                 for msg in self.messages[1:]:
                     role = msg.get("role", "user")
                     bubble = self._chat_view.add_bubble(role)
-                    bubble.add_text(msg.get("content", ""))
+                    content = msg.get("content", "")
+                    bubble.add_text(content if isinstance(content, str) else str(content))
+                self._chat_view.scroll_to_bottom(force=True)
                 self._set_status(f"Session loaded: {session_name}")
             else:
                 self._set_status(f"Failed to load session: {session_name}")
@@ -2335,7 +2515,7 @@ class ArtifexMainWindow(QMainWindow):
 
     def _on_auto_run(self):
         from core.agent_loop import AutonomyLevel, RunConfig, RunControl
-        if self._busy or self._auto_running:
+        if self._engine_in_use() or self._backend_switching:
             self._auto_status.setText("Busy — finish the current run first.")
             return
         goal = self._auto_goal.text().strip()
@@ -2369,6 +2549,10 @@ class ArtifexMainWindow(QMainWindow):
         cfg = RunConfig.default(level)
         cfg.sampler_preset = self._auto_preset.currentText().lower()
         cfg.enable_thinking = self._auto_thinking.isChecked()
+        # Same default as the API's agent runs (api/agent_api.py): a template
+        # default of xhigh can think past the whole completion budget and
+        # return nothing (see RunConfig.reasoning_effort).
+        cfg.reasoning_effort = "medium"
         cfg.plan = "auto" if self._auto_plan.isChecked() else "off"
         # Run on a private copy of the conversation so the chat stays clean;
         # the final summary is folded back into the conversation at the end.
@@ -2418,12 +2602,18 @@ class ArtifexMainWindow(QMainWindow):
 
     def _on_auto_event(self, ev):
         k = ev.kind
+        # Stream chunks are batched (20 updates/s at most); anything else
+        # flushes them first so the log keeps its order.
+        if k == "assistant_chunk":
+            self._auto_log_batcher.add(ev.text or "")
+            return
+        if k == "thinking_chunk":
+            self._auto_think_batcher.add(ev.text or "")
+            return
+        self._auto_log_batcher.flush_now()
+        self._auto_think_batcher.flush_now()
         if k == "round_start":
             self._auto_append(f"\n── round {ev.round} ──")
-        elif k == "assistant_chunk":
-            self._auto_insert(self._auto_log, ev.text)
-        elif k == "thinking_chunk":
-            self._auto_insert(self._thinking_output, ev.text)
         elif k == "action_proposed":
             risk = getattr(ev.decision, "risk_level", None)
             risk = risk.name if risk is not None else "?"
@@ -2497,6 +2687,8 @@ class ArtifexMainWindow(QMainWindow):
                  "stop": Decision.STOP}.get(which, Decision.APPROVE))
 
     def _on_auto_finished(self, result):
+        self._auto_log_batcher.flush_now()
+        self._auto_think_batcher.flush_now()
         self._auto_append(
             f"\n■ {result.status}  ({result.rounds} rounds, {result.actions_run} actions)")
         if result.summary:
@@ -2558,44 +2750,103 @@ class ArtifexMainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════
 
     def _setup_resource_timer(self):
-        self._resource_timer = QTimer()
-        self._resource_timer.setInterval(3000)
-        self._resource_timer.timeout.connect(self._update_resources)
-        self._resource_timer.start()
+        # Sampled on a worker thread (ui.qt_workers.ResourceMonitor). The
+        # VRAM figure is device-wide, all processes (DXGI/PDH on Windows):
+        # the old torch.cuda.memory_allocated() only counted this process's
+        # own tensors, so it read ~0 with a llama-server or Ollama model
+        # loaded, and it needed torch, which chat-only installs don't have.
+        self._resource_monitor = ResourceMonitor(interval_s=3.0)
+        self._resource_monitor.sample.connect(self._on_resource_sample)
+        self._resource_monitor.start()
 
-    def _update_resources(self):
+    def _on_resource_sample(self, data):
         parts = []
-        try:
-            import torch
-            if torch.cuda.is_available():
-                alloc = torch.cuda.memory_allocated() / (1024**3)
-                total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                frac = alloc / total if total > 0 else 0
-                parts.append(f"VRAM: {alloc:.1f}/{total:.1f}GB")
-                self._meters["VRAM"].set_value(frac, f"{alloc:.1f}/{total:.0f}G")
-        except ImportError:
-            pass
-        except Exception as e:
-            _log.debug("VRAM monitor error: %s", e)
-
-        try:
-            import psutil
-            ram = psutil.virtual_memory()
-            ram_used = ram.used / (1024**3)
-            ram_total = ram.total / (1024**3)
-            cpu = psutil.cpu_percent()
+        vram = data.get("vram")
+        if vram:
+            used, total, frac, detail = vram
+            parts.append(f"VRAM (all apps): {detail}")
+            self._meters["VRAM"].set_value(frac, f"{used:.1f}/{total:.0f}G")
+        ram = data.get("ram")
+        if ram:
+            ram_used, ram_total, ram_frac = ram
             parts.append(f"RAM: {ram_used:.1f}/{ram_total:.0f}GB")
+            self._meters["RAM"].set_value(ram_frac, f"{ram_used:.1f}/{ram_total:.0f}G")
+        cpu = data.get("cpu")
+        if cpu is not None:
             parts.append(f"CPU: {cpu:.0f}%")
-            self._meters["RAM"].set_value(ram.percent / 100, f"{ram_used:.1f}/{ram_total:.0f}G")
             self._meters["CPU"].set_value(cpu / 100, f"{cpu:.0f}%")
-        except ImportError:
-            pass
-        except Exception as e:
-            _log.debug("System monitor error: %s", e)
 
         tip = " | ".join(parts)
         for meter in self._meters.values():
             meter.setToolTip(tip)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # SHUTDOWN
+    # ═══════════════════════════════════════════════════════════════════
+
+    def closeEvent(self, event):
+        self.hide()            # disappear at once; the wait below is short
+        self._shutdown()
+        super().closeEvent(event)
+
+    def _shutdown(self):
+        """Stop every worker before the window (and its QThreads) go away.
+
+        Runs once, from closeEvent or QApplication.aboutToQuit. Without it a
+        close during a generation, pipeline or autonomous run destroyed
+        running QThreads at interpreter teardown, which aborts the process.
+        """
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+
+        # Ask everything to stop.
+        self._cancel_event.set()
+        if self._auto_control is not None:
+            self._auto_control.request_stop()
+        if self._auto_worker is not None:
+            try:
+                from core.agent_loop import Decision
+                self._auto_worker.resolve(Decision.STOP)   # a pending approval
+            except Exception as e:
+                _log.debug("auto worker stop: %s", e)
+        monitor = getattr(self, "_resource_monitor", None)
+        if monitor is not None:
+            monitor.stop()
+        for stream in (getattr(self, "_ptt_stream", None),
+                       getattr(self._mic_recorder, "_stream", None)):
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
+        self._ptt_stream = None
+
+        # Give them a moment (one shared deadline, not one each).
+        workers = [self._current_worker, self._current_action_worker,
+                   self._auto_worker, self._backend_worker, monitor,
+                   *self._retired_workers]
+        still_running = wait_for_workers(workers, timeout_s=5.0)
+
+        if not still_running:
+            self._drop_engine()
+            return
+
+        # Something would not stop in time (a model mid-load, a tool action
+        # mid-command). Tearing down a running QThread aborts the process
+        # with no log, so leave deliberately instead: flush the logs and
+        # exit. Model servers started here die with this process
+        # (core.proc_tree.tie_children_to_this_process).
+        _log.warning("Closing with %d worker(s) still running: exiting now",
+                     len(still_running))
+        import logging
+        for handler in logging.getLogger().handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
+        os._exit(0)
 
     # ═══════════════════════════════════════════════════════════════════
     # PUSH-TO-TALK (hold Space in Voice Assistant mode)
@@ -2608,7 +2859,8 @@ class ArtifexMainWindow(QMainWindow):
                 and self._mode_combo.currentText() == "Voice Assistant"
                 and not self._prompt_input.hasFocus()
                 and not self._ptt_active
-                and not self._busy):
+                and not self._engine_in_use()
+                and not self._backend_switching):
             self._ptt_active = True
             self._ptt_audio_data = []
             self._ptt_stream = None

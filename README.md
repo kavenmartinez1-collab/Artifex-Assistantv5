@@ -419,7 +419,6 @@ pip install -r requirements-3060.txt         # RTX 3060 12GB (pinned versions)
 pip install -r requirements-rtx5060ti.txt    # RTX 5060 Ti 8GB (pinned versions)
 
 # 3. Optional extras
-pip install fastapi uvicorn    # For the REST API server
 pip install pytest             # For running the test suite
 ```
 
@@ -453,7 +452,7 @@ The downloader auto-detects the model type and estimates VRAM requirements.
 
 ```bash
 # Set up Ollama (installs, starts server, pulls a model)
-python setup_ollama.py                  # Default: qwen3.5:9b
+python setup_ollama.py qwen3.5:9b      # Pull a model (the model name is required)
 python setup_ollama.py qwen3.5:4b      # Smaller model for tight VRAM
 python setup_ollama.py --list           # List installed Ollama models
 python setup_ollama.py --status         # Check Ollama server status
@@ -466,9 +465,9 @@ python download_model.py --ollama qwen3.5:9b
 
 ```bash
 python main.py          # CLI — interactive assistant with agent tools
-python main_gui.py      # GUI — cyberpunk desktop interface
+python main_gui_qt.py   # GUI — cyberpunk desktop interface
 python main_api.py      # API — OpenAI-compatible REST server on :8000
-launch.bat              # Windows — double-click desktop shortcut
+launch.bat              # Windows — double-click to start the CLI (run setup.cmd first)
 
 # API server with full options
 python main_api.py --backend ollama --gateway http://localhost:8080 --port 8000
@@ -502,6 +501,7 @@ https://github.com/user-attachments/assets/911f3f29-d70f-402c-960c-1c68f7d2de22
 |---------|-------------|
 | `/backend transformers` | Switch to HuggingFace Transformers backend |
 | `/backend ollama` | Switch to Ollama backend |
+| `/backend llama_cpp` | Switch to the llama.cpp server backend (GGUF models) |
 | `/backend` | Show current backend and model |
 | `/models` | Model inventory: ready / not configured / broken. `/models add <#> [name] [ctx]` adds an unconfigured GGUF after confirmation |
 | `/context STANDARD` | Switch to standard context profile (lower VRAM) |
@@ -526,6 +526,7 @@ https://github.com/user-attachments/assets/911f3f29-d70f-402c-960c-1c68f7d2de22
 | `/refresh` | Compress history and free VRAM |
 | `/clear` | Reset conversation (keeps knowledge) |
 | `/cleanup` | Deep clean — reset conversation + remove stale workspace data |
+| `/help` | List every command |
 | `exit` or `quit` | Exit the assistant |
 
 ### How Agent Tools Work
@@ -563,7 +564,7 @@ The PyQt6 GUI provides a production-grade desktop interface with full multimodal
 - **Resource monitor** — real-time VRAM/RAM/CPU in status bar
 - **Keyboard shortcut** — Ctrl+Enter to execute
 
-> **Note:** The legacy FreeSimpleGUI GUI (`main_gui.py`) is still available but deprecated. The PyQt6 GUI is the recommended interface.
+> **Note:** The old FreeSimpleGUI GUI was removed. `python main_gui.py` still works: it starts this same PyQt6 GUI.
 
 ---
 
@@ -857,7 +858,7 @@ brew install ollama
 
 ```bash
 # Setup helper: finds Ollama, starts the server, pulls a model
-python setup_ollama.py                  # Default: qwen3.5:9b
+python setup_ollama.py qwen3.5:9b      # Pull a model (the model name is required)
 python setup_ollama.py qwen3.5:4b      # Smaller model
 python setup_ollama.py --status         # Check what's installed
 python setup_ollama.py --list           # List all models
@@ -1696,7 +1697,7 @@ source venv/bin/activate     # Linux/macOS
 # ── Core services ──
 python main.py                           # CLI assistant
 python main_gui_qt.py                    # GUI (PyQt6 desktop — recommended)
-python main_gui.py                       # GUI (legacy FreeSimpleGUI)
+python main_gui.py                       # Same PyQt6 GUI (old entry point name)
 python main_api.py                       # API server (port 8000)
 python main_api.py --backend ollama      # API with Ollama backend
 python main_api.py --backend ollama --model qwen3.6-27b-q2kxl --port 8000
@@ -1758,12 +1759,12 @@ python main_api.py
 Artifex-Assistant-V5/
   main.py                  # CLI entry point
   main_gui_qt.py           # PyQt6 GUI entry point (recommended)
-  main_gui.py              # Legacy FreeSimpleGUI entry point
+  main_gui.py              # Old entry point name; starts the PyQt6 GUI
   main_api.py              # API server entry point
   setup_wizard.py          # GPU detection and setup wizard
   setup_ollama.py          # Ollama setup helper (install, start, pull)
   download_model.py        # Model downloader (HuggingFace + Ollama)
-  launch.bat               # Windows desktop launcher
+  launch.bat               # Windows launcher for the CLI (uses the installer's venv)
   Modelfile.example        # Ollama Modelfile template (copy to Modelfile, set your GGUF path)
   llama_cpp_config.example.json  # llama.cpp backend config template (copy to llama_cpp_config.json)
   ollama_config.json       # Per-model Ollama settings (KV quant, context overrides)
@@ -1820,8 +1821,6 @@ Artifex-Assistant-V5/
     qt_workers.py          # QThread workers + TokenBatcher for smooth streaming
     qt_widgets.py          # DropZone, ImageViewer, AudioPlayer, VideoPlayer, MicRecorder, ChatView
     qt_launcher.py         # PyQt6 QApplication setup
-    cyber_gui.py           # Legacy FreeSimpleGUI GUI
-    gui_theme.py           # Legacy GUI theming
     terminal.py            # Terminal utilities
   api/
     server.py              # FastAPI OpenAI-compatible REST API (streaming for both backends, tool execution)
@@ -2136,7 +2135,7 @@ cd webgpu && npm run dev
 - accelerate >= 1.6.0
 - numpy >= 1.24.0
 - diffusers >= 0.30.0 (for image/3D/video pipelines)
-- FreeSimpleGUI >= 5.0.0 (for GUI mode)
+- PyQt6 >= 6.11 (for GUI mode)
 - FastAPI + uvicorn (for API server mode)
 - pytest >= 8.0.0 (for testing)
 

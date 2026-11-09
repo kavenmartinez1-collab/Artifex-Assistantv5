@@ -11,6 +11,8 @@ import traceback
 
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, QObject
 
+from ui.gui_logic import read_vram_devices, vram_summary
+
 
 class TokenBatcher(QObject):
     """Batches streaming tokens and flushes to the GUI at a capped rate.
@@ -100,6 +102,14 @@ class GenerationWorker(QThread):
         # tool calls inside its analysis channel, which the regular
         # `response` variable from generate_streaming never sees.
         self._thinking_text: str = ""
+        # Visible answer so far (what the bubble shows). On cancel this is
+        # what goes into the history, so the model later sees what the user
+        # saw instead of a "[Generation cancelled]" placeholder.
+        self._response_text: str = ""
+        self.cancelled: bool = False
+        # Forward-pass telemetry is opt-in: the GUI turns it on only while
+        # the Forward Pass tab is showing (it hooks every layer per token).
+        self.want_telemetry: bool = False
 
     def run(self):
         try:
@@ -113,11 +123,21 @@ class GenerationWorker(QThread):
                 self._thinking_text += t
                 self.thinking_received.emit(t)
 
-            from core.engine_ollama import OllamaEngine
-            starts_in_think = self.enable_thinking and not isinstance(self.engine, OllamaEngine)
+            # Engines that emit explicit <think> tags (llama.cpp, ollama,
+            # claude CLI) start the stream OUTSIDE a think block; only
+            # transformers/webgpu pre-fill <think>. Same rule as api/server.py
+            # and core/agent_loop.py — an isinstance(OllamaEngine) check here
+            # sent a llama.cpp model's whole answer to the thinking pane.
+            starts_in_think = bool(
+                self.enable_thinking
+                and getattr(self.engine, "stream_starts_in_think", True))
+
+            def _on_response(t):
+                self._response_text += t
+                self.response_received.emit(t)
 
             tf = ThinkFilter(
-                on_response=lambda t: self.response_received.emit(t),
+                on_response=_on_response,
                 on_thinking=_on_thinking,
                 starts_in_think=starts_in_think,
             )
@@ -157,7 +177,7 @@ class GenerationWorker(QThread):
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
                 on_token=on_token,
-                on_telemetry=on_telemetry,
+                on_telemetry=on_telemetry if self.want_telemetry else None,
                 enable_thinking=self.enable_thinking,
             )
 
@@ -165,7 +185,13 @@ class GenerationWorker(QThread):
             self.finished.emit(response or "")
 
         except InterruptedError:
-            self.finished.emit("[Generation cancelled]")
+            # The partial answer, not a placeholder: see _response_text.
+            self.cancelled = True
+            try:
+                tf.flush()   # text the filter was still holding back
+            except Exception:
+                pass
+            self.finished.emit(self._response_text)
         except Exception as e:
             self.error.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
@@ -265,3 +291,67 @@ class ActionWorker(QThread):
 
         except Exception as e:
             self.error.emit(f"{type(e).__name__}: {e}")
+
+
+class BackendSwitchWorker(QThread):
+    """Switch the active backend and list its models off the GUI thread.
+
+    core.config.set_active_backend("ollama") probes the Ollama server with
+    retries and sleeps, and get_model_names() repeats the probe when it found
+    nothing — with Ollama not running that froze the window for seconds.
+
+    Signals:
+        switched(str, list): backend name, its model names (possibly empty)
+    """
+
+    switched = pyqtSignal(str, list)
+
+    def __init__(self, backend: str):
+        super().__init__()
+        self.backend = backend
+
+    def run(self):
+        names = []
+        try:
+            from core.config import set_active_backend, get_model_names
+            set_active_backend(self.backend)
+            names = list(get_model_names() or [])
+        except Exception:
+            names = []
+        self.switched.emit(self.backend, names)
+
+
+class ResourceMonitor(QThread):
+    """Samples VRAM / RAM / CPU off the GUI thread.
+
+    Signals:
+        sample(dict): {"vram": vram_summary() tuple or None,
+                       "ram": (used_gb, total_gb, fraction) or None,
+                       "cpu": percent or None}
+    """
+
+    sample = pyqtSignal(dict)
+
+    def __init__(self, interval_s: float = 3.0):
+        super().__init__()
+        self._interval_s = interval_s
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        while not self._stop.is_set():
+            data = {"vram": vram_summary(read_vram_devices()), "ram": None, "cpu": None}
+            try:
+                import psutil
+                ram = psutil.virtual_memory()
+                data["ram"] = (ram.used / (1024 ** 3), ram.total / (1024 ** 3),
+                               ram.percent / 100)
+                data["cpu"] = psutil.cpu_percent()
+            except Exception:
+                pass
+            if self._stop.is_set():
+                break
+            self.sample.emit(data)
+            self._stop.wait(self._interval_s)

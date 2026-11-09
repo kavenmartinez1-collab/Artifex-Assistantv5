@@ -13,19 +13,21 @@ if PROJECT_ROOT not in sys.path:
 
 
 def install_crash_logging():
-    """Log unhandled exceptions before PyQt6 aborts the process.
+    """Log unhandled exceptions, and keep PyQt6 from aborting on them.
 
-    PyQt6 escalates any exception that escapes a slot or a reimplemented
-    virtual (QThread.run, paintEvent, ...) to qFatal().  On Windows that
-    calls __fastfail(FAST_FAIL_FATAL_APP_EXIT), killing the process via
-    interrupt 0x29 without raising a catchable signal — so the faulthandler
-    armed in main_gui_qt.py never sees it, logs/faultdump.log stays empty,
-    and the crash surfaces as a bare exit code 3221226505 (0xC0000409) with
-    no traceback anywhere.
+    With the DEFAULT sys.excepthook, PyQt6 escalates any exception that
+    escapes a slot or a reimplemented virtual (QThread.run, paintEvent, ...)
+    to qFatal().  On Windows that calls __fastfail(FAST_FAIL_FATAL_APP_EXIT),
+    killing the process via interrupt 0x29 without raising a catchable
+    signal — so the faulthandler armed in main_gui_qt.py never sees it,
+    logs/faultdump.log stays empty, and the crash surfaces as a bare exit
+    code 3221226505 (0xC0000409) with no traceback anywhere.
 
-    sys.excepthook still runs before the abort, so this is the last point
-    at which the traceback can be captured.  Handlers are flushed
-    explicitly because the abort gives Python no chance to unwind.
+    PyQt6 only does that while the hook is the default one.  Installing
+    this hook is therefore what keeps the window alive: the exception is
+    logged here and the event loop carries on (the slot that raised simply
+    did not finish).  Handlers are flushed explicitly so the traceback is
+    on disk even if something later does take the process down.
 
     Scope note: this covers the *Python-exception* route to that exit code
     only.  Qt also calls qFatal on its own for allocation failure, which
@@ -45,9 +47,9 @@ def install_crash_logging():
             text = "".join(
                 traceback.format_exception(exc_type, exc_value, exc_tb)
             )
-            log.critical(
-                "UNHANDLED EXCEPTION in %s — PyQt6 will abort the process "
-                "(exit 3221226505) immediately after this line:\n%s",
+            log.error(
+                "UNHANDLED EXCEPTION in %s (the action that raised did not "
+                "finish; the window keeps running):\n%s",
                 source, text,
             )
             for handler in logging.getLogger().handlers:
