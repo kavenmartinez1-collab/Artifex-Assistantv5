@@ -108,14 +108,19 @@ def _check_auth(request):
     fails = [t for t in fails if now - t < _AUTH_FAIL_WINDOW]
     _auth_failures[client_ip] = fails
 
-    if len(fails) >= _AUTH_FAIL_MAX:
-        _log.warning("Rate limited auth from %s (%d failures)", client_ip, len(fails))
-        return False
-
     import hmac
     auth_header = request.headers.get("Authorization", "")
     key_header = request.headers.get("X-API-Key", "")
     token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else key_header
+    # The right key always gets in. The limit only stops further GUESSES:
+    # checked first, it locked a phone out for a minute after its stale
+    # saved key was corrected, along with anything sharing its address.
+    if token and hmac.compare_digest(token, _api_key):
+        return True
+
+    if len(fails) >= _AUTH_FAIL_MAX:
+        _log.warning("Rate limited auth from %s (%d failures)", client_ip, len(fails))
+        return False
     if not token:
         fails.append(now)
         _auth_failures[client_ip] = fails
@@ -228,6 +233,51 @@ class TokenizeRequest(BaseModel):
 # ── SSE helpers ──────────────────────────────────────────────────────────
 
 _SENTINEL = object()  # Marks end of generation in queue
+
+
+class _StreamAbandoned(Exception):
+    """The consumer of a generation stream is gone (client disconnected, or
+    the chat job was stopped). Raised inside the producer thread's put()."""
+
+
+class _StreamQueue(queue.Queue):
+    """Bounded hand-off from a generation thread to the SSE generator.
+
+    A plain bounded Queue deadlocks once nobody reads it: the generation
+    thread blocks in put() forever, stops reading the model server's reply,
+    and the server's single slot stays busy until the old answer hits its
+    token cap, so "Stop, then send again" waited behind the abandoned
+    answer. abandon() makes every later put() raise instead; the exception
+    unwinds through the engine's on_token, which closes its HTTP response
+    and frees the slot.
+    """
+
+    def __init__(self):
+        super().__init__(maxsize=256)
+        self._abandoned = threading.Event()
+
+    def put(self, item, block=True, timeout=None):
+        while True:
+            if self._abandoned.is_set():
+                raise _StreamAbandoned()
+            try:
+                return super().put(item, timeout=0.25)
+            except queue.Full:
+                continue
+
+    def finish(self):
+        """Producer's last word. Never raises."""
+        try:
+            self.put(_SENTINEL)
+        except _StreamAbandoned:
+            pass
+
+    def abandon(self):
+        self._abandoned.set()
+        try:                      # wake a reader still blocked in get()
+            queue.Queue.put(self, _SENTINEL, block=False)
+        except queue.Full:
+            pass
 
 
 def _make_sse_chunk(chat_id: str, model: str, delta: dict,
@@ -416,12 +466,14 @@ def _infer_backend_from_model(name) -> str | None:
     else None. Sentinel names return None — let the caller fall back to
     the active backend.
 
-    Probe order is "cheapest first, most-likely first": Ollama's tag
-    list is an in-memory dict, llama.cpp/claude_cli are small JSON
-    configs, and the transformers MODELS map is also in memory.  If a
-    name appears under multiple backends the first hit wins (Ollama →
-    llama.cpp → claude_cli → transformers).  Callers wanting a specific
-    backend should set request.backend explicitly.
+    Everything already in memory is checked first (the known Ollama tags,
+    the llama.cpp/claude_cli configs, the transformers MODELS map); if a
+    name appears under several backends the first hit wins (Ollama →
+    llama.cpp → claude_cli → transformers). Only a name found nowhere
+    asks Ollama for a fresh tag list, in case it was just pulled: that is
+    a network round trip (and seconds of retries when Ollama is down),
+    which every request naming a llama.cpp model used to pay first.
+    Callers wanting a specific backend should set request.backend.
     """
     if _is_auto_sentinel(name):
         return None
@@ -433,11 +485,6 @@ def _infer_backend_from_model(name) -> str | None:
 
     if name in OLLAMA_MODELS:
         return "ollama"
-    # Refresh once in case it was just pulled — same pattern as
-    # _resolve_model_for_request uses for explicit names.
-    refresh_ollama_models()
-    if name in OLLAMA_MODELS:
-        return "ollama"
 
     if name in get_llama_cpp_models():
         return "llama_cpp"
@@ -447,6 +494,11 @@ def _infer_backend_from_model(name) -> str | None:
 
     if name in MODELS:
         return "transformers"
+
+    # Unknown everywhere: it may have just been pulled into Ollama.
+    refresh_ollama_models()
+    if name in OLLAMA_MODELS:
+        return "ollama"
 
     return None
 
@@ -777,6 +829,22 @@ def _proxy_ollama_chat(ollama_messages, model, temperature, max_tokens, options,
     }
 
 
+def _put_error(out_queue, e):
+    try:
+        out_queue.put(("error", str(e)))
+    except _StreamAbandoned:
+        pass
+
+
+def _finish_queue(out_queue):
+    """End-of-stream marker; works for a plain Queue too (tests pass one)."""
+    finish = getattr(out_queue, "finish", None)
+    if finish:
+        finish()
+    else:
+        out_queue.put(_SENTINEL)
+
+
 # ── Ollama streaming ────────────────────────────────────────────────────
 
 def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
@@ -856,16 +924,16 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
             try:
                 resp = urllib.request.urlopen(req, timeout=timeout)
             except Exception as e2:
-                out_queue.put(("error", str(e2)))
-                out_queue.put(_SENTINEL)
+                _put_error(out_queue, e2)
+                _finish_queue(out_queue)
                 return
         else:
-            out_queue.put(("error", str(e)))
-            out_queue.put(_SENTINEL)
+            _put_error(out_queue, e)
+            _finish_queue(out_queue)
             return
     except Exception as e:
-        out_queue.put(("error", str(e)))
-        out_queue.put(_SENTINEL)
+        _put_error(out_queue, e)
+        _finish_queue(out_queue)
         return
 
     tf = ThinkFilter(
@@ -907,12 +975,17 @@ def _stream_ollama_raw(ollama_messages, model, temperature, max_tokens,
                     "done_reason": chunk.get("done_reason", "stop"),
                 }))
                 break
+    except _StreamAbandoned:
+        _log.info("Ollama stream abandoned by its reader; closing the response")
     except Exception as e:
-        out_queue.put(("error", str(e)))
+        _put_error(out_queue, e)
     finally:
-        tf.flush()
+        try:
+            tf.flush()
+        except _StreamAbandoned:
+            pass
         resp.close()
-        out_queue.put(_SENTINEL)
+        _finish_queue(out_queue)
 
 
 # ── Transformers streaming ──────────────────────────────────────────────
@@ -977,10 +1050,12 @@ def _stream_transformers_raw(engine, messages, max_tokens, temperature,
             "completion_tokens": stats.get("completion_tokens", 0),
             "finish_reason": stats.get("finish_reason", "stop"),
         }))
+    except _StreamAbandoned:
+        _log.info("Generation stream abandoned by its reader; stopped reading the model")
     except Exception as e:
-        out_queue.put(("error", str(e)))
+        _put_error(out_queue, e)
     finally:
-        out_queue.put(_SENTINEL)
+        _finish_queue(out_queue)
 
 
 _WEB_TOOL_SYSTEM_PROMPT = (
@@ -1114,13 +1189,33 @@ def _clamp_max_tokens(messages, max_tokens: int, backend: str,
 
 # ── Unified streaming with optional tool execution ──────────────────────
 
-async def _stream_with_tools(messages: list, model: str, max_tokens: int,
-                             temperature: float, options: dict,
-                             use_web_tools: bool, backend: str,
-                             grammar=None, response_format=None,
-                             enable_thinking=True,
-                             reasoning_effort=None,
-                             workspace: str = ""):
+async def _stream_with_tools(*args, **kwargs):
+    """_stream_with_tools_impl, plus the guarantee that when this generator
+    is closed early (client disconnect, chat-job Stop, an error) the
+    generation thread behind it is told to stop instead of being left
+    blocked on a queue nobody reads."""
+    queues: list = []
+    inner = _stream_with_tools_impl(*args, _queues=queues, **kwargs)
+    try:
+        async for chunk in inner:
+            yield chunk
+    finally:
+        for q in queues:
+            q.abandon()
+        try:
+            await inner.aclose()
+        except BaseException:
+            pass
+
+
+async def _stream_with_tools_impl(messages: list, model: str, max_tokens: int,
+                                  temperature: float, options: dict,
+                                  use_web_tools: bool, backend: str,
+                                  grammar=None, response_format=None,
+                                  enable_thinking=True,
+                                  reasoning_effort=None,
+                                  workspace: str = "",
+                                  _queues: list = None):
     """Full streaming generator with optional tool execution loop.
 
     Yields SSE events. Handles both Ollama and Transformers backends.
@@ -1222,7 +1317,9 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                     yield f"data: {json.dumps({'x_context_fit': fit})}\n\n"
 
         # Start generation in a background thread
-        q = queue.Queue(maxsize=256)
+        q = _StreamQueue()
+        if _queues is not None:
+            _queues.append(q)
 
         if backend == "ollama":
             has_images = _messages_have_images(current_messages)
@@ -1354,7 +1451,9 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                 ),
             })
             # One final generation pass with tools disabled
-            q_final = queue.Queue(maxsize=256)
+            q_final = _StreamQueue()
+            if _queues is not None:
+                _queues.append(q_final)
             if backend == "ollama":
                 ollama_final = _convert_messages_for_ollama(current_messages)
                 t = threading.Thread(
@@ -1381,6 +1480,8 @@ async def _stream_with_tools(messages: list, model: str, max_tokens: int,
                     yield _make_sse_chunk(chat_id, model, {"x_thinking": data})
                 elif kind == "content":
                     yield _make_sse_chunk(chat_id, model, {"content": data})
+                elif kind == "error":
+                    yield f"data: {json.dumps({'error': data})}\n\n"
             t.join(timeout=10)
             break
 
@@ -1634,6 +1735,11 @@ def create_app():
                     detail={"message": "An agent run is active — stop it first",
                             "run_id": live.id})
             mq = get_model_queue()
+            busy = mq.busy_reason()
+            if busy:        # e.g. a chat reply still generating on this engine
+                raise HTTPException(
+                    status_code=409,
+                    detail={"message": f"{busy} — stop it or wait, then reload"})
             async with mq._lock:
                 if not mq._current_model:
                     raise HTTPException(
@@ -1750,11 +1856,16 @@ def create_app():
                 reasoning_effort=(req.reasoning_effort or None),
             )
 
-        from api.chat_jobs import register_chat_job_routes
+        from api.chat_jobs import register_chat_job_routes, live_chat_busy_reason
         register_chat_job_routes(app, check_auth=_check_auth,
                                  prepare=_chat_job_prepare,
                                  stream_factory=_chat_job_stream,
                                  session_dir=SESSION_DIR)
+        # A generating job keeps its engine: no idle shrink, no Create job
+        # and no request for another model may unload it mid-answer. (The
+        # job's own load runs before it reports busy, so it never blocks
+        # itself, and an agent run's busy check still applies to it.)
+        get_model_queue().register_busy_check(live_chat_busy_reason)
 
     # ─── Model inventory ─────────────────────────────────────────────────
     # Every reachable model with a ready / unconfigured / broken status.
@@ -1897,9 +2008,11 @@ def create_app():
     async def health(request: Request):
         if not _check_auth(request):
             raise HTTPException(status_code=401, detail="Invalid API key")
-        report = run_health_check()
+        # Off the event loop: the probes inside (GPU query, Ollama and
+        # gateway with 3 s timeouts each) froze every open stream meanwhile.
+        report = await asyncio.to_thread(run_health_check)
         # Include web gateway status and backend info
-        report["web_gateway"] = gateway_available()
+        report["web_gateway"] = await asyncio.to_thread(gateway_available)
         report["backend"] = get_active_backend()
         # Phone app capability — the client hides Agent/Files when the
         # server is serving web search/read only.
@@ -1993,8 +2106,9 @@ def create_app():
         else:
             text = body.text
 
-        engine = _get_engine()
-        count = engine.count_tokens(text)
+        def _count():
+            return _get_engine().count_tokens(text)
+        count = await asyncio.to_thread(_count)   # HTTP to the model server
         return {"token_count": count, "text_length": len(text)}
 
     # ─── Chat Completions ─────────────────────────────────────────────────
@@ -2090,10 +2204,13 @@ def create_app():
                     async with mq._lock:
                         await mq.switch_if_needed(model, backend, ctx_tier=ctx_tier)
 
+                        # In a thread: a cold load takes tens of seconds and
+                        # used to freeze every other stream and poll with it.
                         if backend == "ollama":
-                            _get_engine()  # Verify Ollama is reachable
+                            await asyncio.to_thread(_get_engine)  # Verify Ollama is reachable
                         else:
-                            _get_engine(ctx_tier=ctx_tier)  # Load engine at tier
+                            await asyncio.to_thread(
+                                lambda: _get_engine(ctx_tier=ctx_tier))  # Load engine at tier
 
                         async for chunk in _stream_with_tools(
                             messages, model, max_tokens, temperature,
@@ -2151,7 +2268,7 @@ def create_app():
                     raise HTTPException(status_code=502, detail=str(e))
 
             # Transformers / llama_cpp non-streaming
-            engine = _get_engine(ctx_tier=ctx_tier)
+            engine = await asyncio.to_thread(lambda: _get_engine(ctx_tier=ctx_tier))
             # The same clamp _stream_with_tools applies — this path never
             # reaches it, so without this a non-streaming image request could
             # still ask for more completion than the loaded window can return
@@ -2423,10 +2540,7 @@ def create_app():
             except Exception:
                 raise HTTPException(status_code=400, detail="image_base64 is not valid base64")
             img_b64 = body.image_base64
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-            tmp.write(img_bytes)
-            tmp.close()
-            image_path = tmp.name
+            image_path = None       # written below, only if a pipeline needs a file
         else:
             raise HTTPException(
                 status_code=400,
@@ -2506,6 +2620,16 @@ def create_app():
                 ),
             )
 
+        # An inline image needs a file for the pipeline. Written only now
+        # (the Ollama and refusal paths above never used it) and removed
+        # afterwards: it used to stay in the temp folder, one user image
+        # per call, outside everything the purge clears.
+        tmp_image = None
+        if image_path is None:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+            tmp.write(img_bytes)
+            tmp.close()
+            image_path = tmp_image = tmp.name
         try:
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(None, lambda: svc.run_pipeline(
@@ -2533,6 +2657,12 @@ def create_app():
         except Exception as e:
             _log.error("Vision pipeline error: %s", e)
             raise HTTPException(status_code=500, detail=f"Vision pipeline failed: {e}")
+        finally:
+            if tmp_image:
+                try:
+                    os.unlink(tmp_image)
+                except OSError:
+                    pass
 
     # ─── Audio TTS ───────────────────────────────────────────────────────
 
@@ -2577,6 +2707,9 @@ def create_app():
         """Transcribe audio to text (STT). Accepts file_id."""
         if not _check_auth(request):
             raise HTTPException(status_code=401, detail="Invalid API key")
+
+        if body is None:
+            raise HTTPException(status_code=400, detail="Provide a JSON body with file_id")
 
         from core.services import get_service
         svc = get_service()

@@ -206,7 +206,10 @@ def _resolves_to_private(host: str) -> str | None:
     """Resolve hostname and check if any resulting IP is private/loopback/reserved.
 
     Returns a reason string if blocked, None if all resolved IPs are public.
-    Catches IP encoding tricks (octal, hex, decimal), IPv6, and DNS rebinding.
+    Catches IP encoding tricks (octal, hex, decimal) and IPv6. "Public" means
+    globally routable: that also rules out 100.64.0.0/10, the carrier-grade
+    NAT block Tailscale hands out, which is_private does not cover; a page
+    could otherwise send the model to another device on the tailnet.
     """
     import socket
     import ipaddress
@@ -221,7 +224,11 @@ def _resolves_to_private(host: str) -> str | None:
             ip = ipaddress.ip_address(sockaddr[0])
         except ValueError:
             continue
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None:          # ::ffff:10.0.0.1 is 10.0.0.1
+            ip = mapped
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified or not ip.is_global):
             return f"Blocked: {host} resolves to private/reserved address {ip}"
     return None
 

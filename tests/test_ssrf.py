@@ -67,6 +67,19 @@ class TestResolvesToPrivate:
             result = _resolves_to_private("example.com")
             assert result is None
 
+    @pytest.mark.parametrize("ip", [
+        "100.64.0.1", "100.101.102.103", "100.127.255.254",   # CGNAT: where tailnet devices live
+        "::ffff:100.101.102.103",                             # the same, IPv4-mapped
+        "198.18.0.1",                                         # benchmarking range
+        "224.0.0.1", "0.0.0.0",
+    ])
+    def test_non_global_ranges_blocked(self, ip):
+        """is_private misses 100.64.0.0/10; only globally routable addresses pass."""
+        with patch("socket.getaddrinfo", return_value=self._mock_resolve(ip)):
+            assert _resolves_to_private("evil.com") is not None
+        ok, _ = (False, "") if ":" in ip else sanitize_url(f"http://{ip}:8000/health")
+        assert ok is False
+
     def test_unresolvable_passes(self):
         """Unresolvable hosts pass — let the fetcher fail naturally."""
         import socket

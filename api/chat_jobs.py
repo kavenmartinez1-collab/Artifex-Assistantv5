@@ -32,15 +32,21 @@ Design notes:
 - ONE live job at a time (409 with the live id), mirroring agent runs —
   the GPU serves one stream anyway.
 
-- Stop caveat: _stream_with_tools has no cancel hook, so stop marks the
-  job stopped and detaches from the generator; the engine drains its
-  current round in the background. Delivered text stops immediately.
+- Stop: the worker closes the _stream_with_tools generator, which tells
+  the generation thread to stop reading the model (see _StreamQueue in
+  api/server.py), so the model server's slot is free for the next message.
+  A job that is stopping no longer blocks a new one.
 
 - Engine/queue: like the agent worker, jobs use _get_engine() directly
   (the model-queue asyncio lock belongs to the server's main loop and
-  cannot be taken from a private one). Model/tier switching therefore
-  follows whatever is or gets loaded — on this single-model deployment
-  that is the same behavior the agent runs have always had.
+  cannot be taken from a private one). While a job generates it reports
+  itself busy to the model queue (live_chat_busy_reason), so the idle
+  shrink, a Create job or a request for another model cannot unload the
+  engine under it.
+
+- The start request answers at once with the job id; the engine load runs
+  in the background. A phone that asks to stop (or loses its connection)
+  during a cold load therefore already knows which job that is.
 """
 from __future__ import annotations
 
@@ -62,6 +68,7 @@ _log = get_logger(__name__)
 _MAX_KEPT_JOBS = 10
 
 _jobs: dict[str, "ChatJob"] = {}
+_launch_tasks: set = set()       # keeps the background engine loads referenced
 _jobs_lock = threading.Lock()
 
 
@@ -114,6 +121,7 @@ class ChatJob:
         self._live: list[tuple[int, dict]] = []   # (serial, payload) ring
         self._serial = 0
         self._stop = threading.Event()
+        self.generating = False          # the worker is using the engine
 
     @property
     def terminal(self) -> bool:
@@ -137,6 +145,17 @@ class ChatJob:
                 us = payload.get("x_usage") or delta.get("x_usage")
                 if us:
                     self.usage = us
+                # A tool round ended: the model starts a fresh segment and
+                # the phone keeps only that one. Keeping every round here
+                # glued the first round's text (raw @search lines included)
+                # onto the final answer for a reattaching phone and in the
+                # saved session.
+                if payload.get("x_tool_done"):
+                    self.text = ""
+                err = payload.get("error")
+                if err:
+                    self.error = (err if isinstance(err, str)
+                                  else json.dumps(err))[:500]
                 content = delta.get("content")
                 if content:
                     self.text += content
@@ -151,7 +170,7 @@ class ChatJob:
     def finish(self, status: str, error: str = ""):
         with self._cond:
             self.status = status
-            self.error = error
+            self.error = error or self.error
             self.finished_at = time.time()
             self._cond.notify_all()
 
@@ -198,13 +217,19 @@ def _worker(job: ChatJob, stream_factory, model: str, session_dir: str):
                 pass
 
     loop = asyncio.new_event_loop()
+    job.generating = True
     try:
         loop.run_until_complete(consume())
-        job.finish("stopped" if job._stop.is_set() else "done")
+        # A generation error arrives as an {"error": ...} payload, not an
+        # exception. Ending "done" hid it from a phone that was away and
+        # saved the cut-off answer as if it were complete.
+        job.finish("stopped" if job._stop.is_set()
+                   else "error" if job.error else "done")
     except Exception as e:
         _log.exception("Chat job %s crashed", job.id)
         job.finish("error", str(e)[:500])
     finally:
+        job.generating = False
         loop.close()
 
     # Persist the finished exchange server-side so the conversation exists
@@ -227,6 +252,13 @@ def _worker(job: ChatJob, stream_factory, model: str, session_dir: str):
                           key=lambda j: j.created)
         for j in finished[: max(0, len(finished) - _MAX_KEPT_JOBS)]:
             _jobs.pop(j.id, None)
+
+
+def live_chat_busy_reason():
+    """Model-queue busy check: a chat job is generating right now."""
+    with _jobs_lock:
+        busy = any(j.generating and not j.terminal for j in _jobs.values())
+    return "A chat reply is being generated" if busy else None
 
 
 def register_chat_job_routes(app, check_auth, prepare, stream_factory, session_dir: str):
@@ -258,29 +290,46 @@ def register_chat_job_routes(app, check_auth, prepare, stream_factory, session_d
     async def start_job(body: ChatJobRequest, request: Request):
         _auth(request)
         with _jobs_lock:
-            live = next((j for j in _jobs.values() if not j.terminal), None)
+            # A job that was told to stop is on its way out and must not
+            # capture the next message: the phone used to attach to it and
+            # show the old, cut-off answer as the reply to the new question.
+            live = next((j for j in _jobs.values()
+                         if not j.terminal and not j._stop.is_set()), None)
             if live is not None:
                 raise HTTPException(
                     status_code=409,
                     detail={"message": "A chat job is already running",
-                            "job_id": live.id})
+                            "job_id": live.id,
+                            "session_id": live.req.session_id})
             job = ChatJob(body)
             _jobs[job.id] = job
-        # Switch/load the right engine on the MAIN loop before the worker
-        # runs (image requests route to a vision model here). A failure
-        # marks the job errored rather than silently generating on the
-        # wrong model.
-        try:
-            resolved_model = await prepare(body)
-        except Exception as e:
-            _log.exception("Chat job %s prepare failed", job.id)
-            job.finish("error", f"engine prepare failed: {e}"[:500])
-            return {"job_id": job.id, "status": job.status}
-        threading.Thread(target=_worker,
-                         args=(job, stream_factory, resolved_model, session_dir),
-                         name=f"chat-job-{job.id}", daemon=True).start()
-        _log.info("Chat job %s started (model=%s, session=%s, web=%s)",
-                  job.id, resolved_model, body.session_id, bool(body.web_tools))
+
+        async def launch():
+            # Switch/load the right engine on the MAIN loop before the worker
+            # runs (image requests route to a vision model here). A failure
+            # marks the job errored rather than silently generating on the
+            # wrong model.
+            try:
+                resolved_model = await prepare(body)
+            except Exception as e:
+                _log.exception("Chat job %s prepare failed", job.id)
+                job.finish("error", f"engine prepare failed: {e}"[:500])
+                return
+            if job._stop.is_set():       # stopped while the model loaded
+                job.finish("stopped")
+                return
+            threading.Thread(target=_worker,
+                             args=(job, stream_factory, resolved_model, session_dir),
+                             name=f"chat-job-{job.id}", daemon=True).start()
+            _log.info("Chat job %s started (model=%s, session=%s, web=%s)",
+                      job.id, resolved_model, body.session_id, bool(body.web_tools))
+
+        # Answer with the id now and load in the background: held open through
+        # a cold load, this request left the phone with no id to stop or
+        # reattach to if it was locked or tapped Stop meanwhile.
+        task = asyncio.get_running_loop().create_task(launch())
+        _launch_tasks.add(task)
+        task.add_done_callback(_launch_tasks.discard)
         return {"job_id": job.id, "status": job.status}
 
     @app.get("/v1/chat/jobs/{job_id}")

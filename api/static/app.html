@@ -2123,7 +2123,18 @@ function mdBlocks(text) {
   return out.join("\n");
 }
 
+// Never throws. A runaway answer (thousands of nested quotes or list levels)
+// overflows the block parser's stack; it then comes back as escaped plain
+// text. Thrown from here, the error left a finished turn stuck on "Stop" and
+// made the saved chat fail to open ever again.
 function renderMarkdown(src) {
+  try { return renderMarkdownUnsafe(src); }
+  catch (e) {
+    return '<pre class="md-plain" style="white-space:pre-wrap">' +
+      escapeHtml(String(src == null ? "" : src)) + "</pre>";
+  }
+}
+function renderMarkdownUnsafe(src) {
   // NUL is the placeholder delimiter; a literal NUL in the input could
   // forge a reference to a fence/code/link slot that doesn't exist and
   // throw mid-render. Strip it before anything else.
@@ -2340,6 +2351,7 @@ async function loadSession(id) {
     localStorage.removeItem(CHAT_JOB_KEY);
     chatJobId = null;
     pendingTurnEl = null;
+    compactNext = false;        // that was about the chat being left
     conversation = (s.messages || []).filter(m => m && m.role !== "system");
     clearAttachments();
     renderTranscript();
@@ -2383,6 +2395,9 @@ async function deleteSession(id) {
     const r = await fetch("/v1/sessions/" + id, { method: "DELETE", headers: authHeaders() });
     if (!r.ok && r.status !== 404) return;
     if (id === activeSessionId) {
+      // A reply still streaming into the chat being deleted would carry on
+      // unseen, and the server would save it and bring the chat back.
+      if (isStreaming) stopChat();
       activeSessionId = null;
       localStorage.removeItem(SESSION_KEY);
       conversation = [];
@@ -2400,6 +2415,7 @@ function newChat() {
   localStorage.removeItem(CHAT_JOB_KEY);
   chatJobId = null;
   pendingTurnEl = null;
+  compactNext = false;          // that was about the chat being left
   activeSessionId = null;
   localStorage.removeItem(SESSION_KEY);
   conversation = [];
@@ -3002,8 +3018,9 @@ const HOLO_MAX_TOKENS = 1024;
 const HOLO_PROMPT = "\n\nYou are speaking through a holographic avatar and your words may be read " +
   "aloud: answer conversationally and keep it short unless asked for detail.";
 
-// -> {jobId} | {jobId, attached:true} | {fallback:true}, or throws.
-async function startChatJob(base, signal) {
+// -> {jobId} | {jobId, attached:true} | {jobId, replaced:true} |
+//    {fallback:true}, or throws.
+async function startChatJob(base, signal, retried) {
   const r = await fetch("/v1/chat/jobs", {
     method: "POST",
     headers: authHeaders({ "Content-Type": "application/json" }),
@@ -3028,7 +3045,20 @@ async function startChatJob(base, signal) {
   try { data = await r.json(); } catch (e) {}
   if (r.status === 409) {
     const d = data && data.detail;
-    // One job at a time: watch the one that is already running.
+    // A reply still running for ANOTHER chat (left behind by New chat) must
+    // not be shown here as the answer to this message. One GPU, one reply:
+    // stop that one and send this message again. A stopping job no longer
+    // blocks the server, so the retry goes straight through.
+    if (d && d.job_id && !retried && (d.session_id || "") !== (activeSessionId || "")) {
+      try {
+        await fetch("/v1/chat/jobs/" + d.job_id + "/stop",
+          { method: "POST", headers: authHeaders(), signal: signal });
+      } catch (e) { if (e.name === "AbortError") throw e; }
+      const again = await startChatJob(base, signal, true);
+      if (!again.fallback) again.replaced = true;
+      return again;
+    }
+    // Same chat (a second device, a double send): watch the one in flight.
     if (d && d.job_id) return { jobId: d.job_id, attached: true };
   }
   if (!r.ok) throw new Error("Server returned " + r.status);
@@ -3169,7 +3199,10 @@ async function runAssistantTurn(opts) {
     el.innerHTML = "&#x1F50D; " + labels.map(escapeHtml).join("<br>");
     addBlock(el);
   };
+  let lastError = "";
   const addError = msg => {
+    if (msg === lastError) return;     // the stream and the job end both carry it
+    lastError = msg;
     flushRender();
     addBlock(Object.assign(document.createElement("div"),
       { className: "err-text", textContent: msg }));
@@ -3303,6 +3336,10 @@ async function runAssistantTurn(opts) {
         if (started.attached) {
           addBlock(Object.assign(document.createElement("div"),
             { className: "tool-status", textContent: "Attached to the reply already in flight." }));
+        }
+        if (started.replaced) {
+          addBlock(Object.assign(document.createElement("div"),
+            { className: "tool-status", textContent: "Stopped the reply still running in another chat." }));
         }
       }
     }
@@ -3450,6 +3487,10 @@ async function bootChatJob() {
     if (!r.ok) { scheduleChatReattach(); return; }
     const s = await r.json();
     chatReattachTries = 0;
+    // The user may have sent a new message while that request was out: this
+    // job is then no longer the page's business, and carrying on would wipe
+    // the new turn's bubble and replace the conversation under it.
+    if (isStreaming || localStorage.getItem(CHAT_JOB_KEY) !== id) return;
     if (s.status === "running") {
       reattachChat(id);                      // snapshot repaints what we missed
       return;

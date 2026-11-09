@@ -239,9 +239,23 @@ async def fetch(req: FetchRequest, request: Request):
         url = "https://" + url
 
     # Fetch page — safe_request validates the URL and every redirect hop
+    # Streamed, and cut off at the cap: read whole, a link to a multi-GB file
+    # was buffered in memory in full before the size check ever ran.
     try:
-        resp = await safe_request("GET", url, timeout=FETCH_TIMEOUT)
-        resp.raise_for_status()
+        resp = await safe_request("GET", url, timeout=FETCH_TIMEOUT, stream=True)
+        try:
+            resp.raise_for_status()
+            body = bytearray()
+            async for chunk in resp.aiter_bytes(65536):
+                body += chunk
+                if len(body) > MAX_FETCH_BYTES:
+                    raise HTTPException(
+                        413, f"Page too large (over {MAX_FETCH_BYTES // 1024} KB)")
+            content_type = resp.headers.get("content-type", "")
+            encoding = resp.encoding or "utf-8"
+            final_url = str(resp.url)
+        finally:
+            await resp.aclose()
     except HTTPException:
         raise
     except httpx.TimeoutException:
@@ -251,12 +265,10 @@ async def fetch(req: FetchRequest, request: Request):
     except Exception as e:
         raise HTTPException(502, f"Fetch failed: {e}")
 
-    # Size check
-    if len(resp.content) > MAX_FETCH_BYTES:
-        raise HTTPException(413, f"Page too large ({len(resp.content) // 1024} KB, max {MAX_FETCH_BYTES // 1024} KB)")
-
-    content_type = resp.headers.get("content-type", "")
-    html = resp.text
+    try:
+        html = bytes(body).decode(encoding, errors="replace")
+    except LookupError:                 # a charset name Python doesn't know
+        html = bytes(body).decode("utf-8", errors="replace")
 
     # PDF detection
     if "application/pdf" in content_type or url.lower().endswith(".pdf"):
@@ -278,7 +290,7 @@ async def fetch(req: FetchRequest, request: Request):
         result["text"] = result["text"][:max_chars] + "\n\n[...content truncated]"
 
     return {
-        "url": str(resp.url),  # may differ from request URL after redirects
+        "url": final_url,  # may differ from request URL after redirects
         "content_type": content_type,
         "text": result["text"],
         "title": result["title"],

@@ -264,11 +264,18 @@ def _resolve_model(tool: str, requested: str | None) -> str:
     return os.path.join(_models_dir(), requested)
 
 
+def _int_param(params: dict, key: str, default: int) -> int:
+    """A numeric setting; a missing key or an explicit null means the default
+    ({"seed": null} from a client used to be a TypeError and a 500)."""
+    value = params.get(key)
+    return default if value is None or value == "" else int(value)
+
+
 def _pipeline_kwargs(tool: str, model_path: str, params: dict,
                      image_path: str | None) -> dict:
     """Settings each model family needs, applied server-side."""
     prompt = (params.get("prompt") or "").strip()
-    seed = int(params.get("seed", -1))
+    seed = _int_param(params, "seed", -1)
     family = _family(model_path)
     if tool == "image":
         w, h = SIZES.get(params.get("size") or "square", SIZES["square"])
@@ -285,10 +292,10 @@ def _pipeline_kwargs(tool: str, model_path: str, params: dict,
         return kw
     if tool == "restore":
         return {"image_path": image_path, "prompt": prompt,
-                "upscale": int(params.get("upscale", 2))}
+                "upscale": _int_param(params, "upscale", 2)}
     if tool == "music":
         return {"prompt": prompt,
-                "duration_seconds": max(1, min(30, int(params.get("duration", 10))))}
+                "duration_seconds": max(1, min(30, _int_param(params, "duration", 10)))}
     if tool == "video":
         return {"prompt": prompt}
     if tool == "3d":
@@ -381,6 +388,13 @@ async def _run(job: dict, pipeline_type: str, model_path: str, kwargs: dict,
         for ptype in list(svc.get_loaded_pipelines()):
             if ptype != pipeline_type:
                 svc.unload_pipeline(ptype)
+        # Same tool, different model: unload that one too. load_pipeline
+        # reads an empty model path as "whatever is loaded", so a Classic
+        # (no AI model) restore after an AI one silently ran the AI
+        # pipeline again while the job said "classic".
+        cached = svc._cache.get(pipeline_type)
+        if cached is not None and cached.model_path != model_path:
+            svc.unload_pipeline(pipeline_type)
         return svc.run_pipeline(pipeline_type, model_path, kwargs=kwargs,
                                 progress_callback=progress, store_output=True)
 

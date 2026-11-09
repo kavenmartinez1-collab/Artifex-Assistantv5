@@ -96,20 +96,31 @@ def _check_ollama():
 
 def _check_dependencies():
     """Check key package versions."""
-    packages = [
-        "torch", "transformers", "bitsandbytes", "accelerate",
-        "diffusers", "safetensors", "Pillow", "PyQt6",
-        "colorama", "psutil", "huggingface_hub", "scipy",
-        "sentence_transformers", "faiss",
-    ]
+    # Read from the installed metadata, never by importing: importing pulled
+    # torch, transformers, diffusers, faiss and PyQt6 into a chat-only API
+    # process on the first phone connect (seconds, on the event loop), and
+    # "Pillow" is not an importable name at all, so it always read missing.
+    from importlib import metadata
+    packages = {
+        "torch": ("torch",), "transformers": ("transformers",),
+        "bitsandbytes": ("bitsandbytes",), "accelerate": ("accelerate",),
+        "diffusers": ("diffusers",), "safetensors": ("safetensors",),
+        "Pillow": ("pillow",), "PyQt6": ("PyQt6",),
+        "colorama": ("colorama",), "psutil": ("psutil",),
+        "huggingface_hub": ("huggingface_hub", "huggingface-hub"),
+        "scipy": ("scipy",),
+        "sentence_transformers": ("sentence-transformers",),
+        "faiss": ("faiss-cpu", "faiss-gpu", "faiss"),
+    }
     result = {}
-    for pkg in packages:
-        try:
-            mod = importlib.import_module(pkg.replace("-", "_"))
-            version = getattr(mod, "__version__", "installed")
-            result[pkg] = version
-        except ImportError:
-            result[pkg] = None  # not installed
+    for pkg, dists in packages.items():
+        result[pkg] = None  # not installed
+        for dist in dists:
+            try:
+                result[pkg] = metadata.version(dist)
+                break
+            except metadata.PackageNotFoundError:
+                continue
     return result
 
 
