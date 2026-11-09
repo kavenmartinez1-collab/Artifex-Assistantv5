@@ -1,6 +1,9 @@
 @echo off
 rem Artifex setup.
-rem   Double-click:        install Artifex (shows the plan, asks first)
+rem   Double-click:        install Artifex (shows the plan, asks first); once
+rem                        installed, a numbered menu: start it, add extras,
+rem                        phone access, exposure check
+rem   setup install        just the install, no menu
 rem   setup packs          list the optional extras
 rem   setup pack voice     add one (voice, vision, create, webgpu, ...)
 rem   setup remote check   is anything reachable that shouldn't be?
@@ -39,14 +42,10 @@ if not "%~1"=="" (
 title Artifex setup
 echo Using: %PY%
 echo.
-%PY% -m installer install
+rem First time: installs (shows the plan, asks first), then offers to start
+rem Artifex. After that: a numbered menu (start, extras, phone, check).
+%PY% -m installer menu
 if errorlevel 1 goto :failed
-echo.
-echo Done. Start Artifex by double-clicking "Artifex GUI.cmd" in this folder
-echo ^(or "Artifex CLI.cmd" for the terminal version^).
-echo Extras any time: in this folder's window type   setup packs
-echo.
-pause
 exit /b 0
 
 :failed

@@ -14,10 +14,13 @@ Rules, because an installer is exactly what a supply-chain attack aims at:
 """
 
 import hashlib
+import http.client
 import os
 import shutil
 import stat
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -74,9 +77,41 @@ def file_matches(path: str, size: int, sha256: str) -> bool:
     return sha256_file(path) == sha256.lower()
 
 
+class DownloadError(RuntimeError):
+    """The network gave out. The part already fetched is kept, so running the
+    same command again continues from there."""
+
+
+RETRIES = 5                 # tries per download before giving up for now
+_NO_RETRY = (400, 401, 403, 404, 410, 451)
+
+
+def _hash_prefix(part: str, size: int):
+    """(sha256 of what is already in `part`, its length), or a fresh hash and
+    0 when there is nothing usable to continue from."""
+    h = hashlib.sha256()
+    try:
+        have = os.path.getsize(part)
+    except OSError:
+        return h, 0
+    if not 0 < have < size:
+        return h, 0
+    with open(part, "rb") as f:
+        for block in iter(lambda: f.read(CHUNK), b""):
+            h.update(block)
+    return h, have
+
+
 def download(url: str, dest: str, size: int, sha256: str, allowed_hosts,
-             progress=None, opener=None) -> str:
-    """Fetch `url` to `dest` only if it matches the pinned size and SHA-256."""
+             progress=None, opener=None, sleep=time.sleep) -> str:
+    """Fetch `url` to `dest` only if it matches the pinned size and SHA-256.
+
+    A dropped connection is retried, and a download that still can't finish
+    keeps its .part file: the next run asks the server for the rest (an HTTP
+    Range request) instead of starting a multi-GB file over. The kept bytes
+    are hashed again first, so the SHA-256 checked at the end always covers
+    the whole file; a .part that was tampered with fails it and is deleted.
+    """
     if not host_allowed(url, allowed_hosts):
         raise VerifyError(f"refused: {url} is not https on an allowed host")
     if file_matches(dest, size, sha256):
@@ -84,34 +119,70 @@ def download(url: str, dest: str, size: int, sha256: str, allowed_hosts,
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     part = dest + ".part"
     opener = opener or urllib.request.build_opener(_AllowListRedirects(allowed_hosts))
-    h, got = hashlib.sha256(), 0
+    name = os.path.basename(dest)
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Artifex-Installer/1"})
-        with opener.open(req, timeout=60) as resp, open(part, "wb") as out:
-            if not host_allowed(resp.geturl(), allowed_hosts):
-                raise VerifyError("refused: download ended on a host that is not allowed")
-            while True:
-                block = resp.read(CHUNK)
-                if not block:
-                    break
-                got += len(block)
-                if got > size:
-                    raise VerifyError(f"{os.path.basename(dest)}: larger than the pinned "
-                                      f"{size} bytes; refused")
-                h.update(block)
-                out.write(block)
-                if progress:
-                    progress(got, size)
-        if got != size:
-            raise VerifyError(f"{os.path.basename(dest)}: got {got} bytes, expected {size}")
-        if h.hexdigest() != sha256.lower():
-            raise VerifyError(f"{os.path.basename(dest)}: SHA-256 does not match the pinned "
-                              "value. The file was deleted and nothing was installed.")
-        os.replace(part, dest)
-        return dest
-    finally:
+        last = None
+        for attempt in range(RETRIES):
+            if attempt:
+                sleep(min(2 ** attempt, 30))
+            h, got = _hash_prefix(part, size)
+            headers = {"User-Agent": "Artifex-Installer/1"}
+            if got:
+                headers["Range"] = f"bytes={got}-"
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with opener.open(req, timeout=60) as resp:
+                    if not host_allowed(resp.geturl(), allowed_hosts):
+                        raise VerifyError("refused: download ended on a host that is not allowed")
+                    # 206 = the server is sending only the rest. Anything else
+                    # is the whole file again: start the hash and file over.
+                    if got and getattr(resp, "status", 200) != 206:
+                        h, got = hashlib.sha256(), 0
+                    with open(part, "ab" if got else "wb") as out:
+                        if progress and got:
+                            progress(got, size)
+                        while True:
+                            block = resp.read(CHUNK)
+                            if not block:
+                                break
+                            got += len(block)
+                            if got > size:
+                                raise VerifyError(f"{name}: larger than the pinned "
+                                                  f"{size} bytes; refused")
+                            h.update(block)
+                            out.write(block)
+                            if progress:
+                                progress(got, size)
+            except VerifyError:
+                raise
+            except urllib.error.HTTPError as e:
+                if e.code == 416:          # our .part doesn't fit the server's file
+                    if os.path.exists(part):
+                        os.remove(part)
+                elif e.code in _NO_RETRY:
+                    raise DownloadError(f"{name}: the server answered HTTP {e.code}") from e
+                last = e
+                continue
+            except (OSError, http.client.HTTPException) as e:
+                last = e                   # dropped connection, timeout, DNS...
+                continue
+            if got < size:                 # closed early without an error
+                last = OSError(f"connection closed after {got} of {size} bytes")
+                continue
+            if h.hexdigest() != sha256.lower():
+                raise VerifyError(f"{name}: SHA-256 does not match the pinned "
+                                  "value. The file was deleted and nothing was installed.")
+            os.replace(part, dest)
+            return dest
+        raise DownloadError(
+            f"{name}: the download kept stopping ({last}). What was fetched so far is "
+            "kept; run the same command again and it continues from there.")
+    except VerifyError:
+        # Only a failed safety check throws the partial file away. A dropped
+        # network or a closed window (Ctrl+C) keeps it for the next run.
         if os.path.exists(part):
             os.remove(part)
+        raise
 
 
 def _member_is_link(info: zipfile.ZipInfo) -> bool:

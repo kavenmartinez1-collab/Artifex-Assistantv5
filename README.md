@@ -72,11 +72,20 @@ talking hologram avatar (Victoria, an original character) that answers out loud:
    - No Python? It fetches python.org's portable Python into the folder
      (checksum and signature verified), so you don't need to install anything
      yourself.
-3. **Start Artifex.** Double-click **Artifex GUI.cmd** in the same folder
-   (or **Artifex CLI.cmd** for the terminal version).
+   - Internet dropped, or you closed the window? Double-click `setup.cmd`
+     again: finished files are kept and a half-downloaded model continues
+     where it stopped.
+3. **Start Artifex.** Setup offers to start it as soon as it's done. Later,
+   double-click **Artifex GUI.cmd** in the same folder (or **Artifex CLI.cmd**
+   for the terminal version).
 
-**Optional extras**, any time later: in the Artifex folder, click the address
-bar at the top of the window, type `cmd`, press **Enter**, then type:
+**Optional extras**, any time later: double-click `setup.cmd` again. Once
+Artifex is installed it shows a short numbered menu (start Artifex, add an
+extra, phone access, exposure check); pick a number and it shows what it will
+do and asks before changing anything.
+
+Prefer typing? In the Artifex folder, click the address bar at the top of the
+window, type `cmd`, press **Enter**, then type:
 
 | Want to... | Type |
 |---|---|
@@ -93,24 +102,8 @@ bar at the top of the window, type `cmd`, press **Enter**, then type:
 Everything it downloads is pinned and checksum-verified, it needs no admin
 rights, and everything stays on 127.0.0.1 (your phone reaches it only over
 your private Tailscale network). Already have Python 3.11-3.13? `setup.cmd`
-uses it, and `python -m installer ...` works the same way. Details:
-[Setup Guide](#setup-guide).
-
-| Want to... | Type |
-|---|---|
-| See the extras | `python -m installer packs` |
-| Talk and listen (voice) | `python -m installer pack voice` |
-| Show it pictures | `python -m installer pack vision` |
-| Make images, music, 3D | `python -m installer pack create` |
-| Run AI in your web browser (Artifex Web, with LFM3) | `python -m installer pack webgpu` |
-| A bigger, smarter model on one 12 GB+ card + 32 GB RAM (Qwen3.8-Flash-Next on Strata) | `python -m installer pack strata` |
-| A talking hologram avatar on your phone (Holo tab, Orpheus + Piper voices, avatars from any photo) | `python -m installer pack holo` |
-| Use it from your phone, safely | `python -m installer remote setup` |
-| Check nothing is exposed to the internet | `python -m installer remote check` |
-
-Everything it downloads is pinned and checksum-verified, it needs no admin
-rights, and everything stays on 127.0.0.1 (your phone reaches it only over
-your private Tailscale network). Details: [Setup Guide](#setup-guide).
+uses it, and `python -m installer ...` works the same way (`setup pack voice`
+is `python -m installer pack voice`). Details: [Setup Guide](#setup-guide).
 
 ---
 
@@ -257,14 +250,22 @@ Python environment (no PyTorch), and launchers. It needs only Python 3.11 to
 under this folder. About a minute plus the model download.
 
 Easiest: double-click **setup.cmd** (it finds your Python, or fetches a
-pinned portable one into `python\`, then runs `install`). Or by hand:
+pinned portable one into `python\`, then runs `menu`: the install the first
+time, a numbered menu of everything below after that). Or by hand:
 
 ```bash
 git clone <repo-url> && cd <repo>
 python -m installer probe      # what this PC has (no network)
 python -m installer plan       # what it would install, and why
 python -m installer install    # shows the plan, asks, then installs
+python -m installer menu       # install if needed, then the numbered menu
 ```
+
+Downloads retry on a dropped connection and resume: an interrupted run keeps
+its `.part` file and the next run fetches only the rest. The SHA-256 check
+still covers the whole file, so a resumed download is verified exactly like a
+fresh one. An environment that a stopped run left half-installed is finished
+by the next run instead of being treated as yours.
 
 Then double-click **Artifex CLI.cmd**, **Artifex GUI.cmd**, or
 **Artifex API (this PC only).cmd**.

@@ -160,6 +160,7 @@ PYTORCH_INDEX = "https://download.pytorch.org/whl/cu128"
 ALLOWED_EXTRA_INDEXES = (PYTORCH_INDEX,)
 SUPPORTED_PYTHON = ((3, 11), (3, 13))   # wheels in the locks cover these
 INSTALLER_MARKER = "artifex-installer.txt"
+UNFINISHED_MARKER = "artifex-installer-unfinished.txt"
 GATEWAY_URL = "http://127.0.0.1:8080"   # the web-search pack's gateway (loopback only)
 
 
@@ -227,7 +228,12 @@ def install_env(root: str, gui: bool = True, log=print, run=subprocess.run) -> s
     venv = os.path.join(os.path.abspath(root), "venv")
     py = os.path.join(venv, "Scripts", "python.exe") if os.name == "nt" \
         else os.path.join(venv, "bin", "python")
-    if os.path.exists(venv):
+    unfinished = os.path.join(venv, UNFINISHED_MARKER)
+    # A venv this installer started but didn't finish (pip was interrupted, the
+    # network dropped) is its own to complete; without this it would be "kept"
+    # forever with packages missing and the launchers would never start.
+    resuming = os.path.isfile(unfinished)
+    if os.path.exists(venv) and not resuming:
         log(f"keeping your existing Python environment {venv} (not modified)")
         return py
     if not python_ok():
@@ -235,9 +241,17 @@ def install_env(root: str, gui: bool = True, log=print, run=subprocess.run) -> s
             f"Python {sys.version_info[0]}.{sys.version_info[1]} is not supported here; "
             f"use {SUPPORTED_PYTHON[0][0]}.{SUPPORTED_PYTHON[0][1]} to "
             f"{SUPPORTED_PYTHON[1][0]}.{SUPPORTED_PYTHON[1][1]}")
-    log(f"creating {venv}")
-    run([sys.executable, "-m", "venv", venv], check=True)
-    cmd = [py, "-m", "pip", "install", "--isolated", "--require-hashes",
+    # The marker goes in before anything else, so a run that dies at any
+    # later point is still recognised as ours.
+    os.makedirs(venv, exist_ok=True)
+    with open(unfinished, "w", encoding="utf-8") as f:
+        f.write("python -m installer started this environment and has not finished it\n")
+    if resuming and os.path.isfile(py):
+        log(f"finishing the Python environment {venv} that an earlier run started")
+    else:
+        log(f"creating {venv}")
+        run([sys.executable, "-m", "venv", venv], check=True)
+    cmd =[py, "-m", "pip", "install", "--isolated", "--require-hashes",
            "--only-binary=:all:", "--no-input", "--disable-pip-version-check",
            "-r", LOCKS["core"]]
     if gui:
@@ -246,9 +260,9 @@ def install_env(root: str, gui: bool = True, log=print, run=subprocess.run) -> s
     run(cmd, check=True)
     # Marks the venv as the installer's own: packs may add their locked
     # packages to it, but never to a venv someone built by hand.
-    os.makedirs(venv, exist_ok=True)
     with open(os.path.join(venv, INSTALLER_MARKER), "w", encoding="utf-8") as f:
         f.write("created by python -m installer; packs may add hash-locked packages here\n")
+    os.remove(unfinished)
     return py
 
 
@@ -280,6 +294,38 @@ def write_launchers(root: str, model_id: str, gui: bool = True) -> list:
             f.write("\n".join(lines) + "\n")
         written.append(path)
     return written
+
+
+def is_installed(root: str) -> bool:
+    """Core chat is in place: a finished environment and at least one model."""
+    root = os.path.abspath(root)
+    py = venv_python(root)
+    venv = os.path.dirname(os.path.dirname(py))
+    if not os.path.isfile(py) or os.path.isfile(os.path.join(venv, UNFINISHED_MARKER)):
+        return False
+    try:
+        with open(os.path.join(root, "llama_cpp_config.json"), encoding="utf-8") as f:
+            return bool(json.load(f).get("models"))
+    except (OSError, ValueError):
+        return False
+
+
+def has_gui(root: str) -> bool:
+    return os.path.isfile(os.path.join(os.path.abspath(root), "Artifex GUI.cmd"))
+
+
+def start_app(root: str, gui: bool = True, popen=subprocess.Popen):
+    """Start Artifex the way its launchers do (same folder, same two settings),
+    as a direct process: no cmd.exe and nothing typed by the user in between."""
+    root = os.path.abspath(root)
+    py = venv_python(root)
+    env = dict(os.environ, ARTIFEX_BACKEND="llama_cpp", WEB_GATEWAY_URL=GATEWAY_URL)
+    if gui:
+        pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
+        return popen([pyw if os.path.isfile(pyw) else py, "main_gui_qt.py"], cwd=root, env=env)
+    # The terminal version gets a window of its own, so setup can close.
+    return popen([py, "main.py"], cwd=root, env=env,
+                 creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
 
 
 def write_phone_launcher(root: str, port: int = 8000, model_id: str = None) -> str:
@@ -335,8 +381,22 @@ def install_core(pl: dict, catalog: dict, reuse_dirs=None, force=False, log=prin
                        progress=progress)
         log("  checksum OK")
     # 3. Smoke-test the (verified) server binary, then register the model.
-    out = subprocess.run([pl["server_exe"], "--version"], capture_output=True,
-                         text=True, timeout=60)
+    try:
+        out = subprocess.run([pl["server_exe"], "--version"], capture_output=True,
+                             text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("llama-server didn't answer within a minute; the model was not "
+                           "registered. Run this again, or try --variant vulkan or cpu.")
+    if out.returncode != 0:
+        # Registering a server that can't start would only move the failure
+        # to the first chat, with a far less clear message.
+        code = out.returncode & 0xFFFFFFFF
+        why = ("Windows couldn't find a DLL it needs (0xC0000135). On a fresh Windows that "
+               "is usually the Microsoft Visual C++ Redistributable (x64): install it from "
+               "Microsoft, then run this again."
+               if code == 0xC0000135 else
+               f"it exited with code {code:#x}. Try --variant vulkan or --variant cpu.")
+        raise RuntimeError(f"llama-server ({pl['variant']}) doesn't start on this PC: {why}")
     version = (out.stdout + out.stderr).strip().splitlines()
     log("llama-server: " + (next((l for l in version if "version" in l.lower()), "")
                             or "(no version line)"))

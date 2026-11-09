@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import zipfile
 
 import pytest
@@ -124,6 +125,82 @@ def test_existing_identical_file_is_not_downloaded_again(tmp_path):
             raise AssertionError("must not download")
     fetch.download("https://huggingface.co/x", str(dest), len(data), _sha(data), HOSTS,
                    opener=Boom())
+
+
+# ── resume and retry ────────────────────────────────────────────────────────
+
+class _Flaky:
+    """Serves `data`, honouring Range, but drops each connection after `per`
+    bytes; `fail_first` opens raise outright."""
+    def __init__(self, data, per, ranges=True, fail_first=0):
+        self.data, self.per, self.ranges, self.fail_first = data, per, ranges, fail_first
+        self.requests = []
+
+    def open(self, req, timeout=None):
+        rng = req.get_header("Range")
+        self.requests.append(rng)
+        if self.fail_first:
+            self.fail_first -= 1
+            raise OSError("connection reset")
+        start = int(rng[6:-1]) if (rng and self.ranges) else 0
+        resp = _Resp(self.data[start:start + self.per], "https://huggingface.co/x")
+        resp.status = 206 if (rng and self.ranges) else 200
+        return resp
+
+
+def test_a_dropped_download_continues_instead_of_starting_over(tmp_path):
+    data = bytes(range(256)) * 40
+    dest = str(tmp_path / "m.gguf")
+    srv = _Flaky(data, per=4000)
+    fetch.download("https://huggingface.co/x", dest, len(data), _sha(data), HOSTS,
+                   opener=srv, sleep=lambda s: None)
+    assert open(dest, "rb").read() == data and not os.path.exists(dest + ".part")
+    assert srv.requests == [None, "bytes=4000-", "bytes=8000-"]
+
+
+def test_a_download_that_keeps_failing_leaves_its_part_for_next_time(tmp_path):
+    data = b"z" * 9000
+    dest = str(tmp_path / "m.gguf")
+    with pytest.raises(fetch.DownloadError, match="continues from there"):
+        fetch.download("https://huggingface.co/x", dest, len(data), _sha(data), HOSTS,
+                       opener=_Flaky(data, per=1000), sleep=lambda s: None)
+    assert os.path.getsize(dest + ".part") == 1000 * fetch.RETRIES and not os.path.exists(dest)
+    # The next run asks only for the rest, and the whole file still verifies.
+    srv = _Flaky(data, per=9000)
+    fetch.download("https://huggingface.co/x", dest, len(data), _sha(data), HOSTS,
+                   opener=srv, sleep=lambda s: None)
+    assert srv.requests == [f"bytes={1000 * fetch.RETRIES}-"]
+    assert open(dest, "rb").read() == data
+
+
+def test_a_tampered_part_file_cannot_get_past_the_hash(tmp_path):
+    data = b"good" * 1000
+    dest = str(tmp_path / "m.gguf")
+    with open(dest + ".part", "wb") as f:
+        f.write(b"evil" * 500)                       # same length as the real first half
+    with pytest.raises(VerifyError, match="SHA-256"):
+        fetch.download("https://huggingface.co/x", dest, len(data), _sha(data), HOSTS,
+                       opener=_Flaky(data, per=len(data)), sleep=lambda s: None)
+    assert not os.path.exists(dest) and not os.path.exists(dest + ".part")
+
+
+def test_a_server_without_range_support_starts_the_file_over(tmp_path):
+    data = b"abc" * 1000
+    dest = str(tmp_path / "m.gguf")
+    with open(dest + ".part", "wb") as f:
+        f.write(b"stale bytes")
+    fetch.download("https://huggingface.co/x", dest, len(data), _sha(data), HOSTS,
+                   opener=_Flaky(data, per=len(data), ranges=False), sleep=lambda s: None)
+    assert open(dest, "rb").read() == data
+
+
+def test_a_refused_connection_is_retried(tmp_path):
+    data = b"q" * 100
+    dest = str(tmp_path / "a.zip")
+    srv = _Flaky(data, per=100, fail_first=2)
+    fetch.download("https://github.com/x", dest, len(data), _sha(data), HOSTS,
+                   opener=srv, sleep=lambda s: None)
+    assert len(srv.requests) == 3 and open(dest, "rb").read() == data
 
 
 # ── unzip ───────────────────────────────────────────────────────────────────
@@ -300,6 +377,93 @@ def test_env_never_touches_an_existing_venv(tmp_path):
     recipes.install_env(str(tmp_path), log=lambda *a: None, run=boom)
 
 
+def test_an_interrupted_env_is_finished_on_the_next_run(tmp_path):
+    def pip_dies(cmd, check):
+        if "pip" in cmd:
+            raise subprocess.CalledProcessError(1, cmd)
+    with pytest.raises(subprocess.CalledProcessError):
+        recipes.install_env(str(tmp_path), log=lambda *a: None, run=pip_dies)
+    venv = tmp_path / "venv"
+    assert (venv / recipes.UNFINISHED_MARKER).exists()
+    assert not (venv / recipes.INSTALLER_MARKER).exists()
+    assert not recipes.is_installed(str(tmp_path))
+    calls = []
+    recipes.install_env(str(tmp_path), log=lambda *a: None, run=lambda cmd, check: calls.append(cmd))
+    assert any("pip" in c for c in calls)            # it was NOT "kept, not modified"
+    assert (venv / recipes.INSTALLER_MARKER).exists()
+    assert not (venv / recipes.UNFINISHED_MARKER).exists()
+
+
+def test_a_server_that_cannot_start_is_not_registered(tmp_path, monkeypatch):
+    pl = {"server_exe": str(tmp_path / "llama-server.exe"), "server_dir": str(tmp_path),
+          "variant": "cuda-13.4", "backend_files": [], "download_dir": str(tmp_path),
+          "model": {"file": "m.gguf", "size": 1, "sha256": "0" * 64, "repo": "r", "id": "m"},
+          "model_url": "https://huggingface.co/x", "model_path": str(tmp_path / "m.gguf"),
+          "config_path": str(tmp_path / "llama_cpp_config.json")}
+    open(pl["server_exe"], "w").close()
+    monkeypatch.setattr(recipes.fetch, "download", lambda *a, **k: None)
+    monkeypatch.setattr(recipes.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+        a, 0xC0000135 - (1 << 32), "", ""))
+    with pytest.raises(RuntimeError, match="Visual C\\+\\+ Redistributable"):
+        recipes.install_core(pl, {"allowed_hosts": HOSTS}, log=lambda *a: None)
+    assert not os.path.exists(pl["config_path"])
+
+
+# ── the double-click menu ───────────────────────────────────
+
+def _answers(monkeypatch, *lines):
+    it = iter(lines)
+    def fake_input(prompt=""):
+        try:
+            return next(it)
+        except StopIteration:
+            raise EOFError
+    monkeypatch.setattr("builtins.input", fake_input)
+
+
+def test_menu_installs_first_and_a_no_is_not_a_failure(tmp_path, monkeypatch):
+    from installer import __main__ as cli
+    ran = []
+    _answers(monkeypatch)                            # nothing typed at all
+    assert cli._menu(str(tmp_path), main_fn=lambda argv: ran.append(argv) or 1) == 0
+    assert ran == [["install", "--root", str(tmp_path)]]
+    # A real failure is passed on, so setup.cmd says it did not finish.
+    assert cli._menu(str(tmp_path), main_fn=lambda argv: 5) == 5
+
+
+def test_menu_choices_run_the_ordinary_commands(tmp_path, monkeypatch):
+    from installer import __main__ as cli
+    from installer import packs
+    monkeypatch.setattr(recipes, "is_installed", lambda root: True)
+    started = []
+    monkeypatch.setattr(recipes, "start_app", lambda root, gui=True: started.append(gui))
+    ran = []
+    voice = str(list(packs.PACKS).index("voice") + 1)
+    _answers(monkeypatch, "3", voice, "3", "nope", "5", "1", "2", "9", "")
+    assert cli._menu(str(tmp_path), main_fn=lambda argv: ran.append(argv) or 0) == 0
+    root = str(tmp_path)
+    assert ran == [["pack", "voice", "--root", root], ["remote", "check", "--root", root]]
+    assert started == [False]                        # no GUI launcher here, so "1" does nothing
+
+
+def test_questions_survive_a_closed_input(monkeypatch):
+    from installer import __main__ as cli
+    _answers(monkeypatch)
+    assert cli._ask("Install this?") is False and cli._ask("Start?", default=True) is False
+    _answers(monkeypatch, "", "", "Y", "n")
+    assert cli._ask("a") is False and cli._ask("b", default=True) is True
+    assert cli._ask("c") is True and cli._ask("d", default=True) is False
+
+
+def test_start_app_runs_the_venv_directly_and_locally(tmp_path):
+    calls = []
+    recipes.start_app(str(tmp_path), gui=False, popen=lambda cmd, **kw: calls.append((cmd, kw)))
+    cmd, kw = calls[0]
+    assert cmd == [recipes.venv_python(str(tmp_path)), "main.py"] and kw["cwd"] == str(tmp_path)
+    assert kw["env"]["ARTIFEX_BACKEND"] == "llama_cpp" and "shell" not in kw
+    assert kw["env"]["WEB_GATEWAY_URL"].startswith("http://127.0.0.1:")
+
+
 def test_python_version_gate():
     assert recipes.python_ok((3, 11)) and recipes.python_ok((3, 13))
     assert not recipes.python_ok((3, 9)) and not recipes.python_ok((3, 14))
@@ -344,7 +508,7 @@ def test_bootstrap_scripts_verify_and_never_pipe_to_a_shell():
         for bad in ("invoke-expression", "iex ", "| iex", "downloadstring", "curl ", "bitsadmin",
                     "-encodedcommand", "start-process -verb runas"):
             assert bad not in low, bad
-    assert "-m installer install" in cmd and "-m installer %*" in cmd and r'installer\get-python.ps1' in cmd
+    assert "-m installer menu" in cmd and "-m installer %*" in cmd and r'installer\get-python.ps1' in cmd
     # The ps1 takes every pin from catalog.json and checks all three gates.
     assert "bootstrap_python" in ps1
     assert "Get-FileHash -Algorithm SHA512" in ps1 and "$pin.size" in ps1
