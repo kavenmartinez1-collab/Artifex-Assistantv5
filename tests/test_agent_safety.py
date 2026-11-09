@@ -187,7 +187,8 @@ class TestFindGitRoot(unittest.TestCase):
         here = os.path.dirname(os.path.abspath(__file__))
         root = _find_git_root(here)
         self.assertIsNotNone(root)
-        self.assertTrue(os.path.isdir(os.path.join(root, ".git")))
+        # exists, not isdir: in a git worktree .git is a file
+        self.assertTrue(os.path.exists(os.path.join(root, ".git")))
 
     def test_returns_none_for_no_repo(self):
         from tools.agent_tools import _find_git_root

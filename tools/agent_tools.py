@@ -2544,10 +2544,11 @@ def run_edit_file(content):
 # ─── Git commit-per-edit (P3-T15) ──────────────────────────────────────────
 
 def _find_git_root(path: str) -> str | None:
-    """Walk up from path to find the .git directory. Returns repo root or None."""
+    """Walk up from path to find the repo root (the folder holding .git), or None."""
     d = os.path.abspath(path)
     for _ in range(50):
-        if os.path.isdir(os.path.join(d, ".git")):
+        # A directory in a normal clone; a FILE in a worktree or submodule.
+        if os.path.exists(os.path.join(d, ".git")):
             return d
         parent = os.path.dirname(d)
         if parent == d:
