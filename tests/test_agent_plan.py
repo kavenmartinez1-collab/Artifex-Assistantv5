@@ -72,3 +72,25 @@ def test_failed_step_marks_run_incomplete():
                      empty_round_no_think=False)
     res = r.run("goal", [])
     assert res.status != "done"
+
+
+def test_message_sent_during_a_step_reaches_the_later_steps():
+    from core.agent_loop import RunControl
+    events = []
+    # Step 1 gets a second round: the message arrived during its first one.
+    r, eng = _runner(["PLAN:\n1. do A\n2. do B", '@done("did A")',
+                      '@done("did A, with tabs")', '@done("did B")'], events)
+    control = r.control = RunControl()
+    # Arrives while step 1 is generating; step 1's own history is thrown away.
+    real = eng.generate_streaming
+
+    def gen(messages, max_tokens, temperature, on_token=None, **kw):
+        if len(eng.calls) == 1:
+            control.inject_message("use tabs, not spaces")
+        return real(messages, max_tokens, temperature, on_token, **kw)
+
+    eng.generate_streaming = gen
+    assert r.run("goal text", []).status == "done"
+    step2 = "\n".join(m["content"] for m in eng.calls[-1])
+    assert "step 2 of 2: do B" in step2
+    assert "use tabs, not spaces" in step2

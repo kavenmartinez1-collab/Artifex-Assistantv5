@@ -793,7 +793,16 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
                     return {"queued": True, "run_id": run.id, "status": run.status,
                             "answered_approval": taken}
                 run.control.inject_message(text)
-                return {"queued": True, "run_id": run.id, "status": run.status}
+                out = {"queued": True, "run_id": run.id, "status": run.status}
+                first_turn = not any(e.get("kind") == "done" for e in run.events)
+                if first_turn and run.config.attempts > 1:
+                    out["note"] = ("Best-of-N run: your message reaches the attempt "
+                                   "in progress only, not the other attempts.")
+                elif first_turn and run.config.plan != "off":
+                    out["note"] = ("Plan-first run: your message reaches the step in "
+                                   "progress and is passed on to the later steps; "
+                                   "it does not rewrite the plan.")
+                return out
 
         # Reviving: put the run's own model back first — a chat on another
         # model may have swapped it out since the run finished.

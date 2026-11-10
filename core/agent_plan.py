@@ -134,6 +134,10 @@ def _run_steps(runner, goal, history, steps, plan_text, host_emit) -> RunResult:
     used = 0
     reports: List[str] = []
     statuses: List[str] = []
+    # What the user says while a step runs lands in that step's own (thrown
+    # away) history. Carry it to the steps that follow, or they would go on
+    # as if nothing had been said.
+    said_from = len(runner._steer_log)
     for k, step in enumerate(steps, 1):
         if runner.control.stop_requested:
             statuses.append("stopped:user")
@@ -147,6 +151,10 @@ def _run_steps(runner, goal, history, steps, plan_text, host_emit) -> RunResult:
             break
         before = list(runner._verifier.edited) if runner._verifier else []
         progress = ("Done so far:\n" + "\n".join(reports) + "\n\n") if reports else ""
+        said = runner._steer_log[said_from:]
+        if said:
+            progress += ("The user said this while the earlier steps ran - follow it:\n"
+                         + "\n".join(f"- {s}" for s in said) + "\n\n")
         sub_goal = _STEP_GOAL.format(goal=goal.strip(), n=n, plan=plan_text,
                                      progress=progress, k=k, step=step)
         runner.emit(AgentEvent("step", text=f"step {k}/{n}: {step}"))
