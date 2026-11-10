@@ -438,6 +438,13 @@ def test_api_message_during_a_pause_continues_with_the_text():
         Decision.APPROVE, "go on, but slower")
 
 
+def test_api_stop_typed_at_a_pause_stops_the_run():
+    run = _api_run()
+    _answer_later(run, lambda: run.answer_with_message("Stop"))
+    assert run.request_approval(None, None, "human gate: 10 actions")[0] == Decision.STOP
+    assert run.control.stop_requested
+
+
 def test_api_message_with_nothing_pending_is_not_an_answer():
     assert _api_run().answer_with_message("hello") is None
 

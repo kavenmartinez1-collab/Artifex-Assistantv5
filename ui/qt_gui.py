@@ -2711,6 +2711,12 @@ class ArtifexMainWindow(QMainWindow):
         card = self._auto_card
         if card is not None and not card.answered and self._auto_worker:
             gate = card.is_gate
+            if gate and text.lower() in ("stop", "s", "n", "no", "cancel", "abort", "halt"):
+                # "stop" typed at a pause means stop, not "carry on and stop".
+                self._auto_pending.pop()
+                self._auto_view.remove_item(bubble)
+                self._on_auto_stop()
+                return
             card.mark("continued" if gate else "denied")
             self._auto_card = None
             self._auto_worker.resolve(Decision.APPROVE if gate else Decision.DENY, text)

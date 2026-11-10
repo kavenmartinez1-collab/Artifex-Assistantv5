@@ -94,6 +94,8 @@ _EVENT_TEXT_CAP = 8000       # chars of any single text field kept per event
 _MAX_EVENTS = 6000           # events kept per run; the oldest are dropped past it
 _EVENT_TRIM = 1000           # how many go at once when the cap is hit
 _THINK_RUN_CHARS = 400_000   # think-block text kept per run, across all rounds
+# Typed at a gate/breaker pause, these stop the run rather than continue it.
+_STOP_WORDS = ("stop", "s", "n", "no", "cancel", "abort", "halt")
 
 _runs: dict[str, "AgentRun"] = {}
 _runs_lock = threading.Lock()
@@ -367,7 +369,12 @@ class AgentRun:
             pending = self.pending_approval
         if pending is None:
             return None
-        decision = "deny" if pending.get("action") else "approve"
+        if pending.get("action"):
+            decision = "deny"
+        elif text.strip().lower() in _STOP_WORDS:
+            decision, text = "stop", ""     # "stop" at a pause means stop
+        else:
+            decision = "approve"
         return decision if self.answer_approval(decision, text) else None
 
     def finish(self, status: str, summary: str = ""):
