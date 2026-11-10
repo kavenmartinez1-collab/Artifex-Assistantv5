@@ -15,7 +15,8 @@
     GET  /v1/agent/runs/{id}            snapshot (status + pending approval)
     GET  /v1/agent/runs/{id}/events     SSE event feed (?since=<index>)
     POST /v1/agent/runs/{id}/approval   {"decision": approve|always|deny|stop}
-    POST /v1/agent/runs/{id}/stop       abort the run
+    POST /v1/agent/runs/{id}/message    steer a working run / continue a finished one
+    POST /v1/agent/runs/{id}/stop       interrupt the turn
 
   The streaming UI (thinking collapse, tool-status blocks, segment reset
   after tools) is ported from Kbot Web Suite's assistant page, adapted from
@@ -335,7 +336,7 @@
     font-weight: 700; font-size: 15px; padding: 0 16px;
     min-height: var(--tap); min-width: 66px; flex: none;
   }
-  #send-btn.stop { background: var(--err); color: #fff; }
+  #send-btn.stop, #agent-send.stop { background: var(--err); color: #fff; }
   #send-btn:disabled, #agent-send:disabled { opacity: .45; }
 
   /* ── Agent view ─────────────────────────────────────── */
@@ -354,22 +355,10 @@
     min-height: var(--tap); display: flex; align-items: center;
   }
   #agent-setup > summary::-webkit-details-marker { display: none; }
-  #agent-goal {
-    width: 100%; background: var(--panel2); border: 1px solid var(--border);
-    color: var(--text); border-radius: 10px; padding: 11px;
-    font: 16px/1.4 inherit; resize: vertical; min-height: 78px;   /* 16px: no zoom */
-  }
-  #agent-goal:focus { outline: none; border-color: var(--accent); }
-  #agent-start {
-    width: 100%; margin-top: 10px; border: none; border-radius: 10px;
-    background: var(--accent); color: var(--on-accent); font-weight: 700;
-    font-size: 15px; padding: 0 12px; min-height: 48px;
-  }
-  #agent-start:disabled { opacity: .4; }
-  /* Two stacked rows: status + Stop, then the follow-up composer (which
-     appears as soon as a run exists and stays after it ends — a finished
-     run is revivable in place). One padded container so the home-indicator
-     inset is applied once. */
+  /* Two stacked rows: the status line (spinner, what it is doing, elapsed
+     time, tokens), then the composer, which is always there: it starts a
+     conversation, steers a working one and continues a finished one. One
+     padded container so the home-indicator inset is applied once. */
   #agent-bar {
     display: flex; flex-direction: column; align-items: stretch; gap: 7px;
     flex: none;
@@ -383,131 +372,113 @@
     flex: 1; min-width: 0; font-size: 12px; color: var(--dim);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  #agent-stop {
-    border: 1px solid rgba(255,59,92,.5); background: rgba(255,59,92,.12);
-    color: var(--err); border-radius: 10px; padding: 0 18px;
-    font-size: 14px; font-weight: 600; flex: none;
-    min-height: var(--tap); min-width: 92px;
+  #agent-new {
+    border: 1px solid var(--border); background: var(--panel2); color: var(--dim);
+    border-radius: 10px; padding: 0 12px; font-size: 12px; flex: none;
+    min-height: 32px;
   }
-  /* Sits ABOVE #agent-bar in the same flex column, so the two can never
-     overlap however tall the pending action is; only the text panes scroll,
-     keeping the three buttons on screen at all times. */
-  #approval {
-    flex: none; margin: 0;
-    padding: 10px calc(var(--gut) + var(--sar)) 10px calc(var(--gut) + var(--sal));
-    background: rgba(252,238,10,.09); border-top: 2px solid var(--warn);
+  .spin {
+    flex: none; width: 11px; height: 11px; border-radius: 50%;
+    border: 2px solid var(--accent); border-top-color: transparent;
+    animation: agspin .8s linear infinite;
   }
-  #approval .ap-t {
+  @keyframes agspin { to { transform: rotate(360deg); } }
+  /* The approval prompt is a card IN the conversation, right under the tool
+     row it is about; only its text panes scroll, so the buttons stay on
+     screen however long the request is. Once answered it shrinks to its
+     title line. */
+  .ap-card {
+    padding: 10px 11px; border-radius: 10px;
+    background: rgba(252,238,10,.09); border: 1px solid rgba(252,238,10,.3);
+    border-top: 2px solid var(--warn);
+  }
+  .ap-card.answered { padding: 5px 11px; border-top-width: 1px; opacity: .7; }
+  .ap-card.answered .ap-t { margin: 0; animation: none; }
+  .ap-card.answered .ap-what, .ap-card.answered .ap-why,
+  .ap-card.answered .ap-btns { display: none; }
+  .ap-card .ap-t {
     font-size: 11px; letter-spacing: 1.5px; color: var(--warn); margin-bottom: 6px;
   }
-  #approval .ap-what {
+  .ap-card .ap-what {
     font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; white-space: pre-wrap;
     max-height: 30dvh; overflow-y: auto; -webkit-overflow-scrolling: touch;
     margin-bottom: 3px;
   }
-  #approval .ap-why {
+  .ap-card .ap-why {
     font-size: 12px; color: var(--dim); margin-bottom: 9px;
     overflow-wrap: anywhere; max-height: 12dvh; overflow-y: auto;
   }
-  #approval .ap-btns { display: flex; gap: 8px; }
-  #approval .ap-btns button {
+  .ap-card .ap-btns { display: flex; gap: 8px; }
+  .ap-card .ap-btns button {
     flex: 1; min-width: 0; border-radius: 10px; padding: 0 4px;
     min-height: 46px; font-size: 14px;
     font-weight: 600; border: 1px solid var(--border); background: var(--panel2);
     color: var(--text);
   }
-  #approval .ap-btns button.go { background: var(--ok); border-color: var(--ok); color: var(--on-accent); }
-  #approval .ap-btns button.no { color: var(--err); border-color: rgba(255,59,92,.45); }
+  .ap-card .ap-btns button.go { background: var(--ok); border-color: var(--ok); color: var(--on-accent); }
+  .ap-card .ap-btns button.no { color: var(--err); border-color: rgba(255,59,92,.45); }
 
   .ev { margin: 0 0 9px; font-size: 13.5px; }
-  .ev-round {
-    display: flex; align-items: center; gap: 9px; color: var(--dim);
-    font-size: 10.5px; letter-spacing: 2px; margin: 16px 0 10px;
-  }
-  .ev-round:before, .ev-round:after { content: ""; flex: 1; height: 1px; background: var(--border); }
   .ev-note {
     font-size: 12.5px; color: var(--dim); padding: 5px 2px; overflow-wrap: anywhere;
   }
   .ev-note.warn { color: var(--warn); }
   .ev-note.bad { color: var(--err); }
   .ev-note.good { color: var(--ok); }
-  .ev-msg {
-    background: var(--panel); border: 1px solid var(--border);
-    border-radius: 10px; padding: 9px 11px; overflow-wrap: anywhere;
-  }
-  /* Follow-up the user sent into the run. Right-aligned and plain text, so
-     it reads the same as a user turn in the chat tab. */
-  .ev-user {
-    margin: 0 0 9px auto; max-width: 88%;
-    background: var(--user); border: 1px solid rgba(255,42,109,.45);
-    border-radius: 12px; padding: 9px 11px;
-    white-space: pre-wrap; overflow-wrap: anywhere;
-  }
-  .ev-user.pending { opacity: .55; border-style: dashed; }
-  .ev-user .q {
+  /* The agent conversation uses the chat tab's bubbles (.msg / .body) and
+     thinking fold; these are the agent-only pieces. */
+  #agent-feed .msg { margin-bottom: 10px; }
+  #agent-feed .msg-user .body { white-space: normal; }
+  #agent-feed .msg.pending .body { opacity: .55; border-style: dashed; }
+  #agent-feed .msg .q {
     display: block; margin-top: 4px; font-size: 10.5px;
     letter-spacing: 1px; color: var(--dim);
   }
-  .ev-stream {
-    background: var(--panel); border: 1px dashed var(--border);
-    border-radius: 10px; padding: 9px 11px;
+  #agent-feed details.thinking.ev { margin: 0 0 9px; }
+  .live-txt { white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* One collapsed line per tool call: state, tool, what it was asked, how it
+     went. The full request and the output are inside the fold. */
+  .trow {
+    margin: 0 0 5px 3px; padding: 0 0 0 9px; font-size: 12.5px;
+    border-left: 2px solid var(--dim);
   }
-  .ev-stream .live-txt { white-space: pre-wrap; overflow-wrap: anywhere; }
-  .ev-final {
-    border: 1px solid var(--border); border-left: 3px solid var(--ok);
-    border-radius: 10px; padding: 9px 11px; background: var(--panel);
+  .trow.r-SAFE, .trow.r-LOW { border-left-color: var(--ok); }
+  .trow.r-MEDIUM { border-left-color: var(--warn); }
+  .trow.r-HIGH { border-left-color: var(--orange); }
+  .trow.r-CRITICAL { border-left-color: var(--err); }
+  .trow > summary {
+    list-style: none; cursor: pointer; display: flex; flex-wrap: wrap;
+    align-items: center; gap: 4px 8px; min-height: 38px;
   }
-  .ev-final.bad { border-left-color: var(--err); }
-  .ev-final .ft { font-size: 11px; letter-spacing: 1.5px; color: var(--dim); margin-bottom: 5px; }
-  .chip {
-    display: flex; gap: 9px; align-items: flex-start;
-    background: var(--panel); border: 1px solid var(--border);
-    border-left: 3px solid var(--dim); border-radius: 10px; padding: 9px 10px;
-    max-width: 100%;
+  .trow > summary::-webkit-details-marker { display: none; }
+  .trow .tst { flex: none; width: 16px; text-align: center; color: var(--dim); }
+  .trow .tst.run { color: var(--accent); animation: pulse 1.2s infinite; }
+  .trow .tst.ok { color: var(--ok); }
+  .trow .tst.bad { color: var(--err); }
+  .trow .tty {
+    flex: none; font-size: 10.5px; letter-spacing: 1px; text-transform: uppercase;
+    color: var(--accent);
   }
-  .chip.r-SAFE, .chip.r-LOW { border-left-color: var(--ok); }
-  .chip.r-MEDIUM { border-left-color: var(--warn); }
-  .chip.r-HIGH { border-left-color: var(--orange); }
-  .chip.r-CRITICAL { border-left-color: var(--err); }
-  .chip .cmain { flex: 1; min-width: 0; }
-  .chip .chead {
-    display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-bottom: 3px;
+  .trow .tds {
+    flex: 1; min-width: 0; font-family: var(--mono);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .chip .ctype {
-    font-size: 10.5px; letter-spacing: 1px; text-transform: uppercase;
-    color: var(--dim); overflow-wrap: anywhere;
+  .trow[open] .tds { white-space: normal; overflow-wrap: anywhere; }
+  .trow .trs { flex: none; font-size: 11px; color: var(--dim); }
+  .trow .tprev {
+    flex-basis: 100%; font-family: var(--mono); font-size: 11.5px; color: var(--err);
+    white-space: pre-wrap; overflow-wrap: anywhere; max-height: 4.6em; overflow: hidden;
+    padding-bottom: 5px;
   }
-  .chip .risk {
-    font-size: 9.5px; letter-spacing: 1px; padding: 1px 6px; border-radius: 20px;
-    border: 1px solid var(--border); color: var(--dim); flex: none;
-  }
-  .chip.r-MEDIUM .risk { color: var(--warn); border-color: rgba(252,238,10,.45); }
-  .chip.r-HIGH .risk { color: var(--orange); border-color: rgba(255,138,61,.45); }
-  .chip.r-CRITICAL .risk { color: var(--err); border-color: rgba(255,59,92,.45); }
-  .chip .cdisp { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
-  .chip pre.cfull {
-    margin: 4px 0 0; padding: 6px 8px; border-radius: 6px; background: var(--panel2);
+  .trow[open] .tprev { display: none; }
+  .trow .tbody { padding: 0 0 7px; }
+  .trow .tlab { font-size: 10.5px; letter-spacing: 1px; color: var(--dim); margin: 6px 0 2px; text-transform: uppercase; }
+  .trow .twhy { font-size: 11.5px; color: var(--dim); margin-top: 3px; overflow-wrap: anywhere; }
+  .trow pre {
+    margin: 2px 0 0; padding: 6px 8px; border-radius: 6px; background: var(--panel2);
     font-family: var(--mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere;
-    max-height: 40dvh; overflow: auto; -webkit-overflow-scrolling: touch;
+    max-height: 36dvh; overflow: auto; -webkit-overflow-scrolling: touch;
     overscroll-behavior: contain;
-  }
-  .chip .cwhy { font-size: 11.5px; color: var(--dim); margin-top: 3px; overflow-wrap: anywhere; }
-  .chip .cstate {
-    font-size: 15px; line-height: 1.2; flex: none; color: var(--dim);
-    min-width: 20px; text-align: center;
-  }
-  .chip .cstate.run { color: var(--accent); animation: pulse 1.2s infinite; }
-  .chip .cstate.ok { color: var(--ok); }
-  .chip .cstate.bad { color: var(--err); }
-  .chip details { margin-top: 4px; }
-  .chip details summary {
-    font-size: 11.5px; color: var(--dim); cursor: pointer;
-    min-height: var(--tap); display: flex; align-items: center;
-  }
-  .chip details pre {
-    margin: 2px 0 0; max-height: 34dvh; overflow: auto;
-    -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
-    white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px;
   }
 
   /* ── Files view ─────────────────────────────────────── */
@@ -774,9 +745,8 @@
     #model-badge { max-width: 20vw; }
     .msg .body { padding: 9px 10px; }
     .md .tw, .body pre, .md pre { margin-left: -2px; margin-right: -2px; }
-    #approval .ap-btns { gap: 6px; }
-    #approval .ap-btns button { font-size: 13px; }
-    #agent-stop { min-width: 80px; padding: 0 12px; }
+    .ap-card .ap-btns { gap: 6px; }
+    .ap-card .ap-btns button { font-size: 13px; }
     #send-btn, #agent-send { min-width: 58px; padding: 0 12px; }
   }
   /* ── Landscape / short viewports ────────────────────── */
@@ -784,7 +754,7 @@
     .welcome { margin-top: 4dvh; }
     .welcome .t { font-size: 18px; }
     details.thinking .tb { max-height: 30dvh; }
-    #approval .ap-what { max-height: 16dvh; }
+    .ap-card .ap-what { max-height: 16dvh; }
   }
 
   /* ── Cyberpunk layer ─────────────────────────────────────
@@ -914,11 +884,11 @@
   .cb-h button { font-family: var(--mono); text-transform: uppercase; letter-spacing: 1px; font-size: 10.5px; }
 
   /* Inputs: dark wells, neon focus */
-  #chat-input, #agent-msg, #agent-goal, #create-prompt, #create-model, #create-duration,
+  #chat-input, #agent-msg, #create-prompt, #create-model, #create-duration,
   .panel input[type=password], .panel input[type=number], .panel select, .panel textarea {
     background: rgba(5,6,12,.78);
   }
-  #chat-input:focus, #agent-msg:focus, #agent-goal:focus, #create-prompt:focus,
+  #chat-input:focus, #agent-msg:focus, #create-prompt:focus,
   .panel input:focus, .panel select:focus, .panel textarea:focus {
     outline: none; border-color: var(--accent);
     box-shadow: 0 0 0 1px rgba(0,240,255,.3), 0 0 16px rgba(0,240,255,.22);
@@ -926,17 +896,17 @@
   #attach-btn, #mic-btn { border-color: rgba(0,240,255,.3); }
 
   /* Primary actions */
-  #send-btn, #agent-send, #agent-start, #create-go {
+  #send-btn, #agent-send, #create-go {
     background: linear-gradient(90deg, var(--accent), #7ffbff);
     border-radius: 3px; text-transform: uppercase; letter-spacing: 1.5px;
     font-family: var(--hud);
     box-shadow: 0 0 14px rgba(0,240,255,.45), inset 0 0 0 1px rgba(255,255,255,.35);
   }
-  #send-btn.stop {
+  #send-btn.stop, #agent-send.stop {
     background: linear-gradient(90deg, var(--accent2), var(--err)); color: #fff;
     box-shadow: 0 0 14px rgba(255,42,109,.55);
   }
-  #send-btn:disabled, #agent-send:disabled, #agent-start:disabled, #create-go:disabled { box-shadow: none; }
+  #send-btn:disabled, #agent-send:disabled, #create-go:disabled { box-shadow: none; }
   .seg { border-radius: 3px; border-color: rgba(0,240,255,.25); }
   .seg button { font-family: var(--mono); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
   .seg button.on { box-shadow: 0 0 12px rgba(0,240,255,.5); position: relative; }
@@ -946,37 +916,37 @@
   .btn:active, #files-bar button:active { border-color: var(--accent); }
 
   /* HUD section labels */
-  .panel .pt, .cr-label, .sb-sec, #agent-setup > summary, #purge-box > summary, .ev-final .ft {
+  .panel .pt, .cr-label, .sb-sec, #agent-setup > summary, #purge-box > summary {
     font-family: var(--mono); color: var(--accent);
   }
   .panel .pt:before, .cr-label:before, .sb-sec:before { content: "// "; color: var(--accent2); }
 
   /* Agent feed */
-  .ev-round { color: var(--accent); font-family: var(--mono); }
-  .ev-round:before { background: linear-gradient(90deg, transparent, rgba(0,240,255,.5)); }
-  .ev-round:after { background: linear-gradient(90deg, rgba(255,42,109,.5), transparent); }
-  .ev-msg, .ev-stream, .ev-final, .chip, #agent-setup, #create-form, .job {
+  #agent-setup, #create-form, .job {
     background: var(--glass); border-radius: 3px;
   }
-  .ev-user { background: linear-gradient(135deg, rgba(255,42,109,.18), rgba(42,15,46,.92) 60%); border-radius: 3px; }
-  .ev-final { box-shadow: -4px 0 14px -6px var(--ok); }
-  .ev-final.bad { box-shadow: -4px 0 14px -6px var(--err); }
-  .chip .ctype, .chip .risk, .st { font-family: var(--mono); }
-  .chip .cstate.run { text-shadow: 0 0 8px var(--accent); }
+  .trow .tty, .trow .trs, .st { font-family: var(--mono); }
+  .trow .tst.run { text-shadow: 0 0 8px var(--accent); }
+  .trow pre { border-radius: 2px; background: rgba(5,6,12,.6); }
+  .spin { box-shadow: 0 0 8px rgba(0,240,255,.5); }
+  #agent-status { font-family: var(--mono); letter-spacing: .5px; }
+  #agent-new { border-radius: 3px; font-family: var(--mono); text-transform: uppercase; letter-spacing: 1px; }
   .job-s.run:before { box-shadow: 0 0 8px var(--accent); }
 
   /* Approval: hazard tape */
-  #approval { position: relative; border-top: none; padding-top: 16px; }
-  #approval:before {
+  .ap-card { position: relative; border-top: none; padding-top: 16px; border-radius: 3px; overflow: hidden; }
+  .ap-card.answered { padding-top: 9px; }
+  .ap-card.answered:before { height: 3px; opacity: .6; }
+  .ap-card:before {
     content: ""; position: absolute; left: 0; right: 0; top: 0; height: 5px;
     background: repeating-linear-gradient(-45deg, var(--warn) 0 9px, #0a0a05 9px 18px);
   }
-  #approval .ap-t {
+  .ap-card .ap-t {
     font-family: var(--mono); letter-spacing: 3px;
     text-shadow: 0 0 10px rgba(252,238,10,.6); animation: breathe 1.6s ease-in-out infinite;
   }
-  #approval .ap-btns button { border-radius: 3px; }
-  #approval .ap-btns button.go { box-shadow: 0 0 12px rgba(61,255,160,.45); }
+  .ap-card .ap-btns button { border-radius: 3px; }
+  .ap-card .ap-btns button.go { box-shadow: 0 0 12px rgba(61,255,160,.45); }
 
   /* Drawers */
   #sidebar, #drawer { background: rgba(9,11,23,.97); }
@@ -1044,10 +1014,10 @@
 <div id="agent-view" class="view hidden">
   <div class="scroll-wrap">
     <div id="agent-scroll">
-    <details id="agent-setup" open>
-      <summary>NEW RUN</summary>
-      <textarea id="agent-goal" spellcheck="false" enterkeyhint="done"
-        placeholder="Goal — e.g. list the .py files here and write their names to files.txt"></textarea>
+    <details id="agent-setup">
+      <summary>AGENT SETTINGS</summary>
+      <div class="hint" style="margin-top:0">Used when a conversation starts. Each one gets a
+        fresh workspace under output/agent_runs/; one works at a time.</div>
       <div style="margin-top:10px">
         <div class="pt" style="font-size:11px;letter-spacing:1.5px;color:var(--dim);margin-bottom:6px">AUTONOMY</div>
         <div class="seg" id="autonomy-seg">
@@ -1077,35 +1047,25 @@
           itself is whatever ctx the engine is loaded at - change that under
           Settings &rarr; Engine.</div>
       </div>
-      <button id="agent-start" onclick="startAgentRun()">Start run</button>
-      <div class="hint">Runs in a fresh workspace under output/agent_runs/. One run at a time.</div>
     </details>
-      <div id="agent-feed"></div>
+      <div id="agent-feed"><div class="welcome"><div class="t">ARTIFEX<span> Agent</span></div>
+        <div class="s">Ask for something done on the PC. It runs tools as it goes,</div>
+        <div class="s">and you can message it while it works.</div></div></div>
     </div>
     <button id="agent-to-bottom" class="to-bottom hidden" aria-label="Scroll to latest"
       onclick="scrollAgentToBottom()">&#8595;</button>
   </div>
-  <div id="approval" class="hidden">
-    <div class="ap-t">APPROVAL REQUIRED</div>
-    <div class="ap-what" id="ap-what"></div>
-    <div class="ap-why" id="ap-why"></div>
-    <div class="ap-btns">
-      <button class="go" onclick="answerApproval('approve')" id="ap-approve">Approve</button>
-      <button onclick="answerApproval('always')" id="ap-always"
-        title="Approve, and don't ask again in this run for the same kind of action">Always</button>
-      <button onclick="answerApproval('deny')" id="ap-deny">Deny</button>
-      <button class="no" onclick="answerApproval('stop')">Stop</button>
-    </div>
-  </div>
   <div id="agent-bar">
     <div class="ab-row">
-      <span id="agent-status">No run.</span>
-      <button id="agent-stop" class="hidden" onclick="stopAgentRun()">Stop</button>
+      <span id="agent-spin" class="spin hidden"></span>
+      <span id="agent-status">Ready.</span>
+      <button id="agent-new" class="hidden" onclick="newAgentSession()"
+        title="Leave this conversation and start a fresh one">New</button>
     </div>
-    <div class="ab-row hidden" id="agent-composer">
+    <div class="ab-row" id="agent-composer">
       <textarea id="agent-msg" rows="1" enterkeyhint="send"
-        placeholder="Continue with a follow-up..."></textarea>
-      <button id="agent-send" onclick="sendAgentMessage()">Send</button>
+        placeholder="What should it do?"></textarea>
+      <button id="agent-send" onclick="agentSendOrStop()">Send</button>
     </div>
   </div>
 </div>
@@ -2461,16 +2421,10 @@ function openRun(id) {
   closeSidebar();
   showTab("agent");
   if (agentRunId === id) return;                       // already attached
-  // Same run we were following? Resume from our stored index; otherwise
-  // replay the whole feed from the start.
-  const stored = localStorage.getItem(RUN_KEY);
-  let since = 0;
-  if (stored === id) {
-    const n = parseInt(localStorage.getItem(RUN_I_KEY) || "-1", 10);
-    since = isNaN(n) ? 0 : Math.max(0, n + 1);
-  }
-  feed().innerHTML = "";
-  beginRun(id, since, true);
+  // The whole conversation is replayed from the server's event buffer.
+  agentDetach();
+  feedReset();
+  beginRun(id, 0);
 }
 
 // ── Sidebar open/close ───────────────────────────────────
@@ -3970,25 +3924,37 @@ async function previewAdd(path, row, btn) {
 // ═════════════════════════════════════════════════════════
 // Agent tab
 //
-// One run at a time server-side (409 carries the live run's id, which we
-// attach to instead of erroring). The SSE feed needs the bearer header, so
-// it is a streaming fetch, not EventSource. run_id + the last event index
-// ("i") are persisted so a backgrounded phone can reattach with ?since=.
+// A conversation with an agent that can act. The server keeps one run (= one
+// conversation) live at a time: 409 carries the live run's id, which we
+// attach to instead of erroring. The first message starts a run, every later
+// one steers it (picked up at the next step) or, once the turn is over,
+// continues it in place. The SSE feed needs the bearer header, so it is a
+// streaming fetch, not EventSource. The run id is persisted; on reload the
+// whole conversation is replayed from the server's in-memory event buffer.
 // ═════════════════════════════════════════════════════════
 const RUN_KEY = "ax_run_id", RUN_I_KEY = "ax_run_i";
 let agentRunId = null;
 let agentLastI = -1;
 let agentAborter = null;
 let agentStreaming = false;
-let agentDone = true;             // no live run known
+let agentDone = true;             // no live turn known
 let agentSawEnd = false;
 let agentRetryTimer = null;
 let agentRetries = 0;
-let agStream = null;              // live chunk block {wrap, think, tb, txt}
-let agChip = null;                // chip for the action currently in flight
-let agPending = [];               // follow-ups POSTed but not yet echoed back
+let agStream = null;              // live reply bubble {wrap, fold, txt}
+let agRow = null;                 // tool row of the action currently in flight
+let agCard = null;                // approval card still waiting for an answer
+let agPending = [];               // messages POSTed but not yet echoed back
+let agLastText = "";              // last assistant text shown (dedupes "done")
+let agBubble = null;              // this round's reply bubble, until its first tool row
+let agPhase = "", agIdle = "Ready.";
+let agTurnT0 = 0, agTurnTok = 0, agTick = null;
 
 const feed = () => $("agent-feed");
+const AGENT_WELCOME_HTML =
+  '<div class="welcome"><div class="t">ARTIFEX<span> Agent</span></div>' +
+  '<div class="s">Ask for something done on the PC. It runs tools as it goes,</div>' +
+  '<div class="s">and you can message it while it works.</div></div>';
 
 function isTerminalStatus(s) {
   s = String(s || "");
@@ -4011,43 +3977,142 @@ function el(tag, cls, txt) {
   if (txt != null) e.textContent = txt;
   return e;
 }
-function feedAdd(node) {
+function feedAdd(node, force) {
   const box = $("agent-scroll");
   const pinned = isPinned(box);
+  const w = feed().querySelector(".welcome");
+  if (w) w.remove();
   feed().appendChild(node);
-  if (pinned) pinTo(box);
+  if (pinned || force) pinTo(box);
   updateToBottom();
   if (activeTab !== "agent") $("tab-agent").classList.add("unread");
   return node;
 }
+function feedReset() {
+  feed().innerHTML = AGENT_WELCOME_HTML;
+  agStream = null; agRow = null; agCard = null; agLastText = "";
+}
 function agentNote(text, cls) {
   return feedAdd(el("div", "ev ev-note" + (cls ? " " + cls : ""), text));
 }
-function setAgentStatus(text) { $("agent-status").textContent = text; }
-function updateAgentUi() {
-  const live = !!agentRunId && !agentDone;
-  $("agent-start").disabled = live;
-  $("agent-stop").classList.toggle("hidden", !live);
-  $("tab-agent").classList.toggle("live", live);
-  // The composer appears as soon as a run exists and stays after it ends:
-  // a terminal run is revived in place by the same endpoint.
-  $("agent-composer").classList.toggle("hidden", !agentRunId);
-  $("agent-send").disabled = !agentRunId;
-  $("agent-msg").placeholder = live ? "Steer the run..." : "Continue with a follow-up...";
+
+// ── Conversation kit ──────────────────────────────────────
+// Bubbles, the thinking fold and tool rows. Built on the chat tab's own
+// classes (.msg / .meta / .body / details.thinking), so both tabs look the
+// same and the chat tab can be moved onto these builders later.
+function fmtSecs(s) {
+  s = Math.max(0, Math.round(s));
+  return s < 60 ? s + "s" : Math.floor(s / 60) + "m " + String(s % 60).padStart(2, "0") + "s";
+}
+function fmtClock(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+function fmtTok(n) { return n < 1000 ? String(n) : (n / 1000).toFixed(1) + "k"; }
+
+function cvBubble(role) {
+  const b = el("div", "msg msg-" + role);
+  b.appendChild(el("div", "meta", role === "user" ? "You" : "Artifex"));
+  b._body = b.appendChild(el("div", "body"));
+  return b;
+}
+// "Thought for 12s" - closed after the round, open while it streams.
+function cvThinkFold(text, seconds, open) {
+  const d = el("details", "thinking");
+  d.open = !!open;
+  d._sum = d.appendChild(el("summary", null, open ? "Thinking..."
+    : seconds >= 1 ? "Thought for " + fmtSecs(seconds) : "Thought briefly"));
+  d._tb = d.appendChild(el("div", "tb", text || ""));
+  return d;
+}
+// One collapsed line per tool call; the full request and the output are
+// inside the fold.
+function cvToolRow(action, risk, policyReason) {
+  const a = action || {};
+  const d = el("details", "ev trow r-" + (risk || "NONE"));
+  const s = d.appendChild(el("summary"));
+  d._state = s.appendChild(el("span", "tst", "○"));
+  s.appendChild(el("span", "tty", a.type || "action"));
+  let disp = String(a.display || "");
+  if (a.type && disp.indexOf(a.type + ": ") === 0) disp = disp.slice(a.type.length + 2);
+  s.appendChild(el("span", "tds", disp));
+  d._res = s.appendChild(el("span", "trs", risk && risk !== "SAFE" && risk !== "LOW" ? risk : ""));
+  d._sum = s;
+  d._body = d.appendChild(el("div", "tbody"));
+  // The whole request (command, script, both sides of an edit), never cut.
+  d._body.appendChild(el("pre", "tfull", a.full || a.display || ""));
+  if (policyReason) d._body.appendChild(el("div", "twhy", policyReason));
+  return d;
+}
+function cvRowState(row, glyph, cls, summary) {
+  if (!row) return;
+  row._state.textContent = glyph;
+  row._state.className = "tst" + (cls ? " " + cls : "");
+  if (summary != null) row._res.textContent = summary;
+}
+function cvRowOutput(row, text, failed) {
+  if (!row || !text) return;
+  row._body.appendChild(el("div", "tlab", "output"));
+  row._body.appendChild(el("pre", "tout", text));
+  if (failed) {
+    // A failure shows its last lines without being opened.
+    const tail = text.trim().split("\n").slice(-3).join("\n");
+    row._sum.appendChild(el("span", "tprev", tail));
+  }
 }
 
-// ── Follow-up messages ────────────────────────────────────
-// POST is acknowledged immediately but the run only picks the text up at its
-// next round boundary, where it emits a persisted user_message event. Until
-// that echo arrives the bubble is shown dimmed; the echo reconciles it.
+// ── Status line ───────────────────────────────────────────
+function agentLive() { return !!agentRunId && !agentDone; }
+function statusRender() {
+  const live = agentLive();
+  $("agent-spin").classList.toggle("hidden", !live);
+  $("agent-status").textContent = live
+    ? (agPhase || "Working") + " · " + fmtClock(Date.now() - agTurnT0) +
+      (agTurnTok ? " · " + fmtTok(agTurnTok) + " tok" : "")
+    : agIdle;
+}
+function setAgentStatus(text) { agIdle = text; statusRender(); }
+function agSetPhase(text) { agPhase = text; statusRender(); }
+function turnClock(on) {
+  if (on) {
+    agTurnT0 = Date.now(); agTurnTok = 0; agPhase = "Starting";
+    if (!agTick) agTick = setInterval(statusRender, 1000);
+  } else if (agTick) {
+    clearInterval(agTick); agTick = null;
+  }
+  statusRender();
+}
+function agentBtnMode() {
+  const b = $("agent-send");
+  const stop = agentLive() && !$("agent-msg").value.trim();
+  b.textContent = stop ? "Stop" : "Send";
+  b.classList.toggle("stop", stop);
+}
+function updateAgentUi() {
+  const live = agentLive();
+  $("tab-agent").classList.toggle("live", live);
+  $("agent-new").classList.toggle("hidden", !agentRunId || live);
+  $("agent-msg").placeholder = live ? "Message it while it works..."
+    : (agentRunId ? "Reply to continue..." : "What should it do?");
+  agentBtnMode();
+  statusRender();
+}
+
+// ── User messages ─────────────────────────────────────────
+// POST is acknowledged at once, but the run only picks the text up at its
+// next step, where it emits a persisted user_message event. Until that echo
+// arrives the bubble is shown dimmed; the echo reconciles it.
 function agentUserBubble(text, pending) {
-  const b = el("div", "ev ev-user" + (pending ? " pending" : ""));
-  b.appendChild(document.createTextNode(text));
-  if (pending) b.appendChild(el("span", "q", "queued..."));
-  return feedAdd(b);
+  const b = cvBubble("user");
+  b._body.innerHTML = renderPlain(text);
+  if (pending) {
+    b.classList.add("pending");
+    b._body.appendChild(el("span", "q", "queued"));
+  }
+  return feedAdd(b, true);
 }
 function confirmPending(text) {
-  // The server truncates event text at 8000 chars, so a very long follow-up
+  // The server truncates event text at 8000 chars, so a very long message
   // comes back as a prefix of what we sent — match that too.
   let idx = -1;
   for (let n = 0; n < agPending.length; n++) {
@@ -4059,10 +4124,12 @@ function confirmPending(text) {
   p.el.classList.remove("pending");
   const q = p.el.querySelector(".q");
   if (q) q.remove();
+  // Where the run actually read it, which is where a replay draws it.
+  if (p.el !== feed().lastElementChild) feedAdd(p.el, true);
   return true;
 }
 
-// ── Live chunk block (assistant/thinking tokens, live listeners only) ──
+// ── Live reply (assistant/thinking tokens, live listeners only) ──
 //
 // The server flushes persisted events before the live chunk ring in the same
 // batch, so the tail tokens of a round can arrive AFTER that round's
@@ -4073,103 +4140,119 @@ let agGenerating = true;
 function agentChunk(text, thinking) {
   if (!text || !agGenerating) return;
   if (!agStream) {
-    const wrap = el("div", "ev ev-stream");
-    const think = el("details", "thinking");
-    think.open = true;
-    think.appendChild(el("summary", null, "Thinking..."));
-    const tb = el("div", "tb");
-    think.appendChild(tb);
-    think.classList.add("hidden");
+    const wrap = cvBubble("assistant");
+    const fold = cvThinkFold("", 0, true);
+    fold.classList.add("hidden");
     const txt = el("div", "live-txt");
-    wrap.appendChild(think);
-    wrap.appendChild(txt);
-    agStream = { wrap: wrap, think: think, tb: tb, txt: txt };
+    wrap._body.appendChild(fold);
+    wrap._body.appendChild(txt);
+    wrap._body.appendChild(el("span", "cursor"));
+    agStream = { wrap: wrap, fold: fold, txt: txt };
     feedAdd(wrap);
   }
   const box = $("agent-scroll");
   const pinned = isPinned(box);
   if (thinking) {
-    agStream.think.classList.remove("hidden");
-    agStream.tb.appendChild(document.createTextNode(text));
-    agStream.tb.scrollTop = agStream.tb.scrollHeight;
+    agStream.fold.classList.remove("hidden");
+    agStream.fold._tb.appendChild(document.createTextNode(text));
+    agStream.fold._tb.scrollTop = agStream.fold._tb.scrollHeight;
+    if (agPhase !== "Thinking") agSetPhase("Thinking");
   } else {
-    if (agStream.think.open) agStream.think.open = false;
+    if (agStream.fold.open) agStream.fold.open = false;
     agStream.txt.appendChild(document.createTextNode(text));
+    if (agPhase !== "Writing") agSetPhase("Writing");
   }
   if (pinned) pinTo(box);
 }
 function agentEndChunks() {
   if (agStream) { agStream.wrap.remove(); agStream = null; }
 }
-
-// ── Action chips ──────────────────────────────────────────
-function agentChip(ev) {
-  const a = ev.action || {};
-  const risk = ev.risk || "";
-  const wrap = el("div", "ev chip r-" + (risk || "NONE"));
-  const state = el("span", "cstate", "○");
-  const main = el("div", "cmain");
-  const head = el("div", "chead");
-  head.appendChild(el("span", "ctype", a.type || "action"));
-  if (risk) head.appendChild(el("span", "risk", risk));
-  main.appendChild(head);
-  main.appendChild(el("div", "cdisp", a.display || ""));
-  // The whole request (command, script, both sides of an edit), never cut.
-  // Scrolls inside the chip when long instead of being truncated.
-  if (a.full && a.full !== a.display) main.appendChild(el("pre", "cfull", a.full));
-  if (ev.policy_reason) main.appendChild(el("div", "cwhy", ev.policy_reason));
-  wrap.appendChild(main);
-  wrap.appendChild(state);
-  wrap._state = state;
-  wrap._main = main;
-  agChip = wrap;
-  return feedAdd(wrap);
-}
-function chipState(glyph, cls, why) {
-  if (!agChip) return null;
-  agChip._state.textContent = glyph;
-  agChip._state.className = "cstate" + (cls ? " " + cls : "");
-  if (why) {
-    const w = el("div", "cwhy", why);
-    agChip._main.appendChild(w);
+// The finished round: the thinking fold (kept by the server, so it survives
+// a reload) and the reply as markdown.
+function agentAssistant(ev) {
+  const text = (ev.text || "").trim();
+  const fold = ev.thinking ? cvThinkFold(ev.thinking, ev.think_s || 0, false) : null;
+  if (!text) {
+    if (fold) { fold.classList.add("ev"); feedAdd(fold); }
+    return;
   }
-  return agChip;
+  const b = cvBubble("assistant");
+  if (fold) b._body.appendChild(fold);
+  const md = el("div", "md");
+  md.innerHTML = renderMarkdown(text);
+  b._body.appendChild(md);
+  b._md = md; b._raw = text;
+  agLastText = text;
+  agBubble = feedAdd(b);
 }
-function chipOutput(text) {
-  if (!agChip || !text) return;
-  const d = el("details");
-  d.appendChild(el("summary", null, "output (" + text.length + " chars)"));
-  d.appendChild(el("pre", null, text));
-  agChip._main.appendChild(d);
+// A reply that called tools carries their syntax (@read_file("x"), a
+// ```bash block). The tool row right under it shows the same request in
+// full, so the bubble keeps only the prose. Edit blocks are left alone:
+// they can contain fences of their own.
+function stripToolSyntax(text) {
+  return text
+    .replace(/```(?:bash|sh|shell|powershell|ps1|pwsh|cmd|python|py)\b[^\n]*\n[\s\S]*?\n```[ \t]*(?=\n|$)/g, "")
+    .replace(/^[ \t]*@[a-z_]+\([^\n]*\)[ \t]*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n").trim();
+}
+function agentTrimBubble() {
+  const b = agBubble;
+  agBubble = null;
+  if (!b || !b._raw) return;
+  const prose = stripToolSyntax(b._raw);
+  if (prose === b._raw) return;
+  if (prose) { b._md.innerHTML = renderMarkdown(prose); return; }
+  b._md.remove();
+  if (!b._body.children.length) b.remove();
 }
 
-// ── Approval ──────────────────────────────────────────────
-let approvalKind = "action";   // "action" | "gate"
+// ── Approval (a card in the conversation) ─────────────────
 function showApproval(payload, kind) {
-  approvalKind = kind || "action";
+  if (agCard) return;                       // already on screen
+  const gate = kind === "gate";
   const a = (payload && payload.action) || null;
   const risk = payload && payload.risk ? payload.risk : "";
-  $("ap-what").textContent = a
+  const card = el("div", "ev ap-card");
+  card._t = card.appendChild(el("div", "ap-t", gate ? "PAUSED" : "APPROVAL REQUIRED"));
+  card.appendChild(el("div", "ap-what", a
     ? (a.type || "action") + "  " + (a.full || a.display || "")
-    : (payload && payload.reason ? payload.reason : "The run is waiting on you.");
+    : (payload && payload.reason ? payload.reason : "It is waiting on you.")));
   const why = [];
   if (risk) why.push("risk " + risk);
   if (a && payload && payload.reason) why.push(payload.reason);
-  $("ap-why").textContent = why.join(" - ");
-  $("ap-approve").textContent = approvalKind === "gate" ? "Continue" : "Approve";
-  $("ap-deny").classList.toggle("hidden", approvalKind === "gate");
-  // "Always" remembers a rule for this run (commands with the same prefix,
-  // edits to the same file). A gate/breaker pause has nothing to remember.
-  $("ap-always").classList.toggle("hidden", approvalKind === "gate");
-  $("approval").classList.remove("hidden");
-  setAgentStatus("awaiting your approval");
+  if (why.length) card.appendChild(el("div", "ap-why", why.join(" - ")));
+  const btns = card.appendChild(el("div", "ap-btns"));
+  const btn = (label, decision, cls) => {
+    const b = btns.appendChild(el("button", cls || null, label));
+    b.onclick = () => answerApproval(decision);
+    return b;
+  };
+  btn(gate ? "Continue" : "Approve", "approve", "go");
+  // "Always" remembers a rule for this conversation (commands with the same
+  // prefix, edits to the same file). A gate/breaker pause has nothing to
+  // remember, and nothing to deny.
+  if (!gate) {
+    btn("Always", "always").title =
+      "Approve, and don't ask again in this conversation for the same kind of action";
+    btn("Deny", "deny");
+  }
+  agCard = card;
+  feedAdd(card, true);
+  agSetPhase("Waiting for your approval");
   if (activeTab !== "agent") $("tab-agent").classList.add("unread");
 }
-function hideApproval() { $("approval").classList.add("hidden"); }
+function closeApproval(label) {
+  if (!agCard) return;
+  agCard.classList.add("answered");
+  agCard._t.textContent = "APPROVAL · " + String(label || "answered").toUpperCase();
+  agCard = null;
+}
+function hideApproval() { closeApproval("answered"); }
 
 async function answerApproval(decision) {
   if (!agentRunId) return;
-  hideApproval();
+  closeApproval(decision === "always" ? "always" : decision === "approve" ? "approved"
+    : decision === "deny" ? "denied" : "stopped");
   if (decision === "stop") agentSawEnd = false;
   try {
     const r = await fetch("/v1/agent/runs/" + agentRunId + "/approval", {
@@ -4178,20 +4261,22 @@ async function answerApproval(decision) {
       body: JSON.stringify({ decision: decision }),
     });
     if (r.status === 409) { agentNote("That prompt was already answered.", "warn"); return; }
-    if (!r.ok) { agentNote("Approval failed: HTTP " + r.status, "bad"); return; }
-    agentNote("You chose: " + (decision === "always" ? "always (this run)" : decision), "warn");
+    if (!r.ok) agentNote("Approval failed: HTTP " + r.status, "bad");
   } catch (e) {
     agentNote("Approval failed: " + e.message, "bad");
   }
 }
 
-// ── Start / stop ──────────────────────────────────────────
-async function startAgentRun() {
-  const goal = $("agent-goal").value.trim();
-  if (!goal) { $("agent-goal").focus(); return; }
-  if (!store.k) { toggleDrawer(); return; }
-  $("agent-start").disabled = true;
-  setAgentStatus("starting...");
+// ── Start / send / stop ───────────────────────────────────
+async function startAgentRun(goal) {
+  goal = String(goal || "").trim();
+  if (!goal) return;
+  const giveBack = () => {
+    const box = $("agent-msg");
+    if (!box.value) box.value = goal;
+    agentBtnMode();
+  };
+  setAgentStatus("Starting...");
   try {
     const r = await fetch("/v1/agent/runs", {
       method: "POST",
@@ -4210,6 +4295,7 @@ async function startAgentRun() {
       // run silently took whatever happened to be loaded.
       body: JSON.stringify(Object.assign({
         goal: goal,
+        interactive: true,
         model: $("model-select").value || undefined,
         autonomy: currentAutonomy(),
         plan: currentPlan(),
@@ -4224,53 +4310,53 @@ async function startAgentRun() {
     let data = null;
     try { data = await r.json(); } catch (e) {}
     if (r.status === 409 && data && data.detail && data.detail.run_id) {
-      agentNote("A run is already active - attaching to it.", "warn");
-      beginRun(data.detail.run_id, 0, true);
+      giveBack();
+      feedReset();
+      beginRun(data.detail.run_id, 0);
+      agentNote("Another conversation is still working - attached to it. Your text is back in the box.", "warn");
       return;
     }
-    if (r.status === 401) { agentNote("Invalid API key - check Settings.", "bad"); setAgentStatus("no run"); updateAgentUi(); return; }
+    if (r.status === 401) { giveBack(); agentNote("Invalid API key - check Settings.", "bad"); setAgentStatus("Ready."); return; }
     if (!r.ok) {
       const d = data && data.detail;
+      giveBack();
       agentNote("Could not start: " + (typeof d === "string" ? d
         : (d && d.message) || "HTTP " + r.status), "bad");
-      setAgentStatus("no run");
-      updateAgentUi();
+      setAgentStatus("Ready.");
       return;
     }
-    feed().innerHTML = "";
+    feedReset();
     $("agent-setup").open = false;
-    agentNote("Goal: " + goal);
-    if (data.folder) agentNote("Workspace: " + data.folder);
-    beginRun(data.run_id, 0, false);
+    beginRun(data.run_id, 0);
+    // Shown at once; the server's own echo (event 0) reconciles it.
+    agPending.push({ text: goal, el: agentUserBubble(goal, true) });
   } catch (e) {
+    giveBack();
     agentNote("Could not start: " + e.message, "bad");
-    setAgentStatus("no run");
-    updateAgentUi();
+    setAgentStatus("Ready.");
   }
 }
 
-function beginRun(runId, since, attaching) {
+function beginRun(runId, since) {
   agentRunId = runId;
   agentDone = false;
   agentLastI = since > 0 ? since - 1 : -1;
   agentRetries = 0;
-  agChip = null;
-  agPending = [];        // a NEW run drops any follow-ups aimed at the old one
+  agRow = null;
+  agPending = [];        // a NEW run drops anything aimed at the old one
   agentEndChunks();
   rememberRun();
+  turnClock(true);
   updateAgentUi();
-  if (attaching) {
-    $("agent-setup").open = false;
-    agentNote("Attached to run " + runId + ".");
-  }
   agentAttach(since);
 }
 
-// Send one follow-up. Live run -> queued for the next round boundary.
-// Terminal run -> revived in place, same workspace/history/event indices.
-async function sendAgentText(text, isResend) {
+// Send one message into the run. Working -> queued for the next step.
+// Turn over -> the conversation continues in place (same workspace, history
+// and event indices).
+async function sendAgentText(text) {
   const bubble = agentUserBubble(text, true);
-  const entry = { text: text, el: bubble, resent: !!isResend };
+  const entry = { text: text, el: bubble };
   agPending.push(entry);
   const drop = () => {
     const n = agPending.indexOf(entry);
@@ -4287,14 +4373,17 @@ async function sendAgentText(text, isResend) {
     try { data = await r.json(); } catch (e) {}
     if (r.status === 409 && data && data.detail && data.detail.run_id) {
       drop();
-      agentNote("Another run is active - attaching to it.", "warn");
-      beginRun(data.detail.run_id, 0, true);
+      feedReset();
+      beginRun(data.detail.run_id, 0);
+      agentNote("Another conversation is working - attached to it.", "warn");
       return false;
     }
     if (r.status === 404) {
       drop();
-      agentNote("That run no longer exists on the server.", "warn");
+      agentNote("That conversation is no longer on the server. Send again to start a new one.", "warn");
       clearRunRef();
+      $("agent-msg").value = text;
+      agentBtnMode();
       return false;
     }
     if (!r.ok) {
@@ -4304,13 +4393,14 @@ async function sendAgentText(text, isResend) {
         : (d && d.message) || "HTTP " + r.status), "bad");
       return false;
     }
+    if (data && data.note) agentNote(data.note, "warn");
     if (data && data.revived) {
-      // Restarted in place: indices continue, so resume from where we left off.
+      // Next turn of the same conversation: indices continue.
       agentDone = false;
       agentSawEnd = false;
       agentRetries = 0;
-      agentNote("- run revived -", "good");
       rememberRun();
+      turnClock(true);
       updateAgentUi();
       agentAttach(agentLastI + 1);
     }
@@ -4322,54 +4412,58 @@ async function sendAgentText(text, isResend) {
   }
 }
 
+// Enter in the composer: send. (Never stops - an empty Enter does nothing.)
 function sendAgentMessage() {
   const box = $("agent-msg");
   const text = box.value.trim();
-  if (!text || !agentRunId) return;
+  if (!text) return;
   if (!store.k) { toggleDrawer(); return; }
   box.value = "";
   box.style.height = "auto";
-  sendAgentText(text, false);
+  agentBtnMode();
+  if (agentRunId) sendAgentText(text); else startAgentRun(text);
+}
+// The one button: Stop while it works and the box is empty, Send otherwise.
+function agentSendOrStop() {
+  if (agentLive() && !$("agent-msg").value.trim()) stopAgentRun();
+  else sendAgentMessage();
 }
 
-// The run ended before picking a queued follow-up up (the server drops
-// anything queued during the final round). Resend it once, which revives the
-// run; if it is dropped a second time, hand the text back to the composer
-// rather than looping.
+// Messages the turn never reached (it was interrupted first). The server
+// keeps going on anything queued when a turn ends by itself, so this only
+// happens after Stop: hand the text back rather than restarting the agent
+// the user just stopped.
 function handleDroppedPendings() {
   if (!agPending.length) return;
   const dropped = agPending.splice(0);
   dropped.forEach(p => p.el.remove());
-  const stale = dropped.filter(p => p.resent);
-  const fresh = dropped.filter(p => !p.resent);
-  if (stale.length) {
-    const box = $("agent-msg");
-    box.value = (box.value ? box.value + "\n" : "") + stale.map(p => p.text).join("\n");
-    agentNote("Follow-up still wasn't picked up - text put back in the composer.", "warn");
-  }
-  if (!fresh.length) return;
-  agentNote("Run ended before your message was picked up - resending to continue it.", "warn");
-  (async () => {
-    for (const p of fresh) {
-      if (!agentRunId) break;
-      await sendAgentText(p.text, true);
-    }
-  })();
+  const box = $("agent-msg");
+  box.value = (box.value ? box.value + "\n" : "") + dropped.map(p => p.text).join("\n");
+  agentBtnMode();
+  agentNote("Your queued message was not picked up - it is back in the box.", "warn");
 }
 
 async function stopAgentRun() {
   if (!agentRunId) return;
-  setAgentStatus("stopping...");
-  hideApproval();
+  agSetPhase("Interrupting");
+  closeApproval("stopped");
   try {
     const r = await fetch("/v1/agent/runs/" + agentRunId + "/stop", {
       method: "POST", headers: authHeaders(),
     });
     if (!r.ok) agentNote("Stop failed: HTTP " + r.status, "bad");
-    else agentNote("Stop requested.", "warn");
   } catch (e) {
     agentNote("Stop failed: " + e.message, "bad");
   }
+}
+
+function newAgentSession() {
+  if (agentLive()) { agentNote("It is still working - press Stop first.", "warn"); return; }
+  agentDetach();
+  clearRunRef();
+  feedReset();
+  setAgentStatus("Ready.");
+  $("agent-msg").focus();
 }
 
 // ── SSE attach / reattach ─────────────────────────────────
@@ -4389,14 +4483,13 @@ async function agentAttach(since) {
   agentStreaming = true;
   agentSawEnd = false;
   agGenerating = true;
-  setAgentStatus("run " + runId + " - connected");
   updateAgentUi();
   try {
     const r = await fetch("/v1/agent/runs/" + runId + "/events?since=" + Math.max(0, since), {
       headers: authHeaders(), signal: ac.signal,
     });
     if (r.status === 404) {
-      agentNote("Run " + runId + " is gone.", "warn");
+      agentNote("That conversation is no longer on the server.", "warn");
       finishRun("gone", "");
       clearRunRef();
       return;
@@ -4404,8 +4497,9 @@ async function agentAttach(since) {
     if (r.status === 401) {
       // Retrying with the same bad key would just spin the backoff.
       agentNote("Invalid API key - check Settings, then reopen this tab.", "bad");
-      agentDone = true; agentDetach(); updateAgentUi();
-      setAgentStatus("unauthorized");
+      agentDone = true; agentDetach(); turnClock(false);
+      setAgentStatus("Unauthorized.");
+      updateAgentUi();
       return;
     }
     if (!r.ok) throw new Error("HTTP " + r.status);
@@ -4448,9 +4542,9 @@ async function agentAttach(since) {
 
 function scheduleReattach(delay) {
   if (agentRetryTimer || !agentRunId) return;
-  if (agentRetries > 40) { setAgentStatus("disconnected - reopen the app to retry"); return; }
+  if (agentRetries > 40) { agSetPhase("Disconnected - reopen the app to retry"); return; }
   agentRetries++;
-  setAgentStatus("reconnecting...");
+  if (agentRetries > 1) agSetPhase("Reconnecting");
   agentRetryTimer = setTimeout(async () => {
     agentRetryTimer = null;
     if (!agentRunId || agentDone) return;
@@ -4459,8 +4553,11 @@ function scheduleReattach(delay) {
       if (r.status === 404) { finishRun("gone", ""); clearRunRef(); return; }
       if (!r.ok) { scheduleReattach(); return; }   // 401/5xx: keep the run ref
       const s = await r.json();
-      if (isTerminalStatus(s.status)) { renderFinal(s.status, s.summary); return; }
-      if (s.pending_approval) showApproval(s.pending_approval, s.pending_approval.action ? "action" : "gate");
+      // The stream drains whatever we missed and ends itself on a finished
+      // turn; a prompt whose event we never saw comes from the snapshot.
+      if (s.pending_approval && !agCard) {
+        showApproval(s.pending_approval, s.pending_approval.action ? "action" : "gate");
+      }
       agentAttach(agentLastI + 1);
     } catch (e) {
       scheduleReattach();
@@ -4468,17 +4565,23 @@ function scheduleReattach(delay) {
   }, delay != null ? delay : Math.min(1000 + agentRetries * 500, 8000));
 }
 
-// A terminal run is NOT forgotten: it can be revived in place by a follow-up,
-// so the stored id/index survives a page reload. Storage is cleared only by
-// starting a new run (beginRun overwrites both keys) or by clearRunRef() when
-// the server says the run is gone.
-function finishRun(status, summary) {
+// A finished turn is NOT forgotten: the next message continues it in place,
+// so the stored id survives a page reload. Storage is cleared only by
+// starting a new conversation or by clearRunRef() when the server says the
+// run is gone.
+function finishRun(status) {
   agentDone = true;
   agGenerating = false;
   agentEndChunks();
-  hideApproval();
+  closeApproval("closed");
+  if (agRow) { cvRowState(agRow, "■", "", "interrupted"); agRow = null; }
   agentDetach();
-  setAgentStatus(status ? "run " + status : "no run");
+  turnClock(false);
+  const st = String(status || "");
+  setAgentStatus(st.indexOf("done") === 0 ? "Ready - reply to continue."
+    : st === "stopped:user" ? "Interrupted - reply to continue."
+    : st === "gone" ? "Ready."
+    : "Stopped (" + st.replace(/^stopped:/, "") + ") - reply to continue.");
   updateAgentUi();
   refreshModelBadge();
 }
@@ -4487,22 +4590,11 @@ function clearRunRef() {
   forgetRun();
   agentRunId = null;
   agentLastI = -1;
+  agentDone = true;
   agPending.forEach(p => p.el.remove());
   agPending = [];
+  turnClock(false);
   updateAgentUi();
-}
-
-function renderFinal(status, summary) {
-  const bad = String(status).indexOf("done") !== 0;
-  const box = el("div", "ev ev-final" + (bad ? " bad" : ""));
-  box.appendChild(el("div", "ft", String(status || "finished").toUpperCase()));
-  if (summary) {
-    const md = el("div", "md");
-    md.innerHTML = renderMarkdown(summary);
-    box.appendChild(md);
-  }
-  feedAdd(box);
-  finishRun(status, summary);
 }
 
 // ── Event dispatch ────────────────────────────────────────
@@ -4523,48 +4615,63 @@ function agentEvent(ev) {
     return;
   }
 
-  // Any persisted event closes the live-token block and, except for the
-  // ones that raise it, dismisses a stale approval panel.
+  // Any persisted event closes the live reply and, except for the ones that
+  // raise it, settles an approval card that is still open (it was answered
+  // from another device, or this is a replay).
   agentEndChunks();
-  if (k !== "approval_required" && k !== "gate_pause" && k !== "breaker_tripped") hideApproval();
+  if (agCard && k !== "approval_required" && k !== "gate_pause" && k !== "breaker_tripped") {
+    closeApproval(k === "action_started" || k === "approval_remembered" ? "approved"
+      : k === "denied" ? "denied" : "answered");
+  }
 
   switch (k) {
     case "round_start":
-      agChip = null;
+      agRow = null;
+      agBubble = null;
       agGenerating = true;
-      feedAdd(el("div", "ev ev-round", "ROUND " + (ev.round || "?")));
-      setAgentStatus("run " + agentRunId + " - round " + (ev.round || "?"));
+      agSetPhase("Thinking");
       break;
     case "user_message":
-      // Echo of a follow-up at the point the run actually picked it up (or
-      // round 0 of a revival). Reconcile the dimmed bubble we already showed.
+      // The point where the run actually picked a message up. Reconcile the
+      // dimmed bubble we already showed, or draw it (replay, other device).
       if (!confirmPending(ev.text || "")) agentUserBubble(ev.text || "", false);
       break;
-    case "assistant_message": {
+    case "assistant_message":
       agGenerating = false;
-      const box = el("div", "ev ev-msg md");
-      box.innerHTML = renderMarkdown(ev.text || "");
-      feedAdd(box);
+      agentAssistant(ev);
+      if (ev.stats && ev.stats.completion_tokens) {
+        agTurnTok += ev.stats.completion_tokens;
+        statusRender();
+      }
       break;
-    }
     case "action_proposed":
-      agentChip(ev);
+      agentTrimBubble();
+      agRow = feedAdd(cvToolRow(ev.action, ev.risk || "", ev.policy_reason || ""));
       break;
     case "action_started":
-      chipState("▶", "run");
-      setAgentStatus("running " + ((ev.action && ev.action.type) || "action"));
+      cvRowState(agRow, "▶", "run");
+      agSetPhase("Running " + ((ev.action && ev.action.type) || "action"));
       break;
-    case "action_result":
-      chipState(ev.success ? "✓" : "✗", ev.success ? "ok" : "bad");
-      chipOutput(ev.output || "");
-      agChip = null;
+    case "action_result": {
+      const out = (ev.output || "").trim();
+      const n = out ? out.split("\n").length : 0;
+      cvRowState(agRow, ev.success ? "✓" : "✗", ev.success ? "ok" : "bad",
+        n ? n + (n === 1 ? " line" : " lines") : "no output");
+      cvRowOutput(agRow, out, !ev.success);
+      agRow = null;
       break;
+    }
     case "blocked":
-      chipState("⊘", "bad", ev.reason ? "blocked: " + ev.reason : "blocked by policy");
-      agChip = null;
+      cvRowState(agRow, "⊘", "bad", "blocked");
+      if (agRow) agRow._body.appendChild(el("div", "twhy", ev.reason || "blocked by policy"));
+      agRow = null;
+      break;
+    case "denied":
+      cvRowState(agRow, "⊘", "", "skipped");
+      agRow = null;
       break;
     case "approval_required":
-      chipState("?", "");
+      cvRowState(agRow, "?", "");
       showApproval({
         action: ev.action || null,
         risk: ev.risk || "",
@@ -4572,13 +4679,19 @@ function agentEvent(ev) {
       }, "action");
       break;
     case "approval_remembered":
-      agentNote(ev.text || "Approval remembered for this run");
+      agentNote(ev.text || "Approval remembered for this conversation");
       break;
     case "auto_approved":
       agentNote("Auto-approved: " + (ev.reason || "covered by an earlier approval"));
       break;
     case "compacted":
       agentNote("Context compacted: " + (ev.reason || "fit to model window"));
+      break;
+    case "trimmed":
+      agentNote(ev.text || "Older events are no longer kept.");
+      break;
+    case "workspace":
+      agentNote("Workspace: " + (ev.text || ""));
       break;
     case "model":
       // Which model the run actually loaded, and whether it can see images.
@@ -4587,11 +4700,9 @@ function agentEvent(ev) {
       refreshModelBadge();
       break;
     case "gate_pause":
-      agentNote("Human gate: " + (ev.reason || ""), "warn");
-      showApproval({ reason: "Human gate: " + (ev.reason || "") }, "gate");
+      showApproval({ reason: "Checkpoint: " + (ev.reason || "") }, "gate");
       break;
     case "breaker_tripped":
-      agentNote("Circuit breaker: " + (ev.reason || ""), "warn");
       showApproval({ reason: "Circuit breaker: " + (ev.reason || "") }, "gate");
       break;
     case "format_retry":
@@ -4638,23 +4749,20 @@ function agentEvent(ev) {
     case "repo_map":
       break;   // internal; the size is not worth a line in the feed
     case "done": {
-      const box = el("div", "ev ev-final");
-      box.appendChild(el("div", "ft", "DONE"));
-      if (ev.summary) {
-        const md = el("div", "md");
-        md.innerHTML = renderMarkdown(ev.summary);
-        box.appendChild(md);
-      }
-      feedAdd(box);
+      // A turn that ended on a plain reply already showed it. A summary that
+      // came some other way (the finish tool, a planned run) still needs to.
+      const s = (ev.summary || "").trim();
+      if (s && s !== agLastText) agentAssistant({ text: s });
       break;
     }
     case "end":
-      // Synthesized by the SSE endpoint once the run is terminal. The
-      // "done" event above already printed the summary; keep this terse.
-      agentNote("— run " + (ev.status || "finished") + " —", "good");
+      // Synthesized by the SSE endpoint once the turn is over.
       agentSawEnd = true;
-      finishRun(ev.status || "finished", ev.summary || "");
-      handleDroppedPendings();   // anything queued in the final round was lost
+      if (String(ev.status || "").indexOf("error") === 0) {
+        agentNote("Error: " + (ev.summary || ev.status), "bad");
+      }
+      finishRun(ev.status || "done");
+      handleDroppedPendings();
       break;
     default:
       agentNote(k + (ev.reason ? ": " + ev.reason : ""), "");
@@ -4666,8 +4774,6 @@ let agentBooting = false;
 async function agentBoot() {
   const id = localStorage.getItem(RUN_KEY);
   if (!id || !store.k || agentRunId || agentBooting) return;
-  let lastI = parseInt(localStorage.getItem(RUN_I_KEY) || "-1", 10);
-  if (isNaN(lastI)) lastI = -1;
   agentBooting = true;
   try {
     const r = await fetch("/v1/agent/runs/" + id, { headers: authHeaders() });
@@ -4676,26 +4782,18 @@ async function agentBoot() {
     if (r.status === 404) { forgetRun(); return; }
     if (!r.ok) return;
     const s = await r.json();
-    const terminal = isTerminalStatus(s.status);
     agentRunId = id;
-    agentLastI = lastI;
-    agentDone = terminal;
+    agentLastI = -1;
+    agentDone = isTerminalStatus(s.status);
     agentRetries = 0;
     agPending = [];
-    $("agent-setup").open = false;
-    feed().innerHTML = "";
-    // A finished run is kept and shown: the composer below revives it.
-    agentNote(terminal
-      ? "Run " + id + " finished (" + s.status + "). Send a follow-up to continue it."
-      : "Reattached to run " + id + " (" + s.status + ").");
-    if (s.goal) agentNote("Goal: " + s.goal);
-    if (s.pending_approval) {
-      showApproval(s.pending_approval, s.pending_approval.action ? "action" : "gate");
-    }
+    feedReset();
+    if (!agentDone) turnClock(true);
     updateAgentUi();
-    // Drains anything that landed after our last seen index. For a terminal
-    // run that is the missed tail plus an immediate `end`.
-    agentAttach(agentLastI + 1);
+    // The whole conversation again, from the server's event buffer: the page
+    // kept nothing. A finished turn replays and ends at once; a live one
+    // carries on streaming, with any open approval as its last card.
+    agentAttach(0);
   } catch (e) {
     /* offline: leave the stored run alone, boot will retry on reconnect */
   } finally {
@@ -5281,6 +5379,7 @@ inputEl.addEventListener("keydown", function (e) {
 $("agent-msg").addEventListener("input", function () {
   this.style.height = "auto";
   this.style.height = Math.min(this.scrollHeight, 120) + "px";
+  agentBtnMode();          // Stop <-> Send follows whether there is text
 });
 $("agent-msg").addEventListener("keydown", function (e) {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendAgentMessage(); }

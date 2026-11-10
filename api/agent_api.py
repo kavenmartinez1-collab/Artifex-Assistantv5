@@ -235,6 +235,7 @@ class AgentRun:
         # The session's AgentRunner, made by the first worker and reused by
         # every later turn (pinned notes, repo map and steer log live on it).
         self.runner: Optional[AgentRunner] = None
+        self._model_note = ""
         self._prompt_cache: dict = {}
         # Persisted (non-chunk) events. events[k] has index _ev_base + k:
         # the list is capped, the indices clients hold are not renumbered.
@@ -481,7 +482,11 @@ def _worker(run: AgentRun, get_engine, goal: str | None = None):
         run.vision = _engine_vision(engine)
         run.model_info = _model_info_text(run.model, resolved_ctx, run.vision)
         seeing = {True: "can see images", False: "text only"}.get(run.vision, "vision unknown")
-        run.emit(AgentEvent("model", text=f"Model: {run.model} ({seeing}, ctx {resolved_ctx})"))
+        # Said once, and again only if a later turn runs on something else.
+        note = f"Model: {run.model} ({seeing}, ctx {resolved_ctx})"
+        if note != run._model_note:
+            run._model_note = note
+            run.emit(AgentEvent("model", text=note))
 
         prompt_cache = run._prompt_cache
 
@@ -683,6 +688,7 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
             _prune_finished()
 
         run.emit(AgentEvent("user_message", text=body.goal, round=0))
+        run.emit(AgentEvent("workspace", text=run.folder))
         run.thread = threading.Thread(
             target=_worker, args=(run, get_engine),
             name=f"agent-run-{run.id}", daemon=True,
