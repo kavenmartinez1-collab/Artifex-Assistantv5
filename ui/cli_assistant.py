@@ -7,7 +7,9 @@ import sys
 import os
 import gc
 import platform
+import queue
 import subprocess
+import threading
 import time
 
 from colorama import Fore, Style
@@ -23,7 +25,8 @@ from core.inference import (ThinkFilter, compress_history,
 from core.prompts import build_assistant_prompt
 from core.knowledge import KnowledgeManager
 from core import harness
-from core.agent_loop import AgentRunner, RunConfig, AutonomyLevel, Decision
+from core.agent_loop import AgentRunner, RunConfig, RunControl, AutonomyLevel, Decision
+from core.sandbox.approvals import ApprovalMemory
 from tools.agent_tools import (
     extract_agent_actions,
     full_request,
@@ -262,12 +265,126 @@ def _handle_kb_command(args, km):
         print(f"{Fore.YELLOW}  Unknown /kb subcommand: {subcmd}{Style.RESET_ALL}\n")
 
 
+def _glyphs():
+    """Marks for the transcript, or plain ASCII when the console can't show them."""
+    marks = {"dot": "⏺", "elbow": "⎿", "think": "✻", "stop": "■", "more": "…"}
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        "".join(marks.values()).encode(enc)
+    except (UnicodeError, LookupError):
+        marks = {"dot": "*", "elbow": "L", "think": "~", "stop": "#", "more": "..."}
+    return marks
+
+
+def _fmt_secs(seconds) -> str:
+    s = max(0, int(round(seconds or 0)))
+    return f"{s}s" if s < 60 else f"{s // 60}m {s % 60:02d}s"
+
+
 class _ConsoleHost:
-    """Console event sink + approval callback for the autonomous runner (CLI)."""
+    """Console event sink + approval prompt for the agent loop (CLI).
+
+    Prints a conversation the way a terminal agent does: prose, then one
+    marked line per tool call with its (short) result indented under it.
+    Everything long is still reachable: /expand prints the last tool output
+    in full, /think the model's reasoning for the last turn.
+
+    emit() is called from the turn's worker thread while the main thread
+    keeps the terminal (status line, typed messages), so every write goes
+    through one lock.
+    """
+
+    _RESULT_LINES = 3          # lines of a tool result shown under its call
+    _SPIN = "|/-\\"
 
     def __init__(self):
+        self._lock = threading.RLock()
         self._streaming = False
         self._shown = False      # this round's reply is already on screen
+        self._held = None        # events buffered while the user types a line
+        self._g = _glyphs()
+        self._tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        self._status_on = False  # a status line is on screen (no newline yet)
+        self._phase = ""
+        self._phase_t0 = 0.0
+        self._spin_i = 0
+        self._last_tick = 0.0
+        self.thoughts = []       # (seconds, text) per round of the current turn
+        self.last_output = None  # (tool label, full output) of the last tool
+        self.tokens = 0
+        self._answered = None    # text typed as an approval answer, not echoed again
+
+    # ── status line (main thread) ───────────────────────────────────────────
+
+    def begin_turn(self):
+        with self._lock:
+            self.thoughts = []
+            self.tokens = 0
+            self._phase, self._phase_t0 = "Starting", time.monotonic()
+
+    def end_turn(self):
+        with self._lock:
+            self._end_stream()
+            self._clear_status()
+            self._phase = ""
+
+    def status_text(self) -> str:
+        """What the agent is doing right now (also the prompt_toolkit toolbar)."""
+        if not self._phase:
+            return ""
+        text = f"{self._phase}{self._g['more']} {_fmt_secs(time.monotonic() - self._phase_t0)}"
+        if self.tokens:
+            text += f" · {self.tokens} tok"
+        return text + " · esc to interrupt"
+
+    def tick(self):
+        """Redraw the one-line status while nothing else is being printed."""
+        if not self._tty:
+            return
+        with self._lock:
+            now = time.monotonic()
+            if (self._streaming or self._held is not None or not self._phase
+                    or now - self._last_tick < 0.25):
+                return
+            self._last_tick = now
+            self._spin_i = (self._spin_i + 1) % len(self._SPIN)
+            sys.stdout.write(f"\r\x1b[2K{Fore.CYAN}  {self._SPIN[self._spin_i]} "
+                             f"{self.status_text()}{Style.RESET_ALL}")
+            sys.stdout.flush()
+            self._status_on = True
+
+    def _clear_status(self):
+        if self._status_on:
+            sys.stdout.write("\r\x1b[2K")
+            sys.stdout.flush()
+            self._status_on = False
+
+    def _set_phase(self, text):
+        self._phase, self._phase_t0 = text, time.monotonic()
+
+    # ── typed-while-working support ─────────────────────────────────────────
+
+    def hold(self, on: bool):
+        """While the user types a line, output waits (it would scramble the
+        line); releasing prints what arrived meanwhile, in order."""
+        with self._lock:
+            if on:
+                if self._held is None:
+                    self._end_stream()
+                    self._clear_status()
+                    self._held = []
+                return
+            held, self._held = self._held or [], None
+            for ev in held:
+                self._emit(ev)
+
+    def say(self, text: str, color=Fore.CYAN):
+        with self._lock:
+            self._end_stream()
+            self._clear_status()
+            print(f"{color}{text}{Style.RESET_ALL}")
+
+    # ── events (worker thread) ──────────────────────────────────────────────
 
     def _end_stream(self):
         if self._streaming:
@@ -276,13 +393,27 @@ class _ConsoleHost:
             self._streaming = False
 
     def emit(self, ev):
+        with self._lock:
+            if self._held is not None:
+                self._held.append(ev)
+                return
+            self._emit(ev)
+
+    def _emit(self, ev):
         k = ev.kind
+        g = self._g
         if k == "round_start":
             self._shown = False
-        elif k == "assistant_chunk":
+            self._set_phase("Thinking")
+            return
+        if k == "thinking_chunk":
+            return
+        self._clear_status()
+        if k == "assistant_chunk":
             if not self._streaming:
-                sys.stdout.write(f"\n{Fore.CYAN}  assistant > {Fore.WHITE}")
+                sys.stdout.write(f"\n{Fore.CYAN}{g['dot']} {Fore.WHITE}")
                 self._streaming = True
+                self._set_phase("Writing")
             sys.stdout.write(ev.text)
             sys.stdout.flush()
             self._shown = True
@@ -293,36 +424,80 @@ class _ConsoleHost:
             # the session, never shown). Print whatever wasn't streamed.
             text = ((ev.text if k == "assistant_message" else ev.summary) or "").strip()
             if text and not self._shown:
-                print(f"\n{Fore.CYAN}  assistant > {Fore.WHITE}{text}{Style.RESET_ALL}")
+                print(f"\n{Fore.CYAN}{g['dot']} {Fore.WHITE}{text}{Style.RESET_ALL}")
                 self._shown = True
+            if k == "assistant_message":
+                thinking = getattr(ev, "thinking", "") or ""
+                if thinking:
+                    secs = getattr(ev, "think_s", 0.0) or 0.0
+                    self.thoughts.append((secs, thinking))
+                    if secs >= 1:
+                        print(f"{Style.DIM}  {g['think']} Thought for {_fmt_secs(secs)}"
+                              f" (/think to read){Style.RESET_ALL}")
+                stats = getattr(ev, "stats", None) or {}
+                self.tokens += int(stats.get("completion_tokens") or 0)
+        elif k == "user_message":
+            # A message typed while it worked, at the point the loop read it.
+            # (An answer typed at an approval prompt is already on screen.)
+            self._end_stream()
+            if ev.text == self._answered:
+                self._answered = None
+            else:
+                print(f"{Fore.GREEN}> {ev.text}{Style.RESET_ALL}")
         elif k == "action_proposed":
             # The whole request (full command/script, both sides of an edit),
-            # never cut; the approval prompt and "running:" below stay short.
+            # never cut: one line when it fits, the full text indented when not.
             self._end_stream()
-            print(f"{Fore.CYAN}  tool request: {Fore.WHITE}{ev.action.type}{Style.RESET_ALL}")
-            for line in (full_request(ev.action) or "").splitlines():
-                print(f"{Fore.WHITE}    {line}{Style.RESET_ALL}")
+            full = (full_request(ev.action) or ev.action.display or "").strip("\n")
+            if full.startswith(ev.action.type + ": "):
+                full = full[len(ev.action.type) + 2:]
+            lines = full.splitlines()
+            if len(lines) <= 1 and len(full) <= 100:
+                print(f"{Fore.CYAN}{g['dot']} {Fore.WHITE}{ev.action.type}"
+                      f"({full}){Style.RESET_ALL}")
+            else:
+                print(f"{Fore.CYAN}{g['dot']} {Fore.WHITE}{ev.action.type}{Style.RESET_ALL}")
+                for line in lines:
+                    print(f"{Fore.WHITE}    {line}{Style.RESET_ALL}")
         elif k == "action_started":
-            print(f"{Fore.CYAN}  running: {Fore.WHITE}{ev.action.display}{Style.RESET_ALL}")
+            self._set_phase(f"Running {ev.action.type}")
         elif k == "action_result":
-            status = "ok" if ev.success else "ERROR"
-            color = Fore.GREEN if ev.success else Fore.RED
             out = (ev.output or "").strip()
-            print(f"{color}  [{status}]{Style.RESET_ALL} {Fore.WHITE}{out[:1000]}{Style.RESET_ALL}")
+            self.last_output = (f"{ev.action.type}: {ev.action.display}", out)
+            color = Fore.GREEN if ev.success else Fore.RED
+            lines = out.splitlines()
+            if not lines:
+                lines = ["(no output)" if ev.success else "ERROR (no output)"]
+            # A failure shows its END (where the error is), a success its start.
+            shown = lines[:self._RESULT_LINES] if ev.success else lines[-self._RESULT_LINES:]
+            for n, line in enumerate(shown):
+                lead = f"  {g['elbow']} " if n == 0 else "    "
+                print(f"{color}{lead}{Fore.WHITE}{line[:200]}{Style.RESET_ALL}")
+            rest = len(lines) - len(shown)
+            if rest > 0:
+                print(f"{Style.DIM}    {g['more']} +{rest} lines (/expand){Style.RESET_ALL}")
+            self._set_phase("Thinking")
         elif k == "blocked":
-            print(f"{Fore.RED}  BLOCKED: {ev.action.display} — {ev.reason}{Style.RESET_ALL}")
+            print(f"{Fore.RED}  {g['elbow']} BLOCKED: {ev.reason}{Style.RESET_ALL}")
+        elif k == "denied":
+            print(f"{Fore.YELLOW}  {g['elbow']} skipped{Style.RESET_ALL}")
         elif k == "breaker_tripped":
             print(f"{Fore.RED}  circuit breaker: {ev.reason}{Style.RESET_ALL}")
         elif k == "gate_pause":
-            print(f"{Fore.YELLOW}  human gate: {ev.reason}{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}  checkpoint: {ev.reason}{Style.RESET_ALL}")
+        elif k == "compacted":
+            print(f"{Style.DIM}  context compacted: {ev.reason}{Style.RESET_ALL}")
         elif k == "git":
-            print(f"{Fore.CYAN}  [git] {ev.text}{Style.RESET_ALL}")
+            print(f"{Style.DIM}  [git] {ev.text}{Style.RESET_ALL}")
         elif k == "approval_remembered":
             print(f"{Fore.CYAN}  {ev.text}{Style.RESET_ALL}")
         elif k == "auto_approved":
             print(f"{Fore.CYAN}  auto-approved ({ev.reason}){Style.RESET_ALL}")
         elif k == "error":
             print(f"{Fore.RED}  error: {ev.reason}{Style.RESET_ALL}")
+        elif k == "stopped":
+            self._end_stream()
+            print(f"{Fore.YELLOW}  {g['stop']} {ev.reason}{Style.RESET_ALL}")
         elif k == "plan":
             self._end_stream()
             print(f"{Fore.CYAN}  PLAN:{Style.RESET_ALL}")
@@ -344,21 +519,314 @@ class _ConsoleHost:
         elif k in ("attempt", "attempts", "judge"):
             print(f"{Fore.CYAN}  ◆ {ev.text}{Style.RESET_ALL}")
 
-    def approval(self, action, decision, reason):
-        self._end_stream()
+    # ── approvals (main thread) ─────────────────────────────────────────────
+
+    @staticmethod
+    def read_answer(action, ans: str):
+        """What a typed answer to an approval prompt means. Anything that is
+        not one of the short answers is taken as a message: "no, and here is
+        why" for an action, "carry on, and ..." for a pause."""
+        raw = (ans or "").strip()
+        low = raw.lower()
         if action is None:   # circuit-breaker / human-gate pause
-            ans = input(f"{Fore.YELLOW}  {reason} — continue? [Y/n/stop]: {Fore.WHITE}").strip().lower()
-            return Decision.STOP if ans in ("n", "no", "s", "stop") else Decision.APPROVE
-        risk = getattr(decision, "risk_level", None)
-        risk = risk.name if risk is not None else "?"
-        print(f"{Fore.YELLOW}  [{risk}] {action.type}: {Fore.WHITE}{action.display}{Style.RESET_ALL}")
-        ans = input(f"{Fore.YELLOW}  Execute? [y/a=always this run/N/stop]: "
-                    f"{Fore.WHITE}").strip().lower()
-        if ans in ("s", "stop"):
+            if low in ("n", "no", "s", "stop"):
+                return Decision.STOP
+            if low in ("", "y", "yes"):
+                return Decision.APPROVE
+            return (Decision.APPROVE, raw)
+        if low in ("s", "stop"):
             return Decision.STOP
-        if ans in ("a", "always"):
+        if low in ("a", "always"):
             return Decision.APPROVE_ALWAYS
-        return Decision.APPROVE if ans in ("y", "yes") else Decision.DENY
+        if low in ("y", "yes"):
+            return Decision.APPROVE
+        if low in ("", "n", "no"):
+            return Decision.DENY
+        return (Decision.DENY, raw)
+
+    def approval_prompt(self, action, decision, reason) -> str:
+        """Print what is being asked; returns the prompt for the answer."""
+        with self._lock:
+            self._end_stream()
+            self._clear_status()
+            self._set_phase("Waiting for your approval")
+            if action is None:
+                return f"{Fore.YELLOW}  {reason} — continue? [Y/n/stop, or type a message]: {Fore.WHITE}"
+            risk = getattr(decision, "risk_level", None)
+            risk = risk.name if risk is not None else "?"
+            print(f"{Fore.YELLOW}  [{risk}] {action.type}: {Fore.WHITE}{action.display}{Style.RESET_ALL}")
+            return (f"{Fore.YELLOW}  Run it? [y / a=always / N / stop, or type why not]: "
+                    f"{Fore.WHITE}")
+
+    def answered(self, action, typed: str):
+        """Turn what was typed at an approval prompt into the loop's answer."""
+        answer = self.read_answer(action, typed)
+        if isinstance(answer, tuple):
+            self._answered = answer[1]
+        return answer
+
+    def approval(self, action, decision, reason):
+        prompt = self.approval_prompt(action, decision, reason)
+        return self.answered(action, input(prompt))
+
+
+# ── Running a turn while the terminal stays live ─────────────────────────
+
+_ESC = object()
+
+
+class _KeyPoller:
+    """Typed-while-working input without any extra package.
+
+    Windows: single keys through msvcrt. The first printable key opens a
+    "> " line (output is held back meanwhile so it cannot scramble it),
+    Enter sends it, Esc on an empty line interrupts the turn. Elsewhere: a
+    whole line, once Enter is pressed (the terminal echoes it as it comes).
+    """
+
+    def __init__(self, host):
+        self.host = host
+        self.buf = None
+        try:
+            import msvcrt
+            self._ms = msvcrt
+        except ImportError:
+            self._ms = None
+
+    @property
+    def composing(self) -> bool:
+        return self.buf is not None
+
+    def _close(self):
+        self.buf = None
+        sys.stdout.write(Style.RESET_ALL + "\n")
+        sys.stdout.flush()
+        self.host.hold(False)
+
+    def poll(self):
+        """None, _ESC, or a finished line."""
+        if self._ms is None:
+            import select
+            try:
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    return sys.stdin.readline().strip() or None
+            except (OSError, ValueError):
+                pass
+            return None
+        ms = self._ms
+        while ms.kbhit():
+            ch = ms.getwch()
+            if ch in ("\x00", "\xe0"):       # arrow / function key: 2nd half
+                ms.getwch()
+                continue
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch == "\x1b":
+                if self.buf is None:
+                    return _ESC
+                self._close()                 # Esc drops the line being typed
+                continue
+            if self.buf is None:
+                if ch in ("\r", "\n", "\x08"):
+                    continue
+                self.host.hold(True)
+                self.buf = ""
+                sys.stdout.write(f"{Fore.GREEN}> {Fore.WHITE}")
+            if ch in ("\r", "\n"):
+                line = self.buf.strip()
+                self._close()
+                return line or None
+            if ch == "\x08":
+                if self.buf:
+                    self.buf = self.buf[:-1]
+                    sys.stdout.write("\b \b")
+            elif ch.isprintable():
+                self.buf += ch
+                sys.stdout.write(ch)
+            sys.stdout.flush()
+        return None
+
+
+def _interactive_terminal() -> bool:
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _prompt_toolkit():
+    """The prompt_toolkit module if it is installed (it is optional: nothing
+    in requirements pulls it in), else None."""
+    try:
+        import prompt_toolkit
+        import prompt_toolkit.patch_stdout   # noqa: F401
+        return prompt_toolkit
+    except Exception:
+        return None
+
+
+def _plain_turn_loop(thread, asks, host, control, poller=None):
+    """Main-thread side of a turn with no extra package: answer approval
+    prompts, read typed messages, keep the status line moving, and turn
+    Ctrl+C into an interrupt instead of ending the program."""
+    while thread.is_alive():
+        try:
+            if poller is not None:
+                got = poller.poll()
+                if got is _ESC:
+                    control.request_stop()
+                    host.say("  interrupting" + host._g["more"], Fore.YELLOW)
+                elif got:
+                    control.inject_message(got)
+                if poller.composing:
+                    time.sleep(0.02)
+                    continue
+            try:
+                action, decision, reason, slot, done = asks.get(timeout=0.05)
+            except queue.Empty:
+                host.tick()
+                continue
+            slot["answer"] = host.approval(action, decision, reason)
+            done.set()
+        except KeyboardInterrupt:
+            if not control.stop_requested:
+                control.request_stop()
+                host.say("\n  interrupting" + host._g["more"]
+                         + " (the conversation is kept)", Fore.YELLOW)
+        except EOFError:
+            control.request_stop()
+
+
+def _ptk_turn_loop(thread, asks, host, control, ptk):
+    """The same, with prompt_toolkit: a real input line stays at the bottom
+    while output scrolls above it, with the status in a toolbar. A line typed
+    while it works is a message for the agent - or the answer, when it is
+    asking for approval. Esc interrupts."""
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.patch_stdout import patch_stdout
+
+    session = PromptSession()
+    pending = {}                    # the approval being asked, if any
+    finished = threading.Event()
+
+    kb = KeyBindings()
+
+    @kb.add("escape", eager=True)
+    def _interrupt(event):
+        control.request_stop()
+
+    def toolbar():
+        if pending:
+            return " approval: y / a=always / n / stop, or type why not"
+        return " " + (host.status_text() or "working")
+
+    def watch():
+        # Posts approval questions above the input line, and closes the
+        # prompt once the turn is over (it would otherwise wait for Enter).
+        while not finished.is_set():
+            if not pending:
+                try:
+                    action, decision, reason, slot, done = asks.get(timeout=0.1)
+                    prompt = host.approval_prompt(action, decision, reason)
+                    print(prompt + Style.RESET_ALL)
+                    pending.update(action=action, slot=slot, done=done)
+                except queue.Empty:
+                    pass
+            else:
+                time.sleep(0.1)
+            if not thread.is_alive():
+                app = session.app
+                if app.is_running:
+                    try:
+                        app.loop.call_soon_threadsafe(
+                            lambda: app.is_running and app.exit(result=None))
+                    except Exception:
+                        pass
+                time.sleep(0.05)
+
+    watcher = threading.Thread(target=watch, name="agent-turn-watch", daemon=True)
+    with patch_stdout(raw=True):
+        watcher.start()
+        try:
+            while thread.is_alive():
+                try:
+                    line = session.prompt("> ", bottom_toolbar=toolbar,
+                                          key_bindings=kb, refresh_interval=0.5)
+                except KeyboardInterrupt:
+                    control.request_stop()
+                    continue
+                except EOFError:
+                    control.request_stop()
+                    continue
+                line = (line or "").strip()
+                if pending:
+                    if not line and not thread.is_alive():
+                        break
+                    pending["slot"]["answer"] = host.answered(pending["action"], line)
+                    done = pending["done"]
+                    pending.clear()
+                    done.set()
+                elif line:
+                    control.inject_message(line)
+        finally:
+            finished.set()
+            watcher.join(timeout=2)
+
+
+def _drive_turn(runner, text, history, host, control):
+    """Run one turn on a worker thread and keep the terminal live meanwhile.
+
+    The agent loop used to run on the main thread, so nothing could be typed
+    until it finished and Ctrl+C ended the whole program (losing the turn).
+    Now: a line typed while it works is queued for its next step, Esc or
+    Ctrl+C interrupts it and keeps the conversation, and approval prompts are
+    asked here, on the thread that owns the keyboard.
+    """
+    box = {}
+    asks = queue.Queue()
+
+    def ask(action, decision, reason):          # called on the worker thread
+        slot, done = {}, threading.Event()
+        asks.put((action, decision, reason, slot, done))
+        while not done.wait(0.1):
+            if control.stop_requested:
+                return Decision.STOP
+        return slot.get("answer", Decision.STOP)
+
+    def work():
+        try:
+            turn = getattr(runner, "run_turn", None) or runner.run
+            box["result"] = turn(text, history)
+        except BaseException as e:               # re-raised on the main thread
+            box["error"] = e
+
+    runner.request_approval = ask
+    host.begin_turn()
+    thread = threading.Thread(target=work, name="agent-turn", daemon=True)
+    thread.start()
+    try:
+        live = _interactive_terminal()
+        ptk = _prompt_toolkit() if live else None
+        if ptk is not None:
+            try:
+                _ptk_turn_loop(thread, asks, host, control, ptk)
+            except Exception as e:               # fall back rather than lose the turn
+                _log.warning("prompt_toolkit input failed (%s); plain input", e)
+                _plain_turn_loop(thread, asks, host, control,
+                                 _KeyPoller(host) if live else None)
+        else:
+            _plain_turn_loop(thread, asks, host, control,
+                             _KeyPoller(host) if live else None)
+    finally:
+        if thread.is_alive():        # left the loop on an error: don't hang on it
+            control.request_stop()
+        thread.join()
+        host.hold(False)
+        host.end_turn()
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
 
 
 _last_inventory: list = []   # the numbered list the last /models printed
@@ -426,12 +894,14 @@ def _models_command(args: str):
 _HELP_LINES = (
     "  Commands: /workspace <path>|scan, /harness <detect|adopt|on|off>, /refresh, /clear, /cleanup, /purge",
     "  Knowledge: /kb search|add|list|show|remove|export|import|prune, /index [path]",
-    "  Agent:    /run <goal>  (autonomous loop),  /autonomy manual|guided|full,  /plan on|off",
+    "  Agent:    /run <goal>  (works through it on its own),  /autonomy manual|guided|full,  /plan on|off",
+    "            /think (the last turn's reasoning),  /expand (the last tool output in full)",
+    "  While it works: type a message + Enter to steer it; Esc or Ctrl+C interrupts and keeps the conversation",
     "  Session:  /save [name], /load [name|#], /sessions, /export [path]",
     "  Pipeline: /mode <mode>, /attach <file>, /output <dir>, /open <file>",
     "  System:   /backend transformers|ollama|llama_cpp, /context STANDARD|HIGH, /ctx <num>, /health, /compile, /turboquant",
     "  Models:   /models (inventory), /models add <#> [name] [ctx]  (add an unconfigured GGUF)",
-    "  Type /help to see this list again, 'exit' to quit.",
+    "  Type /help to see this list again, 'exit' (or Ctrl+C twice) to quit.",
 )
 
 _CLI_BACKENDS = ("transformers", "ollama", "llama_cpp")
@@ -578,6 +1048,40 @@ def run_assistant():
     _voice_listener = None  # Lazy-loaded for voice/artifex mode
 
     host = _ConsoleHost()
+    # One conversation: plain messages and /run goals are turns of the same
+    # history, and these last as long as it does. Stop/interrupt state and
+    # queued messages; "always" approvals; the notes the model pinned.
+    session_control = RunControl()
+    session_approvals = ApprovalMemory()
+    session_state = {"_notes": [], "_repo_map": "", "_steer_log": []}
+    last_interrupt = [0.0]                # Ctrl+C at the prompt: twice to quit
+
+    def _agent_turn(text, cfg, history):
+        """Run one turn (a plain message or a /run goal) and return its result."""
+        cfg.interactive = True
+        session_control.reset()
+        # Built once per turn: the knowledge and session-map text in it move
+        # as tools run, and a prompt that changed every round made the
+        # server re-read the whole conversation each time.
+        base_prompt = _build_system_prompt()
+        runner = AgentRunner(
+            engine, build_system_prompt=lambda: base_prompt,
+            emit=host.emit, request_approval=host.approval,
+            km=km, session_map=session_map, config=cfg,
+            control=session_control, approvals=session_approvals,
+        )
+        for attr, value in session_state.items():
+            if hasattr(runner, attr):
+                setattr(runner, attr, value)
+        try:
+            return _drive_turn(runner, text, history, host, session_control)
+        finally:
+            for attr in session_state:
+                session_state[attr] = getattr(runner, attr, session_state[attr])
+            # Typed, but the turn was interrupted before reading it.
+            for unread in session_control.drain_messages():
+                print(f"{Fore.YELLOW}  not read before the interrupt: {unread}{Style.RESET_ALL}")
+
     cli_autonomy = AutonomyLevel.GUIDED  # level used by /run
     cli_plan = "off"                      # /plan on|off — plan-first mode for /run
     _recent_failures = []                 # times of recent command failures
@@ -638,6 +1142,9 @@ def run_assistant():
             if user_input.lower() == "/clear":
                 history = [{"role": "system", "content": _build_system_prompt()}]
                 _first_message = True
+                # A new conversation: pinned notes and "always" approvals go too.
+                session_state.update(_notes=[], _repo_map="", _steer_log=[])
+                session_approvals = ApprovalMemory()
                 session_map.clear()
                 clear_cache()
                 engine.periodic_cleanup()
@@ -654,6 +1161,9 @@ def run_assistant():
                 # Clear everything /clear does
                 history = [{"role": "system", "content": _build_system_prompt()}]
                 _first_message = True
+                # A new conversation: pinned notes and "always" approvals go too.
+                session_state.update(_notes=[], _repo_map="", _steer_log=[])
+                session_approvals = ApprovalMemory()
                 session_map.clear()
                 clear_cache()
                 engine.periodic_cleanup()
@@ -866,14 +1376,29 @@ def run_assistant():
                 if cli_autonomy == AutonomyLevel.FULL_AUTO:
                     print(f"{Fore.YELLOW}  Full-auto — all policy-allowed actions run unattended; "
                           f"CRITICAL + ratchet still stop it.{Style.RESET_ALL}")
-                result = AgentRunner(
-                    engine, build_system_prompt=_build_system_prompt,
-                    emit=host.emit, request_approval=host.approval,
-                    km=km, session_map=session_map, config=run_cfg,
-                ).run(goal, history)
+                result = _agent_turn(goal, run_cfg, history)
                 print(f"\n{Fore.CYAN}  ■ {result.status} "
                       f"({result.rounds} rounds, {result.actions_run} actions){Style.RESET_ALL}\n")
                 history = _settle_history(history, engine, mode_cfg.context_window)
+                continue
+
+            # /think — the reasoning behind the last turn (kept in memory only)
+            if user_input.lower() == "/think":
+                if not host.thoughts:
+                    print(f"{Fore.CYAN}  No thinking kept for the last turn.{Style.RESET_ALL}\n")
+                for n, (secs, thought) in enumerate(host.thoughts, 1):
+                    print(f"{Fore.CYAN}  ── round {n}, thought for {_fmt_secs(secs)} ──{Style.RESET_ALL}")
+                    print(f"{Style.DIM}{thought}{Style.RESET_ALL}\n")
+                continue
+
+            # /expand — the last tool output, in full
+            if user_input.lower() == "/expand":
+                if not host.last_output:
+                    print(f"{Fore.CYAN}  No tool has run yet.{Style.RESET_ALL}\n")
+                else:
+                    label, output = host.last_output
+                    print(f"{Fore.CYAN}  {label}{Style.RESET_ALL}")
+                    print(f"{Fore.WHITE}{output or '(no output)'}{Style.RESET_ALL}\n")
                 continue
 
             # /health command
@@ -1165,11 +1690,7 @@ def run_assistant():
             turn_cfg = RunConfig.default(AutonomyLevel.MANUAL)
             turn_cfg.framing = False
             turn_cfg.max_rounds = MAX_AGENT_ROUNDS
-            AgentRunner(
-                engine, build_system_prompt=_build_system_prompt,
-                emit=host.emit, request_approval=host.approval,
-                km=km, session_map=session_map, config=turn_cfg,
-            ).run(user_input, history)
+            _agent_turn(user_input, turn_cfg, history)
 
             # Settle the history (see _settle_history), cleanup, and auto-save
             history = _settle_history(history, engine, mode_cfg.context_window)
@@ -1183,7 +1704,19 @@ def run_assistant():
             except Exception:
                 pass  # auto-save is best-effort
 
-        except (KeyboardInterrupt, EOFError):
+        except KeyboardInterrupt:
+            # Ctrl+C while the agent works interrupts the turn (see
+            # _drive_turn). Here, at the prompt, the first one only warns: it
+            # is too easy to press it once more than was needed.
+            if time.monotonic() - last_interrupt[0] > 2.0:
+                last_interrupt[0] = time.monotonic()
+                print(f"\n{Fore.YELLOW}  Press Ctrl+C again to quit.{Style.RESET_ALL}")
+                continue
+            kb_count = km.session_store.count if km.session_store else 0
+            print(f"\n{Fore.CYAN}  Knowledge: {kb_count} entries saved to workspace store.")
+            print(f"{Fore.YELLOW}  Goodbye.{Style.RESET_ALL}")
+            break
+        except EOFError:
             kb_count = km.session_store.count if km.session_store else 0
             print(f"\n{Fore.CYAN}  Knowledge: {kb_count} entries saved to workspace store.")
             print(f"{Fore.YELLOW}  Goodbye.{Style.RESET_ALL}")
