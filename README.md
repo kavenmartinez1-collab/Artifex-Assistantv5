@@ -27,8 +27,8 @@ Captured from a real session on the author's PC (local paths and addresses blurr
 
 **Phone / web app** — chat, agent runs, image tools, settings, and **Holo**, a
 talking hologram avatar that answers out loud. It ships as **Ember**, an orb of
-light whose rings and core move with its voice; Victoria (an original character)
-is built in too, and any photo can become an avatar of your own:
+light whose rings and core move with its voice, and any photo can become an
+avatar of your own:
 
 <p align="center">
   <img src="docs/screenshots/holo.webp" width="300" alt="Holo: Ember, an orb of light, answering while the view turns">
@@ -43,7 +43,7 @@ is built in too, and any photo can become an avatar of your own:
 <p align="center">
   <img src="docs/screenshots/app-holo.jpg" width="190" alt="Holo: Ember speaking">
   <img src="docs/screenshots/app-holo-setup.jpg" width="190" alt="Holo setup: voice, brain, prompt, avatar">
-  <img src="docs/screenshots/app-holo-editor.jpg" width="190" alt="Holo editor for an avatar made from a photo: face points and persona">
+  <img src="docs/screenshots/app-holo-editor.jpg" width="190" alt="Holo editor: name, voice set and persona">
 </p>
 
 **Desktop app (Qt)**

@@ -9,14 +9,15 @@
 (function () {
   "use strict";
   const BASE = (document.currentScript && document.currentScript.src.replace(/[^/]*$/, "")) || "/app/holo/";
-  // The built-in avatar. Uploaded ones come from /v1/holo/avatars in the same
-  // shape; landmarks are image pixels, y down (hand-measured for this one).
+  // The shape of a picture avatar (uploaded ones come from /v1/holo/avatars
+  // like this); landmarks are image pixels, y down. These values are only the
+  // fallback for a photo whose face points are missing.
   const DEFAULT_AVATAR = {
-    id: "default", name: "Victoria", gender: "female", persona: "", w: 896, h: 1152, status: "ready",
-    landmarks: {      // MediaPipe's eyes; the lip line placed by hand
-      mouth: { c: [474, 555], dir: [0.996, -0.09], hw: 42 },
-      eyes: [{ c: [383, 427], dir: [0.993, 0.119], hw: 40, hh: 20 },
-             { c: [543, 414], dir: [0.960, -0.282], hw: 43, hh: 20 }],
+    id: "default", name: "Holo", gender: "female", persona: "", w: 896, h: 1152, status: "ready",
+    landmarks: {
+      mouth: { c: [448, 560], dir: [1, 0], hw: 42 },
+      eyes: [{ c: [368, 430], dir: [1, 0], hw: 40, hh: 20 },
+             { c: [528, 430], dir: [1, 0], hw: 40, hh: 20 }],
     },
   };
   const AVATAR_KEY = "ax_holo_avatar";
@@ -50,15 +51,19 @@
     return a;
   }
   function isBuiltin(a) { return !!a && (a.id === "default" || a.id === "orb"); }
-  function builtinById(id) { return id === "orb" ? orbAvatar() : defaultAvatar(); }
+  // This build ships no portrait: the orb is the only built-in, and every
+  // picture avatar is one the user made from a photo.
+  const HAS_PORTRAIT = false;
+  function builtinById(id) { return id === "orb" || !HAS_PORTRAIT ? orbAvatar() : defaultAvatar(); }
   function builtins() {
+    if (!HAS_PORTRAIT) return [orbAvatar()];
     return BUILTIN_FIRST === "orb" ? [orbAvatar(), defaultAvatar()] : [defaultAvatar(), orbAvatar()];
   }
   // What this phone last showed, when that was a built-in (uploaded ones
   // arrive with the avatar list); else the shipped first choice.
   function startAvatar() {
     let want = null; try { want = localStorage.getItem(AVATAR_KEY); } catch (e) {}
-    return want === "orb" || want === "default" ? builtinById(want) : builtins()[0];
+    return want === "orb" || (want === "default" && HAS_PORTRAIT) ? builtinById(want) : builtins()[0];
   }
   function builtinUrls(a) {
     return a.kind === "orb" ? { orb: true } : { img: BASE + "avatar.jpg", depth: BASE + "avatar_depth.png" };
@@ -475,7 +480,7 @@ void main(){
       <div class="holo-caption" id="holo-caption"></div>
       <div class="holo-composer">
         <button class="btn holo-voice" id="holo-voice" aria-label="Read replies aloud">&#128263;</button>
-        <textarea id="holo-input" rows="1" placeholder="Talk to Victoria..." enterkeyhint="send"
+        <textarea id="holo-input" rows="1" placeholder="Talk to Ember..." enterkeyhint="send"
           autocapitalize="sentences" autocorrect="on"></textarea>
         <button class="btn" id="holo-send">Send</button>
       </div>`;
@@ -751,7 +756,7 @@ void main(){
     n.textContent = "avatar: " + (H.avatar ? H.avatar.name : "?");
     const inp = H.el.querySelector("#holo-input");
     const nm = H.avatar && H.avatar.name;
-    if (inp) inp.placeholder = "Talk to " + (nm || "Victoria") + "...";
+    if (inp) inp.placeholder = "Talk to " + (nm || "Ember") + "...";
     fillPickers(); updatePromptLabel();
     const ed = H.el.querySelector("#holo-edit");
     if (ed) ed.style.display = "";

@@ -226,6 +226,12 @@ def test_orb_shader_declares_every_uniform_the_page_sets():
 def test_both_builtin_avatars_exist_and_one_is_first():
     src, re = _holo_js()
     assert 'id: "orb", kind: "orb"' in src and 'id: "default"' in src
+    # a build without a shipped portrait must not point at picture files it doesn't have
+    if "const HAS_PORTRAIT = false;" in src:
+        holo_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "api", "static", "holo")
+        assert not os.path.exists(os.path.join(holo_dir, "avatar.jpg"))
+        assert "if (!HAS_PORTRAIT) return [orbAvatar()];" in src
     first = re.search(r'const BUILTIN_FIRST = "(\w+)";', src).group(1)
     assert first in ("orb", "default")
     # the picture avatar still loads its two textures; the orb needs none
