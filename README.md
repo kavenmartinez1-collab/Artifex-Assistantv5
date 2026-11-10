@@ -26,10 +26,12 @@ All glory to **Jesus Christ**, through whom all things were made and in whom all
 Captured from a real session on the author's PC (local paths and addresses blurred).
 
 **Phone / web app** — chat, agent runs, image tools, settings, and **Holo**, a
-talking hologram avatar (Victoria, an original character) that answers out loud:
+talking hologram avatar that answers out loud. It ships as **Ember**, an orb of
+light whose rings and core move with its voice; Victoria (an original character)
+is built in too, and any photo can become an avatar of your own:
 
 <p align="center">
-  <img src="docs/screenshots/holo.webp" width="300" alt="Holo: Victoria answering out loud while the view sways">
+  <img src="docs/screenshots/holo.webp" width="300" alt="Holo: Ember, an orb of light, answering while the view turns">
 </p>
 
 <p align="center">
@@ -39,9 +41,9 @@ talking hologram avatar (Victoria, an original character) that answers out loud:
   <img src="docs/screenshots/app-settings.jpg" width="190" alt="Settings">
 </p>
 <p align="center">
-  <img src="docs/screenshots/app-holo.jpg" width="190" alt="Holo speaking">
+  <img src="docs/screenshots/app-holo.jpg" width="190" alt="Holo: Ember speaking">
   <img src="docs/screenshots/app-holo-setup.jpg" width="190" alt="Holo setup: voice, brain, prompt, avatar">
-  <img src="docs/screenshots/app-holo-editor.jpg" width="190" alt="Holo face and persona editor">
+  <img src="docs/screenshots/app-holo-editor.jpg" width="190" alt="Holo editor for an avatar made from a photo: face points and persona">
 </p>
 
 **Desktop app (Qt)**

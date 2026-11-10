@@ -201,3 +201,32 @@ def test_cpu_only_engine_coexists_with_orpheus():
     assert e._coexists_with_orpheus
     e = LlamaCppEngine("big", {"path": "x.gguf"})
     assert not e._coexists_with_orpheus
+
+
+# ── the built-in orb avatar (drawn by a shader in holo.js) ─────────────────────
+
+def _holo_js():
+    import re
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(here, "api", "static", "holo", "holo.js"), encoding="utf-8").read()
+    return src, re
+
+
+def test_orb_shader_declares_every_uniform_the_page_sets():
+    src, re = _holo_js()
+    shader = re.search(r"const FS_ORB = `(.*?)`;", src, re.S).group(1)
+    wanted = re.search(r'for \(const n of \[([^\]]+)\]\) H\.uo\[n\]', src).group(1)
+    names = re.findall(r'"(\w+)"', wanted)
+    assert len(names) >= 8
+    declared = set(re.findall(r"\bu[A-Z]\w*", " ".join(re.findall(r"uniform [^;]+;", shader))))
+    assert set(names) <= declared, set(names) - declared
+    assert "${" not in shader            # a template literal: nothing may interpolate
+
+
+def test_both_builtin_avatars_exist_and_one_is_first():
+    src, re = _holo_js()
+    assert 'id: "orb", kind: "orb"' in src and 'id: "default"' in src
+    first = re.search(r'const BUILTIN_FIRST = "(\w+)";', src).group(1)
+    assert first in ("orb", "default")
+    # the picture avatar still loads its two textures; the orb needs none
+    assert 'a.kind === "orb" ? { orb: true }' in src

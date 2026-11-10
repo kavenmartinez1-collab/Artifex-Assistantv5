@@ -34,6 +34,35 @@
     if (o.landmarks && o.landmarks.eyes && o.landmarks.mouth) { a.landmarks = o.landmarks; a.landmark_source = "user"; }
     return a;
   }
+  // The second built-in has no picture at all: "Ember", an orb of light drawn
+  // entirely by a shader (rings, traces and a core that follow the voice).
+  const ORB_AVATAR = { id: "orb", kind: "orb", name: "Ember", gender: "male", persona: "", status: "ready",
+                       voice_pref: /alan|joe/i };
+  const ORB_EDIT_KEY = "ax_holo_orb";           // this phone's edits to it
+  const BUILTIN_FIRST = "orb";                   // the avatar a new phone starts with
+  function orbAvatar() {
+    let o = {};
+    try { o = JSON.parse(localStorage.getItem(ORB_EDIT_KEY) || "{}") || {}; } catch (e) {}
+    const a = Object.assign({}, ORB_AVATAR);
+    if (typeof o.name === "string" && o.name.trim()) a.name = o.name.trim().slice(0, 40);
+    if (typeof o.persona === "string") a.persona = o.persona.slice(0, 2500);
+    if (["female", "male", "neutral"].includes(o.gender)) a.gender = o.gender;
+    return a;
+  }
+  function isBuiltin(a) { return !!a && (a.id === "default" || a.id === "orb"); }
+  function builtinById(id) { return id === "orb" ? orbAvatar() : defaultAvatar(); }
+  function builtins() {
+    return BUILTIN_FIRST === "orb" ? [orbAvatar(), defaultAvatar()] : [defaultAvatar(), orbAvatar()];
+  }
+  // What this phone last showed, when that was a built-in (uploaded ones
+  // arrive with the avatar list); else the shipped first choice.
+  function startAvatar() {
+    let want = null; try { want = localStorage.getItem(AVATAR_KEY); } catch (e) {}
+    return want === "orb" || want === "default" ? builtinById(want) : builtins()[0];
+  }
+  function builtinUrls(a) {
+    return a.kind === "orb" ? { orb: true } : { img: BASE + "avatar.jpg", depth: BASE + "avatar_depth.png" };
+  }
   const PROMPT_KEY = "ax_holo_prompt";   // both | system | persona
   const PROMPT_MODES = [["both", "Artifex + persona"], ["system", "Artifex prompt only"], ["persona", "Persona only"]];
   const VOICE_KEY = "ax_holo_voice", SPEAK_KEY = "ax_holo_speak";
@@ -174,7 +203,121 @@ void main(){
   gl_FragColor = vec4(outc, clamp(a + mote, 0.0, 1.0));
 }`;
 
+  // The orb: three nested shells of broken light bands (each pixel's ray hits
+  // a shell on its near and far side, so you see through it), two comet rings,
+  // segmented rims, sparks and a core. uPhase is time that runs faster while
+  // it speaks or thinks; uLevel is the voice's loudness.
+  const FS_ORB = `precision highp float;
+varying vec2 vUv;
+uniform vec2 uRes, uTilt;
+uniform vec3 uView;
+uniform float uRot, uT, uPhase, uLevel, uGlitch, uThink, uSpeak;
+
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+mat3 rotX(float a){ float c = cos(a), s = sin(a); return mat3(1.0, 0.0, 0.0, 0.0, c, s, 0.0, -s, c); }
+mat3 rotY(float a){ float c = cos(a), s = sin(a); return mat3(c, 0.0, -s, 0.0, 1.0, 0.0, s, 0.0, c); }
+mat3 rotZ(float a){ float c = cos(a), s = sin(a); return mat3(c, s, 0.0, -s, c, 0.0, 0.0, 0.0, 1.0); }
+
+// light on a shell, d = unit direction in the shell's own frame
+float bandsOf(vec3 d, float seed, float bands){
+  float lat = asin(clamp(d.y, -1.0, 1.0)) / 1.5708;
+  float lon = atan(d.z, d.x) / 6.2832 + 0.5;
+  float v = (lat * 0.5 + 0.5) * bands;
+  float row = floor(v), f = abs(fract(v) - 0.5);
+  float rs = hash(vec2(row, seed));
+  float segs = floor(5.0 + rs * 20.0);
+  float u = fract(lon + uPhase * 0.07 * (rs - 0.5)) * segs;      // every band drifts at its own pace
+  float cell = floor(u), g = fract(u);
+  float h = hash(vec2(cell + row * 31.0, seed * 7.0 + 1.0));
+  float fl = 0.62 + 0.38 * sin(uT * (2.0 + h * 9.0) + h * 40.0);
+  float ends = smoothstep(0.0, 0.05, g) * smoothstep(1.0, 0.95, g);
+  float line = (1.0 - smoothstep(0.03, 0.11, f)) * step(0.40, h);
+  float blk = (1.0 - smoothstep(0.30, 0.36, f)) * step(0.90, h) * 0.5;
+  float tick = (1.0 - smoothstep(0.0, 0.035, g)) * step(0.72, hash(vec2(cell, row + seed)))
+             * (1.0 - smoothstep(0.30, 0.45, f));
+  return ((line + blk) * ends + tick) * fl * smoothstep(1.0, 0.82, abs(lat));
+}
+
+// a comet running round a great circle of the shell
+float comet(vec3 d, float speed){
+  float on = 1.0 - smoothstep(0.0, 0.045, abs(d.y));
+  float a = fract(atan(d.z, d.x) / 6.2832 - uPhase * speed);
+  return on * (pow(a, 5.0) * 1.6 + 0.10);
+}
+
+void main(){
+  vec2 q = (vUv - 0.5 - uView.xy) * uRes;
+  float cr = cos(uRot), sr = sin(uRot);
+  q = vec2(cr * q.x + sr * q.y, -sr * q.x + cr * q.y);
+  vec2 p = q / min(uRes.x, uRes.y) / uView.z;
+  p.y -= 0.03;
+
+  float row = floor(vUv.y * 46.0);
+  if (hash(vec2(row, floor(uT * 24.0))) < uGlitch * 0.35) p.x += (hash(vec2(row, uT)) - 0.5) * 0.05 * uGlitch;
+
+  float lvl = clamp(uLevel, 0.0, 1.0);
+  float breathe = 1.0 + 0.012 * sin(uT * 1.3) + 0.035 * lvl;
+  vec3 amber = mix(vec3(1.0, 0.56, 0.09), vec3(1.0, 0.74, 0.34), uThink * 0.6);
+  vec3 hot = vec3(1.0, 0.90, 0.60);
+  mat3 tilt = rotX(-uTilt.y * 0.34) * rotY(uTilt.x * 0.34);
+  float r = length(p), r2 = r * r;
+  float ang = atan(p.y, p.x) / 6.2832 + 0.5;
+  vec3 col = vec3(0.0);
+
+  for (int i = 0; i < 3; i++) {
+    float fi = float(i);
+    float R = (0.40 - 0.115 * fi) * breathe;
+    float dir = mod(fi, 2.0) < 0.5 ? 1.0 : -1.0;
+    if (r2 < R * R) {
+      float z = sqrt(R * R - r2);
+      mat3 m = rotY(uPhase * (0.20 + 0.13 * fi) * dir) * rotX(0.45 + fi * 0.95) * rotZ(fi * 0.7) * tilt;
+      float nb = 16.0 - 4.5 * fi;
+      float front = bandsOf(m * (vec3(p, z) / R), fi + 1.0, nb);
+      float back = bandsOf(m * (vec3(p, -z) / R), fi + 1.0, nb);
+      col += amber * (front + 0.42 * back) * (0.85 + 0.22 * fi + 0.7 * lvl);
+    }
+    // the shell's outline, in arcs that turn
+    float arcs = step(0.38, hash(vec2(floor(fract(ang + uPhase * 0.03 * dir * (fi + 1.0)) * (26.0 - 6.0 * fi)), fi + 9.0)));
+    col += amber * exp(-pow((r - R) / 0.0035, 2.0)) * arcs * (0.55 + 0.5 * lvl);
+  }
+
+  // two comets on their own rings
+  float Rc = 0.27 * breathe;
+  if (r2 < Rc * Rc) {
+    float z = sqrt(Rc * Rc - r2);
+    mat3 m1 = rotX(1.15 + 0.2 * sin(uPhase * 0.11)) * rotZ(0.5) * tilt;
+    mat3 m2 = rotX(-0.7) * rotZ(-0.9 + 0.2 * cos(uPhase * 0.09)) * tilt;
+    vec3 f = vec3(p, z) / Rc, b = vec3(p, -z) / Rc;
+    float c = comet(m1 * f, 0.33) + 0.5 * comet(m1 * b, 0.33) + comet(m2 * f, -0.24) + 0.5 * comet(m2 * b, -0.24);
+    col += mix(amber, hot, 0.5) * c * (0.75 + 0.9 * lvl);
+  }
+
+  // the core: flares with the voice, breathes when idle
+  float pulse = 0.5 + 0.5 * sin(uT * 2.1);
+  float cw = 0.0028 * (1.0 + 2.2 * lvl + 0.25 * pulse + 0.5 * uThink * sin(uT * 7.0));
+  col += hot * exp(-r2 / cw) * (1.3 + 2.0 * lvl);
+  col += amber * exp(-r / 0.10) * (0.30 + 0.55 * lvl + 0.10 * pulse);
+  col += amber * exp(-max(r - 0.40 * breathe, 0.0) / 0.05) * 0.07 * (1.0 + lvl);
+
+  // sparks drifting out of it
+  vec2 pc = vec2(ang * 40.0, r * 22.0 - uT * (0.5 + 0.9 * uSpeak + 0.5 * uThink));
+  vec2 cell = floor(pc), fr = fract(pc) - 0.5;
+  float h = hash(cell);
+  vec2 jit = vec2(hash(cell + 3.1), hash(cell + 7.7)) - 0.5;
+  float spark = step(0.90, h) * smoothstep(0.16, 0.0, length(fr - jit * 0.6)) * (0.5 + 0.5 * sin(uT * 3.0 + h * 40.0));
+  col += mix(amber, hot, 0.35) * 1.4 * spark * smoothstep(0.62, 0.30, r) * smoothstep(0.03, 0.12, r) * 0.9;
+
+  col *= 0.90 + 0.10 * sin(vUv.y * uRes.y * 1.6);
+  col *= 0.94 + 0.06 * sin(uT * 53.0) * sin(uT * 7.3) - uGlitch * 0.2;
+  col += (hash(vUv * uRes + uT) - 0.5) * 0.03 * step(0.02, max(col.r, col.g));
+  col = max(col, 0.0);
+  gl_FragColor = vec4(col, clamp(max(col.r, max(col.g, col.b)), 0.0, 1.0));
+}`;
+
   const CSS = `
+#holo-view.orb { background:
+  radial-gradient(55% 40% at 50% 46%, rgba(255,150,30,.16), transparent 72%),
+  radial-gradient(120% 70% at 50% 100%, rgba(40,110,255,.16), transparent 60%), var(--bg); }
 #holo-view { overflow: hidden; background:
   radial-gradient(120% 70% at 50% 100%, rgba(0,240,255,.16), transparent 60%),
   radial-gradient(90% 60% at 50% 35%, rgba(255,42,109,.10), transparent 70%), var(--bg); }
@@ -376,7 +519,7 @@ void main(){
     const ps = el.querySelector("#holo-psel");
     ps.onchange = () => { try { localStorage.setItem(PROMPT_KEY, ps.value); } catch (e) {} updatePromptLabel(); };
     as.onchange = () => {
-      const a = (H.avatars || [defaultAvatar()]).find(x => x.id === as.value);
+      const a = (H.avatars || builtins()).find(x => x.id === as.value);
       if (a) chooseAvatar(a);
     };
     const sheet = el.querySelector("#holo-sheet");
@@ -390,7 +533,8 @@ void main(){
     el.querySelector("#holo-add").onclick = () => { sheetShow(false); el.querySelector("#holo-file").click(); };
     el.querySelector("#holo-file").onchange = e => { const f = e.target.files[0]; e.target.value = ""; if (f) uploadAvatar(f); };
     el.querySelector("#holo-edit").onclick = () => { sheetShow(false); openEditor(); };
-    H.avatar = defaultAvatar(); H.urls = { img: BASE + "avatar.jpg", depth: BASE + "avatar_depth.png" };
+    H.avatar = startAvatar(); H.urls = builtinUrls(H.avatar);
+    el.classList.toggle("orb", H.avatar.kind === "orb");
 
     // One finger turns her (and stays where you leave it); two fingers pinch
     // to zoom and drag to pan; the wheel zooms; double-tap resets the view.
@@ -458,7 +602,7 @@ void main(){
 
     if (!initGL()) {
       const f = document.createElement("div"); f.className = "holo-fallback";
-      f.style.backgroundImage = `url(${BASE}avatar.jpg)`;
+      if (H.urls.img) f.style.backgroundImage = `url(${H.urls.img})`;
       H.canvas.replaceWith(f);
     }
     hookAudio();
@@ -516,7 +660,7 @@ void main(){
     if (!H.el) return;
     opts(H.el.querySelector("#holo-vsel"), femaleVoices().map(v => [v, voiceName(v) + (isStreamVoice(v) ? "  (Orpheus)" : "  (Piper)")]), holoVoice());
     opts(H.el.querySelector("#holo-msel"), brainList().map(m => [m, (HOLO_BRAINS.includes(m) ? "★ " : "") + m]), holoModel());
-    const av = (H.avatars || [defaultAvatar()]).filter(a => a.status === "ready");
+    const av = (H.avatars || builtins()).filter(a => a.status === "ready");
     opts(H.el.querySelector("#holo-asel"), av.map(a => [a.id, a.name]), H.avatar && H.avatar.id);
     opts(H.el.querySelector("#holo-psel"), PROMPT_MODES, promptMode());
   }
@@ -529,7 +673,7 @@ void main(){
   // once it has been given a persona.
   function hasPersona(a) {
     a = a || H.meta || H.avatar;
-    return !!a && (a.id !== "default" || !!(a.persona || "").trim());
+    return !!a && (!isBuiltin(a) || !!(a.persona || "").trim());
   }
   function updatePromptLabel() {
     const n = H.el && H.el.querySelector("#holo-pname"); if (!n) return;
@@ -554,7 +698,7 @@ void main(){
     try {
       const r = await fetch("/v1/holo/avatars", { headers: authHeaders() });
       if (!r.ok) return;
-      H.avatars = [defaultAvatar()].concat((await r.json()).data || []);
+      H.avatars = builtins().concat((await r.json()).data || []);
     } catch (e) { return; }
     let want = null; try { want = localStorage.getItem(AVATAR_KEY); } catch (e) {}
     const a = H.avatars.find(x => x.id === want && x.status === "ready");
@@ -576,7 +720,7 @@ void main(){
     H.meta = a;                                          // persona/name usable right away
     const seq = H.avatarSeq = (H.avatarSeq || 0) + 1;   // a later pick wins over a slow fetch
     let urls;
-    if (a.id === "default") urls = { img: BASE + "avatar.jpg", depth: BASE + "avatar_depth.png" };
+    if (isBuiltin(a)) urls = builtinUrls(a);
     else {
       try {
         const base = "/v1/holo/avatars/" + a.id + "/";
@@ -592,7 +736,8 @@ void main(){
     H.avatar = a; H.urls = urls; H.meta = a;
     try { localStorage.setItem(AVATAR_KEY, a.id); } catch (e) {}
     const fb = H.el && H.el.querySelector(".holo-fallback");     // no WebGL: show the picture flat
-    if (fb) fb.style.backgroundImage = "url(" + urls.img + ")";
+    if (fb) fb.style.backgroundImage = urls.img ? "url(" + urls.img + ")" : "none";
+    if (H.el) H.el.classList.toggle("orb", a.kind === "orb");
     H.glitch = 1;
     applyAvatarGL();
     // the old blobs go once the new textures are in (the GPU copy is made)
@@ -639,7 +784,7 @@ void main(){
     }
     H.watching.delete(m.id);
     if (m.status !== "ready") { diag("avatar failed: " + (m.error || m.status)); return; }
-    H.avatars = (H.avatars || [defaultAvatar()]).filter(a => a.id !== m.id).concat([m]);
+    H.avatars = (H.avatars || builtins()).filter(a => a.id !== m.id).concat([m]);
     await chooseAvatar(m);
     diag("avatar ready (" + m.landmark_source + ") - check the dots");
     openEditor();
@@ -649,7 +794,7 @@ void main(){
   // sizes stay the detector's; the eye line sets both eyes' tilt.
   function openEditor() {
     const a = H.avatar; if (!a) return;
-    const builtin = a.id === "default";
+    const builtin = isBuiltin(a), orb = a.kind === "orb";
     if (H.closeEditor) H.closeEditor();
     const ed = H.el.querySelector("#holo-editor");
     const L = a.landmarks || {
@@ -663,8 +808,8 @@ void main(){
       mouthR: [mo.c[0] + md[0] * mo.hw, mo.c[1] + md[1] * mo.hw],
     };
     ed.innerHTML = `
-      <div class="holo-ed-hint">Drag the yellow dots onto the eyes and the pink ones onto the mouth corners. ${
-        { mediapipe: "Placed by face detection.", vision: "Placed by the vision model; check them.", guess: "A rough guess: place them.", user: "Your placement." }[a.landmark_source] || ""}</div>
+      <div class="holo-ed-hint">${orb ? "Ember has no face to mark: give it a name, a voice set and a persona." : "Drag the yellow dots onto the eyes and the pink ones onto the mouth corners."} ${
+        orb ? "" : { mediapipe: "Placed by face detection.", vision: "Placed by the vision model; check them.", guess: "A rough guess: place them.", user: "Your placement." }[a.landmark_source] || ""}</div>
       <div class="holo-ed-pic"><img alt=""></div>
       <div class="holo-ed-row"><input id="holo-ed-name" maxlength="40" placeholder="Name">
         <select id="holo-ed-gender" aria-label="Voices"><option value="female">female voices</option><option value="male">male voices</option><option value="neutral">all voices</option></select></div>
@@ -675,7 +820,7 @@ void main(){
     ed.querySelector("#holo-ed-persona").value = a.persona || "";
     ed.querySelector("#holo-ed-gender").value = a.gender || "neutral";
     const pic = ed.querySelector(".holo-ed-pic"), img = pic.querySelector("img");
-    img.src = H.urls.img;
+    if (orb) pic.style.display = "none"; else img.src = H.urls.img;
     const dots = {};
     const box = () => {     // where the contained image actually sits
       const r = pic.getBoundingClientRect(), s = Math.min(r.width / a.w, r.height / a.h);
@@ -685,7 +830,7 @@ void main(){
       const b = box();
       for (const k in dots) { dots[k].style.left = (b.ox + pts[k][0] * b.s) + "px"; dots[k].style.top = (b.oy + pts[k][1] * b.s) + "px"; }
     };
-    for (const [k, label] of [["eyeL", "eye"], ["eyeR", "eye"], ["mouthL", "mouth"], ["mouthR", "mouth"]]) {
+    for (const [k, label] of orb ? [] : [["eyeL", "eye"], ["eyeR", "eye"], ["mouthL", "mouth"], ["mouthR", "mouth"]]) {
       const d = document.createElement("div");
       d.className = "holo-dot" + (k.startsWith("mouth") ? " m" : "") + (k === "mouthL" ? " lft" : k === "mouthR" ? " rgt" : "");
       d.innerHTML = "<span>" + label + "</span>";
@@ -721,16 +866,16 @@ void main(){
     ed.querySelector("#holo-ed-del").onclick = async e => {
       if (!delArmed) { delArmed = true; e.target.textContent = "Tap again"; return; }
       if (builtin) {         // back to the original name, persona and dots
-        try { localStorage.removeItem(DEFAULT_EDIT_KEY); } catch (err) {}
-        const d = defaultAvatar();
-        H.avatars = (H.avatars || []).map(x => (x.id === "default" ? d : x));
+        try { localStorage.removeItem(orb ? ORB_EDIT_KEY : DEFAULT_EDIT_KEY); } catch (err) {}
+        const d = builtinById(a.id);
+        H.avatars = (H.avatars || []).map(x => (x.id === a.id ? d : x));
         close(); H.choosing = null; chooseAvatar(d); diag("built-in avatar reset");
         return;
       }
       const r = await fetch("/v1/holo/avatars/" + a.id, { method: "DELETE", headers: authHeaders() }).catch(() => null);
       if (!r || !r.ok) { e.target.textContent = "Delete"; delArmed = false; msg("Delete failed" + (r ? ": " + r.status : "")); return; }
       H.avatars = (H.avatars || []).filter(x => x.id !== a.id);
-      close(); chooseAvatar(defaultAvatar());
+      close(); chooseAvatar(builtins()[0]);
     };
     ed.querySelector("#holo-ed-save").onclick = async e => {
       const btn = e.currentTarget;
@@ -749,11 +894,12 @@ void main(){
                      gender: ed.querySelector("#holo-ed-gender").value };
       try {
         if (builtin) {       // no server manifest: this phone keeps the edits
-          try { localStorage.setItem(DEFAULT_EDIT_KEY, JSON.stringify(body)); } catch (err) { throw new Error("couldn't store on this phone"); }
-          const d = defaultAvatar();
-          H.avatar = H.meta = d; H.avatars = (H.avatars || []).map(x => (x.id === "default" ? d : x));
+          if (orb) delete body.landmarks;
+          try { localStorage.setItem(orb ? ORB_EDIT_KEY : DEFAULT_EDIT_KEY, JSON.stringify(body)); } catch (err) { throw new Error("couldn't store on this phone"); }
+          const d = builtinById(a.id);
+          H.avatar = H.meta = d; H.avatars = (H.avatars || []).map(x => (x.id === a.id ? d : x));
           applyAvatarGL(); updateAvatarLabel(); updateVoiceLabel();
-          btn.textContent = "Saved ✓"; msg("Saved on this phone. Watch the blink.");
+          btn.textContent = "Saved ✓"; msg(orb ? "Saved on this phone." : "Saved on this phone. Watch the blink.");
           H.blinkT = 0;
           setTimeout(() => { if (H.closeEditor === close) close(); diag("saved " + d.name); }, 700);
           return;
@@ -780,6 +926,9 @@ void main(){
     let v = null; try { v = localStorage.getItem(voiceKey()); } catch (e) {}
     if (v && fem.includes(v)) return v;
     // defaults: Piper Jenny / Joe (instant, no GPU); Orpheus voices are opt-in
+    const pref = H.avatar && H.avatar.voice_pref;
+    const liked = pref && fem.find(x => pref.test(x) && !isStreamVoice(x));
+    if (liked) return liked;
     return fem.find(x => /jenny|joe/i.test(x)) || fem.find(x => !isStreamVoice(x)) || fem[0] || null;
   }
   function updateVoiceLabel() {
@@ -808,8 +957,20 @@ void main(){
   function setupGL(gl) {
     const vs = compile(gl, gl.VERTEX_SHADER, VS), fs = compile(gl, gl.FRAGMENT_SHADER, FS);
     if (!vs || !fs) return false;
-    const p = gl.createProgram(); gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+    const p = gl.createProgram(); gl.attachShader(p, vs); gl.attachShader(p, fs);
+    gl.bindAttribLocation(p, 0, "aPos"); gl.linkProgram(p);
     if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { diag("link: " + gl.getProgramInfoLog(p)); return false; }
+    // the orb's own program, on the same quad (attribute 0 in both)
+    H.progOrb = null; H.uo = {};
+    const fo = compile(gl, gl.FRAGMENT_SHADER, FS_ORB);
+    if (fo) {
+      const po = gl.createProgram(); gl.attachShader(po, vs); gl.attachShader(po, fo);
+      gl.bindAttribLocation(po, 0, "aPos"); gl.linkProgram(po);
+      if (gl.getProgramParameter(po, gl.LINK_STATUS)) {
+        H.progOrb = po;
+        for (const n of ["uRes", "uTilt", "uView", "uRot", "uT", "uPhase", "uLevel", "uGlitch", "uThink", "uSpeak"]) H.uo[n] = gl.getUniformLocation(po, n);
+      } else diag("orb link: " + gl.getProgramInfoLog(po));
+    }
     gl.useProgram(p);
     const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
@@ -826,6 +987,7 @@ void main(){
   // Face uniforms + both textures for H.avatar (H.urls: its image + depth).
   function applyAvatarGL() {
     const gl = H.gl; if (!gl || !H.urls) return;
+    if (H.urls.orb) { H.ready = 2; return; }       // drawn by its shader: nothing to load
     const a = H.avatar, L = a.landmarks || DEFAULT_AVATAR.landmarks;
     const norm = v => { const l = Math.hypot(v[0], v[1]) || 1; return [v[0] / l, v[1] / l]; };
     const [e0, e1] = L.eyes, mo = L.mouth;
@@ -836,6 +998,7 @@ void main(){
     gl.uniform4f(H.u.uE1, e1.c[0], e1.c[1], e1.hw, e1.hh); gl.uniform2fv(H.u.uE1d, norm(e1.dir));
     if (H.texFor !== H.urls) {
       H.texFor = H.urls;
+      if (!H.tex[0]) H.ready = 0;                  // coming from the orb: nothing to show until these load
       loadPair(H.urls);
     }
   }
@@ -1267,6 +1430,8 @@ void main(){
 
     if (Math.random() < dt * 2) { const s = document.getElementById("holo-sync"); if (s) s.textContent = (96 + Math.random() * 3.9).toFixed(1); }
 
+    // the orb's clock: turns faster while it speaks or thinks
+    H.phase = (H.phase || 0) + dt * (1 + 2.2 * H.speakS + 1.1 * H.thinkS);
     const gl = H.gl; if (!gl || H.ready < 2) return;
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     const w = Math.round(H.canvas.clientWidth * dpr), h = Math.round(H.canvas.clientHeight * dpr);
@@ -1274,6 +1439,16 @@ void main(){
     if (H.canvas.width !== w || H.canvas.height !== h) { H.canvas.width = w; H.canvas.height = h; }
     gl.viewport(0, 0, w, h);
     gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    if (H.urls && H.urls.orb && H.progOrb) {
+      const u = H.uo;
+      gl.useProgram(H.progOrb);
+      gl.uniform2f(u.uRes, w, h); gl.uniform2fv(u.uTilt, H.tilt); gl.uniform3fv(u.uView, H.view); gl.uniform1f(u.uRot, H.rot || 0);
+      gl.uniform1f(u.uT, t); gl.uniform1f(u.uPhase, H.phase); gl.uniform1f(u.uLevel, Math.max(0, H.mouth));
+      gl.uniform1f(u.uGlitch, H.glitch); gl.uniform1f(u.uThink, H.thinkS); gl.uniform1f(u.uSpeak, H.speakS);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      return;
+    }
+    gl.useProgram(H.prog);
     gl.uniform2f(H.u.uRes, w, h); gl.uniform2fv(H.u.uTilt, H.tilt); gl.uniform3fv(H.u.uView, H.view); gl.uniform1f(H.u.uRot, H.rot || 0);
     gl.uniform1f(H.u.uT, t); gl.uniform1f(H.u.uMouth, Math.max(0, H.mouth));
     gl.uniform1f(H.u.uBlink, H.blink); gl.uniform1f(H.u.uGlitch, H.glitch);
