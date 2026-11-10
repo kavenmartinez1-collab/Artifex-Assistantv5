@@ -13,7 +13,7 @@ Endpoints (all bearer-authed via the check_auth callable the server passes in):
     GET  /v1/agent/runs/{id}/events        SSE: replay buffered events, then live
     POST /v1/agent/runs/{id}/approval      {"decision": "approve"|"always"|"deny"|"stop"}
     POST /v1/agent/runs/{id}/message       follow-up: steer live / revive done
-    POST /v1/agent/runs/{id}/stop          abort the run
+    POST /v1/agent/runs/{id}/stop          interrupt the turn (the run stays revivable)
 
 Design notes:
 
@@ -42,6 +42,21 @@ Design notes:
   timeout: an unanswered prompt holds the run in "awaiting_approval"
   indefinitely, which is visible in the run list and resumable from the
   phone whenever the user comes back.
+
+- A run is a CONVERSATION (interactive=true, the default): the first goal
+  and every follow-up are user turns of one history, driven by one
+  AgentRunner that lives on the AgentRun. The system prompt carries no GOAL
+  and does not change between turns, so a follow-up costs no prompt-cache
+  rebuild. "done" / "stopped:*" mean "this turn is over, waiting for the
+  user"; POST .../message starts the next turn in place. interactive=false
+  is the strict unattended loop (GOAL in the prompt, stall nudges) that
+  scripted callers and benches want.
+
+- Everything a run holds is in memory and bounded: the newest _MAX_EVENTS
+  events (event indices keep counting; a client asking for older ones is
+  told they are gone), and at most _THINK_RUN_CHARS of think-block text
+  across the run (oldest rounds lose theirs first). Nothing is written to
+  disk.
 
 - The run names its model. Starting (or reviving) a run switches the model
   queue to it BEFORE the worker loads the engine — the same path chat takes —
@@ -76,6 +91,9 @@ _log = get_logger(__name__)
 
 _MAX_KEPT_RUNS = 20          # finished runs retained for the list/replay
 _EVENT_TEXT_CAP = 8000       # chars of any single text field kept per event
+_MAX_EVENTS = 6000           # events kept per run; the oldest are dropped past it
+_EVENT_TRIM = 1000           # how many go at once when the cap is hit
+_THINK_RUN_CHARS = 400_000   # think-block text kept per run, across all rounds
 
 _runs: dict[str, "AgentRun"] = {}
 _runs_lock = threading.Lock()
@@ -131,6 +149,15 @@ class AgentRunRequest(BaseModel):
         None, ge=1, le=5,
         description="Best-of-N: attempt the goal N times from the same commit and keep the best (core/agent_attempts.py). Needs a clean git worktree. Default 1.",
     )
+    interactive: Optional[bool] = Field(
+        True,
+        description=(
+            "true (default): a conversation - follow-ups are user turns, the "
+            "system prompt stays fixed, a reply with no tool action hands the "
+            "turn back to the user. false: the strict unattended loop (GOAL "
+            "in the system prompt, nudged until it acts or emits @done)."
+        ),
+    )
 
 
 class ApprovalRequest(BaseModel):
@@ -161,6 +188,11 @@ def _serialize_event(ev: AgentEvent) -> dict:
             d[k] = v[: _EVENT_TEXT_CAP]
     if ev.success is not None:
         d["success"] = ev.success
+    if getattr(ev, "thinking", ""):
+        d["thinking"] = ev.thinking[: _EVENT_TEXT_CAP]
+        d["think_s"] = ev.think_s
+    if getattr(ev, "stats", None):
+        d["stats"] = ev.stats
     if ev.action is not None:
         d["action"] = _action_dict(ev.action)
     if ev.decision is not None:
@@ -200,7 +232,16 @@ class AgentRun:
         # "Always" rules the user granted; kept across revivals of this run.
         self.approvals = ApprovalMemory()
         self.history: list = []
-        self.events: list[dict] = []      # persisted (non-chunk) events, indexable
+        # The session's AgentRunner, made by the first worker and reused by
+        # every later turn (pinned notes, repo map and steer log live on it).
+        self.runner: Optional[AgentRunner] = None
+        self._prompt_cache: dict = {}
+        # Persisted (non-chunk) events. events[k] has index _ev_base + k:
+        # the list is capped, the indices clients hold are not renumbered.
+        self.events: list[dict] = []
+        self._ev_base = 0
+        self._think_events: list[dict] = []   # events still holding thinking text
+        self._think_chars = 0
         self._cond = threading.Condition()
         self._live_chunks: list[tuple[int, dict]] = []   # (serial, chunk) ring for live listeners
         self._chunk_serial = 0
@@ -225,11 +266,40 @@ class AgentRun:
                 (self._round_thinking if ev.kind == "thinking_chunk"
                  else self._round_text).append(d.get("text") or "")
             else:
-                d["i"] = len(self.events)
+                d["i"] = self._ev_base + len(self.events)
                 self.events.append(d)
                 self._round_text.clear()
                 self._round_thinking.clear()
+                self._bound_memory(d)
             self._cond.notify_all()
+
+    @property
+    def event_end(self) -> int:
+        """Index the next persisted event will get (call with _cond held)."""
+        return self._ev_base + len(self.events)
+
+    def events_from(self, idx: int) -> list:
+        """Persisted events with index >= idx (call with _cond held)."""
+        return self.events[max(0, idx - self._ev_base):]
+
+    def _bound_memory(self, d: dict):
+        """Keep a day-long session from growing without limit (lock held)."""
+        if d.get("thinking"):
+            self._think_events.append(d)
+            self._think_chars += len(d["thinking"])
+            while self._think_chars > _THINK_RUN_CHARS and len(self._think_events) > 1:
+                old = self._think_events.pop(0)
+                self._think_chars -= len(old.pop("thinking", ""))
+                old["thinking_dropped"] = True
+        if len(self.events) > _MAX_EVENTS:
+            gone = self.events[:_EVENT_TRIM]
+            del self.events[:_EVENT_TRIM]
+            self._ev_base += _EVENT_TRIM
+            for old in gone:
+                if old.get("thinking"):
+                    self._think_chars -= len(old["thinking"])
+            self._think_events = [e for e in self._think_events
+                                  if e.get("i", 0) >= self._ev_base]
 
     # ── approval bridge ─────────────────────────────────────────────────
     def request_approval(self, action, decision, reason) -> Decision:
@@ -303,7 +373,9 @@ class AgentRun:
                 "summary": self.summary,
                 "created": self.created,
                 "finished_at": self.finished_at,
-                "event_count": len(self.events),
+                "event_count": self.event_end,
+                "first_event": self._ev_base,
+                "interactive": bool(self.config.interactive),
                 "pending_approval": self.pending_approval,
                 # What the run actually got, once the engine reported its
                 # loaded window. None until the worker has resolved it.
@@ -411,7 +483,7 @@ def _worker(run: AgentRun, get_engine, goal: str | None = None):
         seeing = {True: "can see images", False: "text only"}.get(run.vision, "vision unknown")
         run.emit(AgentEvent("model", text=f"Model: {run.model} ({seeing}, ctx {resolved_ctx})"))
 
-        prompt_cache: dict = {}
+        prompt_cache = run._prompt_cache
 
         def build_system_prompt() -> str:
             # Same prompt stack the Qt GUI uses — the full tool catalog
@@ -447,16 +519,27 @@ def _worker(run: AgentRun, get_engine, goal: str | None = None):
         with run._cond:
             run.status = "running"
             run._cond.notify_all()
-        runner = AgentRunner(
-            engine,
-            build_system_prompt=build_system_prompt,
-            emit=run.emit,
-            request_approval=run.request_approval,
-            config=run.config,
-            control=run.control,
-            approvals=run.approvals,
-        )
-        result = runner.run(goal, run.history)
+        runner = run.runner
+        if runner is None:
+            runner = run.runner = AgentRunner(
+                engine,
+                build_system_prompt=build_system_prompt,
+                emit=run.emit,
+                request_approval=run.request_approval,
+                config=run.config,
+                control=run.control,
+                approvals=run.approvals,
+            )
+        else:
+            # A later turn of the same conversation. The engine object may be
+            # a new one (the model was swapped out and back in between).
+            runner.engine = engine
+            runner.build_system_prompt = build_system_prompt
+            runner._native = runner._engine_takes_tools()
+        if run.config.interactive:
+            result = runner.run_turn(goal, run.history)
+        else:
+            result = runner.run(goal, run.history)
         run.finish(result.status, result.summary)
         _log.info("Agent run %s finished: %s (%d rounds, %d actions)",
                   run.id, result.status, result.rounds, result.actions_run)
@@ -570,6 +653,7 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
                 config.plan = "auto"
             if body.attempts:
                 config.attempts = body.attempts
+            config.interactive = body.interactive is not False
 
             if body.folder:
                 folder = os.path.abspath(os.path.expanduser(body.folder))
@@ -598,6 +682,7 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
             _runs[run.id] = run
             _prune_finished()
 
+        run.emit(AgentEvent("user_message", text=body.goal, round=0))
         run.thread = threading.Thread(
             target=_worker, args=(run, get_engine),
             name=f"agent-run-{run.id}", daemon=True,
@@ -725,28 +810,34 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
             while True:
                 out, done_now = [], False
                 with run._cond:
+                    if next_idx < run._ev_base:
+                        # The capped buffer no longer has what was asked for.
+                        out.append({"kind": "trimmed",
+                                    "text": f"{run._ev_base - next_idx} older "
+                                            "events are no longer kept"})
+                        next_idx = run._ev_base
                     if last_chunk_serial is None:
                         # Instead of the backlog: the missed events, then the
                         # current round's text as one chunk_snapshot.
                         last_chunk_serial = run._chunk_serial
-                        out.extend(run.events[next_idx:])
-                        next_idx = len(run.events)
+                        out.extend(run.events_from(next_idx))
+                        next_idx = run.event_end
                         if run._round_text or run._round_thinking:
                             out.append({
                                 "kind": "chunk_snapshot",
                                 "text": "".join(run._round_text),
                                 "thinking": "".join(run._round_thinking),
                             })
-                    if not out and next_idx >= len(run.events) and not run.terminal:
+                    if not out and next_idx >= run.event_end and not run.terminal:
                         run._cond.wait(timeout=15.0)
-                    while next_idx < len(run.events):
-                        out.append(run.events[next_idx])
-                        next_idx += 1
+                    if next_idx < run.event_end:
+                        out.extend(run.events_from(next_idx))
+                        next_idx = run.event_end
                     for serial, chunk in run._live_chunks:
                         if serial > last_chunk_serial:
                             out.append(chunk)
                             last_chunk_serial = serial
-                    if run.terminal and next_idx >= len(run.events):
+                    if run.terminal and next_idx >= run.event_end:
                         done_now = True
                 if out:
                     for d in out:

@@ -77,6 +77,16 @@ class AgentEvent:
     output: str = ""
     reason: str = ""
     summary: str = ""
+    # assistant_message only: the round's think block (capped, see
+    # THINK_KEEP_CHARS), how long it took, and the engine's token counts.
+    thinking: str = ""
+    think_s: float = 0.0
+    stats: Optional[dict] = None
+
+
+# Chars of one round's think block carried on its assistant_message event, so
+# hosts can show "Thought for 12s" after the round. Head and tail are kept.
+THINK_KEEP_CHARS = 6000
 
 
 @dataclass
@@ -150,6 +160,14 @@ class RunConfig:
     # checks and that a fresh-context judge prefers. Needs a clean git
     # worktree; 1 = a normal run.
     attempts: int = 1
+    # A person is driving the loop as a conversation (the phone, Qt and CLI
+    # agent views). The system prompt then carries no GOAL and never changes
+    # between turns (follow-ups are plain user turns, so the server keeps its
+    # prompt cache); a reply without a tool action hands the turn back to the
+    # user instead of being nudged; and pinned notes and the repo map last
+    # for the whole session. False is the strict unattended loop the agent
+    # bench and scripted runs use.
+    interactive: bool = False
 
     @classmethod
     def default(cls, autonomy: AutonomyLevel = AutonomyLevel.GUIDED) -> "RunConfig":
@@ -208,6 +226,11 @@ class RunControl:
         with self._msg_lock:
             out, self._messages[:] = list(self._messages), []
             return out
+
+    @property
+    def has_messages(self) -> bool:
+        with self._msg_lock:
+            return bool(self._messages)
 
     def request_stop(self):
         self._stop.set()
@@ -303,6 +326,11 @@ class AgentRunner:
         self._native = self._engine_takes_tools()
         self._last_calls: list = []
         self._native_prompt = None   # ((cwd, goal), text): built once, not per round
+        # What the user said mid-run, for hosts and for planned steps (each
+        # step starts from a fresh history and would otherwise never see it).
+        self._steer_log: List[str] = []
+        self._round_thinking = ("", 0.0)   # (text, seconds) of the last round
+        self._round_stats: dict = {}
 
     # ── public ──────────────────────────────────────────────────────────────
 
@@ -312,6 +340,31 @@ class AgentRunner:
             from core.agent_attempts import run_attempts
             return run_attempts(self, goal, history)
         return self._run_once(goal, history)
+
+    def run_turn(self, text: str, history: list) -> RunResult:
+        """One user turn of an interactive session.
+
+        Runs the loop on `text`, then keeps going on anything the user queued
+        that the loop never reached (sent during its last round, or after the
+        round cap) - those used to be dropped. A turn the user stopped leaves
+        its queue alone: the host decides what to do with it.
+
+        The round cap, the circuit breaker and the human gate count per turn;
+        notes and "always" approvals belong to the session and are kept.
+        """
+        while True:
+            self.gate = GateState()
+            self.breaker = CircuitBreaker()
+            result = self.run(text, history)
+            if self.control.stop_requested or result.status.startswith("stopped:user"):
+                return result
+            queued = self.control.drain_messages()
+            if not queued:
+                return result
+            for q in queued:
+                self._steer_log.append(q)
+                self.emit(AgentEvent("user_message", text=q))
+            text = "\n\n".join(queued)
 
     def _run_once(self, goal: str, history: list) -> RunResult:
         if self.config.plan != "off" and goal and not history_has_assistant(history):
@@ -323,12 +376,17 @@ class AgentRunner:
              max_rounds: Optional[int] = None) -> RunResult:
         """One loop over `history`. keep_state=True (planned steps) keeps the
         run's verifier, notes, repo map and clock across calls."""
+        session = self.config.interactive
         if not keep_state:
             self._t0 = time.monotonic()
             self._actions_run = 0
             self._verifier = None
-            self._notes = []
-            self._repo_map = self._build_repo_map() if self.config.repo_map else ""
+            if not session:
+                self._notes = []
+            # A session builds the map once: rebuilding it per turn would
+            # change the system prompt and throw the prompt cache away.
+            if not (session and self._repo_map):
+                self._repo_map = self._build_repo_map() if self.config.repo_map else ""
         self._round = 0
         self._done_holds = 0
         self.goal = goal or ""
@@ -336,6 +394,8 @@ class AgentRunner:
             history.append({"role": "user", "content": goal})
         consecutive_failures = 0
         format_retries = 0
+        acted = False          # an action ran in this turn
+        steer_nudged = False   # the one "carry on" nudge after a mid-turn message
 
         for rnd in range(1, (max_rounds or self.config.max_rounds) + 1):
             self._round = rnd
@@ -349,7 +409,10 @@ class AgentRunner:
             # Follow-up messages from the host (phone/GUI) land between
             # rounds as ordinary user turns, so the next generation sees
             # them exactly like mid-task steering in a chat.
+            steered = False
             for injected in self.control.drain_messages():
+                steered = True
+                self._steer_log.append(injected)
                 history.append({"role": "user", "content": injected})
                 self.emit(AgentEvent("user_message", text=injected, round=rnd))
 
@@ -381,8 +444,11 @@ class AgentRunner:
                 history.append({"role": "assistant", "content": resp})
             if self.km:
                 self._safe(lambda: self.km.add_from_ai_response(resp))
-            if resp.strip() or not calls:
-                self.emit(AgentEvent("assistant_message", text=resp, round=rnd))
+            think_text, think_s = self._round_thinking
+            if resp.strip() or not calls or think_text:
+                self.emit(AgentEvent("assistant_message", text=resp, round=rnd,
+                                     thinking=think_text, think_s=think_s,
+                                     stats=self._round_stats or None))
 
             if calls:
                 # Each call becomes the AgentAction the text parser would
@@ -404,6 +470,11 @@ class AgentRunner:
                     hold = self._hold_done()
                     if hold:
                         self._native_feedback(history, call_ids, call_slots, [], hold)
+                        continue
+                    if self.control.has_messages:
+                        # The user wrote while this round ran: answer the
+                        # finish call and go round again instead of ending.
+                        self._native_feedback(history, call_ids, call_slots, [], "")
                         continue
                     self.emit(AgentEvent("done", summary=done, round=rnd))
                     return self._finish("done", history, done)
@@ -449,7 +520,8 @@ class AgentRunner:
                                     self._empty_nudge() if blank
                                     else self._format_nudge()})
                     continue
-                if format_retries < 2 and self._looks_like_stalled_plan(resp):
+                if (format_retries < 2 and not session
+                        and self._looks_like_stalled_plan(resp)):
                     # "Step 1: find the definition." <end of turn> — a chat
                     # reflex: announce, then wait for the user. Nobody is
                     # listening; push it to act (observed on Qwen3.6, s4).
@@ -475,6 +547,17 @@ class AgentRunner:
                 hold = self._hold_done()
                 if hold:
                     history.append({"role": "user", "content": hold})
+                    continue
+                if self.control.has_messages:
+                    # A message arrived during this round. Ending here would
+                    # drop it; the drain at the top of the next round adds it.
+                    continue
+                if session and steered and acted and done is None and not steer_nudged:
+                    # The model answered a mid-task message in prose, which
+                    # would hand the turn back with the task half done. Ask
+                    # once whether there is work left.
+                    steer_nudged = True
+                    history.append({"role": "user", "content": self._steer_nudge()})
                     continue
                 summary = done if done else resp.strip()
                 self.emit(AgentEvent("done", summary=summary, round=rnd))
@@ -612,6 +695,7 @@ class AgentRunner:
                     ok, out = False, f"ERROR: {e}"
                 out = out or ""
                 self._actions_run += 1
+                acted = True
 
                 if ok:
                     self.breaker.record_success(action.content)
@@ -686,6 +770,8 @@ class AgentRunner:
                 if hold:
                     history[-1]["content"] += "\n\n" + hold
                     continue
+                if self.control.has_messages:
+                    continue
                 self.emit(AgentEvent("done", summary=done, round=rnd))
                 return self._finish("done", history, done)
 
@@ -726,12 +812,14 @@ class AgentRunner:
             # machine facts and the goal. The host's base prompt is not
             # built at all here (it was built every round and thrown away),
             # and the native prompt is built once per goal, not per round.
-            key = (os.getcwd(), self.goal)
+            session = self.config.interactive
+            key = (os.getcwd(), "" if session else self.goal)
             if self._native_prompt is None or self._native_prompt[0] != key:
                 from core.native_agent_tools import build_native_agent_prompt
                 from core.prompts import _environment_note
                 self._native_prompt = (key, build_native_agent_prompt(
-                    self._safe_env_note(_environment_note), key[0], self.goal))
+                    self._safe_env_note(_environment_note), key[0], key[1],
+                    interactive=session))
             content = self._native_prompt[1]
         else:
             try:
@@ -739,8 +827,13 @@ class AgentRunner:
             except Exception as e:
                 _log.warning("build_system_prompt failed: %s", e)
                 base = ""
-            content = (build_autonomous_prompt(base, self.goal, repo_map=self._repo_map)
-                       if self.config.framing else base)
+            if not self.config.framing:
+                content = base
+            elif self.config.interactive:
+                content = build_autonomous_prompt(base, "", repo_map=self._repo_map,
+                                                  interactive=True)
+            else:
+                content = build_autonomous_prompt(base, self.goal, repo_map=self._repo_map)
         if history and history[0].get("role") == "system":
             history[0]["content"] = content
         else:
@@ -1036,6 +1129,10 @@ class AgentRunner:
         from core.inference import ThinkFilter
         self._gen_error = ""
         parts: List[str] = []
+        think: List[str] = []
+        think_t = [0.0, 0.0]     # first / last thinking token (monotonic)
+        self._round_thinking = ("", 0.0)
+        self._round_stats = {}
 
         def on_resp(t):
             if self.control.stop_requested:
@@ -1046,7 +1143,21 @@ class AgentRunner:
         def on_think(t):
             if self.control.stop_requested:
                 raise GenerationAborted()
+            now = time.monotonic()
+            if not think_t[0]:
+                think_t[0] = now
+            think_t[1] = now
+            think.append(t)
             self.emit(AgentEvent("thinking_chunk", text=t, round=self._round))
+
+        def keep_thinking():
+            text = "".join(think).strip()
+            if len(text) > THINK_KEEP_CHARS:
+                head = THINK_KEEP_CHARS // 3
+                text = (text[:head] + "\n[... thinking shortened ...]\n"
+                        + text[-(THINK_KEEP_CHARS - head):])
+            self._round_thinking = (
+                text, round(think_t[1] - think_t[0], 1) if text else 0.0)
 
         # One round of recovery after an empty response: thinking off, so
         # the whole completion budget is available for content. Consumed
@@ -1076,6 +1187,7 @@ class AgentRunner:
             # transcript keeps what was said; the round loop's stop checks
             # prevent any of its actions from running and end the run.
             self._safe(tf.flush)
+            keep_thinking()
             return "".join(parts)
         except Exception as e:
             _log.exception("agent_loop generation failed")
@@ -1084,8 +1196,15 @@ class AgentRunner:
             self._safe(tf.flush)
             return ""
         self._safe(tf.flush)
+        keep_thinking()
+        stats = getattr(self.engine, "_last_gen_stats", None) or {}
+        if not isinstance(stats, dict):
+            stats = {}
+        self._round_stats = {
+            k: stats[k] for k in ("prompt_tokens", "completion_tokens",
+                                  "predicted_per_second")
+            if isinstance(stats.get(k), (int, float)) and stats.get(k)}
         if self._native:
-            stats = getattr(self.engine, "_last_gen_stats", None) or {}
             self._last_calls = list(stats.get("tool_calls") or [])
         return resp if isinstance(resp, str) and resp else "".join(parts)
 
@@ -1255,6 +1374,15 @@ class AgentRunner:
         )
 
     @staticmethod
+    def _steer_nudge() -> str:
+        return (
+            "[automated] If the task you were working on is not finished, "
+            "continue it now with a tool action. If it is finished, or the "
+            "user asked you to stop or wait, reply with one short line and no "
+            "tool action."
+        )
+
+    @staticmethod
     def _empty_nudge() -> str:
         """The round produced zero content tokens.
 
@@ -1330,7 +1458,10 @@ class AgentRunner:
 
     def _feedback(self, outputs: List[str]) -> str:
         body = "\n\n".join(outputs) if outputs else "(no output)"
-        if self.config.framing:
+        if self.config.framing and self.config.interactive:
+            tail = ("Continue the task. When it is finished, tell the user "
+                    "briefly what you did, with no tool action.")
+        elif self.config.framing:
             tail = ("Continue toward the GOAL. When it is fully done, give a short "
                     'final summary or emit @done("one-line summary").')
         else:

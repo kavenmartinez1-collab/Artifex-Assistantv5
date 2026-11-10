@@ -76,8 +76,26 @@ You are Artifex, an agent working on the user's own Windows PC in a loop, not a 
   blocked and need the user, call finish and say what you need."""
 
 
-def build_native_agent_prompt(env_note: str, workspace: str, goal: str) -> str:
-    out = NATIVE_AGENT_PREAMBLE
+# Conversational variant (RunConfig.interactive): no GOAL section, so the
+# prompt does not change between follow-ups.
+NATIVE_INTERACTIVE_PREAMBLE = """\
+You are Artifex, an agent working with the user on their own Windows PC. This is
+an ongoing conversation, and you can act.
+- Use the provided tools to do the work. Each tool call really runs, and its
+  result comes back to you; then decide the next step.
+- Never ask the user to run something: call the tool yourself.
+- A file counts only once it is on disk: write it with write_file or edit_file.
+- While there is work left, keep calling tools. A reply without a tool call
+  hands control back to the user: do that when the task is done (say briefly
+  what you did, or call finish), when the user asked something that needs no
+  action, or when you need the user's input.
+- The user can send a message while you work. Answer it briefly, follow any
+  change of direction, and keep working unless told to stop."""
+
+
+def build_native_agent_prompt(env_note: str, workspace: str, goal: str,
+                              interactive: bool = False) -> str:
+    out = NATIVE_INTERACTIVE_PREAMBLE if interactive else NATIVE_AGENT_PREAMBLE
     if env_note:
         out += "\n\n" + env_note
     if workspace:

@@ -244,6 +244,31 @@ AUTONOMOUS MODE — you are running in a self-driving loop, not a chat.
   get summarized when the context fills up; pinned notes are kept word for word."""
 
 
+# The same loop, driven as a conversation (RunConfig.interactive): a person is
+# on the other end, can send a message while the agent works, and gets the
+# turn back whenever a reply ends without a tool action. No GOAL section goes
+# with it - each user message is an ordinary turn, so the system prompt stays
+# byte-identical across follow-ups and the server keeps its prompt cache.
+INTERACTIVE_PREAMBLE = """\
+AGENT MODE — you are working with the user in an ongoing conversation, and you can act.
+- Tool markers are LIVE: writing @tool("arg") or a ```bash```/```python``` block
+  EXECUTES it. After each result is fed back to you, decide the NEXT action.
+- NEVER ask the user to run a command — YOU run it. NEVER simulate user messages.
+- Take ONE focused step per turn so each result can guide the next.
+- While there is work left, END your turn with a live tool action. A turn that
+  ends without one hands control back to the user: do that only when the task
+  is finished, when the user asked something that needs no action, or when you
+  need the user's input.
+- The user can send a message while you work. Answer it briefly, follow any
+  change of direction, and keep working in the same turn unless told to stop.
+- A deliverable counts only when it is ON DISK. If the task asks for a file,
+  it is not finished until an ```edit``` block has actually written it —
+  showing the content in your reply saves nothing. Report the path you wrote.
+- When the task is done, STOP issuing tools and tell the user briefly what you did.
+- @note("fact") pins a finding, decision or plan step for yourself. Older turns
+  get summarized when the context fills up; pinned notes are kept word for word."""
+
+
 def _environment_note() -> str:
     """Runtime facts about the box the agent's commands actually run on.
 
@@ -354,13 +379,18 @@ def shell_execution_note() -> str:
 _ENV_NOTE_CACHE: str = ""
 
 
-def build_autonomous_prompt(base_prompt: str, goal: str = "", repo_map: str = "") -> str:
+def build_autonomous_prompt(base_prompt: str, goal: str = "", repo_map: str = "",
+                            interactive: bool = False) -> str:
     """Wrap the assistant base prompt with the autonomous loop framing + goal
-    (and the run's repo map, when there is one, right before the goal)."""
+    (and the run's repo map, when there is one, right before the goal).
+
+    interactive=True swaps in the conversational framing; callers pass no
+    goal with it (see INTERACTIVE_PREAMBLE)."""
     global _ENV_NOTE_CACHE
     if not _ENV_NOTE_CACHE:
         _ENV_NOTE_CACHE = _environment_note()
-    out = f"{base_prompt}\n\n{AUTONOMOUS_PREAMBLE}\n\n{_ENV_NOTE_CACHE}"
+    preamble = INTERACTIVE_PREAMBLE if interactive else AUTONOMOUS_PREAMBLE
+    out = f"{base_prompt}\n\n{preamble}\n\n{_ENV_NOTE_CACHE}"
     if repo_map:
         out += f"\n\n{repo_map}"
     if goal:
