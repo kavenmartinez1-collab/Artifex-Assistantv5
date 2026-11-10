@@ -35,7 +35,7 @@ from core.sandbox.circuit_breaker import CircuitBreaker
 from core.sandbox.human_gate import GateState
 from tools.agent_tools import (
     extract_agent_actions, run_agent_action, detect_done,
-    MAX_AGENT_ROUNDS, git_commit_edit, git_revert_last,
+    MAX_AGENT_ROUNDS, git_commit_edit, git_revert_last, set_cancel_check,
 )
 from tools.tool_cache import maybe_cache_output, update_session_map
 
@@ -284,7 +284,10 @@ class AgentRunner:
     emit                — (AgentEvent) -> None: display sink.
     request_approval    — (action, decision, reason) -> Decision: blocking. For
         per-action prompts action/decision are set; for breaker/gate pauses they
-        are None and `reason` explains. Return APPROVE/APPROVE_ALWAYS/DENY/STOP.
+        are None and `reason` explains. Return APPROVE/APPROVE_ALWAYS/DENY/STOP,
+        or (Decision, "what the user typed"): with DENY the text goes back to
+        the model as the reason, with APPROVE on a pause it is queued as the
+        user's next message.
     approvals           — ApprovalMemory holding the "always" rules. Pass the
         same one across revivals of a run so they survive follow-ups; default
         is a fresh, empty one per runner.
@@ -632,12 +635,12 @@ class AgentRunner:
                         continue
                     self.emit(AgentEvent("approval_required", action=action,
                                          decision=decision, round=rnd))
-                    dec = self.request_approval(action, decision, "")
+                    dec, said = self._ask(action, decision, "")
                     if dec == Decision.STOP:
                         flush_outputs()
                         return self._finish("stopped:user", history)
                     if dec == Decision.DENY:
-                        outputs.append(f"[skipped by user] {action.display}")
+                        outputs.append(self._denied(action, said, rnd))
                         deferred_done_ok = False
                         continue
                     # "Always" on an out-of-scope prompt approves this one
@@ -648,7 +651,7 @@ class AgentRunner:
                 trip = self.breaker.check_and_trip()
                 if trip:
                     self.emit(AgentEvent("breaker_tripped", reason=trip, round=rnd))
-                    if self.request_approval(None, None, f"circuit breaker: {trip}") == Decision.STOP:
+                    if not self._pause(f"circuit breaker: {trip}"):
                         flush_outputs()
                         return self._finish("stopped:breaker", history)
                     # reset(), not acknowledge(): acknowledge keeps the
@@ -666,12 +669,12 @@ class AgentRunner:
                     else:
                         self.emit(AgentEvent("approval_required", action=action,
                                              decision=decision, round=rnd))
-                        dec = self.request_approval(action, decision, "")
+                        dec, said = self._ask(action, decision, "")
                         if dec == Decision.STOP:
                             flush_outputs()
                             return self._finish("stopped:user", history)
                         if dec == Decision.DENY:
-                            outputs.append(f"[skipped by user] {action.display}")
+                            outputs.append(self._denied(action, said, rnd))
                             deferred_done_ok = False
                             continue
                         if dec == Decision.APPROVE_ALWAYS:
@@ -685,6 +688,9 @@ class AgentRunner:
                 self.emit(AgentEvent("action_started", action=action, round=rnd))
                 if action.type == "edit_file":
                     self._before_edit(action)
+                # A stop while the command runs ends its whole process tree
+                # instead of waiting out the timeout (up to five minutes).
+                set_cancel_check(lambda: self.control.stop_requested)
                 try:
                     # policy_check=False: this loop already ran check_policy
                     # (blocked/approval handling above) — re-checking inside
@@ -693,6 +699,8 @@ class AgentRunner:
                     ok, out = run_agent_action(action, policy_check=False)
                 except Exception as e:  # executor blew up — treat as failure
                     ok, out = False, f"ERROR: {e}"
+                finally:
+                    set_cancel_check(None)
                 out = out or ""
                 self._actions_run += 1
                 acted = True
@@ -750,7 +758,7 @@ class AgentRunner:
             greason = self.gate.should_gate(rnd)
             if greason:
                 self.emit(AgentEvent("gate_pause", reason=greason, round=rnd))
-                if self.request_approval(None, None, f"human gate: {greason}") == Decision.STOP:
+                if not self._pause(f"human gate: {greason}"):
                     flush_outputs()
                     return self._finish("stopped:gate", history)
                 self.gate.acknowledge_gate(rnd)
@@ -780,6 +788,33 @@ class AgentRunner:
         return self._finish("stopped:max_rounds", history)
 
     # ── internals ─────────────────────────────────────────────────────────────
+
+    def _ask(self, action, decision, reason):
+        """request_approval, normalized to (Decision, what the user typed)."""
+        res = self.request_approval(action, decision, reason)
+        if isinstance(res, tuple):
+            return res[0], str(res[1] or "").strip() if len(res) > 1 else ""
+        return res, ""
+
+    def _denied(self, action, text: str, rnd: int) -> str:
+        """The user said no (maybe with a reason). Returns the tool feedback."""
+        self.emit(AgentEvent("denied", action=action, reason=text, round=rnd))
+        if not text:
+            return f"[skipped by user] {action.display}"
+        self._steer_log.append(text)
+        self.emit(AgentEvent("user_message", text=text, round=rnd))
+        return (f"[skipped by user] {action.display}\n"
+                f"The user declined it and said: {text}")
+
+    def _pause(self, reason: str) -> bool:
+        """Breaker / human-gate pause. False = the user stopped the run. Text
+        typed at the pause is queued as their next message."""
+        dec, text = self._ask(None, None, reason)
+        if dec == Decision.STOP:
+            return False
+        if text:
+            self.control.inject_message(text)
+        return True
 
     def _needs_approval(self, action, decision) -> bool:
         """Whether to pause for human approval before running `action`.
@@ -1133,15 +1168,19 @@ class AgentRunner:
         think_t = [0.0, 0.0]     # first / last thinking token (monotonic)
         self._round_thinking = ("", 0.0)
         self._round_stats = {}
+        # Set once the stream is over, so the filter's final flush can hand
+        # over the few characters it was still holding after an interrupt
+        # (they used to be cut off the partial reply).
+        closing = [False]
 
         def on_resp(t):
-            if self.control.stop_requested:
+            if self.control.stop_requested and not closing[0]:
                 raise GenerationAborted()
             parts.append(t)
             self.emit(AgentEvent("assistant_chunk", text=t, round=self._round))
 
         def on_think(t):
-            if self.control.stop_requested:
+            if self.control.stop_requested and not closing[0]:
                 raise GenerationAborted()
             now = time.monotonic()
             if not think_t[0]:
@@ -1186,6 +1225,7 @@ class AgentRunner:
             # User stop, not a failure: return the partial text so the
             # transcript keeps what was said; the round loop's stop checks
             # prevent any of its actions from running and end the run.
+            closing[0] = True
             self._safe(tf.flush)
             keep_thinking()
             return "".join(parts)

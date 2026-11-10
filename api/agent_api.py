@@ -162,6 +162,11 @@ class AgentRunRequest(BaseModel):
 
 class ApprovalRequest(BaseModel):
     decision: str = Field(..., description="approve | always | deny | stop")
+    text: Optional[str] = Field(
+        None, max_length=8000,
+        description="What the user typed with the decision. With deny it is "
+                    "given to the model as the reason; with approve on a "
+                    "gate/breaker pause it becomes their next message.")
 
 
 class RunMessageRequest(BaseModel):
@@ -252,7 +257,7 @@ class AgentRun:
         self._round_text: list[str] = []
         self._round_thinking: list[str] = []
         self.pending_approval: Optional[dict] = None
-        self._approval_q: "queue.Queue[str]" = queue.Queue()
+        self._approval_q: "queue.Queue[tuple]" = queue.Queue()
         self.thread: Optional[threading.Thread] = None
 
     # ── event sink (called from the worker thread) ──────────────────────
@@ -303,7 +308,7 @@ class AgentRun:
                                   if e.get("i", 0) >= self._ev_base]
 
     # ── approval bridge ─────────────────────────────────────────────────
-    def request_approval(self, action, decision, reason) -> Decision:
+    def request_approval(self, action, decision, reason):
         payload = {
             # The loop passes reason="" for ordinary action approvals; the
             # policy engine's justification lives on the decision. Without
@@ -321,7 +326,7 @@ class AgentRun:
         try:
             while True:
                 try:
-                    reply = self._approval_q.get(timeout=1.0)
+                    reply, said = self._approval_q.get(timeout=1.0)
                     break
                 except queue.Empty:
                     if self.control.stop_requested:
@@ -332,10 +337,10 @@ class AgentRun:
                 if self.status == "awaiting_approval":
                     self.status = "running"
                 self._cond.notify_all()
-        return {"approve": Decision.APPROVE, "always": Decision.APPROVE_ALWAYS,
-                "deny": Decision.DENY}.get(reply, Decision.STOP)
+        return ({"approve": Decision.APPROVE, "always": Decision.APPROVE_ALWAYS,
+                 "deny": Decision.DENY}.get(reply, Decision.STOP), said)
 
-    def answer_approval(self, decision: str) -> bool:
+    def answer_approval(self, decision: str, text: str = "") -> bool:
         with self._cond:
             if self.pending_approval is None:
                 return False
@@ -350,8 +355,20 @@ class AgentRun:
             self._cond.notify_all()
         if decision == "stop":
             self.control.request_stop()
-        self._approval_q.put(decision)
+        self._approval_q.put((decision, text or ""))
         return True
+
+    def answer_with_message(self, text: str) -> Optional[str]:
+        """A message typed while a prompt is open IS the answer: "no, do it
+        this way" for an action, "carry on, and ..." for a gate/breaker
+        pause. Returns what it was taken as, or None if nothing was pending.
+        """
+        with self._cond:
+            pending = self.pending_approval
+        if pending is None:
+            return None
+        decision = "deny" if pending.get("action") else "approve"
+        return decision if self.answer_approval(decision, text) else None
 
     def finish(self, status: str, summary: str = ""):
         with self._cond:
@@ -423,6 +440,13 @@ def live_run_busy_reason() -> str | None:
     if live is None:
         return None
     return f"agent run {live.id} is using the model"
+
+
+def live_run_id() -> str | None:
+    """Id of the run whose turn is working right now, or None."""
+    with _runs_lock:
+        live = next((r for r in _runs.values() if not r.terminal), None)
+    return live.id if live else None
 
 
 def _engine_vision(engine) -> Optional[bool]:
@@ -595,6 +619,18 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
                 status_code=409,
                 detail={"message": "A run is already active", "run_id": live.id},
             )
+        # One generation at a time on the engine: a chat reply still being
+        # written would share (and on a one-slot server, block) the model.
+        try:
+            from api.chat_jobs import live_chat_busy_reason
+            chat = live_chat_busy_reason()
+        except Exception:
+            chat = None
+        if chat:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": f"{chat} - wait for it or stop it first",
+                        "chat": True})
 
     async def _prepare(requested: str | None) -> str | None:
         if prepare_model is None:
@@ -725,7 +761,7 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
         if decision not in ("approve", "always", "deny", "stop"):
             raise HTTPException(status_code=422,
                                 detail="decision must be approve | always | deny | stop")
-        if not run.answer_approval(decision):
+        if not run.answer_approval(decision, (body.text or "").strip()):
             raise HTTPException(status_code=409, detail="Run is not awaiting approval")
         return {"ok": True, "decision": decision}
 
@@ -735,8 +771,10 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
 
         Live run: the text is queued and picked up at the next round boundary
         (the loop emits a user_message event at the actual pickup point). A
-        message queued in the run's final round is dropped when the run ends —
-        the client sees the terminal status and can resend, which revives.
+        message that arrives during the turn's last round keeps the turn
+        going. If the run is waiting on an approval, the message answers it:
+        deny-with-reason for an action, continue-and-say for a pause. Only a
+        turn the user stops leaves queued text unread (the client keeps it).
 
         Terminal run: the run restarts in place — same workspace, same history,
         same event stream (indices continue) — with the text as the new goal.
@@ -750,6 +788,10 @@ def register_agent_routes(app, check_auth, get_engine, default_workspace_root: s
 
         with _runs_lock:
             if not run.terminal:
+                taken = run.answer_with_message(text)
+                if taken:
+                    return {"queued": True, "run_id": run.id, "status": run.status,
+                            "answered_approval": taken}
                 run.control.inject_message(text)
                 return {"queued": True, "run_id": run.id, "status": run.status}
 

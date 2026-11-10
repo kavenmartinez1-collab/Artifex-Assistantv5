@@ -2118,6 +2118,16 @@ def create_app():
         if not _check_auth(request):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
+        # The agent has the engine while one of its turns is working. A chat
+        # reply on the same model would interleave with it (or, on a server
+        # that runs one request at a time, sit behind it and time out).
+        from api.agent_api import live_run_busy_reason
+        if live_run_busy_reason():
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "The agent is working - wait for it or "
+                                   "stop it in the Agent tab first"})
+
         _DEFAULT_MAX_TOKENS = 32768
 
         messages = [m.model_dump() for m in body.messages]

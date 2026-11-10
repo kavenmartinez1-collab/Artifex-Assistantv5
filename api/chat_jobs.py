@@ -301,6 +301,16 @@ def register_chat_job_routes(app, check_auth, prepare, stream_factory, session_d
                     detail={"message": "A chat job is already running",
                             "job_id": live.id,
                             "session_id": live.req.session_id})
+            # The agent has the engine while a turn is working: a chat reply
+            # on the same model would interleave with it (or, on a one-slot
+            # server, sit behind it). Refuse with the run to look at instead.
+            from api.agent_api import live_run_busy_reason, live_run_id
+            if live_run_busy_reason():
+                raise HTTPException(
+                    status_code=409,
+                    detail={"message": "The agent is working - wait for it or "
+                                       "stop it in the Agent tab first",
+                            "agent_run_id": live_run_id()})
             job = ChatJob(body)
             _jobs[job.id] = job
 

@@ -15,6 +15,7 @@ import math
 import signal
 import socket
 import ipaddress
+import threading
 import time
 import random
 
@@ -1136,6 +1137,32 @@ def _kill_process_tree(proc):
         pass
 
 
+# Per-thread "has the user interrupted?" check, set by the agent loop around
+# each action it runs. Thread-local: a chat tool running a command on another
+# thread is not this run's to cancel.
+_cancel_local = threading.local()
+
+
+class CommandInterrupted(Exception):
+    """The user interrupted the run while this command was executing."""
+
+    def __str__(self):
+        return "interrupted by the user before it finished"
+
+
+def set_cancel_check(fn):
+    """fn() -> bool, polled while a command runs on THIS thread; None clears it."""
+    _cancel_local.check = fn
+
+
+def _cancel_requested() -> bool:
+    fn = getattr(_cancel_local, "check", None)
+    try:
+        return bool(fn and fn())
+    except Exception:
+        return False
+
+
 def _run_capture(args, timeout, **kwargs):
     """subprocess.run(capture_output=True) whose timeout ends the WHOLE tree.
 
@@ -1144,14 +1171,28 @@ def _run_capture(args, timeout, **kwargs):
     `python server.py` or `npm run dev` the shell started — kept the wait
     going: a 2 s timeout returned after 12 s behind a 12 s sleep, and never
     behind a server. The tree is killed first, and the drain is bounded.
+
+    The wait is taken in short slices so an interrupt (set_cancel_check) can
+    end the tree the same way, raising CommandInterrupted.
     """
     if not IS_WINDOWS:
         kwargs.setdefault("start_new_session", True)   # own group, for killpg
     proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, **kwargs)
+    deadline = None if timeout is None else time.monotonic() + timeout
     try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+        while True:
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and left <= 0:
+                raise subprocess.TimeoutExpired(args, timeout)
+            try:
+                out, err = proc.communicate(
+                    timeout=0.25 if left is None else min(0.25, left))
+                break
+            except subprocess.TimeoutExpired:
+                if _cancel_requested():
+                    raise CommandInterrupted()
+    except (subprocess.TimeoutExpired, CommandInterrupted):
         _kill_process_tree(proc)
         try:
             proc.communicate(timeout=5)
