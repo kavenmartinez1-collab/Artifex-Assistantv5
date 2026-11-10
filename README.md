@@ -145,6 +145,7 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
   - [Docker Profiles](#docker-profiles)
   - [Network Isolation](#network-isolation-full-profile)
 - [Multi-Modal Pipelines](#multi-modal-pipelines)
+- [Agent Mode: a Conversation You Can Steer](#agent-mode-a-conversation-you-can-steer)
 - [Agent Tools](#agent-tools)
 - [Starting Services](#starting-services)
   - [Control Center (Recommended)](#option-a-control-center-recommended)
@@ -174,6 +175,7 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 - **Three backends** — HuggingFace Transformers (GPU-accelerated), Ollama (pre-quantized GGUF), and llama.cpp (custom forks, bleeding-edge quants)
 - **Automatic VRAM management** — GPU resource pool with nvidia-smi monitoring, CUDA context flush, VRAM-ready gating (prevents crash loops from WDDM reclaim latency), per-request context estimation, hybrid-model-aware KV sizing, multi-GPU device selection, plus GPU tier detection, NF4/INT8 quantization, and KV cache budgeting. **Tier-aware launch context** picks a small llama-server `-c` per request (32K / 64K / 128K / 256K) instead of always using the model's max — saves several GB of KV cache on typical workloads, with grow-on-demand relaunch and a 10-min idle shrink. **Live VRAM baseline** measures what other Windows processes (DWM, browsers, Electron apps) actually hold via nvidia-smi so the reserve isn't a static guess.
 - **Three interfaces** — CLI with agent tools and multimodal pipelines, PyQt6 GUI with inline media, OpenAI-compatible REST API with file management
+- **Steerable agent** — the agent is a conversation, as in a coding-agent terminal: type while it works to steer it, interrupt it at any point, deny a step with a reason, and carry on in the same thread. Same behaviour on the phone, the Qt app and the CLI
 - **Agent tools** — shell execution, Python runner, web search, codebase analysis (grep, glob, architecture), file I/O, edit-in-place
 - **RAG knowledge base** — per-workspace knowledge entries with lifecycle classification, action keys, loop detection
 - **Session persistence** — save/load conversations with full metadata (model, backend, mode)
@@ -738,9 +740,9 @@ If `ARTIFEX_API_KEY` is not set, no authentication is required.
 > [installer section](#quick-start-the-installer-windows).
 
 The API ships a self-contained phone client at **`/app`** — chat with web
-search, server-synced sessions, a file browser, and full agent runs
-(start goals, watch actions stream, approve/deny risky steps, send
-follow-ups) — everything the desktop drives, from a phone. It's a single
+search, server-synced sessions, a file browser, and the agent as a
+conversation (start it, steer it while it works, approve or deny risky
+steps with a reason, stop it, carry on) — everything the desktop drives, from a phone. It's a single
 HTML file with no CDN dependencies, so it works on networks with no
 internet path to the browser.
 
@@ -1430,6 +1432,54 @@ All pipelines are accessed through a shared `MultimodalService` layer (`core/ser
 - **File management** — uploads and generated files stored with persistent index (`output/file_index.json`)
 - **Cancellation** — operations can be interrupted mid-stream
 - **Progress reporting** — uniform callback interface for all pipeline types
+
+---
+
+## Agent Mode: a Conversation You Can Steer
+
+The agent works like a coding-agent terminal: one conversation where the
+model runs tools, and you can talk to it while it works. The phone app's
+**Agent** tab, the Qt app's **AGENT** tab and the CLI behave the same way.
+
+- **One message box.** Your first message starts the conversation. A
+  message sent while the agent is working is queued (shown dimmed) and read
+  at its next step, so you can correct it mid-task ("use the other
+  folder", "skip the tests"). A message after it answers continues the
+  same conversation with everything it has done so far.
+- **A prose reply ends the turn.** When the agent answers in words
+  instead of calling a tool, it waits for you rather than being nudged to
+  keep going.
+- **Stop at any time.** Stop (Esc in the Qt app, Esc or Ctrl+C in the CLI)
+  interrupts at once, including a shell command that is still running
+  (its whole process tree ends). The conversation is kept; your next
+  message picks it up. In the CLI, Ctrl+C twice at the prompt quits.
+- **Approvals take a reason.** Approve, Always and Deny work as before.
+  Typing a reply instead denies the step and passes your words to the
+  model ("The user declined it and said: ..."). At a review pause, a typed
+  message continues the run as your next instruction; a bare `stop`
+  ends it.
+- **Readable transcript.** Each tool call is one collapsed row (tool,
+  request, result, risk colour) that opens to the full request and
+  output; a failed call shows its last lines without opening. Thinking
+  stays viewable per reply ("Thought for Ns"), and finished replies render
+  as markdown.
+- **Plan-first and best-of-N** runs can be steered too: what you say
+  reaches every later planned step. A best-of-N message reaches only the
+  attempt in progress, and the app says so.
+- **One engine user at a time.** While an agent turn is working, chat
+  requests to the same engine get HTTP 409 (and an agent turn is refused
+  while a chat reply is being generated), so the two never interleave on
+  one model.
+
+CLI specifics: a turn runs on a worker thread and the keyboard stays live.
+Type a line and press Enter to queue it for the agent's next step. Long
+tool output is folded (`+N lines (/expand)`): `/expand` prints the last
+tool output in full, and `/think` prints the last turn's thinking. If the optional `prompt_toolkit` package is installed, the
+input line stays at the bottom with a status toolbar; without it, typing
+while it works still works.
+
+The sandbox, risk policy and approval rules are unchanged: the same
+actions still ask, HIGH and CRITICAL included.
 
 ---
 
