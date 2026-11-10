@@ -29,7 +29,7 @@ COPY tools/ ./tools/
 COPY ui/ ./ui/
 COPY api/ ./api/
 COPY knowledge/ ./knowledge/
-COPY main.py main_gui.py main_api.py download_model.py setup.py setup_ollama.py ./
+COPY main.py main_gui.py main_api.py download_model.py setup_ollama.py ./
 
 # Create required directories
 RUN mkdir -p models sessions output logs .tool_cache
