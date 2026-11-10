@@ -518,6 +518,7 @@ class ChatBubble(QFrame):
         self._layout.setContentsMargins(8, 6, 8, 6)
         self._layout.setSpacing(4)
         self._stream_widget = None
+        self._queued_label = None
         self._stream_text_len = 0
         self._stream_newlines = 0
         self._stream_last_line_chars = 0
@@ -587,6 +588,48 @@ class ChatBubble(QFrame):
         player.load_file(path)
         self._layout.addWidget(player)
         return player
+
+    def add_widget(self, widget: QWidget, top: bool = False):
+        """Put any widget in the bubble (top=True: right under the header)."""
+        if top:
+            self._layout.insertWidget(1, widget)
+        else:
+            self._layout.addWidget(widget)
+        return widget
+
+    def set_pending(self, on: bool):
+        """Dim a message that was sent but not read yet ("queued")."""
+        if on and self._queued_label is None:
+            self._queued_label = QLabel("queued — it reads this at its next step")
+            self._queued_label.setProperty("class", "bubbleQueued")
+            self._layout.addWidget(self._queued_label)
+        elif not on and self._queued_label is not None:
+            self._layout.removeWidget(self._queued_label)
+            self._queued_label.deleteLater()
+            self._queued_label = None
+        self.setProperty("pending", "true" if on else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def set_markdown(self, text: str):
+        """Replace the bubble's text with `text` rendered as markdown (a
+        finished reply). Long text stays plain: a word-wrapped rich label
+        that size stalls the layout, same as add_text's cap."""
+        for i in range(self._layout.count() - 1, 0, -1):
+            w = self._layout.itemAt(i).widget()
+            if w is None:
+                continue
+            if w is self._stream_widget or w.property("class") == "bubbleText":
+                self._layout.removeWidget(w)
+                w.deleteLater()
+        self._stream_widget = None
+        if not text:
+            return None
+        label = self.add_text(text)
+        if len(text) <= self._MAX_LABEL_CHARS:
+            label.setTextFormat(Qt.TextFormat.MarkdownText)
+            label.setOpenExternalLinks(False)
+        return label
 
     def append_text(self, text: str):
         """Append text to the streaming content area.
@@ -839,3 +882,308 @@ class ChatView(QScrollArea):
 
     def get_last_bubble(self) -> ChatBubble | None:
         return self._bubbles[-1] if self._bubbles else None
+
+
+    def add_item(self, widget: QWidget, follow: bool = False) -> QWidget:
+        """Add any row widget (a tool row, an approval card, a note) to the
+        conversation. Rows count toward MAX_BUBBLES like bubbles do."""
+        idx = self._container_layout.count() - 1
+        self._container_layout.insertWidget(idx, widget)
+        self._bubbles.append(widget)
+        self._trim_bubbles()
+        if follow:
+            self._auto_scroll = True
+        if self._auto_scroll:
+            self._scroll_to_bottom()
+        return widget
+
+    def remove_item(self, widget: QWidget):
+        """Take one row out again (an empty reply, a retracted message)."""
+        if widget in self._bubbles:
+            self._bubbles.remove(widget)
+            self._container_layout.removeWidget(widget)
+            widget.setParent(None)
+            widget.deleteLater()
+
+    def move_to_end(self, widget: QWidget):
+        """Re-seat a row at the bottom (a queued message, once it is read)."""
+        if widget in self._bubbles:
+            self._bubbles.remove(widget)
+            self._bubbles.append(widget)
+            self._container_layout.removeWidget(widget)
+            self._container_layout.insertWidget(
+                self._container_layout.count() - 1, widget)
+            if self._auto_scroll:
+                self._scroll_to_bottom()
+
+
+# ── Agent conversation rows ──────────────────────────────────────────────
+#
+# The AGENT tab is a ChatView like the chat tab, plus these rows: a fold for
+# the model's thinking, one collapsed line per tool call, the approval card,
+# and dim one-line notes. Colours come from ui/qt_theme.py (object classes
+# below), so every theme restyles them.
+
+_TOOL_FENCE_RE = None
+
+
+def strip_tool_syntax(text: str) -> str:
+    """A reply's prose without the tool calls it made (@read_file("x"), a
+    ```bash block): the tool row under the bubble shows those in full. A reply
+    with an edit block is left exactly as it is: the file text it writes can
+    hold fences and @markers of its own, and those are content."""
+    import re
+    global _TOOL_FENCE_RE
+    if "```edit" in (text or ""):
+        return text
+    if _TOOL_FENCE_RE is None:
+        _TOOL_FENCE_RE = (
+            re.compile(r"```(?:bash|sh|shell|powershell|ps1|pwsh|cmd|python|py)\b"
+                       r"[^\n]*\n.*?\n```[ \t]*(?=\n|$)", re.S),
+            re.compile(r"^[ \t]*@[a-z_]+\([^\n]*\)[ \t]*$", re.M),
+        )
+    out = _TOOL_FENCE_RE[0].sub("", text or "")
+    out = _TOOL_FENCE_RE[1].sub("", out)
+    return re.sub(r"\n{3,}", "\n\n", out).strip()
+
+
+def fmt_secs(seconds: float) -> str:
+    s = max(0, int(round(seconds)))
+    return f"{s}s" if s < 60 else f"{s // 60}m {s % 60:02d}s"
+
+
+class _FoldRow(QFrame):
+    """A one-line header that opens a body built on first use."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._outer = QVBoxLayout(self)
+        self._outer.setContentsMargins(8, 1, 8, 1)
+        self._outer.setSpacing(2)
+        self._head = QPushButton()
+        self._head.setFlat(True)
+        self._head.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._head.setProperty("class", "foldHead")
+        self._head.clicked.connect(self.toggle)
+        self._outer.addWidget(self._head)
+        self._body = None
+        self._open = False
+
+    def _make_body(self) -> QWidget:      # pragma: no cover - overridden
+        return QWidget()
+
+    def toggle(self):
+        self._open = not self._open
+        if self._open and self._body is None:
+            self._body = self._make_body()
+            self._outer.addWidget(self._body)
+        if self._body is not None:
+            self._body.setVisible(self._open)
+        self._render_head()
+
+    def _render_head(self):               # pragma: no cover - overridden
+        pass
+
+    @staticmethod
+    def _text_box(text: str, max_height: int = 240) -> QPlainTextEdit:
+        box = QPlainTextEdit()
+        box.setReadOnly(True)
+        box.setProperty("class", "foldBody")
+        box.setPlainText(text)
+        lines = min(text.count("\n") + 2, 40)
+        box.setFixedHeight(min(max_height, max(44, lines * 17 + 10)))
+        return box
+
+
+class ThinkFold(_FoldRow):
+    """ "Thought for 12s" - closed; click to read the round's thinking."""
+
+    def __init__(self, text: str, seconds: float = 0.0, parent=None):
+        super().__init__(parent)
+        self.setProperty("class", "thinkFold")
+        self._text = text or ""
+        self._label = (f"Thought for {fmt_secs(seconds)}" if seconds >= 1
+                       else "Thought briefly")
+        self._render_head()
+
+    def _make_body(self):
+        return self._text_box(self._text, 220)
+
+    def _render_head(self):
+        self._head.setText(("▾ " if self._open else "▸ ") + self._label)
+
+
+class ToolRow(_FoldRow):
+    """One tool call: state, tool, what was asked, how it went. The whole
+    request and the output are inside the fold."""
+
+    _OUTPUT_SHOWN = 20000      # chars of output put in the fold
+
+    def __init__(self, tool: str, display: str, full: str = "", risk: str = "",
+                 parent=None):
+        super().__init__(parent)
+        self.setProperty("class", "toolRow")
+        self.setProperty("risk", risk or "NONE")
+        self._tool = tool or "action"
+        disp = (display or "").strip()
+        if disp.startswith(self._tool + ": "):
+            disp = disp[len(self._tool) + 2:]
+        self._display = " ".join(disp.split())
+        self._full = full or display or ""
+        self._glyph = "○"
+        self._result = risk if risk not in ("", "SAFE", "LOW", "NONE") else ""
+        self._output = ""
+        self._why = ""
+        self._preview = None
+        self._render_head()
+
+    def set_state(self, glyph: str, state: str = "", result: str = None):
+        self._glyph = glyph
+        self._head.setProperty("state", state)
+        self._head.style().unpolish(self._head)
+        self._head.style().polish(self._head)
+        if result is not None:
+            self._result = result
+        self._render_head()
+
+    def set_output(self, text: str, failed: bool = False):
+        self._output = text or ""
+        if failed and self._output.strip() and self._preview is None:
+            # A failure shows its last lines without being opened.
+            tail = "\n".join(self._output.strip().splitlines()[-3:])
+            self._preview = QLabel(tail[:600])
+            self._preview.setWordWrap(True)
+            self._preview.setProperty("class", "toolFail")
+            self._outer.addWidget(self._preview)
+        self._rebuild_body()
+
+    def set_reason(self, why: str):
+        self._why = why or ""
+        self._rebuild_body()
+
+    def _rebuild_body(self):
+        if self._body is not None:
+            was_open = self._open
+            self._outer.removeWidget(self._body)
+            self._body.deleteLater()
+            self._body = None
+            if was_open:
+                self._open = False
+                self.toggle()
+
+    def _make_body(self):
+        text = self._full
+        if self._why:
+            text += "\n\n" + self._why
+        if self._output:
+            out = self._output
+            if len(out) > self._OUTPUT_SHOWN:
+                out = (out[:self._OUTPUT_SHOWN]
+                       + f"\n[... {len(self._output) - self._OUTPUT_SHOWN:,} more characters]")
+            text += "\n\n── output ──\n" + out
+        return self._text_box(text)
+
+    def _render_head(self):
+        if self._preview is not None:
+            self._preview.setVisible(not self._open)
+        disp = self._display if len(self._display) <= 96 else self._display[:95] + "…"
+        tail = f"   — {self._result}" if self._result else ""
+        self._head.setText(f"{self._glyph}  {self._tool}  {disp}{tail}")
+        self._head.setToolTip(self._full[:1500])
+
+
+class ApprovalCard(QFrame):
+    """The approval prompt, in the conversation under the tool row it is
+    about. `decided` carries approve | always | deny; typing a reply in the
+    composer answers it too (the window does that). Shrinks to one line once
+    answered."""
+
+    decided = pyqtSignal(str)
+
+    def __init__(self, what: str, why: str = "", gate: bool = False, parent=None):
+        super().__init__(parent)
+        self.setProperty("class", "approvalCard")
+        self.is_gate = gate
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 7, 10, 8)
+        lay.setSpacing(5)
+        self._title = QLabel("PAUSED" if gate else "APPROVAL REQUIRED")
+        self._title.setProperty("class", "approvalTitle")
+        lay.addWidget(self._title)
+        self._parts = []
+        # Read-only text box, not a QLabel: it holds the FULL request (a whole
+        # script or both sides of an edit) as plain text and scrolls when long.
+        what_box = QPlainTextEdit()
+        what_box.setReadOnly(True)
+        what_box.setProperty("class", "foldBody")
+        what_box.setPlainText(what)
+        what_box.setFixedHeight(min(200, max(40, (what.count("\n") + 2) * 17 + 8)))
+        lay.addWidget(what_box)
+        self._parts.append(what_box)
+        if why:
+            why_label = QLabel(why)
+            why_label.setWordWrap(True)
+            why_label.setProperty("class", "dim")
+            lay.addWidget(why_label)
+            self._parts.append(why_label)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        buttons = [("Continue" if gate else "Approve", "approve", "primary")]
+        if not gate:
+            # A gate/breaker pause has nothing to remember, and nothing to deny.
+            buttons += [("Always", "always", "secondary"), ("Deny", "deny", "secondary")]
+        for label, decision, cls in buttons:
+            b = QPushButton(label)
+            b.setProperty("class", cls)
+            if decision == "always":
+                b.setToolTip(
+                    "Approve, and don't ask again in this conversation for the "
+                    "same kind of action (same command prefix, or edits to the "
+                    "same file). CRITICAL actions still ask every time.")
+            b.clicked.connect(lambda _=False, d=decision: self.decided.emit(d))
+            row.addWidget(b)
+            self._parts.append(b)
+        hint = QLabel("or type a message to continue with it" if gate
+                      else "or type a reply to say what to do instead")
+        hint.setProperty("class", "dim")
+        row.addWidget(hint, 1)
+        self._parts.append(hint)
+        lay.addLayout(row)
+        self.answered = False
+
+    def mark(self, label: str):
+        """Answered: keep one line saying how."""
+        if self.answered:
+            return
+        self.answered = True
+        for w in self._parts:
+            w.setVisible(False)
+        self._title.setText(f"APPROVAL · {label.upper()}")
+        self.setProperty("answered", "true")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
+class ComposerEdit(QPlainTextEdit):
+    """The message box under a conversation: Enter sends, Shift+Enter makes a
+    new line, Esc interrupts."""
+
+    submitted = pyqtSignal()
+    escaped = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setProperty("class", "composer")
+        self.setTabChangesFocus(True)
+        self.setFixedHeight(58)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (
+                event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            self.submitted.emit()
+            return
+        if key == Qt.Key.Key_Escape:
+            self.escaped.emit()
+            return
+        super().keyPressEvent(event)

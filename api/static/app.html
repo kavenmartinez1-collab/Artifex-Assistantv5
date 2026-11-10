@@ -4190,9 +4190,11 @@ function agentAssistant(ev) {
 }
 // A reply that called tools carries their syntax (@read_file("x"), a
 // ```bash block). The tool row right under it shows the same request in
-// full, so the bubble keeps only the prose. Edit blocks are left alone:
-// they can contain fences of their own.
+// full, so the bubble keeps only the prose. A reply with an edit block is
+// left exactly as it is: the file text it writes can hold fences and
+// @markers of its own, and those are content.
 function stripToolSyntax(text) {
+  if (text.indexOf("```edit") >= 0) return text;
   return text
     .replace(/```(?:bash|sh|shell|powershell|ps1|pwsh|cmd|python|py)\b[^\n]*\n[\s\S]*?\n```[ \t]*(?=\n|$)/g, "")
     .replace(/^[ \t]*@[a-z_]+\([^\n]*\)[ \t]*$/gm, "")

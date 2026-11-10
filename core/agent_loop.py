@@ -360,6 +360,10 @@ class AgentRunner:
             self.breaker = CircuitBreaker()
             result = self.run(text, history)
             if self.control.stop_requested or result.status.startswith("stopped:user"):
+                # Said in the transcript, so a replayed conversation shows
+                # where it was cut off.
+                self.emit(AgentEvent("stopped", reason="interrupted by you",
+                                     round=result.rounds))
                 return result
             queued = self.control.drain_messages()
             if not queued:

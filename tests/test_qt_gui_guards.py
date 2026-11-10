@@ -22,6 +22,8 @@ _REAL = ("_engine_in_use", "_drop_engine", "_set_current_worker", "_finish_busy"
          "_on_model_changed", "_on_backend_changed", "_on_backend_switched",
          "_on_execute", "_on_action_worker_done", "_on_generation_finished",
          "_on_clear", "_on_vram_relief", "_on_auto_run", "_on_auto_event",
+         "_auto_steer", "_auto_confirm_pending", "_on_auto_stop", "_auto_resolve",
+         "_on_auto_finished", "_on_auto_new",
          "_shutdown", "_on_load_session", "_on_save_session", "_run_voice_from_audio",
          "_on_stt_result")
 
@@ -40,6 +42,15 @@ def make_win(**state):
     win._auto_worker = None
     win._auto_control = None
     win._auto_armed_full = False
+    win._auto_runner = None
+    win._auto_history = None
+    win._auto_live = win._auto_row = win._auto_card = win._auto_bubble = None
+    win._auto_pending = []
+    win._auto_last_text = ""
+    win._auto_phase_text = ""
+    win._auto_tokens = 0
+    win._auto_planned = False
+    win._auto_plan_noted = False
     win._ptt_stream = None
     win._resource_monitor = None
     win._mic_recorder._stream = None
@@ -293,7 +304,7 @@ def test_gui_agent_run_uses_medium_reasoning_effort(monkeypatch):
     class _Auto:
         def __init__(self, engine, goal, history, **kw):
             made.update(kw, goal=goal)
-            for sig in ("event", "approval_required", "run_finished", "finished"):
+            for sig in ("agent_event", "approval_required", "run_finished", "finished"):
                 setattr(self, sig, MagicMock())
 
         def start(self):
@@ -301,7 +312,7 @@ def test_gui_agent_run_uses_medium_reasoning_effort(monkeypatch):
 
     monkeypatch.setattr(gui, "AutonomousWorker", _Auto)
     win = make_win(engine=engine_mock())
-    win._auto_goal.text.return_value = "tidy the folder"
+    win._auto_input.toPlainText.return_value = "tidy the folder"
     win._auto_level.currentText.return_value = "Guided"
     win._auto_preset.currentText.return_value = "Agent"
     win._auto_thinking.isChecked.return_value = True
@@ -309,6 +320,8 @@ def test_gui_agent_run_uses_medium_reasoning_effort(monkeypatch):
     win._on_auto_run()
     assert made.get("started") and made["goal"] == "tidy the folder"
     assert made["config"].reasoning_effort == "medium"
+    assert made["config"].interactive is True      # a conversation, not a one-shot run
+    assert made["runner"] is None                  # first turn makes the runner
     assert win._auto_running is True
 
 
@@ -316,7 +329,7 @@ def test_agent_run_is_refused_while_chat_is_generating(monkeypatch):
     monkeypatch.setattr(gui, "AutonomousWorker",
                         lambda *a, **k: pytest.fail("run started while busy"))
     win = make_win(_busy=True)
-    win._auto_goal.text.return_value = "x"
+    win._auto_input.toPlainText.return_value = "x"
     win._on_auto_run()
     assert win._auto_running is False
 
@@ -327,14 +340,239 @@ def test_agent_stream_chunks_are_batched_and_keep_their_order():
     win = make_win()
     win._auto_log_batcher.add.side_effect = lambda t: order.append(("add", t))
     win._auto_log_batcher.flush_now.side_effect = lambda: order.append("flush")
-    win._auto_append.side_effect = lambda t: order.append("append")
     win._on_auto_event(AgentEvent("assistant_chunk", text="Hel", round=1))
     win._on_auto_event(AgentEvent("assistant_chunk", text="lo", round=1))
-    win._auto_insert.assert_not_called()        # no per-token insert any more
+    win._auto_stream_text.assert_not_called()   # no per-token insert any more
     win._on_auto_event(AgentEvent("round_start", round=2))
-    assert order == [("add", "Hel"), ("add", "lo"), "flush", "append"]
+    assert order == [("add", "Hel"), ("add", "lo"), "flush"]
     win._on_auto_event(AgentEvent("thinking_chunk", text="hm", round=2))
-    win._auto_think_batcher.add.assert_called_once_with("hm")
+    win._auto_think_batcher.add.assert_called_with("hm")
+
+
+def test_second_turn_reuses_the_conversations_runner(monkeypatch):
+    made = {}
+
+    class _Auto:
+        def __init__(self, engine, goal, history, **kw):
+            made.update(kw, goal=goal, history=history)
+            for sig in ("agent_event", "approval_required", "run_finished", "finished"):
+                setattr(self, sig, MagicMock())
+            self.runner = kw["runner"]
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(gui, "AutonomousWorker", _Auto)
+    runner, control, history = MagicMock(), MagicMock(), [{"role": "system", "content": "S"}]
+    win = make_win(engine=engine_mock(), _auto_runner=runner, _auto_control=control,
+                   _auto_history=history)
+    win._auto_input.toPlainText.return_value = "and the tests too"
+    win._auto_level.currentText.return_value = "Guided"
+    win._auto_preset.currentText.return_value = "Agent"
+    win._on_auto_run()
+    assert made["runner"] is runner and made["history"] is history
+    assert made["config"] is runner.config
+    control.reset.assert_called_once()             # clears the last turn's Stop
+
+
+def test_message_while_working_is_queued_for_the_next_step():
+    control = MagicMock()
+    win = make_win(_auto_running=True, _auto_control=control)
+    win._auto_input.toPlainText.return_value = "use tabs"
+    win._on_auto_run()
+    control.inject_message.assert_called_once_with("use tabs")
+    assert [t for t, _ in win._auto_pending] == ["use tabs"]
+    win._auto_user_bubble.assert_called_once_with("use tabs", pending=True)
+
+
+def test_queued_message_is_confirmed_when_the_loop_reads_it():
+    from core.agent_loop import AgentEvent
+    bubble = MagicMock()
+    win = make_win(_auto_running=True, _auto_pending=[("use tabs", bubble)])
+    win._on_auto_event(AgentEvent("user_message", text="use tabs", round=3))
+    bubble.set_pending.assert_called_once_with(False)
+    assert win._auto_pending == []
+    win._auto_user_bubble.assert_not_called()       # not drawn twice
+
+
+def test_typing_at_an_approval_denies_with_the_reason():
+    from core.agent_loop import Decision
+    card, worker, control = MagicMock(), MagicMock(), MagicMock()
+    card.answered, card.is_gate = False, False
+    win = make_win(_auto_running=True, _auto_card=card, _auto_worker=worker,
+                   _auto_control=control)
+    win._auto_input.toPlainText.return_value = "no, archive it instead"
+    win._on_auto_run()
+    worker.resolve.assert_called_once_with(Decision.DENY, "no, archive it instead")
+    card.mark.assert_called_once_with("denied")
+    control.inject_message.assert_not_called()      # it went with the answer
+    assert win._auto_card is None
+
+
+def test_typing_at_a_pause_continues_with_the_message():
+    from core.agent_loop import Decision
+    card, worker = MagicMock(), MagicMock()
+    card.answered, card.is_gate = False, True
+    win = make_win(_auto_running=True, _auto_card=card, _auto_worker=worker,
+                   _auto_control=MagicMock())
+    win._auto_input.toPlainText.return_value = "go on"
+    win._on_auto_run()
+    worker.resolve.assert_called_once_with(Decision.APPROVE, "go on")
+
+
+def test_stop_interrupts_and_answers_an_open_approval():
+    from core.agent_loop import Decision
+    card, worker, control = MagicMock(), MagicMock(), MagicMock()
+    card.answered = False
+    win = make_win(_auto_running=True, _auto_card=card, _auto_worker=worker,
+                   _auto_control=control)
+    win._on_auto_stop()
+    control.request_stop.assert_called_once()
+    worker.resolve.assert_called_once_with(Decision.STOP)
+
+
+def test_stop_does_nothing_when_idle():
+    control = MagicMock()
+    win = make_win(_auto_running=False, _auto_control=control)
+    win._on_auto_stop()                              # Esc with nothing running
+    control.request_stop.assert_not_called()
+
+
+def test_interrupted_turn_hands_unread_messages_back_and_keeps_the_conversation():
+    from core.agent_loop import RunResult
+    runner, bubble = MagicMock(), MagicMock()
+    win = make_win(_auto_running=True, _auto_runner=runner,
+                   _auto_pending=[("later, do X", bubble)])
+    win._auto_input.toPlainText.return_value = ""
+    win._on_auto_finished(RunResult(status="stopped:user", rounds=1))
+    win._auto_input.setPlainText.assert_called_once_with("later, do X")
+    win._auto_view.remove_item.assert_called_once_with(bubble)
+    assert win._auto_running is False
+    assert win._auto_runner is runner                # next message continues it
+    assert win.messages == [{"role": "system", "content": "S"}]   # chat tab untouched
+
+
+def test_new_conversation_is_refused_while_working():
+    runner = MagicMock()
+    win = make_win(_auto_running=True, _auto_runner=runner)
+    win._on_auto_new()
+    assert win._auto_runner is runner
+    win._auto_view.clear_chat.assert_not_called()
+
+
+# ── agent conversation widgets ───────────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def qapp():
+    from PyQt6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+def test_strip_tool_syntax_keeps_the_prose():
+    from ui.qt_widgets import strip_tool_syntax
+    text = 'I will look.\n@read_file("a.py")\n\nThen run it:\n```bash\npytest -q\n```\nDone.'
+    assert strip_tool_syntax(text) == "I will look.\n\nThen run it:\n\nDone."
+    # An edit block can hold fences and markers of its own: left alone.
+    edit = 'Writing it.\n```edit\nREADME.md\n```bash\nx\n```\n@note("y")\n```'
+    assert strip_tool_syntax(edit) == edit
+    assert strip_tool_syntax("Just prose with @mention and `code`.") == \
+        "Just prose with @mention and `code`."
+
+
+def test_tool_row_collapsed_line_and_lazy_body(qapp):
+    from ui.qt_widgets import ToolRow
+    row = ToolRow("shell", "shell: git status", "git status", "LOW")
+    assert row._body is None                         # nothing built until opened
+    assert row._head.text().startswith("○  shell  git status")
+    row.set_state("✓", "ok", "12 lines")
+    row.set_output("line\n" * 12)
+    assert "✓" in row._head.text() and "12 lines" in row._head.text()
+    assert row._body is None and row._preview is None
+    row.toggle()
+    assert "git status" in row._body.toPlainText() and "── output ──" in row._body.toPlainText()
+
+
+def test_failed_tool_row_shows_its_last_lines_without_opening(qapp):
+    from ui.qt_widgets import ToolRow
+    row = ToolRow("python", "python: x", "x", "MEDIUM")
+    row.set_state("✗", "bad", "3 lines")
+    row.set_output("a\nb\nTraceback: boom", failed=True)
+    assert row._preview is not None and "boom" in row._preview.text()
+
+
+def test_approval_card_emits_the_choice_and_shrinks_once_answered(qapp):
+    from ui.qt_widgets import ApprovalCard
+    card = ApprovalCard("shell  rm x", "risk HIGH", gate=False)
+    got = []
+    card.decided.connect(got.append)
+    labels = {}
+    from PyQt6.QtWidgets import QPushButton
+    for b in card.findChildren(QPushButton):
+        labels[b.text()] = b
+    assert set(labels) == {"Approve", "Always", "Deny"}
+    labels["Always"].click()
+    assert got == ["always"]
+    card.mark("approved")
+    assert card.answered and card._title.text() == "APPROVAL · APPROVED"
+    assert all(not b.isVisibleTo(card) for b in labels.values())
+
+
+def test_gate_card_has_only_continue(qapp):
+    from ui.qt_widgets import ApprovalCard
+    from PyQt6.QtWidgets import QPushButton
+    card = ApprovalCard("human gate: 10 actions", gate=True)
+    assert [b.text() for b in card.findChildren(QPushButton)] == ["Continue"]
+    assert card.is_gate
+
+
+def test_bubble_markdown_replaces_the_stream_and_keeps_the_fold(qapp):
+    from PyQt6.QtCore import Qt
+    from ui.qt_widgets import ChatView, ThinkFold
+    view = ChatView()
+    bubble = view.add_bubble("assistant")
+    bubble.add_text("")
+    bubble.append_text("**bold** and `code`")
+    fold = bubble.add_widget(ThinkFold("thinking text", 12.4), top=True)
+    label = bubble.set_markdown("**bold** and `code`")
+    assert bubble._stream_widget is None
+    assert label.textFormat() == Qt.TextFormat.MarkdownText
+    assert fold._head.text() == "▸ Thought for 12s"
+    assert bubble._layout.indexOf(fold) == 1         # still right under the header
+    # A very long reply stays plain (rich word-wrapped labels that size stall).
+    long_label = view.add_bubble("assistant").set_markdown("x" * 9000)
+    assert long_label.textFormat() != Qt.TextFormat.MarkdownText
+
+
+def test_queued_bubble_is_marked_and_cleared(qapp):
+    from ui.qt_widgets import ChatView
+    view = ChatView()
+    first = view.add_bubble("user")
+    first.add_text("steer")
+    first.set_pending(True)
+    assert first.property("pending") == "true" and first._queued_label is not None
+    view.add_bubble("assistant")
+    first.set_pending(False)
+    view.move_to_end(first)
+    assert first._queued_label is None and view._bubbles[-1] is first
+
+
+def test_composer_enter_sends_shift_enter_does_not_esc_interrupts(qapp):
+    from PyQt6.QtCore import QEvent, Qt
+    from PyQt6.QtGui import QKeyEvent
+    from ui.qt_widgets import ComposerEdit
+    box = ComposerEdit()
+    got = []
+    box.submitted.connect(lambda: got.append("send"))
+    box.escaped.connect(lambda: got.append("esc"))
+
+    def press(key, mods=Qt.KeyboardModifier.NoModifier, text=""):
+        box.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key, mods, text))
+
+    press(Qt.Key.Key_Return)
+    press(Qt.Key.Key_Return, Qt.KeyboardModifier.ShiftModifier, "\n")
+    press(Qt.Key.Key_Escape)
+    assert got == ["send", "esc"]
+    assert box.toPlainText() == "\n"
 
 
 # ── shutdown ─────────────────────────────────────────────────────────────

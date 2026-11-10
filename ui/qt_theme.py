@@ -690,6 +690,117 @@ def generate_stylesheet(theme: dict = None) -> str:
         color: {t['text']};
     }}
 
+    ChatBubble[pending="true"] {{
+        border-left: 2px dashed {a2};
+        background-color: {rgba(a2, 0.04)};
+    }}
+    QLabel[class="bubbleQueued"] {{
+        font-family: {mono}, monospace;
+        font-size: 7pt;
+        color: {t['dim']};
+        background: transparent;
+    }}
+
+    /* === Agent conversation rows (ui/qt_widgets.py) === */
+    QFrame[class="toolRow"], QFrame[class="thinkFold"] {{
+        background: transparent;
+        border: none;
+        border-left: 2px solid {t['border_hi']};
+        margin: 0px 2px 0px 12px;
+    }}
+    QFrame[class="toolRow"][risk="SAFE"], QFrame[class="toolRow"][risk="LOW"] {{
+        border-left-color: {t['success']};
+    }}
+    QFrame[class="toolRow"][risk="MEDIUM"] {{
+        border-left-color: {t['warning']};
+    }}
+    QFrame[class="toolRow"][risk="HIGH"], QFrame[class="toolRow"][risk="CRITICAL"] {{
+        border-left-color: {t['error']};
+    }}
+    QFrame[class="thinkFold"] {{
+        border-left-color: {rgba(a2, 0.5)};
+        margin: 0px;
+    }}
+    QPushButton[class="foldHead"] {{
+        background: transparent;
+        border: none;
+        text-align: left;
+        padding: 2px 4px;
+        min-height: 18px;
+        font-family: {mono}, monospace;
+        font-size: 9pt;
+        font-weight: normal;
+        color: {t['text']};
+    }}
+    QPushButton[class="foldHead"]:hover {{
+        color: {t['hover']};
+        background-color: {rgba(a, 0.07)};
+    }}
+    QPushButton[class="foldHead"][state="run"] {{
+        color: {a};
+    }}
+    QPushButton[class="foldHead"][state="bad"] {{
+        color: {t['error']};
+    }}
+    QFrame[class="thinkFold"] QPushButton[class="foldHead"] {{
+        color: {t['dim']};
+        font-size: 8pt;
+    }}
+    QPlainTextEdit[class="foldBody"] {{
+        background-color: {rgba(t['output_bg'], 0.85)};
+        border: 1px solid {t['border']};
+        font-family: {mono}, monospace;
+        font-size: 9pt;
+        color: {t['text']};
+    }}
+    QLabel[class="toolFail"] {{
+        background: transparent;
+        color: {t['error']};
+        font-family: {mono}, monospace;
+        font-size: 9pt;
+        padding-left: 24px;
+    }}
+    QFrame[class="approvalCard"] {{
+        background-color: {rgba(t['warning'], 0.08)};
+        border: 1px solid {rgba(t['warning'], 0.45)};
+        border-top: 2px solid {t['warning']};
+        margin: 2px 2px 2px 12px;
+    }}
+    QFrame[class="approvalCard"][answered="true"] {{
+        background-color: transparent;
+        border: 1px solid {rgba(t['warning'], 0.25)};
+    }}
+    QFrame[class="approvalCard"] QLabel {{
+        background: transparent;
+    }}
+    QLabel[class="approvalTitle"] {{
+        color: {t['warning']};
+        font-family: {mono}, monospace;
+        font-size: 8pt;
+        font-weight: bold;
+    }}
+    QLabel[class="agentNote"] {{
+        background: transparent;
+        color: {t['dim']};
+        font-family: {mono}, monospace;
+        font-size: 8pt;
+        padding: 1px 14px;
+    }}
+    QLabel[class="agentNote"][kind="warn"] {{ color: {t['warning']}; }}
+    QLabel[class="agentNote"][kind="bad"] {{ color: {t['error']}; }}
+    QLabel[class="agentNote"][kind="good"] {{ color: {t['success']}; }}
+    QPlainTextEdit[class="composer"] {{
+        background-color: {t['input_bg']};
+        color: {t['text']};
+        border: 1px solid {t['border_hi']};
+        font-family: {mono}, monospace;
+        font-size: 10pt;
+        padding: 4px;
+    }}
+    QPlainTextEdit[class="composer"]:focus {{
+        border-color: {a};
+    }}
+
     /* === Drop zone === */
     DropZone {{
         border: 1px dashed {t['border_hi']};

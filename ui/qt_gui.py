@@ -9,6 +9,7 @@ import gc
 import os
 import sys
 import threading
+import time
 
 # Use the project's get_logger so setup_logging() runs lazily and the
 # rotating file handler in logs/artifex.log gets registered. Bare
@@ -38,6 +39,7 @@ from ui.qt_cyber import (
 from ui.qt_widgets import (
     DropZone, ImageViewer, AudioPlayer, VideoPlayer,
     MicrophoneRecorder, ChatView, ChatBubble,
+    ThinkFold, ToolRow, ApprovalCard, ComposerEdit, strip_tool_syntax,
 )
 from ui.qt_workers import (
     GenerationWorker, PipelineWorker, ActionWorker, TokenBatcher,
@@ -280,18 +282,25 @@ def _format_perf_summary(result) -> str | None:
 
 
 class AutonomousWorker(QThread):
-    """Runs the AgentRunner loop off the UI thread.
+    """Runs one turn of the AgentRunner loop off the UI thread.
 
     Translates AgentRunner events into Qt signals, and turns the runner's
     blocking `request_approval` into an `approval_required` signal that the UI
-    thread answers via `resolve(decision)`.
+    thread answers via `resolve(decision, text)`.
+
+    `runner` is the conversation's AgentRunner from an earlier turn (None on
+    the first one, which makes it); it is kept on `self.runner` for the next.
     """
-    event = pyqtSignal(object)              # core.agent_loop.AgentEvent
+    # Not named `event`: that is QObject.event(), the virtual Qt calls to
+    # deliver every event to this object. Shadowing it with a signal made
+    # each delivery fail ("native Qt signal is not callable"), deleteLater's
+    # deferred delete included.
+    agent_event = pyqtSignal(object)        # core.agent_loop.AgentEvent
     approval_required = pyqtSignal(object)  # dict: {action, decision, reason}
     run_finished = pyqtSignal(object)       # core.agent_loop.RunResult
 
     def __init__(self, engine, goal, history, *, build_system_prompt,
-                 km, session_map, config, control):
+                 km, session_map, config, control, runner=None):
         super().__init__()
         from core.agent_loop import AgentRunner
         self._goal = goal
@@ -299,10 +308,21 @@ class AutonomousWorker(QThread):
         self.control = control
         self._decision = None
         self._decision_event = threading.Event()
-        self._runner = AgentRunner(
-            engine, build_system_prompt=build_system_prompt,
-            emit=self.event.emit, request_approval=self._request_approval,
-            km=km, session_map=session_map, config=config, control=control)
+        if runner is None:
+            runner = AgentRunner(
+                engine, build_system_prompt=build_system_prompt,
+                emit=self.agent_event.emit, request_approval=self._request_approval,
+                km=km, session_map=session_map, config=config, control=control)
+        else:
+            # A later turn: same runner (its notes, approvals and steer log
+            # carry over), this thread's signals, and whatever engine is
+            # loaded now.
+            runner.engine = engine
+            runner._native = runner._engine_takes_tools()
+            runner.build_system_prompt = build_system_prompt
+            runner.emit = self.agent_event.emit
+            runner.request_approval = self._request_approval
+        self.runner = self._runner = runner
 
     def _request_approval(self, action, decision, reason):
         from core.agent_loop import Decision
@@ -315,13 +335,18 @@ class AutonomousWorker(QThread):
                 return Decision.STOP
         return self._decision
 
-    def resolve(self, decision):
-        self._decision = decision
+    def resolve(self, decision, text: str = ""):
+        """Answer the pending prompt. `text` is what the user typed with it:
+        the reason for a deny, or their next message at a pause."""
+        self._decision = (decision, text) if text else decision
         self._decision_event.set()
 
     def run(self):
         try:
-            result = self._runner.run(self._goal, self._history)
+            if self._runner.config.interactive:
+                result = self._runner.run_turn(self._goal, self._history)
+            else:
+                result = self._runner.run(self._goal, self._history)
         except Exception as e:  # surface, never crash the thread silently
             from core.agent_loop import RunResult
             _log.exception("Autonomous run failed")
@@ -373,6 +398,20 @@ class ArtifexMainWindow(QMainWindow):
         self._auto_control = None
         self._auto_running = False
         self._auto_armed_full = False  # one-time Full-auto confirmation per session
+        # The agent conversation (see "agent conversation" below).
+        self._auto_runner = None       # AgentRunner, for the whole conversation
+        self._auto_history = None
+        self._auto_live = None         # bubble the reply is streaming into
+        self._auto_bubble = None       # (bubble, raw text) of this round's reply
+        self._auto_row = None          # tool row of the action in flight
+        self._auto_card = None         # approval card still waiting
+        self._auto_pending = []        # (text, bubble) sent but not read yet
+        self._auto_last_text = ""
+        self._auto_phase_text = ""
+        self._auto_t0 = 0.0
+        self._auto_tokens = 0
+        self._auto_planned = False
+        self._auto_plan_noted = False
 
         # Backend switch in progress (BackendSwitchWorker): no generation
         # may start until the new backend and its model list are in place.
@@ -647,6 +686,10 @@ class ArtifexMainWindow(QMainWindow):
         input_frame = QFrame()
         input_layout = QVBoxLayout(input_frame)
         input_layout.setContentsMargins(0, 0, 0, 0)
+        # The AGENT tab has its own message box; two inputs on screen at once
+        # only invited typing into the wrong one.
+        self._tabs.currentChanged.connect(
+            lambda i: input_frame.setVisible(self._tabs.tabText(i) != "AGENT"))
 
         self._prompt_input = QPlainTextEdit()
         self._prompt_input.setPlaceholderText("Enter your message...")
@@ -992,11 +1035,10 @@ class ArtifexMainWindow(QMainWindow):
         self._response_batcher.batch_ready.connect(self._on_response_batch)
         self._thinking_batcher = TokenBatcher(flush_interval_ms=50)
         self._thinking_batcher.batch_ready.connect(self._on_thinking_batch)
-        # Same batching for the autonomous run's stream (it used to insert
-        # into the log once per token, straight from a queued signal).
+        # Same batching for the agent's stream (it used to insert once per
+        # token, straight from a queued signal).
         self._auto_log_batcher = TokenBatcher(flush_interval_ms=50)
-        self._auto_log_batcher.batch_ready.connect(
-            lambda t: self._auto_insert(self._auto_log, t))
+        self._auto_log_batcher.batch_ready.connect(self._auto_stream_text)
         self._auto_think_batcher = TokenBatcher(flush_interval_ms=50)
         self._auto_think_batcher.batch_ready.connect(
             lambda t: self._auto_insert(self._thinking_output, t))
@@ -2264,106 +2306,110 @@ class ArtifexMainWindow(QMainWindow):
         outer.addWidget(self._agent_status)
         vsplit.addWidget(harness_box)
 
-        # ── Autonomous run (bottom) ──────────────────────────────────────────
-        run_box = QGroupBox("Autonomous Run — pursue a goal step-by-step in this folder")
+        # ── Conversation (bottom) ────────────────────────────────────────────
+        # A chat with an agent that can act: one transcript, one message box.
+        # The first message starts a conversation, a message while it works
+        # steers it, a message after the turn continues it.
+        run_box = QWidget()
         rb = QVBoxLayout(run_box)
+        rb.setContentsMargins(0, 0, 0, 0)
+        rb.setSpacing(6)
 
-        goal_row = QHBoxLayout()
-        goal_row.addWidget(QLabel("Goal:"))
-        self._auto_goal = QLineEdit()
-        self._auto_goal.setPlaceholderText("Describe the task to run autonomously…")
-        goal_row.addWidget(self._auto_goal, 1)
-        goal_row.addWidget(QLabel("Autonomy:"))
+        opt_row = QHBoxLayout()
+        opt_row.addWidget(QLabel("Autonomy:"))
         self._auto_level = QComboBox()
         self._auto_level.addItems(["Manual", "Guided", "Full-auto"])
         self._auto_level.setCurrentText("Guided")
         self._auto_level.setToolTip(
             "Manual: confirm every action\n"
             "Guided: auto-run safe reads, confirm writes / MEDIUM+\n"
-            "Full-auto: run everything policy allows (CRITICAL + ratchet still stop it)")
-        goal_row.addWidget(self._auto_level)
-        goal_row.addWidget(QLabel("Sampling:"))
+            "Full-auto: run everything policy allows (CRITICAL + ratchet still stop it)\n"
+            "Applies from the next message on.")
+        opt_row.addWidget(self._auto_level)
+        opt_row.addWidget(QLabel("Sampling:"))
         self._auto_preset = QComboBox()
         from core.sampling import list_presets
         for name in list_presets():
             self._auto_preset.addItem(name.capitalize())
         self._auto_preset.setCurrentText("Agent")
         self._auto_preset.setToolTip(
-            "Sampler preset for this run (core/sampling.py — same contract as "
+            "Sampler preset (core/sampling.py — same contract as "
             "the WebGPU dropdown).\nAgent is tuned for tool-use discipline; "
             "see agent_bench/ for the measurements.")
-        goal_row.addWidget(self._auto_preset)
+        opt_row.addWidget(self._auto_preset)
         self._auto_thinking = QCheckBox("Thinking")
         self._auto_thinking.setChecked(True)
         self._auto_thinking.setToolTip(
             "Let the model reason in a <think> block before each action.\n"
             "Costs tokens/latency per round; measurably better tool discipline "
             "on Qwen3.6 (agent_bench).")
-        goal_row.addWidget(self._auto_thinking)
+        opt_row.addWidget(self._auto_thinking)
         self._auto_plan = QCheckBox("Plan first")
         self._auto_plan.setChecked(False)
         self._auto_plan.setToolTip(
-            "Split the goal into steps first and run each step in a fresh context\n"
-            "(core/agent_plan.py). Best for goals with several parts; measured ~3x\n"
-            "slower on a single change. A one-step plan runs normally.")
-        goal_row.addWidget(self._auto_plan)
-        rb.addLayout(goal_row)
+            "Split the first request of a conversation into steps and run each "
+            "step in a fresh context\n(core/agent_plan.py). Best for goals with "
+            "several parts; measured ~3x\nslower on a single change. A message "
+            "sent while it works reaches the current step and is passed to the "
+            "later ones; it does not rewrite the plan.")
+        opt_row.addWidget(self._auto_plan)
+        opt_row.addStretch()
+        self._agent_ctx_btn = QPushButton("Folder context")
+        self._agent_ctx_btn.setCheckable(True)
+        self._agent_ctx_btn.setProperty("class", "secondary")
+        self._agent_ctx_btn.setToolTip(
+            "Show the panel that absorbs another agent's context from a folder (.artifex).")
+        opt_row.addWidget(self._agent_ctx_btn)
+        self._auto_new_btn = QPushButton("New")
+        self._auto_new_btn.setProperty("class", "secondary")
+        self._auto_new_btn.setToolTip("Leave this conversation and start a fresh one.")
+        opt_row.addWidget(self._auto_new_btn)
+        rb.addLayout(opt_row)
 
-        btn_row = QHBoxLayout()
-        self._auto_run_btn = QPushButton("Run")
+        self._auto_view = ChatView()
+        rb.addWidget(self._auto_view, 1)
+
+        status_row = QHBoxLayout()
+        self._auto_status = QLabel(self._AUTO_READY)
+        self._auto_status.setProperty("class", "hint")
+        status_row.addWidget(self._auto_status, 1)
         self._auto_pause_btn = QPushButton("Pause")
         self._auto_pause_btn.setProperty("class", "secondary")
         self._auto_pause_btn.setEnabled(False)
-        self._auto_stop_btn = QPushButton("Stop")
+        self._auto_stop_btn = QPushButton("Stop (Esc)")
         self._auto_stop_btn.setProperty("class", "secondary")
         self._auto_stop_btn.setEnabled(False)
-        btn_row.addWidget(self._auto_run_btn)
-        btn_row.addWidget(self._auto_pause_btn)
-        btn_row.addWidget(self._auto_stop_btn)
-        btn_row.addStretch()
-        self._auto_status = QLabel("Idle.")
-        self._auto_status.setProperty("class", "dim")
-        btn_row.addWidget(self._auto_status)
-        rb.addLayout(btn_row)
+        self._auto_stop_btn.setToolTip(
+            "Interrupt now: the reply or command in progress is cut off, the "
+            "conversation stays, and your next message continues it.")
+        status_row.addWidget(self._auto_pause_btn)
+        status_row.addWidget(self._auto_stop_btn)
+        rb.addLayout(status_row)
 
-        # Inline approval bar (shown only when an action/pause needs a human)
-        self._auto_approval = QFrame()
-        self._auto_approval.setVisible(False)
-        ab = QHBoxLayout(self._auto_approval)
-        ab.setContentsMargins(0, 0, 0, 0)
-        # Read-only text box, not a QLabel: it holds the FULL request (a whole
-        # script or both sides of an edit) as plain text and scrolls when long.
-        self._auto_approval_label = QPlainTextEdit()
-        self._auto_approval_label.setReadOnly(True)
-        self._auto_approval_label.setMaximumHeight(220)
-        ab.addWidget(self._auto_approval_label, 1)
-        self._auto_approve_btn = QPushButton("Approve")
-        # Same rule memory as the phone's "Always" (core.sandbox.approvals):
-        # approve, and stop asking for the same kind of action this run.
-        self._auto_always_btn = QPushButton("Always")
-        self._auto_always_btn.setProperty("class", "secondary")
-        self._auto_always_btn.setToolTip(
-            "Approve, and don't ask again in this run for the same kind of "
-            "action (same command prefix, or edits to the same file). "
-            "CRITICAL actions still ask every time.")
-        self._auto_deny_btn = QPushButton("Deny")
-        self._auto_deny_btn.setProperty("class", "secondary")
-        self._auto_abort_btn = QPushButton("Stop")
-        self._auto_abort_btn.setProperty("class", "secondary")
-        for b in (self._auto_approve_btn, self._auto_always_btn,
-                  self._auto_deny_btn, self._auto_abort_btn):
-            ab.addWidget(b)
-        rb.addWidget(self._auto_approval)
-
-        self._auto_log = QPlainTextEdit()
-        self._auto_log.setReadOnly(True)
-        self._auto_log.setMaximumBlockCount(5000)
-        self._auto_log.setProperty("class", "log")
-        rb.addWidget(self._auto_log, 1)
+        input_row = QHBoxLayout()
+        self._auto_input = ComposerEdit()
+        self._auto_input.setPlaceholderText(
+            "Message the agent…   Enter sends · Shift+Enter new line · Esc interrupts")
+        input_row.addWidget(self._auto_input, 1)
+        self._auto_run_btn = QPushButton("Send")
+        self._auto_run_btn.setProperty("class", "primary")
+        self._auto_run_btn.setFixedHeight(58)
+        input_row.addWidget(self._auto_run_btn)
+        rb.addLayout(input_row)
         vsplit.addWidget(run_box)
 
-        vsplit.setSizes([380, 340])
+        # The folder-absorb panel stays out of the way until asked for.
+        harness_box.setVisible(False)
+        vsplit.setSizes([300, 520])
         root.addWidget(vsplit)
+
+        self._auto_clock = QTimer(self)
+        self._auto_clock.setInterval(1000)
+        self._auto_clock.timeout.connect(self._auto_tick)
+        from PyQt6.QtGui import QShortcut, QKeySequence
+        self._auto_esc = QShortcut(QKeySequence("Esc"), run_box)
+        self._auto_esc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._auto_esc.activated.connect(self._on_auto_stop)
 
         # Wire — harness
         self._agent_browse_btn.clicked.connect(self._on_agent_browse)
@@ -2371,14 +2417,14 @@ class ArtifexMainWindow(QMainWindow):
         self._agent_adopt_btn.clicked.connect(self._on_agent_adopt)
         self._agent_resync_btn.clicked.connect(self._on_agent_adopt)  # re-sync = re-adopt
         self._agent_inject_cb.toggled.connect(self._on_agent_inject_toggle)
-        # Wire — autonomous run
+        self._agent_ctx_btn.toggled.connect(harness_box.setVisible)
+        # Wire — conversation
         self._auto_run_btn.clicked.connect(self._on_auto_run)
+        self._auto_input.submitted.connect(self._on_auto_run)
+        self._auto_input.escaped.connect(self._on_auto_stop)
         self._auto_pause_btn.clicked.connect(self._on_auto_pause)
         self._auto_stop_btn.clicked.connect(self._on_auto_stop)
-        self._auto_approve_btn.clicked.connect(lambda: self._auto_resolve("approve"))
-        self._auto_always_btn.clicked.connect(lambda: self._auto_resolve("always"))
-        self._auto_deny_btn.clicked.connect(lambda: self._auto_resolve("deny"))
-        self._auto_abort_btn.clicked.connect(lambda: self._auto_resolve("stop"))
+        self._auto_new_btn.clicked.connect(self._on_auto_new)
         return w
 
     def _refresh_agent_list(self, report):
@@ -2501,10 +2547,14 @@ class ArtifexMainWindow(QMainWindow):
         except Exception as e:
             _log.warning("auto-adopt harness failed: %s", e)
 
-    # ── autonomous run ──────────────────────────────────────────────────────
+    # ── agent conversation ──────────────────────────────────────────────────
+    #
+    # One AgentRunner, one history and one RunControl last for the whole
+    # conversation (pinned notes and "always" approvals with them); each
+    # message the user sends while it is idle is a turn, run on its own
+    # AutonomousWorker thread.
 
-    def _auto_append(self, text: str):
-        self._auto_log.appendPlainText(text.rstrip("\n"))
+    _AUTO_READY = "Ready. Ask for something done in this folder."
 
     def _auto_insert(self, target, text: str):
         cur = target.textCursor()
@@ -2513,14 +2563,72 @@ class ArtifexMainWindow(QMainWindow):
         target.setTextCursor(cur)
         target.ensureCursorVisible()
 
-    def _on_auto_run(self):
-        from core.agent_loop import AutonomyLevel, RunConfig, RunControl
-        if self._engine_in_use() or self._backend_switching:
-            self._auto_status.setText("Busy — finish the current run first.")
+    def _auto_note(self, text: str, kind: str = ""):
+        """A dim one-line notice in the conversation (compaction, git, ...)."""
+        lab = QLabel(text.rstrip("\n"))
+        lab.setWordWrap(True)
+        lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lab.setProperty("class", "agentNote")
+        if kind:
+            lab.setProperty("kind", kind)
+        self._auto_view.add_item(lab)
+        return lab
+
+    def _auto_user_bubble(self, text: str, pending: bool = False):
+        bubble = self._auto_view.add_bubble("user")
+        bubble.add_text(text)
+        if pending:
+            bubble.set_pending(True)
+        return bubble
+
+    def _auto_stream_text(self, text: str):
+        """Batched reply tokens -> the live bubble (made on the first one)."""
+        if self._auto_live is None:
+            self._auto_live = self._auto_view.add_bubble("assistant")
+            self._auto_live.add_text("")
+        self._auto_live.append_text(text)
+        self._auto_view.scroll_to_bottom()
+
+    def _auto_set_phase(self, text: str):
+        if text != self._auto_phase_text:
+            self._auto_phase_text = text
+            self._auto_tick()
+
+    def _auto_tick(self):
+        if not self._auto_running:
             return
-        goal = self._auto_goal.text().strip()
-        if not goal:
-            self._auto_status.setText("Enter a goal first.")
+        secs = max(0, int(time.monotonic() - self._auto_t0))
+        line = f"◌ {self._auto_phase_text or 'Working'}…  {secs // 60}:{secs % 60:02d}"
+        if self._auto_tokens:
+            n = self._auto_tokens
+            line += f"  ·  {n if n < 1000 else f'{n / 1000:.1f}k'} tok"
+        self._auto_status.setText(line + "   ·   Esc to interrupt")
+
+    def _auto_set_working(self, on: bool):
+        self._auto_pause_btn.setEnabled(on)
+        self._auto_pause_btn.setText("Pause")
+        self._auto_stop_btn.setEnabled(on)
+        if on:
+            self._auto_t0 = time.monotonic()
+            self._auto_tokens = 0
+            self._auto_phase_text = "Starting"
+            self._auto_clock.start()
+            self._auto_tick()
+        else:
+            self._auto_clock.stop()
+
+    def _on_auto_run(self):
+        """Send: start a turn, or - while one is working - steer it."""
+        from core.agent_loop import AutonomyLevel, RunConfig, RunControl
+        text = self._auto_input.toPlainText().strip()
+        if not text:
+            return
+        if self._auto_running:
+            self._auto_input.clear()
+            self._auto_steer(text)
+            return
+        if self._engine_in_use() or self._backend_switching:
+            self._auto_status.setText("Busy — the model is in use. Send again when it is free.")
             return
 
         level = {"Manual": AutonomyLevel.MANUAL, "Guided": AutonomyLevel.GUIDED,
@@ -2545,117 +2653,259 @@ class ArtifexMainWindow(QMainWindow):
         if self.engine is None:
             self.engine = create_engine()
 
-        self._auto_control = RunControl()
-        cfg = RunConfig.default(level)
+        runner = self._auto_runner
+        if runner is None:
+            # A new conversation. It starts from a private copy of the chat
+            # (so the agent knows what was said there) and stays separate.
+            self._auto_control = RunControl()
+            cfg = RunConfig.default(level)
+            cfg.interactive = True
+            cfg.plan = "auto" if self._auto_plan.isChecked() else "off"
+            self._auto_history = [dict(m) for m in self.messages]
+            self._auto_planned = cfg.plan == "auto"
+        else:
+            cfg = runner.config
+            self._auto_control.reset()
+            self._auto_planned = False
+        cfg.autonomy = level
         cfg.sampler_preset = self._auto_preset.currentText().lower()
         cfg.enable_thinking = self._auto_thinking.isChecked()
         # Same default as the API's agent runs (api/agent_api.py): a template
         # default of xhigh can think past the whole completion budget and
         # return nothing (see RunConfig.reasoning_effort).
         cfg.reasoning_effort = "medium"
-        cfg.plan = "auto" if self._auto_plan.isChecked() else "off"
-        # Run on a private copy of the conversation so the chat stays clean;
-        # the final summary is folded back into the conversation at the end.
-        history = [dict(m) for m in self.messages]
 
-        self._auto_log.clear()
-        self._auto_append(
-            f"▶ GOAL: {goal}\n  autonomy: {self._auto_level.currentText()}"
-            f"  sampling: {cfg.sampler_preset}"
-            f"  thinking: {'on' if cfg.enable_thinking else 'off'}"
-            f"  plan first: {'on' if cfg.plan == 'auto' else 'off'}")
+        # Built once per turn, here on the UI thread: the knowledge and
+        # session-map text it holds change as tools run, and a system prompt
+        # that changed every round threw the server's prompt cache away.
+        try:
+            base_prompt = self._base_system_prompt()
+        except Exception as e:
+            _log.warning("agent base prompt failed: %s", e)
+            base_prompt = ""
 
+        self._auto_input.clear()
+        self._auto_user_bubble(text)
         self._auto_worker = AutonomousWorker(
-            self.engine, goal, history,
-            build_system_prompt=self._base_system_prompt,
+            self.engine, text, self._auto_history,
+            build_system_prompt=lambda: base_prompt,
             km=self.km, session_map=self.session_map,
-            config=cfg, control=self._auto_control)
-        self._auto_worker.event.connect(self._on_auto_event)
+            config=cfg, control=self._auto_control, runner=runner)
+        self._auto_runner = getattr(self._auto_worker, "runner", None)
+        self._auto_worker.agent_event.connect(self._on_auto_event)
         self._auto_worker.approval_required.connect(self._on_auto_approval)
         self._auto_worker.run_finished.connect(self._on_auto_finished)
         self._auto_worker.finished.connect(self._on_auto_worker_cleanup)
 
         self._auto_running = True
-        self._auto_run_btn.setEnabled(False)
-        self._auto_pause_btn.setEnabled(True)
-        self._auto_stop_btn.setEnabled(True)
-        self._auto_status.setText("Running…")
+        self._auto_set_working(True)
         self._auto_worker.start()
 
+    def _auto_steer(self, text: str):
+        """A message sent while the agent works. It answers an open approval
+        (no-and-why for an action, carry-on-and for a pause); otherwise the
+        loop reads it at its next step."""
+        from core.agent_loop import Decision
+        bubble = self._auto_user_bubble(text, pending=True)
+        self._auto_pending.append((text, bubble))
+        card = self._auto_card
+        if card is not None and not card.answered and self._auto_worker:
+            gate = card.is_gate
+            card.mark("continued" if gate else "denied")
+            self._auto_card = None
+            self._auto_worker.resolve(Decision.APPROVE if gate else Decision.DENY, text)
+            self._set_status("Agent working")
+            return
+        self._auto_control.inject_message(text)
+        if self._auto_planned and not self._auto_plan_noted:
+            self._auto_plan_noted = True
+            self._auto_note("Plan-first run: your message reaches the step in progress "
+                            "and is passed on to the later steps; it does not rewrite "
+                            "the plan.", "warn")
+
+    def _auto_confirm_pending(self, text: str) -> bool:
+        """The loop read a queued message: un-dim it, at the point it was read."""
+        for n, (sent, bubble) in enumerate(self._auto_pending):
+            if sent == text:
+                del self._auto_pending[n]
+                bubble.set_pending(False)
+                self._auto_view.move_to_end(bubble)
+                return True
+        return False
+
     def _on_auto_pause(self):
-        if not self._auto_control:
+        if not self._auto_control or not self._auto_running:
             return
         if self._auto_control.paused:
             self._auto_control.resume()
             self._auto_pause_btn.setText("Pause")
-            self._auto_status.setText("Running…")
+            self._auto_clock.start()
+            self._auto_tick()
         else:
             self._auto_control.request_pause()
             self._auto_pause_btn.setText("Resume")
-            self._auto_status.setText("Paused.")
+            self._auto_clock.stop()
+            self._auto_status.setText("Paused — it stops before its next step.")
 
     def _on_auto_stop(self):
-        if self._auto_control:
-            self._auto_control.request_stop()
-            self._auto_status.setText("Stopping…")
-            self._auto_approval.setVisible(False)
+        """Interrupt the turn. The conversation stays; the next message
+        continues it."""
+        if not (self._auto_control and self._auto_running):
+            return
+        from core.agent_loop import Decision
+        self._auto_control.request_stop()
+        self._auto_set_phase("Interrupting")
+        card = self._auto_card
+        if card is not None and not card.answered:
+            card.mark("stopped")
+            self._auto_card = None
+            if self._auto_worker:
+                self._auto_worker.resolve(Decision.STOP)
+
+    def _on_auto_new(self):
+        if self._auto_running:
+            self._auto_status.setText("It is still working — press Stop first.")
+            return
+        self._auto_runner = None
+        self._auto_history = None
+        self._auto_control = None
+        self._auto_live = self._auto_row = self._auto_card = self._auto_bubble = None
+        self._auto_pending = []
+        self._auto_last_text = ""
+        self._auto_plan_noted = False
+        self._auto_view.clear_chat()
+        self._auto_status.setText(self._AUTO_READY)
+        self._auto_input.setFocus()
+
+    def _auto_finish_reply(self, ev):
+        """The round's reply is complete: the thinking fold (kept after the
+        round) and the text, rendered as markdown."""
+        text = (ev.text or "").strip()
+        thinking = getattr(ev, "thinking", "") or ""
+        bubble, self._auto_live = self._auto_live, None
+        if not text and not thinking:
+            if bubble is not None:
+                self._auto_view.remove_item(bubble)
+            return
+        if bubble is None:
+            bubble = self._auto_view.add_bubble("assistant")
+        if thinking:
+            bubble.add_widget(ThinkFold(thinking, getattr(ev, "think_s", 0.0) or 0.0),
+                              top=True)
+        bubble.set_markdown(text)
+        self._auto_bubble = (bubble, text) if text else None
+        if text:
+            self._auto_last_text = text
+        self._auto_view.scroll_to_bottom()
+
+    def _auto_trim_bubble(self):
+        """The reply called a tool: its bubble keeps the prose only, the tool
+        row under it shows the call."""
+        held, self._auto_bubble = self._auto_bubble, None
+        if not held:
+            return
+        bubble, raw = held
+        prose = strip_tool_syntax(raw)
+        if prose != raw:
+            bubble.set_markdown(prose)
 
     def _on_auto_event(self, ev):
         k = ev.kind
         # Stream chunks are batched (20 updates/s at most); anything else
-        # flushes them first so the log keeps its order.
+        # flushes them first so the conversation keeps its order.
         if k == "assistant_chunk":
             self._auto_log_batcher.add(ev.text or "")
+            self._auto_set_phase("Writing")
             return
         if k == "thinking_chunk":
             self._auto_think_batcher.add(ev.text or "")
+            self._auto_set_phase("Thinking")
             return
         self._auto_log_batcher.flush_now()
         self._auto_think_batcher.flush_now()
+        row = self._auto_row
         if k == "round_start":
-            self._auto_append(f"\n── round {ev.round} ──")
+            self._auto_row = None
+            self._auto_bubble = None
+            self._auto_set_phase("Thinking")
+            if ev.round and ev.round > 1:
+                # Keep rounds apart in the live thinking pane.
+                self._auto_think_batcher.add("\n\n")
+        elif k == "user_message":
+            if not self._auto_confirm_pending(ev.text or ""):
+                self._auto_user_bubble(ev.text or "")
+        elif k == "assistant_message":
+            self._auto_finish_reply(ev)
+            stats = getattr(ev, "stats", None) or {}
+            self._auto_tokens += int(stats.get("completion_tokens") or 0)
         elif k == "action_proposed":
+            self._auto_trim_bubble()
             risk = getattr(ev.decision, "risk_level", None)
-            risk = risk.name if risk is not None else "?"
-            self._auto_append(f"  • {ev.action.type}: {ev.action.display}  [{risk}]")
-            full = full_request(ev.action)
-            if full and full != ev.action.display:
-                self._auto_append("\n".join("      " + line for line in full.splitlines()))
+            self._auto_row = self._auto_view.add_item(ToolRow(
+                ev.action.type, ev.action.display, full_request(ev.action),
+                risk.name if risk is not None else ""))
+        elif k == "action_started":
+            if row is not None:
+                row.set_state("▶", "run")
+            self._auto_set_phase(f"Running {ev.action.type}")
         elif k == "action_result":
-            status = "ok" if ev.success else "FAIL"
-            out = (ev.output or "").strip().replace("\n", " ")[:140]
-            self._auto_append(f"    → {status}: {out}")
+            out = (ev.output or "").strip()
+            n = len(out.splitlines())
+            if row is not None:
+                row.set_state("✓" if ev.success else "✗", "ok" if ev.success else "bad",
+                              f"{n} line{'' if n == 1 else 's'}" if n else "no output")
+                row.set_output(out, failed=not ev.success)
+            self._auto_row = None
         elif k == "blocked":
-            self._auto_append(f"  ⛔ BLOCKED: {ev.action.display} — {ev.reason}")
+            if row is not None:
+                row.set_state("⊘", "bad", "blocked")
+                row.set_reason(f"BLOCKED: {ev.reason}")
+            self._auto_row = None
+        elif k == "denied":
+            if row is not None:
+                row.set_state("⊘", "", "skipped")
+            self._auto_row = None
         elif k == "breaker_tripped":
-            self._auto_append(f"  ⚡ circuit breaker: {ev.reason}")
+            self._auto_note(f"⚡ circuit breaker: {ev.reason}", "warn")
         elif k == "gate_pause":
-            self._auto_append(f"  ⏸ human gate: {ev.reason}")
+            self._auto_note(f"⏸ checkpoint: {ev.reason}", "warn")
         elif k == "compacted":
-            self._auto_append(f"  ⤵ context compacted: {ev.reason}")
+            self._auto_note(f"⤵ context compacted: {ev.reason}")
         elif k == "git":
-            self._auto_append(f"    [git] {ev.text}")
+            self._auto_note(f"[git] {ev.text}")
         elif k == "approval_remembered":
-            self._auto_append(f"    ✓ {ev.text}")
+            self._auto_note(f"✓ {ev.text}")
         elif k == "auto_approved":
-            self._auto_append(f"    ✓ auto-approved: {ev.reason}")
+            self._auto_note(f"✓ auto-approved: {ev.reason}")
+        elif k == "format_retry":
+            self._auto_note(f"nudged the model: {ev.reason}", "warn")
         elif k == "error":
-            self._auto_append(f"  ! error: {ev.reason}")
+            self._auto_note(f"! error: {ev.reason}", "bad")
+        elif k == "stopped":
+            self._auto_note(f"■ stopped: {ev.reason}", "warn")
         elif k == "plan":
-            self._auto_append("  ☰ plan:\n" + "\n".join(
-                "    " + line for line in (ev.text or "").splitlines()))
+            self._auto_note("☰ plan:\n" + "\n".join(
+                "   " + line for line in (ev.text or "").splitlines()))
         elif k == "step":
-            self._auto_append(f"\n▶ {ev.text}")
+            self._auto_note(f"▶ {ev.text}")
         elif k == "step_done":
-            self._auto_append(f"  ✓ step done: {(ev.summary or '')[:200]}")
+            self._auto_note(f"✓ step done: {(ev.summary or '')[:200]}", "good")
         elif k == "step_stopped":
-            self._auto_append(f"  ■ step stopped: {ev.reason}")
+            self._auto_note(f"■ step stopped: {ev.reason}", "warn")
         elif k == "verify":
-            self._auto_append(f"    [auto-check] {(ev.text or '').splitlines()[0] if ev.text else ''}")
+            first = (ev.text or "").splitlines()[0] if ev.text else ""
+            self._auto_note(f"[auto-check] {first}", "good" if ev.success else "warn")
         elif k == "note":
-            self._auto_append(f"    📌 note: {ev.text}")
+            self._auto_note(f"📌 note: {ev.text}")
         elif k in ("attempt", "attempts", "judge"):
-            self._auto_append(f"  ◆ {ev.text}")
+            self._auto_note(f"◆ {ev.text}")
+        elif k == "done":
+            # A turn that ended on a plain reply already showed it; a summary
+            # that came another way (the finish tool, a planned run) has not.
+            summary = (ev.summary or "").strip()
+            if summary and summary != self._auto_last_text:
+                self._auto_last_text = summary
+                self._auto_view.add_bubble("assistant").set_markdown(summary)
 
     def _on_auto_approval(self, payload):
         action = payload.get("action")
@@ -2663,47 +2913,73 @@ class ArtifexMainWindow(QMainWindow):
         reason = payload.get("reason") or ""
         if action is not None:
             risk = getattr(decision, "risk_level", None)
-            risk = risk.name if risk is not None else "?"
-            self._auto_approval_label.setPlainText(
-                f"Approve {action.type} [{risk}]?\n{full_request(action)}")
-            self._auto_approve_btn.setText("Approve")
-            self._auto_always_btn.setVisible(True)
-            self._auto_deny_btn.setVisible(True)
+            why = [f"risk {risk.name}"] if risk is not None else []
+            policy = reason or getattr(decision, "reason", "") or ""
+            if policy:
+                why.append(policy)
+            card = ApprovalCard(f"{action.type}  {full_request(action)}",
+                                " — ".join(why), gate=False)
+            if self._auto_row is not None:
+                self._auto_row.set_state("?", "")
         else:
-            # Gate / circuit-breaker pause: nothing to remember.
-            self._auto_approval_label.setPlainText(f"Paused — {reason}. Continue?")
-            self._auto_approve_btn.setText("Continue")
-            self._auto_always_btn.setVisible(False)
-            self._auto_deny_btn.setVisible(False)
-        self._auto_approval.setVisible(True)
+            # Gate / circuit-breaker pause: nothing to remember or deny.
+            card = ApprovalCard(reason or "It is waiting on you.", gate=True)
+        card.decided.connect(self._auto_resolve)
+        self._auto_card = self._auto_view.add_item(card, follow=True)
+        self._auto_set_phase("Waiting for your approval")
+        self._set_status("The agent is waiting for your approval (AGENT tab)")
 
     def _auto_resolve(self, which: str):
         from core.agent_loop import Decision
-        self._auto_approval.setVisible(False)
+        card, self._auto_card = self._auto_card, None
+        if card is not None:
+            card.mark({"approve": "continued" if card.is_gate else "approved",
+                       "always": "always", "deny": "denied",
+                       "stop": "stopped"}.get(which, "answered"))
         if self._auto_worker:
             self._auto_worker.resolve(
                 {"approve": Decision.APPROVE, "always": Decision.APPROVE_ALWAYS,
                  "deny": Decision.DENY,
                  "stop": Decision.STOP}.get(which, Decision.APPROVE))
+        self._auto_set_phase("Working")
+        self._set_status("Agent working")
 
     def _on_auto_finished(self, result):
         self._auto_log_batcher.flush_now()
         self._auto_think_batcher.flush_now()
-        self._auto_append(
-            f"\n■ {result.status}  ({result.rounds} rounds, {result.actions_run} actions)")
-        if result.summary:
-            self._auto_append(f"  summary: {result.summary}")
-            bubble = self._chat_view.add_bubble("assistant")
-            bubble.add_text(f"[autonomous run · {result.status}]\n{result.summary}")
-            self.messages.append({"role": "assistant", "content": result.summary})
-            self._chat_view.scroll_to_bottom()
+        if self._auto_live is not None:        # a reply that never completed
+            self._auto_live.finalize_stream()
+            self._auto_live = None
+        if self._auto_row is not None:
+            self._auto_row.set_state("■", "", "interrupted")
+            self._auto_row = None
+        if self._auto_card is not None:
+            self._auto_card.mark("closed")
+            self._auto_card = None
+        # Messages the turn never read (it was interrupted first) go back in
+        # the box; a turn that ends by itself keeps going on them instead.
+        if self._auto_pending:
+            left = [t for t, _ in self._auto_pending]
+            for _, bubble in self._auto_pending:
+                self._auto_view.remove_item(bubble)
+            self._auto_pending = []
+            cur = self._auto_input.toPlainText()
+            self._auto_input.setPlainText((cur + "\n" if cur else "") + "\n".join(left))
         self._auto_running = False
-        self._auto_run_btn.setEnabled(True)
-        self._auto_pause_btn.setEnabled(False)
-        self._auto_pause_btn.setText("Pause")
-        self._auto_stop_btn.setEnabled(False)
-        self._auto_approval.setVisible(False)
-        self._auto_status.setText(result.status)
+        self._auto_set_working(False)
+        status = str(result.status or "")
+        if status.startswith("error"):
+            self._auto_note(f"! {result.summary or status}", "bad")
+        tail = f"  ({result.rounds} rounds, {result.actions_run} actions)"
+        if status.startswith("done"):
+            self._auto_status.setText("Ready — reply to continue." + tail)
+        elif status == "stopped:user":
+            self._auto_status.setText("Interrupted — reply to continue." + tail)
+        else:
+            self._auto_status.setText(
+                f"Stopped ({status.replace('stopped:', '')}) — reply to continue." + tail)
+        self._set_status("Agent turn finished")
+        self._auto_view.scroll_to_bottom()
 
     def _on_auto_worker_cleanup(self):
         w = self._auto_worker
