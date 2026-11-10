@@ -9,8 +9,8 @@ from unittest.mock import MagicMock
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-pytest.importorskip("PyQt6.QtWidgets")
-pytest.importorskip("PyQt6.QtMultimedia")
+pytest.importorskip("PyQt6.QtWidgets", exc_type=ImportError)
+pytest.importorskip("PyQt6.QtMultimedia", exc_type=ImportError)
 try:
     import ui.qt_gui as gui
 except Exception as e:      # a Qt module this machine cannot load

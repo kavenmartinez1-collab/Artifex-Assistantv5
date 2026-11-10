@@ -6,9 +6,12 @@ import threading
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-pytest.importorskip("PyQt6.QtCore")
+pytest.importorskip("PyQt6.QtCore", exc_type=ImportError)
 
-from ui.qt_workers import BackendSwitchWorker, GenerationWorker  # noqa: E402
+try:
+    from ui.qt_workers import BackendSwitchWorker, GenerationWorker  # noqa: E402
+except ImportError as e:   # a Qt library this machine cannot load
+    pytest.skip(f"ui.qt_workers not importable here: {e}", allow_module_level=True)
 
 
 class _Engine:
@@ -134,8 +137,8 @@ def test_backend_switch_worker_survives_a_failing_probe(monkeypatch):
 
 @pytest.fixture(scope="module")
 def qapp():
-    pytest.importorskip("PyQt6.QtWidgets")
-    pytest.importorskip("PyQt6.QtMultimedia")
+    pytest.importorskip("PyQt6.QtWidgets", exc_type=ImportError)
+    pytest.importorskip("PyQt6.QtMultimedia", exc_type=ImportError)
     from PyQt6.QtWidgets import QApplication
     try:
         app = QApplication.instance() or QApplication([])
@@ -182,8 +185,8 @@ def test_finalize_without_a_stream_is_a_no_op(qapp):
 
 
 def test_at_bottom():
-    pytest.importorskip("PyQt6.QtWidgets")
-    pytest.importorskip("PyQt6.QtMultimedia")
+    pytest.importorskip("PyQt6.QtWidgets", exc_type=ImportError)
+    pytest.importorskip("PyQt6.QtMultimedia", exc_type=ImportError)
     from ui.qt_widgets import ChatView
     assert ChatView.at_bottom(1000, 1000)
     assert ChatView.at_bottom(980, 1000)
