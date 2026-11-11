@@ -8,6 +8,7 @@ and cancellation support.
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
 from core.pipelines.base import BasePipeline, PipelineResult
@@ -34,6 +35,51 @@ class _CachedPipeline:
         self.last_used = time.time()
 
 
+class _PipelineThread:
+    """The one thread that loads, runs and unloads one pipeline type.
+
+    PyTorch's Windows build allocates CPU tensors with a bundled mimalloc.
+    Memory freed by a thread other than the one that allocated it only goes
+    back to Windows when the allocating thread next calls the allocator, and
+    after a Create job that thread sat idle: an image model loaded by one
+    executor thread and unloaded by another kept ~17 GiB committed for good,
+    and the Strata split then failed to start. Unloaded on its own thread
+    (with MIMALLOC_PURGE_DELAY=0, set in core/__init__.py) it drops to the
+    CUDA runtime's ~4 GiB baseline at once (measured 2026-11-10).
+
+    One thread per type, not one for all, so a transcription doesn't queue
+    behind a minute-long image job.
+    """
+
+    def __init__(self, pipeline_type: str):
+        self._pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"media-{pipeline_type}")
+        self._ident: Optional[int] = None
+        self._pending = 0
+        self._count_lock = threading.Lock()
+
+    def busy(self) -> bool:
+        """A call is queued or running on this thread."""
+        return self._pending > 0
+
+    def call(self, fn, *args, **kwargs):
+        """Run fn on this thread and return its result (inline if already on it)."""
+        if threading.get_ident() == self._ident:
+            return fn(*args, **kwargs)
+        with self._count_lock:
+            self._pending += 1
+
+        def run():
+            self._ident = threading.get_ident()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                with self._count_lock:
+                    self._pending -= 1
+
+        return self._pool.submit(run).result()
+
+
 class MultimodalService:
     """Unified service for running any pipeline type.
 
@@ -49,16 +95,61 @@ class MultimodalService:
         self._file_manager = file_manager or FileManager()
         self._cache: dict[str, _CachedPipeline] = {}
         self._lock = threading.Lock()
+        self._threads: dict[str, _PipelineThread] = {}
 
     @property
     def file_manager(self) -> FileManager:
         return self._file_manager
 
+    def _thread(self, pipeline_type: str) -> _PipelineThread:
+        """The thread that owns pipeline_type (see _PipelineThread)."""
+        with self._lock:
+            t = self._threads.get(pipeline_type)
+            if t is None:
+                t = self._threads[pipeline_type] = _PipelineThread(pipeline_type)
+            return t
+
     # --- Pipeline lifecycle ---
+    # The public methods hand the work to the pipeline type's own thread;
+    # the _-prefixed ones do it and expect to be on that thread.
 
     def load_pipeline(self, pipeline_type: str, model_path: str = "",
                       progress_callback: ProgressCallback = None,
                       **load_kwargs) -> BasePipeline:
+        """Load a pipeline, reusing cache if possible (see _load_pipeline)."""
+        return self._thread(pipeline_type).call(
+            self._load_pipeline, pipeline_type, model_path,
+            progress_callback, **load_kwargs)
+
+    def run_pipeline(self, pipeline_type: str, model_path: str = "",
+                     kwargs: dict = None,
+                     progress_callback: ProgressCallback = None,
+                     cancel_event: threading.Event = None,
+                     store_output: bool = True) -> PipelineResult:
+        """Run a pipeline with full lifecycle management (see _run_pipeline)."""
+        return self._thread(pipeline_type).call(
+            self._run_pipeline, pipeline_type, model_path, kwargs,
+            progress_callback, cancel_event, store_output)
+
+    def unload_pipeline(self, pipeline_type: str,
+                        progress_callback: ProgressCallback = None):
+        """Unload a specific pipeline and free its resources."""
+        with self._lock:
+            if pipeline_type not in self._cache:
+                return
+        self._thread(pipeline_type).call(
+            self._unload_pipeline, pipeline_type, progress_callback)
+
+    def unload_all(self, progress_callback: ProgressCallback = None):
+        """Unload all cached pipelines, each on its own thread."""
+        with self._lock:
+            types = list(self._cache)
+        for ptype in types:
+            self.unload_pipeline(ptype, progress_callback)
+
+    def _load_pipeline(self, pipeline_type: str, model_path: str = "",
+                       progress_callback: ProgressCallback = None,
+                       **load_kwargs) -> BasePipeline:
         """Load a pipeline, reusing cache if possible.
 
         Args:
@@ -101,9 +192,8 @@ class MultimodalService:
 
         return pipeline
 
-    def unload_pipeline(self, pipeline_type: str,
-                        progress_callback: ProgressCallback = None):
-        """Unload a specific pipeline and free its resources."""
+    def _unload_pipeline(self, pipeline_type: str,
+                         progress_callback: ProgressCallback = None):
         with self._lock:
             cached = self._cache.pop(pipeline_type, None)
         if cached and cached.pipeline.is_loaded():
@@ -111,18 +201,6 @@ class MultimodalService:
                 progress_callback(0, 0,
                                   f"Unloading {cached.pipeline.display_name}...")
             cached.pipeline.unload()
-
-    def unload_all(self, progress_callback: ProgressCallback = None):
-        """Unload all cached pipelines."""
-        with self._lock:
-            entries = list(self._cache.items())
-            self._cache.clear()
-        for ptype, cached in entries:
-            if cached.pipeline.is_loaded():
-                if progress_callback:
-                    progress_callback(0, 0,
-                                      f"Unloading {cached.pipeline.display_name}...")
-                cached.pipeline.unload()
 
     def get_loaded_pipelines(self) -> dict[str, str]:
         """Return dict of pipeline_type -> display_name for loaded pipelines."""
@@ -139,11 +217,11 @@ class MultimodalService:
 
     # --- Pipeline execution ---
 
-    def run_pipeline(self, pipeline_type: str, model_path: str = "",
-                     kwargs: dict = None,
-                     progress_callback: ProgressCallback = None,
-                     cancel_event: threading.Event = None,
-                     store_output: bool = True) -> PipelineResult:
+    def _run_pipeline(self, pipeline_type: str, model_path: str = "",
+                      kwargs: dict = None,
+                      progress_callback: ProgressCallback = None,
+                      cancel_event: threading.Event = None,
+                      store_output: bool = True) -> PipelineResult:
         """Run a pipeline with full lifecycle management.
 
         Args:
@@ -171,8 +249,8 @@ class MultimodalService:
             )
 
         # Load pipeline
-        pipeline = self.load_pipeline(pipeline_type, model_path,
-                                      progress_callback)
+        pipeline = self._load_pipeline(pipeline_type, model_path,
+                                       progress_callback)
 
         # Check cancellation after load
         if cancel_event and cancel_event.is_set():
@@ -221,10 +299,14 @@ class MultimodalService:
 
             for ptype, cached in by_age:
                 if cached.pipeline.is_loaded():
+                    owner = self._thread(ptype)
+                    # A pipeline whose thread is busy is mid-run (pulling it
+                    # out from under that run was never safe) or is itself
+                    # evicting this one: waiting on it could deadlock
+                    if owner.busy() and threading.get_ident() != owner._ident:
+                        continue
                     status_fn(f"Unloading {cached.pipeline.display_name}...")
-                    cached.pipeline.unload()
-                    with self._lock:
-                        self._cache.pop(ptype, None)  # pop() won't raise if already removed
+                    owner.call(self._unload_pipeline, ptype)
 
                     # Recalculate free VRAM
                     import gc

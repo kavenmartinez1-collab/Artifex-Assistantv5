@@ -309,3 +309,89 @@ class TestMultimodalServiceVRAM:
 
             # pipe_a (LRU) should have been evicted
             assert pipe_a.unload_count >= 1
+
+
+class ThreadRecordingPipeline(MockPipeline):
+    """Records which thread each load / run / unload ran on."""
+
+    def __init__(self, gate: threading.Event = None):
+        super().__init__()
+        self.threads = {}
+        self.gate = gate
+
+    def load(self, model_path="", status_callback=None, **kwargs):
+        self.threads.setdefault("load", set()).add(threading.get_ident())
+        super().load(model_path, status_callback, **kwargs)
+
+    def run(self, **kwargs):
+        self.threads.setdefault("run", set()).add(threading.get_ident())
+        if self.gate is not None:
+            self.gate.wait(5)
+        return super().run(**kwargs)
+
+    def unload(self, status_callback=None):
+        self.threads.setdefault("unload", set()).add(threading.get_ident())
+        super().unload(status_callback)
+
+
+class TestPipelineThreads:
+    """Each pipeline type is loaded, run and unloaded on one thread of its
+    own: torch's mimalloc only returns memory freed by another thread when
+    the allocating thread allocates again, so a cross-thread unload kept an
+    image model's ~17 GiB committed (2026-11-10)."""
+
+    @patch("core.services.multimodal_service.create_pipeline")
+    def test_load_run_unload_share_one_thread(self, mock_create, tmp_dir):
+        pipe = ThreadRecordingPipeline()
+        mock_create.return_value = pipe
+        svc = MultimodalService(file_manager=FileManager(base_dir=tmp_dir))
+
+        # Callers on different threads, like the API's executor threads
+        t = threading.Thread(target=lambda: svc.run_pipeline(
+            "mock-pipeline", "/m", store_output=False))
+        t.start(); t.join()
+        svc.unload_all()
+
+        threads = pipe.threads["load"] | pipe.threads["run"] | pipe.threads["unload"]
+        assert len(threads) == 1
+        assert threading.get_ident() not in threads
+        assert not pipe.is_loaded()
+        assert svc.get_loaded_pipelines() == {}
+
+    @patch("core.services.multimodal_service.create_pipeline")
+    def test_types_get_separate_threads(self, mock_create, tmp_dir):
+        a, b = ThreadRecordingPipeline(), ThreadRecordingPipeline()
+        mock_create.side_effect = [a, b]
+        svc = MultimodalService(file_manager=FileManager(base_dir=tmp_dir))
+        svc.load_pipeline("pipe-a", "/a")
+        svc.load_pipeline("pipe-b", "/b")
+        assert a.threads["load"] != b.threads["load"]
+
+    @patch("core.services.multimodal_service.create_pipeline")
+    def test_eviction_skips_a_busy_pipeline(self, mock_create, tmp_dir):
+        """Loading B under VRAM pressure while A is mid-run neither blocks
+        on A nor unloads it from under the run."""
+        gate = threading.Event()
+        a = ThreadRecordingPipeline(gate=gate)
+        a.pipeline_type = "pipe-a"
+        b = ThreadRecordingPipeline()
+        b.pipeline_type = "pipe-b"
+        mock_create.side_effect = [a, b]
+        svc = MultimodalService(file_manager=FileManager(base_dir=tmp_dir))
+        svc.load_pipeline("pipe-a", "/a")
+
+        runner = threading.Thread(target=lambda: svc.run_pipeline(
+            "pipe-a", "/a", store_output=False))
+        runner.start()
+        while "run" not in a.threads:
+            pass
+
+        fake_gpu = MagicMock(is_available=True, total_gb=12.0, free_gb=1.0)
+        with patch("core.device.gpu_info", fake_gpu), \
+             patch("torch.cuda.empty_cache"), patch("gc.collect"):
+            svc.load_pipeline("pipe-b", "/b")
+
+        assert a.unload_count == 0
+        assert b.is_loaded()
+        gate.set(); runner.join(5)
+        assert not runner.is_alive()
