@@ -555,6 +555,8 @@ class _ConsoleHost:
             risk = getattr(decision, "risk_level", None)
             risk = risk.name if risk is not None else "?"
             print(f"{Fore.YELLOW}  [{risk}] {action.type}: {Fore.WHITE}{action.display}{Style.RESET_ALL}")
+            if reason:
+                print(f"{Style.DIM}  ({reason}){Style.RESET_ALL}")
             return (f"{Fore.YELLOW}  Run it? [y / a=always / N / stop, or type why not]: "
                     f"{Fore.WHITE}")
 

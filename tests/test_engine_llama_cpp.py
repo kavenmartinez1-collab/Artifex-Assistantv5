@@ -727,3 +727,86 @@ class TestOrphanReclaimOnGateRefusal(unittest.TestCase):
             self.assertEqual(e._reclaim_orphan_servers(), 1)
         self.assertEqual(scan.call_args[0][0], {8085, 8086})   # never our own port
         stop.assert_called_once_with(8086)
+
+
+class TestStreamWatchdog(unittest.TestCase):
+    """A stream that sends nothing for STREAM_STALL_S is given up."""
+
+    def _make_engine(self, external=False):
+        from core.engine_llama_cpp import LlamaCppEngine
+        engine = LlamaCppEngine("test", {"path": "/fake/model.gguf"})
+        engine._loaded = True
+        engine._base_url = "http://localhost:8081"
+        engine._is_server_healthy = lambda: True
+        if external:
+            engine._external_cmd = ["strata.exe"]
+        return engine
+
+    def _resp(self, lines):
+        r = MagicMock()
+        r.__enter__ = MagicMock(return_value=r)
+        r.__exit__ = MagicMock(return_value=False)
+        r.__iter__ = MagicMock(return_value=iter(lines))
+        return r
+
+    def test_progress_requested_and_short_read_timeout(self):
+        from core import engine_llama_cpp as m
+        engine = self._make_engine()
+        with patch("core.engine_llama_cpp.urllib.request.urlopen",
+                   return_value=self._resp([b'data: [DONE]\n'])) as uo:
+            engine.generate_streaming([{"role": "user", "content": "x"}], 10, 0.0)
+        body = json.loads(uo.call_args[0][0].data.decode())
+        self.assertTrue(body["return_progress"])
+        self.assertEqual(uo.call_args[1]["timeout"], m.STREAM_STALL_S)
+
+    def test_external_server_keeps_long_timeout(self):
+        from core import engine_llama_cpp as m
+        engine = self._make_engine(external=True)
+        with patch("core.engine_llama_cpp.urllib.request.urlopen",
+                   return_value=self._resp([b'data: [DONE]\n'])) as uo:
+            engine.generate_streaming([{"role": "user", "content": "x"}], 10, 0.0)
+        body = json.loads(uo.call_args[0][0].data.decode())
+        self.assertNotIn("return_progress", body)
+        self.assertEqual(uo.call_args[1]["timeout"], m.EXTERNAL_STREAM_TIMEOUT_S)
+
+    def test_progress_chunks_are_not_text(self):
+        engine = self._make_engine()
+        lines = [
+            b'data: {"choices":[],"prompt_progress":{"total":9000,"processed":2048}}\n',
+            b'data: {"choices":[{"delta":{}}],"prompt_progress":{"total":9000,"processed":9000}}\n',
+            b'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]
+        with patch("core.engine_llama_cpp.urllib.request.urlopen",
+                   return_value=self._resp(lines)):
+            out = engine.generate_streaming([{"role": "user", "content": "x"}], 10, 0.0)
+        self.assertEqual(out, "hi")
+
+    def test_stall_on_healthy_server_gives_up_without_killing(self):
+        engine = self._make_engine()
+        engine._kill_process = MagicMock()
+        calls = []
+
+        def stall(*a, **k):
+            calls.append(1)
+            raise TimeoutError("timed out")
+        with patch("core.engine_llama_cpp.urllib.request.urlopen", side_effect=stall):
+            with self.assertRaises(ConnectionError) as cm:
+                engine.generate_streaming([{"role": "user", "content": "x"}], 10, 0.0)
+        self.assertIn("sent nothing", str(cm.exception))
+        self.assertEqual(len(calls), 1)            # not retried
+        engine._kill_process.assert_not_called()
+
+    def test_stall_on_dead_server_stops_our_child(self):
+        engine = self._make_engine()
+        engine._is_server_healthy = lambda: False
+        engine._process = MagicMock()
+        engine._process.poll.return_value = None    # our child, still running
+        engine._kill_process = MagicMock()
+        with patch("core.engine_llama_cpp.urllib.request.urlopen",
+                   side_effect=TimeoutError("timed out")):
+            with self.assertRaises(ConnectionError) as cm:
+                engine.generate_streaming([{"role": "user", "content": "x"}], 10, 0.0)
+        self.assertIn("stopped responding", str(cm.exception))
+        engine._kill_process.assert_called_once()
+        self.assertFalse(engine._loaded)

@@ -1286,6 +1286,10 @@ async def _stream_with_tools_impl(messages: list, model: str, max_tokens: int,
     max_tokens = _clamp_max_tokens(current_messages, max_tokens, backend, chat_id)
 
     round_count = 0
+    # The prompt-injection floor's memory for this reply: set once a web
+    # tool has run (or the client sent earlier tool results back), after
+    # which chat refuses code that needs a person (chat_tools._screen).
+    chat_tool_state = {"untrusted": chat_tools.history_has_tool_results(current_messages)}
 
     while True:
         # ── Pre-context assessment ────────────────────────────────────
@@ -1496,7 +1500,8 @@ async def _stream_with_tools_impl(messages: list, model: str, max_tokens: int,
         try:
             if full_mode:
                 tool_output = await loop.run_in_executor(
-                    None, lambda: chat_tools.execute_chat_tools(tools, ws)
+                    None, lambda: chat_tools.execute_chat_tools(tools, ws,
+                                                                chat_tool_state)
                 )
             else:
                 tool_output = await loop.run_in_executor(

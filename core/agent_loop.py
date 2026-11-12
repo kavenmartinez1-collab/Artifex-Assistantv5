@@ -29,7 +29,8 @@ from enum import Enum
 from typing import Callable, List, Optional
 
 from core.prompts import build_autonomous_prompt
-from core.sandbox import check_policy, RiskLevel
+from core.sandbox import (check_policy, RiskLevel, UNTRUSTED_SOURCE_TYPES,
+                          UNTRUSTED_GATE_REASON, needs_human_after_untrusted)
 from core.sandbox.approvals import ApprovalMemory
 from core.sandbox.circuit_breaker import CircuitBreaker
 from core.sandbox.human_gate import GateState
@@ -333,6 +334,12 @@ class AgentRunner:
         # step starts from a fresh history and would otherwise never see it).
         self._steer_log: List[str] = []
         self._round_thinking = ("", 0.0)   # (text, seconds) of the last round
+        # Web text has entered this run (search / web_read / download): from
+        # the next round on FULL_AUTO asks before running code (the rest of
+        # the round that fetched it was written before the text came back).
+        # See _needs_approval.
+        self._untrusted = False
+        self._untrusted_next = False
         self._round_stats: dict = {}
 
     # ── public ──────────────────────────────────────────────────────────────
@@ -390,6 +397,7 @@ class AgentRunner:
             self._verifier = None
             if not session:
                 self._notes = []
+                self._untrusted = self._untrusted_next = False
             # A session builds the map once: rebuilding it per turn would
             # change the system prompt and throw the prompt cache away.
             if not (session and self._repo_map):
@@ -406,6 +414,7 @@ class AgentRunner:
 
         for rnd in range(1, (max_rounds or self.config.max_rounds) + 1):
             self._round = rnd
+            self._untrusted = self._untrusted or self._untrusted_next
             if self.control.stop_requested:
                 return self._finish("stopped:user", history)
             self.control.wait_if_paused()
@@ -676,9 +685,13 @@ class AgentRunner:
                             reason=f"you approved {remembered} earlier in this run",
                             round=rnd))
                     else:
+                        why = (UNTRUSTED_GATE_REASON
+                               if self._untrusted_floor_applies(action, decision)
+                               else "")
                         self.emit(AgentEvent("approval_required", action=action,
-                                             decision=decision, round=rnd))
-                        dec, said = self._ask(action, decision, "")
+                                             decision=decision, round=rnd,
+                                             reason=why))
+                        dec, said = self._ask(action, decision, why)
                         if dec == Decision.STOP:
                             flush_outputs()
                             return self._finish("stopped:user", history)
@@ -713,6 +726,8 @@ class AgentRunner:
                 out = out or ""
                 self._actions_run += 1
                 acted = True
+                if action.type in UNTRUSTED_SOURCE_TYPES:
+                    self._untrusted_next = True
 
                 if ok:
                     self.breaker.record_success(action.content)
@@ -837,7 +852,8 @@ class AgentRunner:
         lvl = self.config.autonomy
         risk = decision.risk_level
         if lvl == AutonomyLevel.FULL_AUTO:
-            return risk == RiskLevel.CRITICAL
+            return (risk == RiskLevel.CRITICAL
+                    or self._untrusted_floor_applies(action, decision))
         if lvl == AutonomyLevel.MANUAL:
             return True
         # GUIDED — auto-run low-risk reads; confirm writes / MEDIUM+.
@@ -848,6 +864,15 @@ class AgentRunner:
         except KeyError:
             ceiling = RiskLevel.LOW
         return risk > ceiling   # RiskLevel is an IntEnum
+
+    def _untrusted_floor_applies(self, action, decision) -> bool:
+        """FULL_AUTO's prompt-injection floor: once web text is in the run,
+        code it might have asked for needs a person (core.sandbox.policy,
+        needs_human_after_untrusted). Other autonomy levels already ask."""
+        return (self._untrusted
+                and self.config.autonomy == AutonomyLevel.FULL_AUTO
+                and decision is not None
+                and needs_human_after_untrusted(action.type, decision.risk_level))
 
     def _set_system_prompt(self, history):
         if self._native:

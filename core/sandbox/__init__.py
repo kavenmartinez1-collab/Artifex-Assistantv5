@@ -30,6 +30,9 @@ from core.sandbox.policy import (
     check_policy,
     classify_action,
     clear_policy_hooks,
+    UNTRUSTED_SOURCE_TYPES,
+    UNTRUSTED_GATE_REASON,
+    needs_human_after_untrusted,
 )
 
 _log = logging.getLogger(__name__)
@@ -72,4 +75,7 @@ __all__ = [
     "classify_action",
     "clear_policy_hooks",
     "install_all_hooks",
+    "UNTRUSTED_SOURCE_TYPES",
+    "UNTRUSTED_GATE_REASON",
+    "needs_human_after_untrusted",
 ]

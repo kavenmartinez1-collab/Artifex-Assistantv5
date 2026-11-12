@@ -113,6 +113,7 @@ _SCRUB_ENV_KEYS = frozenset({
     "NPM_TOKEN",
     "PYPI_TOKEN",
     "ARTIFEX_AGENT_KEY",
+    "ARTIFEX_API_KEY",      # the API's bearer key: a command could call the API with it
     "GATEWAY_AUTH_TOKEN",
     "DATABASE_URL",
     "REDIS_URL",
@@ -122,6 +123,13 @@ _SCRUB_ENV_KEYS = frozenset({
 })
 
 _SCRUB_PREFIXES = ("SECRET_", "TOKEN_", "PRIVATE_KEY_")
+# Name endings that mark a credential whatever the prefix (FOO_API_KEY,
+# BAR_SECRET, ...): a new key added to the launcher is stripped without
+# anyone remembering this list. Endings, not substrings, so settings such as
+# HF_HUB_DISABLE_IMPLICIT_TOKEN or TOKENIZERS_PARALLELISM pass through.
+_SCRUB_SUFFIXES = ("_API_KEY", "_SECRET", "_SECRET_KEY", "_PASSWORD",
+                   "_ACCESS_KEY", "_PRIVATE_KEY", "_SIGNING_KEY", "_HMAC_KEY",
+                   "_AUTH_TOKEN")
 
 
 def scrub_env(env: dict[str, str] | None = None) -> dict[str, str]:
@@ -132,6 +140,8 @@ def scrub_env(env: dict[str, str] | None = None) -> dict[str, str]:
         if key in _SCRUB_ENV_KEYS:
             continue
         if any(key.startswith(p) for p in _SCRUB_PREFIXES):
+            continue
+        if key.upper().endswith(_SCRUB_SUFFIXES):
             continue
         clean[key] = value
     return clean

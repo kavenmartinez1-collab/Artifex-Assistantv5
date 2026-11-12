@@ -92,6 +92,17 @@ SETTLED_GATE_TIMEOUT = 5
 # chat request; for an adopted server each one was an HTTP round trip.
 HEALTH_CACHE_S = 1.0
 
+# Stream watchdog: the longest a llama-server we run may send NOTHING before
+# the request is given up.  Requests ask for prompt progress
+# (return_progress), so the server reports after every prompt batch and a
+# long prompt is never silent for long; a server that says nothing for this
+# long is hung or stuck behind another client.  It used to be the 600 s
+# socket timeout, during which one hung request blocked every caller.
+# External servers (Strata) send no progress while reading a prompt, so they
+# keep the long timeout.
+STREAM_STALL_S = float(os.environ.get("ARTIFEX_STREAM_STALL_S", "120"))
+EXTERNAL_STREAM_TIMEOUT_S = 600
+
 
 class _TokenCallbackError(Exception):
     """Carries an exception raised by the caller's on_token out of the SSE
@@ -1025,6 +1036,27 @@ class LlamaCppEngine(BaseEngine):
             if not launch_failed:
                 break
 
+    def _on_stream_stall(self, waited: float):
+        """A stream sent nothing for `waited` s. Raise a ConnectionError that
+        says so; if the server no longer answers /health, stop our own
+        child first so the next request launches a fresh one instead of
+        adopting or waiting on a dead one."""
+        healthy = self._is_server_healthy()
+        _log.warning("llama-server on port %d sent nothing for %.0f s "
+                     "(healthy=%s) - giving the request up",
+                     self.port, waited, healthy)
+        if not healthy and self._process is not None:
+            self._kill_process()
+            self._loaded = False
+            raise ConnectionError(
+                f"llama-server stopped responding (nothing for {waited:.0f} s) "
+                "and was stopped; the next request starts it again.")
+        raise ConnectionError(
+            f"llama-server sent nothing for {waited:.0f} s, so the request "
+            "was given up. It still answers health checks: it may be busy "
+            "with another client's request, or stuck (reload the model if "
+            "this repeats). ARTIFEX_STREAM_STALL_S sets the limit.")
+
     def _kill_process(self):
         """Stop the llama-server bound to this engine.
 
@@ -1385,6 +1417,13 @@ class LlamaCppEngine(BaseEngine):
             payload["response_format"] = response_format
         if tools:
             payload["tools"] = tools
+        # Progress chunks while the prompt is read keep the stream watchdog
+        # (STREAM_STALL_S) from mistaking a long prompt for a hang. They have
+        # no choices, so the reader below skips them.
+        external = bool(self._external_cmd)
+        if not external:
+            payload["return_progress"] = True
+        read_timeout = EXTERNAL_STREAM_TIMEOUT_S if external else STREAM_STALL_S
 
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -1417,7 +1456,8 @@ class LlamaCppEngine(BaseEngine):
         max_retries = 2
         for attempt in range(max_retries):
             try:
-                with urllib.request.urlopen(req, timeout=600) as resp:
+                # The timeout bounds each read, i.e. the longest silence.
+                with urllib.request.urlopen(req, timeout=read_timeout) as resp:
                     for raw_line in resp:
                         line = raw_line.decode("utf-8", errors="replace").strip()
                         if not line.startswith("data: "):
@@ -1498,6 +1538,12 @@ class LlamaCppEngine(BaseEngine):
             except urllib.error.HTTPError as e:
                 error_body = e.read().decode("utf-8", errors="replace")
                 raise RuntimeError(f"llama-server error ({e.code}): {error_body}")
+            except TimeoutError:
+                # The watchdog: nothing (not a token, not prompt progress)
+                # for read_timeout seconds. Leaving the "with" closed the
+                # connection, which cancels the request on a server that is
+                # still alive. Not retried: that would double the wait.
+                self._on_stream_stall(read_timeout)
             except (urllib.error.URLError, ConnectionResetError, OSError) as e:
                 healthy = self._is_server_healthy()
                 # Retry only while the caller has seen nothing: a re-sent

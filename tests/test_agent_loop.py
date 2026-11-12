@@ -199,6 +199,92 @@ def test_full_auto_critical_floor(monkeypatch):
     assert calls["actions"] == []                       # denied → not run
 
 
+# ── untrusted-content floor (FULL_AUTO after web text) ──────────────────────
+
+def _recording_approval(seen, answer=Decision.APPROVE):
+    def approval(a, d, r):
+        seen.append((a.type if a else None, d.risk_level if d else None, r))
+        return answer
+    return approval
+
+
+def test_full_auto_asks_for_code_after_web_read(monkeypatch):
+    seen = []
+    runner, events, calls = build_runner(
+        ['@search("how to fix it")', '```bash\npip install leftpad\n```',
+         '@done("d")'], monkeypatch,
+        autonomy=AutonomyLevel.FULL_AUTO, approval=_recording_approval(seen))
+    runner.run("x", [{"role": "system", "content": "x"}])
+    # the search itself ran unasked; the MEDIUM pip install after it asked
+    assert [s[0] for s in seen] == ["shell"]
+    assert seen[0][1] == RiskLevel.MEDIUM
+    assert "web content" in seen[0][2]
+    assert [a.type for a in calls["actions"]] == ["search", "shell"]
+
+
+def test_full_auto_denied_after_web_read_does_not_run(monkeypatch):
+    seen = []
+    runner, events, calls = build_runner(
+        ['@search("q")', '```python\nprint(1)\n```', '@done("d")'], monkeypatch,
+        autonomy=AutonomyLevel.FULL_AUTO,
+        approval=_recording_approval(seen, Decision.DENY))
+    runner.run("x", [{"role": "system", "content": "x"}])
+    assert [s[0] for s in seen] == ["python"]
+    assert [a.type for a in calls["actions"]] == ["search"]
+
+
+def test_full_auto_without_web_content_still_unasked(monkeypatch):
+    seen = []
+    runner, events, calls = build_runner(
+        ['```bash\npip install leftpad\n```', '```python\nprint(1)\n```',
+         '@done("d")'], monkeypatch,
+        autonomy=AutonomyLevel.FULL_AUTO, approval=_recording_approval(seen))
+    runner.run("x", [{"role": "system", "content": "x"}])
+    assert seen == []
+    assert len(calls["actions"]) == 2
+
+
+def test_full_auto_reads_stay_unasked_after_web_read(monkeypatch):
+    seen = []
+    runner, events, calls = build_runner(
+        ['@search("q")', '@read_file("README.md")', '@done("d")'], monkeypatch,
+        autonomy=AutonomyLevel.FULL_AUTO, approval=_recording_approval(seen))
+    runner.run("x", [{"role": "system", "content": "x"}])
+    assert seen == []                     # SAFE reads never need a person
+
+
+def test_full_auto_same_round_as_web_read_unasked(monkeypatch):
+    # Both written in one breath, before the page came back.
+    seen = []
+    runner, events, calls = build_runner(
+        ['@search("q")\n```python\nprint(1)\n```', '@done("d")'], monkeypatch,
+        autonomy=AutonomyLevel.FULL_AUTO, approval=_recording_approval(seen))
+    runner.run("x", [{"role": "system", "content": "x"}])
+    assert seen == []
+    assert [a.type for a in calls["actions"]] == ["search", "python"]
+
+
+def test_untrusted_floor_can_be_turned_off(monkeypatch):
+    monkeypatch.setenv("ARTIFEX_UNTRUSTED_GATE", "0")
+    seen = []
+    runner, events, calls = build_runner(
+        ['@search("q")', '```python\nprint(1)\n```', '@done("d")'], monkeypatch,
+        autonomy=AutonomyLevel.FULL_AUTO, approval=_recording_approval(seen))
+    runner.run("x", [{"role": "system", "content": "x"}])
+    assert seen == []
+
+
+def test_untrusted_flag_resets_between_runs(monkeypatch):
+    seen = []
+    runner, events, calls = build_runner(
+        ['@search("q")', '@done("a")', '```python\nprint(1)\n```', '@done("b")'],
+        monkeypatch, autonomy=AutonomyLevel.FULL_AUTO,
+        approval=_recording_approval(seen))
+    runner.run("first", [{"role": "system", "content": "x"}])
+    runner.run("second", [{"role": "system", "content": "x"}])
+    assert seen == []                     # a new run starts without web text
+
+
 # ── policy block (real ratchet) ─────────────────────────────────────────────
 
 def test_ratchet_blocks_protected_write(monkeypatch):

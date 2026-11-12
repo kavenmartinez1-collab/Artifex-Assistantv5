@@ -4685,7 +4685,7 @@ function agentEvent(ev) {
       showApproval({
         action: ev.action || null,
         risk: ev.risk || "",
-        reason: ev.policy_reason || "",
+        reason: ev.reason || ev.policy_reason || "",
       }, "action");
       break;
     case "approval_remembered":

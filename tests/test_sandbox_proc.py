@@ -96,6 +96,26 @@ class TestEnvScrubbing(unittest.TestCase):
         clean = scrub_env(env)
         self.assertNotIn("SECRET_DB_PASSWORD", clean)
 
+    def test_removes_api_key(self):
+        # The API's bearer key: a command with it could drive the API.
+        env = {"ARTIFEX_API_KEY": "k", "ARTIFEX_KALI_SSH": "127.0.0.1:2222"}
+        clean = scrub_env(env)
+        self.assertNotIn("ARTIFEX_API_KEY", clean)
+        self.assertIn("ARTIFEX_KALI_SSH", clean)
+
+    def test_removes_credential_suffixes(self):
+        env = {"FOO_API_KEY": "a", "BAR_SECRET": "b", "DB_PASSWORD": "c",
+               "X_SIGNING_KEY": "d", "Y_HMAC_KEY": "e", "Z_AUTH_TOKEN": "f",
+               # settings that merely mention a token stay
+               "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1",
+               "TOKENIZERS_PARALLELISM": "false"}
+        clean = scrub_env(env)
+        for k in ("FOO_API_KEY", "BAR_SECRET", "DB_PASSWORD",
+                  "X_SIGNING_KEY", "Y_HMAC_KEY", "Z_AUTH_TOKEN"):
+            self.assertNotIn(k, clean)
+        self.assertIn("HF_HUB_DISABLE_IMPLICIT_TOKEN", clean)
+        self.assertIn("TOKENIZERS_PARALLELISM", clean)
+
     def test_empty_env(self):
         self.assertEqual(scrub_env({}), {})
 

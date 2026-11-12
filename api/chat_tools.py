@@ -182,7 +182,25 @@ _CRITICAL_REFUSAL = (
 )
 
 
-def _screen(action) -> str | None:
+_UNTRUSTED_REFUSAL = (
+    "[NOT RUN — {risk} risk after web content]\n"
+    "This reply has already read text from the web, and that text could be "
+    "telling the model what to run. Chat cannot ask you first, so it will "
+    "not run this one: {display}\n"
+    "Ask for it in a new message without web tools, or run it from the "
+    "Agent tab, which asks before running it. (ARTIFEX_UNTRUSTED_GATE=0 on "
+    "the server lifts this.)"
+)
+
+
+def history_has_tool_results(messages) -> bool:
+    """True when the client sent earlier tool results back (role "tool"):
+    web text from a previous reply is then already in the context."""
+    return any(isinstance(m, dict) and m.get("role") == "tool"
+               for m in (messages or []))
+
+
+def _screen(action, untrusted: bool = False) -> str | None:
     """Pre-execution screen. Returns a refusal message, or None to proceed.
 
     This is ON TOP of the sandbox policy engine, not instead of it —
@@ -191,10 +209,16 @@ def _screen(action) -> str | None:
     auto-allows CRITICAL too, and "rm -rf" arriving from a phone with no
     confirmation step is not what anyone meant by giving chat tools.
     """
+    from core.sandbox import (classify_action, RiskLevel,
+                              needs_human_after_untrusted)
+    risk = classify_action(action.type, action.content)
+    if untrusted and needs_human_after_untrusted(action.type, risk):
+        display = str(getattr(action, "display", "") or action.content)[:200]
+        _log.warning("chat refused %s action (%s) after web content: %s",
+                     action.type, risk.name, display)
+        return _UNTRUSTED_REFUSAL.format(risk=risk.name, display=display)
     if allow_critical():
         return None
-    from core.sandbox import classify_action, RiskLevel
-    risk = classify_action(action.type, action.content)
     if risk >= RiskLevel.CRITICAL:
         display = str(getattr(action, "display", "") or action.content)[:200]
         _log.warning("chat refused %s action (%s): %s",
@@ -203,7 +227,7 @@ def _screen(action) -> str | None:
     return None
 
 
-def execute_chat_tools(actions: list, cwd: str) -> str:
+def execute_chat_tools(actions: list, cwd: str, state: dict | None = None) -> str:
     """Run extracted actions and return the combined, capped feedback block.
 
     Never raises: a tool that blows up returns its traceback as text, the
@@ -211,7 +235,16 @@ def execute_chat_tools(actions: list, cwd: str) -> str:
     grep pattern was malformed would be a worse failure than the grep's.
     """
     from tools.agent_tools import run_agent_action, get_tool_output_limit
+    from core.sandbox import UNTRUSTED_SOURCE_TYPES
 
+    # `state` lives for one chat reply (all its tool rounds): once a web tool
+    # has run, its "untrusted" flag makes _screen refuse code that needs a
+    # person. Without it each call starts clean.
+    if state is None:
+        state = {}
+    # As of this round's start: the round's actions were all written before
+    # any page it fetches came back.
+    untrusted = bool(state.get("untrusted"))
     results: list[str] = []
     budget = MAX_ROUND_OUTPUT_CHARS
 
@@ -221,7 +254,7 @@ def execute_chat_tools(actions: list, cwd: str) -> str:
     for action in honoured:
         header = f"[{action.type}] {str(getattr(action, 'display', ''))[:120]}"
 
-        refusal = _screen(action)
+        refusal = _screen(action, untrusted=untrusted)
         if refusal:
             results.append(f"{header}\n{refusal}")
             continue
@@ -246,6 +279,11 @@ def execute_chat_tools(actions: list, cwd: str) -> str:
 
         status = "ok" if ok else "FAILED"
         results.append(f"{header} -> {status}\n{output}")
+        if action.type in UNTRUSTED_SOURCE_TYPES:
+            # Its text reaches the model in the next round, so from then on
+            # (not for the rest of this round, written before it) code
+            # needs a person.
+            state["untrusted"] = True
 
         if budget <= 0:
             remaining = len(honoured) - len(results)

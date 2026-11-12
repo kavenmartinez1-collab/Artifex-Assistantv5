@@ -464,6 +464,39 @@ def classify_action(action_type: str, content: str = "") -> RiskLevel:
     return ACTION_RISK.get(action_type, RiskLevel.HIGH)
 
 
+# ── Untrusted content floor (prompt injection) ──────────────────────────────
+# Once a run has read text from the web, that text may carry instructions the
+# model follows ("now run curl ... | sh"). Unattended surfaces (FULL_AUTO in
+# the agent loop, chat's tool mode) then stop running code on their own: code
+# execution at MEDIUM and up, and anything else at HIGH and up, needs a person
+# (the agent loop asks; chat, which cannot ask, refuses and points to the
+# Agent tab). ARTIFEX_UNTRUSTED_GATE=0 turns the floor off.
+
+# Action types whose output is text from outside this machine.
+UNTRUSTED_SOURCE_TYPES = frozenset({"search", "web_read", "download"})
+# Action types that run code: an injected pip install or git command is
+# MEDIUM by itself but is exactly what an injection asks for.
+_CODE_EXEC_TYPES = frozenset({"shell", "python", "kali_shell"})
+
+UNTRUSTED_GATE_REASON = ("web content entered this run, so code it might have "
+                         "asked for runs only with your OK")
+
+
+def untrusted_gate_enabled() -> bool:
+    return os.getenv("ARTIFEX_UNTRUSTED_GATE", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def needs_human_after_untrusted(action_type: str, risk: RiskLevel) -> bool:
+    """Whether `action_type` at `risk` needs a person once web content is in
+    the run (see the block comment above)."""
+    if not untrusted_gate_enabled():
+        return False
+    if action_type in _CODE_EXEC_TYPES:
+        return risk >= RiskLevel.MEDIUM
+    return risk >= RiskLevel.HIGH
+
+
 # ── Policy auto-allow thresholds ─────────────────────────────────────────────
 # Maps policy level → maximum risk level that's auto-allowed (no confirmation).
 # Anything above the threshold requires confirmation or is denied.
