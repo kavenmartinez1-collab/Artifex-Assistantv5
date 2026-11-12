@@ -71,7 +71,8 @@ def _remote(a) -> int:
         if not remote.tailscale_exe():
             steps.append(f"install Tailscale {catalog['tailscale']['version']} (pinned and "
                          "signature-checked; Windows will ask you to approve it), then you sign in")
-        steps += [f"create {remote.KEY_FILE} (a random 256-bit API key) if it doesn't exist",
+        steps += [f"create {remote.KEYS_FILE} with a random 256-bit API key, stored as a "
+                  f"hash, if there is none (an old {remote.KEY_FILE} is moved in, same key)",
                   f"forward your tailnet's port {a.port} to 127.0.0.1:{a.port} "
                   "(tailscale serve, tailnet only; never Funnel)",
                   "write 'Artifex API (phone via Tailscale).cmd' (still bound to 127.0.0.1)",
@@ -86,7 +87,13 @@ def _remote(a) -> int:
             if not remote.wait_connected():
                 print("Tailscale isn't connected yet; sign in, then run this again.")
                 return 5
-            print("API key: " + remote.ensure_api_key(root))
+            kpath, new_key, note = remote.ensure_api_keys(root)
+            print(f"API keys: {kpath}" + (f" - {note}" if note else ""))
+            if new_key:
+                print("\nYour phone's API key (shown ONCE; only its hash is kept):\n\n"
+                      f"    {new_key}\n\nPaste it into the phone app's settings. Lost it? "
+                      "Regenerate it from another device's settings, or run\n"
+                      f'    python -m core.api_keys --file "{kpath}" rotate phone\n')
             remote.serve_api(a.port)
             print("launcher: " + recipes.write_phone_launcher(root, a.port, a.model))
         except (VerifyError, RuntimeError, ValueError, subprocess.CalledProcessError) as e:

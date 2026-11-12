@@ -223,7 +223,8 @@ class _Req:
 
 
 def test_the_right_key_gets_in_even_after_a_burst_of_wrong_ones(monkeypatch):
-    monkeypatch.setattr(server, "_api_key", "correct-key")
+    from core.api_keys import KeyStore
+    monkeypatch.setattr(server, "_keystore", KeyStore("", legacy_key="correct-key"))
     monkeypatch.setattr(server, "_auth_failures", {})
     for _ in range(server._AUTH_FAIL_MAX + 5):
         assert server._check_auth(_Req("stale-key")) is False

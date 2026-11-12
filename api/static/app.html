@@ -1172,7 +1172,20 @@
     <div class="pt">API KEY</div>
     <input type="password" id="api-key" placeholder="bearer key" autocomplete="off"
       autocapitalize="off" autocorrect="off" spellcheck="false">
-    <div class="hint">The server's ARTIFEX_API_KEY value. Stored only in this browser.</div>
+    <div class="hint">This device's key, stored only in this browser. The server keeps
+      just a hash, so it cannot show a key again: lost one? Regenerate it.</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
+      <button class="btn" onclick="loadApiKeys()">Keys</button>
+      <button class="btn" onclick="regenMyKey()">Regenerate this device's key</button>
+      <button class="btn" onclick="newDeviceKey()">Key for another device</button>
+    </div>
+    <div id="key-reveal" style="display:none;margin-top:8px">
+      <div class="hint" id="key-reveal-label"></div>
+      <input type="text" id="key-reveal-value" readonly onclick="this.select()"
+        autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <div class="hint">Shown once. Tap it to select, then copy it into the other device.</div>
+    </div>
+    <div id="keys-list" class="hint"></div>
   </div>
   <div class="panel">
     <div class="pt">MODEL</div>
@@ -1685,6 +1698,84 @@ function applyToolLevel() {
   if (!phoneToolsFull && (activeTab === "agent" || activeTab === "files")) {
     showTab("chat");
   }
+}
+
+// ── API keys (Settings) ──────────────────────────────────
+// One hashed key per device on the server (core/api_keys.py). A new key
+// comes back once: this device's goes straight into its own storage, another
+// device's is shown for copying.
+async function keysCall(method, path, body) {
+  const r = await fetch(path, {
+    method, body: body ? JSON.stringify(body) : undefined,
+    headers: authHeaders(body ? { "Content-Type": "application/json" } : {}),
+  });
+  let j = {};
+  try { j = await r.json(); } catch (e) {}
+  if (r.status === 401) throw new Error("Invalid API key - check the key above");
+  if (!r.ok) throw new Error((j && j.detail) ? String(j.detail.message || j.detail) : "HTTP " + r.status);
+  return j;
+}
+
+function revealKey(label, key) {
+  $("key-reveal-label").textContent = label;
+  $("key-reveal-value").value = key;
+  $("key-reveal").style.display = "";
+}
+
+async function loadApiKeys() {
+  const box = $("keys-list");
+  box.textContent = "Loading keys...";
+  try {
+    const j = await keysCall("GET", "/v1/auth/keys");
+    box.innerHTML = "";
+    if (!j.file) {
+      box.textContent = "The server runs on a single ARTIFEX_API_KEY. Move it into a key " +
+        "file (python -m core.api_keys migrate) to manage keys per device.";
+      return;
+    }
+    for (const k of j.keys) {
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;gap:8px;margin-top:6px";
+      const me = k.id === j.current;
+      row.innerHTML = "<span style='flex:1'>" + escapeHtml(k.label) + " <span style='opacity:.6'>" +
+        escapeHtml(k.id) + (k.created ? " · " + escapeHtml(k.created.slice(0, 10)) : "") +
+        "</span>" + (me ? " <b>(this device)</b>" : "") + "</span>";
+      if (!me && !k.legacy) {
+        const b = document.createElement("button");
+        b.className = "btn"; b.textContent = "Revoke";
+        b.onclick = () => revokeKey(k.id, k.label);
+        row.appendChild(b);
+      }
+      box.appendChild(row);
+    }
+  } catch (e) { box.textContent = "Keys: " + e.message; }
+}
+
+async function regenMyKey() {
+  if (!confirm("Make a new key for this device? The current one stops working at once.")) return;
+  try {
+    const j = await keysCall("POST", "/v1/auth/keys/rotate", {});
+    localStorage.setItem("ax_key", j.key);
+    $("api-key").value = j.key;
+    $("key-reveal").style.display = "none";
+    $("keys-list").textContent = "New key saved on this device (" + j.label + ").";
+  } catch (e) { $("keys-list").textContent = "Regenerate: " + e.message; }
+}
+
+async function newDeviceKey() {
+  const label = (prompt("Name for the new key (the device it is for):", "laptop") || "").trim();
+  if (!label) return;
+  try {
+    const j = await keysCall("POST", "/v1/auth/keys", { label });
+    revealKey("Key for " + j.label + " (" + j.id + "):", j.key);
+    loadApiKeys();
+  } catch (e) { $("keys-list").textContent = "New key: " + e.message; }
+}
+
+async function revokeKey(id, label) {
+  if (!confirm("Revoke the key for " + label + "? That device is locked out until it gets a new key.")) return;
+  try { await keysCall("DELETE", "/v1/auth/keys/" + encodeURIComponent(id)); loadApiKeys(); }
+  catch (e) { $("keys-list").textContent = "Revoke: " + e.message; }
 }
 
 function showTab(name) {

@@ -913,7 +913,7 @@ def test_leftover_backup_is_not_overwritten_by_the_unpatched_config(tmp_path, mo
 def _run_main_api(monkeypatch, argv):
     pytest.importorskip("uvicorn")
     import main_api
-    for var in ("ARTIFEX_API_KEY", "ARTIFEX_BACKEND", "ARTIFEX_MODEL",
+    for var in ("ARTIFEX_API_KEY", "ARTIFEX_API_KEYS_FILE", "ARTIFEX_BACKEND", "ARTIFEX_MODEL",
                 "ARTIFEX_PHONE_APP"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(sys, "argv", ["main_api.py"] + argv)

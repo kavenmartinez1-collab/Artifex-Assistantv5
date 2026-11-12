@@ -66,7 +66,8 @@ def main():
                         default=os.environ.get("ARTIFEX_PHONE_APP", "").lower()
                         in ("1", "true", "yes", "on"),
                         help="Serve the phone app (/app + sessions/chat jobs; "
-                             "OFF by default). Requires ARTIFEX_API_KEY. "
+                             "OFF by default). Requires an API key "
+                             "(ARTIFEX_API_KEYS_FILE or ARTIFEX_API_KEY). "
                              "Agent/files/engine-reload additionally require "
                              "ARTIFEX_PHONE_FULL_TOOLS=1.")
     args = parser.parse_args()
@@ -90,20 +91,26 @@ def main():
         wt.WEB_GATEWAY_URL = args.gateway
 
     # Refuse to expose the API on the network without authentication
-    if args.host not in LOOPBACK_HOSTS and not os.environ.get("ARTIFEX_API_KEY"):
-        print("ERROR: Binding to a non-localhost address requires ARTIFEX_API_KEY.")
+    from core.api_keys import store_from_env
+    has_key = store_from_env().configured()
+    if args.host not in LOOPBACK_HOSTS and not has_key:
+        print("ERROR: Binding to a non-localhost address requires an API key "
+              "(ARTIFEX_API_KEYS_FILE or ARTIFEX_API_KEY).")
         print(f"  You requested --host {args.host}, which exposes the API on the network.")
-        print("  Set ARTIFEX_API_KEY=<your-secret> or use --host 127.0.0.1 (default).")
+        print("  Make a key file: python -m core.api_keys --file artifex_api_keys.json new phone")
+        print("  and set ARTIFEX_API_KEYS_FILE to it, or use --host 127.0.0.1 (default).")
         return
 
     # The phone app service is opt-in and never runs without a key: even a
     # loopback bind can be forwarded (tailscale serve, reverse proxies), so
     # the phone surface must always be behind bearer auth.
     if args.phone_app:
-        if not os.environ.get("ARTIFEX_API_KEY"):
-            print("ERROR: --phone-app requires ARTIFEX_API_KEY.")
+        if not has_key:
+            print("ERROR: --phone-app requires an API key "
+                  "(ARTIFEX_API_KEYS_FILE or ARTIFEX_API_KEY).")
             print("  The phone app exposes remote endpoints (chat sessions, jobs);")
-            print("  set ARTIFEX_API_KEY=<your-secret> or drop --phone-app.")
+            print("  make a key file (python -m core.api_keys --file "
+                  "artifex_api_keys.json new phone) or drop --phone-app.")
             return
         os.environ["ARTIFEX_PHONE_APP"] = "1"
     else:

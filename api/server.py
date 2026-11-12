@@ -45,14 +45,20 @@ _log = get_logger(__name__)
 # Global engine — initialized on server start, protected by lock
 _engine = None
 _engine_lock = threading.Lock()
-_api_key = os.environ.get("ARTIFEX_API_KEY", "")
+# API keys: hashes in ARTIFEX_API_KEYS_FILE (one per device, see
+# core.api_keys), plus the legacy plaintext ARTIFEX_API_KEY if one is set.
+# _api_key is True when requests must carry a key.
+from core.api_keys import store_from_env as _store_from_env, KeyStoreError
+_keystore = _store_from_env()
+_api_key = _keystore.configured()
 # Rate limiting for failed auth attempts
 _auth_failures: dict[str, list[float]] = {}  # ip -> list of timestamps
 _AUTH_FAIL_WINDOW = 60.0    # seconds
 _AUTH_FAIL_MAX = 10         # max failures per window
 
 if not _api_key:
-    _log.warning("ARTIFEX_API_KEY not set — API authentication is DISABLED")
+    _log.warning("No API key set (ARTIFEX_API_KEYS_FILE / ARTIFEX_API_KEY) — "
+                 "API authentication is DISABLED")
 
 
 def _env_flag(name: str) -> bool:
@@ -96,8 +102,10 @@ def _get_engine(ctx_tier: int | None = None, exact_ctx: bool = False):
 
 
 def _check_auth(request):
-    """Validate API key if configured. Uses constant-time comparison with rate limiting."""
-    if not _api_key:
+    """Validate the API key, if keys are configured, against the stored
+    hashes (constant-time). Rate-limits failures per address. On success the
+    matched key's id is left on request.state.api_key_id."""
+    if not _keystore.configured():
         return True  # No auth required
 
     # Rate limit check
@@ -108,27 +116,26 @@ def _check_auth(request):
     fails = [t for t in fails if now - t < _AUTH_FAIL_WINDOW]
     _auth_failures[client_ip] = fails
 
-    import hmac
     auth_header = request.headers.get("Authorization", "")
     key_header = request.headers.get("X-API-Key", "")
     token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else key_header
     # The right key always gets in. The limit only stops further GUESSES:
     # checked first, it locked a phone out for a minute after its stale
     # saved key was corrected, along with anything sharing its address.
-    if token and hmac.compare_digest(token, _api_key):
+    hit = _keystore.match(token) if token else None
+    if hit is not None:
+        try:
+            request.state.api_key_id = hit.get("id", "")
+        except AttributeError:
+            pass
         return True
 
     if len(fails) >= _AUTH_FAIL_MAX:
         _log.warning("Rate limited auth from %s (%d failures)", client_ip, len(fails))
         return False
-    if not token:
-        fails.append(now)
-        _auth_failures[client_ip] = fails
-        return False
-    if not hmac.compare_digest(token, _api_key):
-        fails.append(now)
-        _auth_failures[client_ip] = fails
-        return False
+    fails.append(now)
+    _auth_failures[client_ip] = fails
+    return False
     return True
 
 
@@ -1654,8 +1661,9 @@ def create_app():
         # A tailnet/LAN forward exposes these endpoints to other devices;
         # never serve them open.
         raise RuntimeError(
-            "ARTIFEX_PHONE_APP is set but ARTIFEX_API_KEY is not — refusing "
-            "to serve the phone app unauthenticated. Set ARTIFEX_API_KEY or "
+            "ARTIFEX_PHONE_APP is set but no API key is (ARTIFEX_API_KEYS_FILE "
+            "or ARTIFEX_API_KEY) — refusing to serve the phone app "
+            "unauthenticated. Make a key file (python -m core.api_keys) or "
             "drop --phone-app.")
     if phone_app_on:
         _log.info("Phone app service ENABLED — tools: %s",
@@ -1696,6 +1704,66 @@ def create_app():
                 raise HTTPException(status_code=404, detail="Not found")
             return FileResponse(path, media_type=_holo_types[m.group(1)],
                                 headers={"Cache-Control": "no-cache"})
+
+        # ─── API keys ────────────────────────────────────────────────────
+        # One hashed key per device (core.api_keys). The phone lists them,
+        # makes a key for another device, regenerates its own, and revokes
+        # lost ones. A new key is returned ONCE; only its hash is stored.
+
+        class ApiKeyNew(BaseModel):
+            label: str = Field("device", max_length=60)
+
+        class ApiKeyRotate(BaseModel):
+            id: Optional[str] = Field(None, max_length=40)   # default: the caller's
+
+        def _key_caller(request: Request) -> str:
+            if not _check_auth(request):
+                raise HTTPException(status_code=401, detail="Invalid API key")
+            return getattr(request.state, "api_key_id", "")
+
+        def _key_err(e: Exception):
+            raise HTTPException(status_code=400, detail=str(e))
+
+        @app.get("/v1/auth/keys")
+        async def api_keys_list(request: Request):
+            me = _key_caller(request)
+            return {"keys": _keystore.list(), "current": me,
+                    "file": bool(_keystore.path)}
+
+        @app.post("/v1/auth/keys")
+        async def api_keys_new(body: ApiKeyNew, request: Request):
+            _key_caller(request)
+            try:
+                entry, key = _keystore.add(body.label)
+            except (KeyStoreError, OSError) as e:
+                _key_err(e)
+            _log.info("API key %s (%s) created", entry["id"], entry["label"])
+            return {**entry, "key": key}
+
+        @app.post("/v1/auth/keys/rotate")
+        async def api_keys_rotate(body: ApiKeyRotate, request: Request):
+            me = _key_caller(request)
+            try:
+                entry, key = _keystore.rotate(body.id or me)
+            except (KeyStoreError, OSError) as e:
+                _key_err(e)
+            _log.info("API key %s (%s) regenerated", entry["id"], entry["label"])
+            return {**entry, "key": key, "was_current": entry["id"] == me}
+
+        @app.delete("/v1/auth/keys/{key_id}")
+        async def api_keys_revoke(key_id: str, request: Request):
+            me = _key_caller(request)
+            if key_id == me:
+                raise HTTPException(
+                    status_code=400,
+                    detail="That is the key this device is using; regenerate "
+                           "it instead, or revoke it from another device.")
+            try:
+                gone = _keystore.revoke(key_id)
+            except (KeyStoreError, OSError) as e:
+                _key_err(e)
+            _log.info("API key %s (%s) revoked", gone["id"], gone["label"])
+            return {"revoked": gone}
 
         # ─── Engine control ──────────────────────────────────────────────
         # Remote ops for the phone: see what's loaded and force a relaunch

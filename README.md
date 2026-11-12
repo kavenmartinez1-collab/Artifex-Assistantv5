@@ -319,7 +319,8 @@ python -m installer remote check   # any time: is anything reachable that should
 
 `remote setup` installs Tailscale if needed (pinned version, checksum and
 Windows code signature from Tailscale Inc. checked; Windows asks you to
-approve it), creates a random API key in `artifex_api_key.txt`, and forwards
+approve it), creates a random API key (shown once; only its hash is kept, in
+`artifex_api_keys.json`), and forwards
 your tailnet's port 8000 to `127.0.0.1:8000` with `tailscale serve`. Artifex
 itself keeps listening on 127.0.0.1 only, so it is reachable from your own
 tailnet devices and nothing else. It never uses Tailscale Funnel, which
@@ -711,23 +712,39 @@ Standard OpenAI clients will ignore the `x_` fields and receive normal content. 
 
 ### Authentication
 
-Set the `ARTIFEX_API_KEY` environment variable to require authentication:
+Keep API keys in a key file. It stores only a SHA-256 hash of each key, one
+key per device, so reading the file does not give anyone a key. Point the
+server at it with `ARTIFEX_API_KEYS_FILE`:
 
 ```bash
-# Set the key
-export ARTIFEX_API_KEY=my-secret-key       # Linux/Mac
-set ARTIFEX_API_KEY=my-secret-key          # Windows
+# Make a key (printed once, copied to the clipboard on Windows)
+python -m core.api_keys --file artifex_api_keys.json new phone
+set ARTIFEX_API_KEYS_FILE=C:\path\to\artifex_api_keys.json   # Windows
+export ARTIFEX_API_KEYS_FILE=/path/to/artifex_api_keys.json      # Linux/Mac
 
-# Requests must include the key
+# Lost or leaked a key? Replace it, or cut a device off:
+python -m core.api_keys rotate phone
+python -m core.api_keys revoke laptop
+python -m core.api_keys list
+
+# An old plaintext key file moves in unchanged (devices keep working):
+python -m core.api_keys migrate artifex_api_key.txt
+
+# Requests must include a key
 curl http://localhost:8000/v1/models \
-  -H "Authorization: Bearer my-secret-key"
+  -H "Authorization: Bearer <key>"
 
 # Or via X-API-Key header
 curl http://localhost:8000/v1/models \
-  -H "X-API-Key: my-secret-key"
+  -H "X-API-Key: <key>"
 ```
 
-If `ARTIFEX_API_KEY` is not set, no authentication is required.
+Changes to the key file take effect without a restart. The phone app's
+settings can also list keys, make one for another device, regenerate its own
+and revoke others. A plain `ARTIFEX_API_KEY` environment variable still works
+(handy for Docker), but it keeps the key in plain text.
+
+If neither is set, no authentication is required.
 
 ---
 
@@ -752,7 +769,7 @@ The phone service is **off by default** and layered:
    API; `/app`, sessions, chat jobs, and all remote-ops endpoints are
    not registered.
 2. **Web-only** — start with `--phone-app` (or `ARTIFEX_PHONE_APP=1`).
-   Requires `ARTIFEX_API_KEY` to be set; the server refuses to start the
+   Requires an API key (`ARTIFEX_API_KEYS_FILE` or `ARTIFEX_API_KEY`); the server refuses to start the
    phone service without it. The client gets chat with web search and
    web read only — no agent, no file access, no engine reload; the
    Agent/Files tabs hide themselves.
@@ -779,8 +796,8 @@ Then from any device on your tailnet:
 http://<your-machine's-tailnet-ip>:8000/app
 ```
 
-Paste your `ARTIFEX_API_KEY` into the client's settings drawer once; it
-persists in that browser.
+Paste the device's API key into the client's settings drawer once; it
+persists in that browser. The same drawer regenerates it if it is lost.
 
 Beyond chat and agent runs, the phone client has:
 
@@ -812,7 +829,7 @@ Hard-won notes for this setup:
   health-checks `localhost`, and other components assume loopback.
   Terminating tailnet traffic in the forwarder and dialing loopback is
   the supported shape.
-- **Set `ARTIFEX_API_KEY` before exposing anything.** A tailnet is
+- **Set an API key before exposing anything.** A tailnet is
   private, but every device on it can reach the port; the key is what
   scopes access to you.
 - Agent runs started from the phone honor the same sandbox, risk
@@ -1965,7 +1982,8 @@ See [LEARNING.md](LEARNING.md) for a deep-dive walkthrough of the architecture, 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ARTIFEX_API_KEY` | *(none)* | API authentication key (optional) |
+| `ARTIFEX_API_KEYS_FILE` | *(none)* | Hashed API key file, one key per device (`python -m core.api_keys`). |
+| `ARTIFEX_API_KEY` | *(none)* | A single plaintext API key (older setup; the key file is preferred) |
 | `ARTIFEX_TRUST_REMOTE_CODE` | *(off)* | `1` lets transformers run Python files from a model's own Hugging Face repo when it loads. Off by default: every model Artifex uses has a built-in class. Only turn it on for a model whose repo code you have read, pinned to a commit. |
 | `ARTIFEX_BACKEND` | *(auto)* | Backend for the CLI/GUI: `llama_cpp`, `ollama`, `transformers`… Default: `llama_cpp` when PyTorch isn't installed and llama.cpp models are configured, else `transformers`. |
 | `CUDA_VISIBLE_DEVICES` | `0` | GPU device index (for multi-GPU systems) |

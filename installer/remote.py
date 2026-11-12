@@ -24,7 +24,6 @@ import ipaddress
 import json
 import os
 import re
-import secrets
 import shutil
 import subprocess
 import time
@@ -36,7 +35,8 @@ WATCHED_PORTS = {8000: "Artifex API", 8080: "web gateway", 8081: "llama.cpp serv
                  8082: "Orpheus voice server"}
 _TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
 _TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
-KEY_FILE = "artifex_api_key.txt"
+KEY_FILE = "artifex_api_key.txt"        # the old plaintext key (migrated away)
+KEYS_FILE = "artifex_api_keys.json"     # hashed keys, one per device (core.api_keys)
 
 OK, WARN, FAIL, INFO = "OK", "WARN", "FAIL", "INFO"
 
@@ -172,16 +172,22 @@ def check_exposure(root: str, api_port: int = 8000, min_version: str = "",
                           fix=hint("remote setup")))
 
     # 4. An API key, since tailnet devices can reach the API.
+    n_keys = _hashed_key_count(root)
     key = ""
     try:
         key = open(os.path.join(root, KEY_FILE), encoding="utf-8").read().strip()
     except OSError:
         pass
-    if fwd and len(key) < 32:
+    if fwd and not n_keys and len(key) < 32:
         f.append(_finding(FAIL, "The API is reachable from your tailnet without a strong key",
                           fix=hint("remote setup") + " (creates one)"))
+    elif n_keys:
+        f.append(_finding(OK, "API keys are set",
+                          f"{KEYS_FILE}: {n_keys} key(s), stored as hashes"))
     elif key:
-        f.append(_finding(OK, "API key is set", f"{KEY_FILE}, {len(key)} characters"))
+        f.append(_finding(WARN, "API key is stored in plain text", KEY_FILE,
+                          fix=hint("remote setup") + " (moves it into a hashed key file, "
+                              "same key)"))
 
     # 5. Tailnet Lock: new devices need signing by a device you trust.
     lk = _ts(["lock", "status"], run=run)
@@ -206,16 +212,40 @@ def report(findings: list) -> str:
     return "\n".join(lines)
 
 
-def ensure_api_key(root: str) -> str:
-    """A 256-bit random key in <root>/artifex_api_key.txt (created once)."""
-    path = os.path.join(root, KEY_FILE)
-    if os.path.isfile(path):
-        key = open(path, encoding="utf-8").read().strip()
-        if len(key) >= 32:
-            return path
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(secrets.token_urlsafe(32) + "\n")
-    return path
+def _hashed_key_count(root: str) -> int:
+    try:
+        with open(os.path.join(root, KEYS_FILE), encoding="utf-8") as fh:
+            return len(json.load(fh).get("keys", []))
+    except (OSError, ValueError, AttributeError):
+        return 0
+
+
+def ensure_api_keys(root: str) -> tuple:
+    """The hashed key file <root>/artifex_api_keys.json, with at least one key.
+
+    Returns (path, new_key, note). new_key is the plaintext of a key made just
+    now (show it once: only its hash is stored), else None. An old
+    artifex_api_key.txt is moved in unchanged - devices that have it keep
+    working - and then deleted, since a plaintext copy is what this replaces.
+    """
+    from core.api_keys import KeyStore, migrate_plaintext
+    path = os.path.join(root, KEYS_FILE)
+    store = KeyStore(path)
+    txt = os.path.join(root, KEY_FILE)
+    old = ""
+    try:
+        old = open(txt, encoding="utf-8").read().strip()
+    except OSError:
+        pass
+    if len(old) >= 32:
+        entry = migrate_plaintext(store, txt, label="phone")
+        os.remove(txt)
+        return path, None, (f"moved the key in {KEY_FILE} into {KEYS_FILE} as "
+                            f"{entry['id']} (same key; {KEY_FILE} deleted)")
+    if store.list():
+        return path, None, ""
+    entry, key = store.add("phone")
+    return path, key, f"new key {entry['id']} (phone)"
 
 
 def verify_signature(path: str, run=subprocess.run) -> str:

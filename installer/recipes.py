@@ -329,7 +329,7 @@ def start_app(root: str, gui: bool = True, popen=subprocess.Popen):
 
 
 def write_phone_launcher(root: str, port: int = 8000, model_id: str = None) -> str:
-    """The API for the phone app: loads the key from artifex_api_key.txt and
+    """The API for the phone app: checks keys against artifex_api_keys.json (hashes) and
     still binds to 127.0.0.1 (Tailscale serve forwards the tailnet to it).
     Agent and file tools stay off; turn them on deliberately with
     ARTIFEX_PHONE_FULL_TOOLS=1 if you want them from the phone."""
@@ -343,8 +343,8 @@ def write_phone_launcher(root: str, port: int = 8000, model_id: str = None) -> s
     model = f" --model {model_id}" if model_id else ""
     lines = ["@echo off", "chcp 65001 >nul", f'cd /d "{croot}"',
              "set ARTIFEX_BACKEND=llama_cpp",
-             f'if not exist "artifex_api_key.txt" (echo Run: {hint("remote setup")} in this folder & pause & exit /b 1)',
-             'set /p ARTIFEX_API_KEY=<"artifex_api_key.txt"',
+             f'if not exist "artifex_api_keys.json" (echo Run: {hint("remote setup")} in this folder & pause & exit /b 1)',
+             f'set "ARTIFEX_API_KEYS_FILE={croot}\\artifex_api_keys.json"',
              f"set WEB_GATEWAY_URL={GATEWAY_URL}",
              f'"{py}" main_api.py --host 127.0.0.1 --port {port} --backend llama_cpp --phone-app'
              f'{model} --gateway {GATEWAY_URL}',

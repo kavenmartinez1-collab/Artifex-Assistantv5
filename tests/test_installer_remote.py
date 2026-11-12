@@ -50,7 +50,8 @@ def ts_installed(monkeypatch):
 
 @pytest.fixture
 def root(tmp_path):
-    (tmp_path / remote.KEY_FILE).write_text("k" * 43)
+    from core.api_keys import KeyStore
+    KeyStore(str(tmp_path / remote.KEYS_FILE)).add("phone")
     return str(tmp_path)
 
 
@@ -156,22 +157,39 @@ def test_installer_signature(out, ok):
             remote.verify_signature("x.msi", run=run)
 
 
-def test_api_key_is_strong_and_kept(tmp_path):
-    path = remote.ensure_api_key(str(tmp_path))
-    key = open(path).read().strip()
+def test_api_key_is_strong_shown_once_and_hashed(tmp_path):
+    from core.api_keys import KeyStore
+    path, key, _ = remote.ensure_api_keys(str(tmp_path))
     assert len(key) >= 40 and re.fullmatch(r"[A-Za-z0-9_-]+", key)
-    assert remote.ensure_api_key(str(tmp_path)) == path
-    assert open(path).read().strip() == key                     # not regenerated
-    (tmp_path / remote.KEY_FILE).write_text("short")
-    remote.ensure_api_key(str(tmp_path))
-    assert len(open(path).read().strip()) >= 40                 # a weak key is replaced
+    assert key not in open(path).read()                         # only the hash is stored
+    assert KeyStore(path).match(key)["label"] == "phone"
+    again = remote.ensure_api_keys(str(tmp_path))
+    assert again[0] == path and again[1] is None                # kept, not regenerated
+
+
+def test_old_plaintext_key_is_moved_in_unchanged(tmp_path):
+    from core.api_keys import KeyStore
+    old = "o" * 43
+    (tmp_path / remote.KEY_FILE).write_text(old + "\n")
+    path, key, note = remote.ensure_api_keys(str(tmp_path))
+    assert key is None and "moved" in note
+    assert KeyStore(path).match(old) is not None                # the phone keeps working
+    assert not (tmp_path / remote.KEY_FILE).exists()            # plaintext gone
+    assert old not in open(path).read()
+
+
+def test_plaintext_key_only_is_a_warning(tmp_path, ts_installed):
+    (tmp_path / remote.KEY_FILE).write_text("k" * 43)
+    f = remote.check_exposure(str(tmp_path), 8000, run=fake_run(serve=SAFE_SERVE))
+    assert any(x["title"] == "API key is stored in plain text" for x in f)
 
 
 def test_phone_launcher_stays_on_loopback(tmp_path):
     path = recipes.write_phone_launcher(str(tmp_path), 8000, "qwen3.5-9b-q4km")
     text = open(path, encoding="utf-8").read()
     assert "--host 127.0.0.1" in text and "0.0.0.0" not in text
-    assert 'set /p ARTIFEX_API_KEY=<"artifex_api_key.txt"' in text
+    assert "artifex_api_keys.json" in text and "ARTIFEX_API_KEYS_FILE" in text
+    assert "ARTIFEX_API_KEY=" not in text                       # no plaintext key
     assert "ARTIFEX_PHONE_FULL_TOOLS" not in text
     with pytest.raises(ValueError):
         recipes.write_phone_launcher(str(tmp_path), 8000, "x & del /q *")
