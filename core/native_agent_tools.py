@@ -17,7 +17,7 @@ from the text protocol's twenty-odd markers.
 
 import json
 
-from tools.agent_tools import AgentAction
+from tools.agent_tools import AgentAction, OVERWRITE_MARK
 
 FINISH_TOOL = "finish"
 
@@ -41,9 +41,13 @@ AGENT_NATIVE_TOOLS = [
         {"code": dict(_S, description="Python source code.")}, ["code"]),
     _fn("read_file", "Read a text file. Optionally only lines start_line..end_line.",
         {"path": _S, "start_line": _I, "end_line": _I}, ["path"]),
-    _fn("write_file", "Create a NEW file with the given content. To change an "
-        "existing file use edit_file.",
-        {"path": _S, "content": _S}, ["path", "content"]),
+    _fn("write_file", "Create a NEW file with the given content. To change part "
+        "of an existing file use edit_file. To replace an existing file "
+        "completely, set overwrite to true (never delete it first).",
+        {"path": _S, "content": _S,
+         "overwrite": {"type": "boolean",
+                       "description": "true = replace the file if it exists."}},
+        ["path", "content"]),
     _fn("edit_file", "Replace one exact piece of text in an existing file.",
         {"path": _S,
          "old_text": dict(_S, description="Exact text currently in the file."),
@@ -170,8 +174,12 @@ def call_to_action(call):
         if err:
             return None, err, None
         path = str(a["path"]).strip()
-        return AgentAction("edit_file", "\x00".join([path, "", str(a.get("content", ""))]),
-                           f'write: {path}'), None, None
+        over = a.get("overwrite")
+        if isinstance(over, str):
+            over = over.strip().lower() in ("true", "1", "yes")
+        old = OVERWRITE_MARK if over else ""
+        return AgentAction("edit_file", "\x00".join([path, old, str(a.get("content", ""))]),
+                           f'write: {path}' + (" (overwrite)" if over else "")), None, None
     if name == "edit_file":
         err = need("path", "old_text")
         if err:

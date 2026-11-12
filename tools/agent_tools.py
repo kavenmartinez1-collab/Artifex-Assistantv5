@@ -253,6 +253,8 @@ def full_request(action) -> str:
         parts = content.split("\x00")
         if len(parts) == 3:
             path, old, new = parts
+            if old == OVERWRITE_MARK:
+                return f"write_file (overwrite): {path}\n{new}"
             if not old:
                 return f"write_file: {path}\n{new}"
             return f"edit_file: {path}\n--- OLD\n{old}\n+++ NEW\n{new}"
@@ -2519,6 +2521,11 @@ def run_grep(content):
     return True, header + "\n".join(results)
 
 
+# OLD value of an edit_file action that means "replace the whole file": the
+# native write_file tool called with overwrite=true (core/native_agent_tools.py).
+OVERWRITE_MARK = "\x01overwrite"
+
+
 def run_edit_file(content):
     """
     Make a targeted string replacement in a file.
@@ -2533,9 +2540,40 @@ def run_edit_file(content):
 
     path, old_str, new_str = parts
     path = path.strip()
+    overwrite = old_str == OVERWRITE_MARK
+    if overwrite:
+        old_str = ""
 
     if not os.path.isabs(path):
         path = os.path.join(os.getcwd(), path)
+
+    if overwrite and os.path.isfile(path):
+        # Whole-file replacement, asked for explicitly. Line endings and a
+        # BOM follow the file being replaced.
+        if path.endswith(".py"):
+            try:
+                compile(new_str, path, "exec")
+            except SyntaxError as e:
+                return False, (f"REJECTED - the new content has a Python syntax error "
+                               f"(line {e.lineno}: {e.msg}). {os.path.basename(path)} was not changed.")
+        try:
+            with open(path, "rb") as f:
+                head = f.read(65536)
+        except OSError as e:
+            return False, f"Cannot read {path}: {e}"
+        text = new_str.replace("\r\n", "\n")
+        if text and not text.endswith("\n"):
+            text += "\n"
+        if b"\r\n" in head:
+            text = text.replace("\n", "\r\n")
+        enc = "utf-8-sig" if head.startswith(b"\xef\xbb\xbf") else "utf-8"
+        try:
+            with open(path, "w", encoding=enc, newline="") as f:
+                f.write(text)
+        except OSError as e:
+            return False, f"Cannot write {path}: {e}"
+        return True, (f"Replaced {os.path.basename(path)} "
+                      f"({new_str.count(chr(10)) + 1} lines)")
 
     if not os.path.isfile(path):
         # Create-file form: empty OLD + nonexistent target. Models reach for
@@ -2593,9 +2631,17 @@ def run_edit_file(content):
     if not old_str.strip():
         # "".count() is len+1, which used to surface as a baffling
         # "appears N times" error. Teach instead.
+        # Reached by the text protocol's ```edit``` block with an empty OLD
+        # and by the native write_file tool on a file that already exists.
+        # The old wording ("use a python code block") meant nothing to a
+        # model on native tools: Qwen3.8-Flash-Next deleted the file so that
+        # write_file would accept it (agent bench 2026-11-11).
         return False, (
-            "OLD is empty — provide the exact existing text to replace. "
-            "To create a new file, use a python code block instead."
+            f"{os.path.basename(path)} already exists, so it was NOT written. "
+            "To replace the whole file, call write_file again with "
+            "overwrite set to true (text protocol: write it from a python "
+            "block). To change part of it, use edit_file with the exact "
+            "existing text. Do not delete the file first."
         )
 
     count = original.count(old_str)

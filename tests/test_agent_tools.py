@@ -256,7 +256,7 @@ class TestEmptyOldEdit:
         from tools.agent_tools import run_edit_file
         ok, out = run_edit_file(f"{target}\x00\x00new text")
         assert not ok
-        assert "OLD is empty" in out
+        assert "already exists" in out
         assert target.read_text(encoding="utf-8") == "x = 1\n"
 
     def test_bold_wrapped_markers_are_inert(self):
@@ -386,7 +386,7 @@ class TestCreateFileEdit:
         target = tmp_path / "f.py"
         target.write_text("x = 1\n", encoding="utf-8")
         ok, out = run_edit_file(f"{target}\x00\x00new")
-        assert not ok and "OLD is empty" in out
+        assert not ok and "already exists" in out
 
     def test_create_file_bad_python_rejected(self, tmp_path):
         import os
