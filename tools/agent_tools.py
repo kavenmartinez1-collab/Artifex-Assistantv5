@@ -1205,6 +1205,57 @@ def _run_capture(args, timeout, **kwargs):
     return subprocess.CompletedProcess(args, proc.returncode, out, err)
 
 
+# `powershell -NoProfile -Command "<script>"` as the WHOLE command. Models that
+# are unsure which shell a command lands in (bash or PowerShell, see
+# _is_bash_syntax) wrap their script this way to be safe. The wrapper then goes
+# through PowerShell twice: the outer one expands every $variable inside the
+# double quotes (to nothing) and does not know `\"`, so the inner one gets a
+# different script. Seen with Qwen3.8-Flash-Next (agent bench 2026-11-11):
+#   powershell -NoProfile -Command "... | ForEach-Object { '{0}' -f $_.FullName }"
+#     -> "You must provide a value expression following the '-f' operator"
+#   powershell -NoProfile -Command "Set-Content app.js -Value 'console.log(\"ready\");'"
+#     -> exit 0, and app.js holds  console.log(" ready\);
+#   powershell -NoProfile -Command "$root='My Documents'; Remove-Item \"$root\Old Stuff\" -Recurse -Force"
+#     -> $root is empty by the time the inner shell runs: the path is \Old Stuff
+_PS_WRAPPER_RE = re.compile(
+    r"^\s*(?:powershell|pwsh)(?:\.exe)?"
+    r"(?:\s+-(?:NoProfile|NoP|NoLogo|NonInteractive|NonI|ExecutionPolicy\s+\S+|ep\s+\S+))*"
+    r"\s+-(?:Command|c)\s+", re.IGNORECASE)
+
+
+def unwrap_powershell_wrapper(command):
+    """(script, True) when `command` is nothing but a PowerShell one-shot
+    wrapper around one quoted script; otherwise (command, False).
+
+    Only unwraps what it can read exactly: one double-quoted argument whose
+    inner double quotes are all escaped (`\\"` or backtick), or one
+    single-quoted argument. Anything after the closing quote, an unquoted
+    script, or a -File / -EncodedCommand call is left alone.
+    """
+    m = _PS_WRAPPER_RE.match(command or "")
+    if not m:
+        return command, False
+    rest = command[m.end():].strip()
+    if len(rest) < 2:
+        return command, False
+    if rest[0] == '"' and rest[-1] == '"':
+        inner = rest[1:-1]
+        # every inner double quote has to be escaped, or the argument ended early
+        if re.search(r'(?<![\\`])"', inner):
+            return command, False
+        inner = inner.replace('\\"', '"').replace('`"', '"')
+    elif rest[0] == "'" and rest[-1] == "'":
+        inner = rest[1:-1]
+        if re.search(r"(?<!')'(?!')", inner.replace("''", "")):
+            return command, False
+        inner = inner.replace("''", "'")
+    else:
+        return command, False
+    if not inner.strip():
+        return command, False
+    return inner.strip("\r\n"), True
+
+
 def run_shell_command(command, timeout=300, cwd=None):
     """
     Execute a shell command.
@@ -1220,6 +1271,9 @@ def run_shell_command(command, timeout=300, cwd=None):
     blocked = _check_dangerous(command)
     if blocked:
         return False, blocked
+    # A script the model wrapped in `powershell -Command "..."` runs as the
+    # script itself: PowerShell reads it once, not twice.
+    command, was_wrapped = unwrap_powershell_wrapper(command)
 
     # stdin=DEVNULL everywhere: nothing the agent runs can be typed into —
     # there is no keyboard on the other end. Without it a command that
@@ -1229,7 +1283,8 @@ def run_shell_command(command, timeout=300, cwd=None):
     ps_file = None
     try:
         if IS_WINDOWS:
-            use_bash = (not _looks_powershell(command)) and _is_bash_syntax(command)
+            use_bash = (not was_wrapped and not _looks_powershell(command)
+                        and _is_bash_syntax(command))
 
             if use_bash and _GIT_BASH:
                 # Route bash-style commands through Git Bash
