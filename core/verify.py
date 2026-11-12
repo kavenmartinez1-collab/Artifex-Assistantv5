@@ -20,6 +20,7 @@ Everything runs in the workspace with the agent's own interpreter, bounded
 by a timeout. Nothing here edits files; reverting is the caller's decision.
 """
 
+import ast
 import os
 import re
 import subprocess
@@ -37,12 +38,14 @@ _FAIL_LINES = 12
 @dataclass
 class CheckReport:
     regressions: List[str] = field(default_factory=list)   # passed before, fail now
+    scripts: List[str] = field(default_factory=list)       # syntax-checked only (not imported)
     still_failing: List[str] = field(default_factory=list)  # failed before too
     new_failing: List[str] = field(default_factory=list)    # tests that did not exist before
     passed: int = 0
     broken_imports: Dict[str, str] = field(default_factory=dict)  # rel path -> error
     details: str = ""
     ran: bool = False
+    checked: int = 0
 
     @property
     def clean(self) -> bool:
@@ -75,7 +78,11 @@ class CheckReport:
                              + " - if the GOAL is fixing a bug, these may be failing "
                                "BECAUSE of it; read them")
         elif not self.broken_imports:
-            lines.append("module imports OK; no related tests found")
+            if self.scripts and len(self.scripts) == self.checked:
+                lines.append("syntax OK (" + ", ".join(self.scripts[:5]) + " is a script: "
+                             "it was NOT run - run it yourself to test it); no related tests found")
+            else:
+                lines.append("module imports OK; no related tests found")
         if self.details:
             lines.append(self.details)
         return "\n".join(lines)
@@ -92,6 +99,92 @@ def _module_name(rel: str) -> Optional[str]:
     return ".".join(parts)
 
 
+def runs_on_import(source: str) -> bool:
+    """Would importing this file DO something (a script), not just define things?
+
+    The import check executes the file. For a module that is how a broken
+    import is caught; for a script it runs the script: the harness itself
+    executed every script the agent wrote, right after the write (before the
+    model, and before any approval of running it) and again when the model
+    said it was done. Agent bench 2026-11-11, multi_chain: merge.py and
+    load_db.py were re-run by the final check after the model had moved the
+    input files away, leaving an empty merged.csv, an empty database and
+    `{}` in totals.json behind a correct "all verified" summary.
+
+    True for top-level statements other than imports, definitions, plain
+    assignments, a docstring and the `if __name__ == "__main__":` block.
+    A file that does not parse is not imported either (the edit tool has
+    already rejected a syntax error).
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return True
+
+    def defines_only(body) -> bool:
+        for node in body:
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef,
+                                 ast.AsyncFunctionDef, ast.ClassDef, ast.Pass,
+                                 ast.Global)):
+                continue
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                value = node.value
+                if value is not None and any(
+                        isinstance(n, (ast.Call, ast.Await, ast.Yield, ast.YieldFrom))
+                        and not _harmless_call(n) for n in ast.walk(value)):
+                    return False
+                continue
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+                continue                      # docstring / bare literal
+            if isinstance(node, ast.If):
+                if _is_main_guard(node.test):
+                    if not defines_only(node.orelse):
+                        return False
+                    continue                  # its body never runs on import
+                if not (defines_only(node.body) and defines_only(node.orelse)):
+                    return False
+                continue
+            if isinstance(node, ast.Try):
+                parts = node.body + node.orelse + node.finalbody
+                for h in node.handlers:
+                    parts = parts + h.body
+                if not defines_only(parts):
+                    return False
+                continue
+            return False
+        return True
+
+    return not defines_only(tree.body)
+
+
+# Calls a module commonly makes while only setting itself up.
+_HARMLESS_CALLS = frozenset({
+    "getLogger", "get_logger", "compile", "frozenset", "set", "dict", "list",
+    "tuple", "namedtuple", "TypeVar", "Path", "PurePath", "dirname", "abspath",
+    "join", "getenv", "get", "field", "dataclass", "Lock", "RLock", "local",
+    "int", "float", "str", "bool", "bytes", "range", "len", "sorted", "max",
+    "min", "environ", "object", "defaultdict", "OrderedDict", "Counter",
+    "lower", "upper", "strip", "split", "format", "resolve", "expanduser",
+})
+
+
+def _harmless_call(node) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+    return name in _HARMLESS_CALLS
+
+
+def _is_main_guard(test) -> bool:
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)):
+        return False
+    sides = [test.left, test.comparators[0]]
+    return (any(isinstance(x, ast.Name) and x.id == "__name__" for x in sides)
+            and any(isinstance(x, ast.Constant) and x.value == "__main__" for x in sides))
+
+
 class EditVerifier:
     """Per-run state: baselines of imports and test results."""
 
@@ -102,6 +195,7 @@ class EditVerifier:
         self._import_base: Dict[str, Optional[str]] = {}   # rel -> error or None
         self._test_base: Dict[str, Dict[str, bool]] = {}   # test rel -> {id: passed}
         self.edited: List[str] = []                         # rel paths, run order
+        self.skipped_scripts: set = set()                   # scripts: syntax-checked, never imported
 
     # ── discovery ──────────────────────────────────────────────────────────
 
@@ -165,6 +259,20 @@ class EditVerifier:
         mod = _module_name(rel)
         if not mod or os.path.basename(rel).startswith("test_"):
             return None
+        # A script is never imported: importing it would run it.
+        try:
+            with open(os.path.join(self.root, rel), encoding="utf-8-sig", errors="replace") as f:
+                source = f.read()
+        except OSError:
+            return None
+        if runs_on_import(source):
+            self.skipped_scripts.add(rel)
+            try:
+                compile(source, rel, "exec")
+            except (SyntaxError, ValueError) as e:
+                return f"SyntaxError: {e}"[:300]
+            return None
+        self.skipped_scripts.discard(rel)
         try:
             r = self._run(["-c", f"import importlib; importlib.import_module({mod!r})"],
                           IMPORT_TIMEOUT_S)
@@ -258,6 +366,9 @@ class EditVerifier:
             if not os.path.isfile(os.path.join(self.root, rel)):
                 continue
             err = self._import_error(rel)
+            rep.checked += 1
+            if rel in self.skipped_scripts:
+                rep.scripts.append(rel)
             if err and self._import_base.get(rel) is None:
                 rep.broken_imports[rel] = err
         files: List[str] = []
