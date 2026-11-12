@@ -493,7 +493,12 @@ class AgentRunner:
                     continue
             else:
                 done = detect_done(resp)
-                actions = extract_agent_actions(resp)
+                # On native tools a reply with no call is prose. Its code
+                # fences are something the model SHOWS the user, not actions:
+                # reading them with the text protocol's parser executed a
+                # snippet the model had quoted from a script it was told not
+                # to run (agent bench 2026-11-11, script_no_run).
+                actions = [] if self._native else extract_agent_actions(resp)
             if done is None and not actions:
                 # No actions and no @done. Distinguish "model is finished and
                 # says so in prose" from "model TRIED to act but the call was
@@ -501,7 +506,7 @@ class AgentRunner:
                 # empty fences). The latter gets corrective feedback and
                 # another round instead of being misread as a final answer.
                 blank = not resp.strip()
-                malformed = self._looks_like_failed_tool_attempt(resp)
+                malformed = self._looks_like_failed_tool_attempt(resp, native=self._native)
                 if format_retries < 2 and (blank or malformed):
                     format_retries += 1
                     if malformed:
@@ -525,7 +530,7 @@ class AgentRunner:
                                if blank else "malformed tool invocation"))
                     history.append({"role": "user", "content":
                                     self._empty_nudge() if blank
-                                    else self._format_nudge()})
+                                    else self._format_nudge(native=self._native)})
                     continue
                 if (format_retries < 2 and not session
                         and self._looks_like_stalled_plan(resp)):
@@ -1365,7 +1370,7 @@ class AgentRunner:
                 "deliberately changes, update that test instead. Then emit @done again.")
 
     @staticmethod
-    def _looks_like_failed_tool_attempt(resp: str) -> bool:
+    def _looks_like_failed_tool_attempt(resp: str, native: bool = False) -> bool:
         """Did the model clearly TRY to invoke tooling that didn't parse?
 
         Signals: a native <tool_call> tag that produced no action (Qwen3.6
@@ -1377,6 +1382,10 @@ class AgentRunner:
             return False
         if "<tool_call" in resp or "<|tool_call>" in resp:
             return True
+        if native:
+            # Native tools: only call debris the server could not parse counts.
+            # A code fence or an @marker in prose is text for the user.
+            return bool(re.search(r"<function=[A-Za-z_]\w*>|</tool_call>|<parameter=\w+>", resp))
         # Caller only reaches here when ZERO actions parsed — so any fenced
         # tool block in the text is by definition a failed invocation
         # (malformed edit, empty body, unknown structure).
@@ -1447,7 +1456,15 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _format_nudge() -> str:
+    def _format_nudge(native: bool = False) -> str:
+        if native:
+            return (
+                "[FORMAT ERROR - automated] Your last message contained "
+                "tool-call text that could not be read as a call, so nothing "
+                "ran. Make the call again as a proper tool call (one call per "
+                "tool, every required argument filled in). If you are "
+                "finished, reply in plain words with no tool-call text."
+            )
         return (
             "[FORMAT ERROR — automated] Your last message tried to invoke a "
             "tool but no valid action could be parsed. Use EXACTLY this "

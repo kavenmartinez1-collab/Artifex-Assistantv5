@@ -176,3 +176,46 @@ def test_plain_engines_keep_the_text_protocol(monkeypatch):
     runner, _ = _runner(Plain(), monkeypatch, [])
     assert runner._native is False
     assert runner.run("x", []).status == "done"
+
+
+# ── prose on native tools is not a set of actions (agent bench 2026-11-11) ──
+
+def test_code_fence_in_a_native_reply_is_not_executed(monkeypatch, tmp_path):
+    """The model wrote cleanup.py, then SHOWED the user part of it in a
+    ```python fence with no tool call. The text-protocol parser ran the fence."""
+    monkeypatch.chdir(tmp_path)
+    reply = ("Created cleanup.py - I have not run it. Here is what it does:\n\n"
+             "```python\nimport os\nfor n in os.listdir('.'):\n    os.remove(n)\n```\n"
+             "Say the word when you want it executed.")
+    engine = NativeEngine([
+        ("", [_call("write_file", path="cleanup.py", content="print('x')\n")]),
+        (reply, []),
+    ])
+    ran = []
+    runner, events = _runner(engine, monkeypatch, ran)
+    runner.config.interactive = True
+    result = runner.run_turn("write cleanup.py, do not run it", [])
+    assert result.status == "done"
+    assert [a.type for a in ran] == ["edit_file"]          # the fence did not run
+    assert not [e for e in events if e.kind == "format_retry"]
+    assert result.summary.startswith("Created cleanup.py")
+
+
+def test_unparsed_call_debris_on_native_gets_a_native_nudge(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    engine = NativeEngine([
+        ("<function=run_shell>\n<parameter=command>\necho hi\n", []),
+        ("", [_call("finish", summary="ok")]),
+    ])
+    ran = []
+    runner, events = _runner(engine, monkeypatch, ran)
+    result = runner.run("say hi", [])
+    assert result.status == "done" and not ran
+    nudge = [m for m in engine.seen_messages[1] if m["role"] == "user"][-1]["content"]
+    assert "proper tool call" in nudge and "@read_file" not in nudge
+
+
+def test_text_protocol_engines_still_run_fences(monkeypatch):
+    assert AgentRunner._looks_like_failed_tool_attempt("```python\nprint(1)\n```")
+    assert not AgentRunner._looks_like_failed_tool_attempt("```python\nprint(1)\n```", native=True)
+    assert AgentRunner._looks_like_failed_tool_attempt("<tool_call>", native=True)

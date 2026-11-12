@@ -31,10 +31,10 @@ class TestUnwrap:
 
     def test_multiline_and_more_flags(self):
         cmd = ('pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "\n'
-               "$root='My Documents'\nRemove-Item -LiteralPath \\\"$root\Old Stuff\\\" -Recurse\n\"")
+               "$root='My Documents'\nRemove-Item -LiteralPath \\\"$root\\Old Stuff\\\" -Recurse\n\"")
         script, wrapped = unwrap_powershell_wrapper(cmd)
         assert wrapped
-        assert script == "$root='My Documents'\nRemove-Item -LiteralPath \"$root\Old Stuff\" -Recurse"
+        assert script == "$root='My Documents'\nRemove-Item -LiteralPath \"$root\\Old Stuff\" -Recurse"
 
     def test_single_quoted_script(self):
         script, wrapped = unwrap_powershell_wrapper("powershell -c 'Write-Output ''hi'' '")
