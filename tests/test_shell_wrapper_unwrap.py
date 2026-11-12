@@ -78,3 +78,19 @@ class TestRunsOnce:
         ok, out = run_shell_command('powershell -NoProfile -Command "(dir -Name) | sort"', cwd=str(tmp_path))
         assert ok, out
         assert out.split() == ["a.txt", "b.txt"]
+
+
+@windows_only
+class TestFailureNamesTheShell:
+    def test_powershell_failure_says_powershell(self, tmp_path):
+        ok, out = run_shell_command('cd "."; Get-Item nothing-here.txt -ErrorAction Stop; ls -la', cwd=str(tmp_path))
+        assert not ok
+        assert "ran in Windows PowerShell" in out or "ran in PowerShell 7" in out
+
+    def test_bash_failure_says_bash(self, tmp_path):
+        ok, out = run_shell_command("ls nothing-here && echo yes", cwd=str(tmp_path))
+        assert not ok and "ran in Git Bash" in out
+
+    def test_success_is_left_alone(self, tmp_path):
+        ok, out = run_shell_command("Write-Output hi", cwd=str(tmp_path))
+        assert ok and out == "hi"

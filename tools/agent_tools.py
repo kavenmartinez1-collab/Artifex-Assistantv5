@@ -1258,6 +1258,19 @@ def unwrap_powershell_wrapper(command):
     return inner.strip("\r\n"), True
 
 
+_SHELL_NOTES = {
+    "bash": ("[this command ran in Git Bash, because its text looked like bash. "
+             "PowerShell cmdlets do not exist there, and an argument that starts "
+             "with / is rewritten as a Windows path]"),
+    "powershell": ("[this command ran in Windows PowerShell 5.1. Bash syntax does "
+                   "not work there: no &&, no `ls -la`, no heredocs. Write plain "
+                   "PowerShell, with no `powershell -Command \"...\"` around it]"),
+    "pwsh": ("[this command ran in PowerShell 7. Bash-only syntax (`ls -la`, "
+             "heredocs) does not work there. Write plain PowerShell, with no "
+             "`pwsh -Command \"...\"` around it]"),
+}
+
+
 def run_shell_command(command, timeout=300, cwd=None):
     """
     Execute a shell command.
@@ -1283,6 +1296,7 @@ def run_shell_command(command, timeout=300, cwd=None):
     # the timeout; now the prompt reads EOF and fails at once with an error
     # the model can act on.
     ps_file = None
+    shell_used = ""
     try:
         if IS_WINDOWS:
             use_bash = (not was_wrapped and not _looks_powershell(command)
@@ -1290,6 +1304,7 @@ def run_shell_command(command, timeout=300, cwd=None):
 
             if use_bash and _GIT_BASH:
                 # Route bash-style commands through Git Bash
+                shell_used = "bash"
                 result = _run_capture(
                     [_GIT_BASH, "-c", command],
                     text=True, timeout=timeout,
@@ -1301,6 +1316,7 @@ def run_shell_command(command, timeout=300, cwd=None):
                 ps_cmd = _bash_to_powershell(command) if use_bash else command
                 ps_bin = shutil.which("pwsh") or shutil.which("powershell")
                 if ps_bin:
+                    shell_used = "pwsh" if "pwsh" in os.path.basename(ps_bin).lower() else "powershell"
                     # Windows PowerShell 5.1 writes UTF-16 for `>` redirects,
                     # producing NUL-riddled files no downstream tool can read
                     # (agent_bench s5: result.txt was UTF-16 "57"). Force
@@ -1359,7 +1375,16 @@ def run_shell_command(command, timeout=300, cwd=None):
         output = result.stdout
         if result.stderr:
             output += result.stderr
-        return (result.returncode == 0), output.strip()
+        ok = result.returncode == 0
+        output = output.strip()
+        if not ok and shell_used:
+            # Which shell a command lands in is decided from its text (see
+            # _is_bash_syntax). A model cannot see that choice, and its
+            # failures then look random: the same `ls -la` works in one call
+            # and fails in the next (agent bench 2026-11-11, a run stopped on
+            # "too many consecutive failures" this way). Say it on failure.
+            output += "\n" + _SHELL_NOTES[shell_used]
+        return ok, output
 
     except subprocess.TimeoutExpired:
         return False, f"Command timed out after {timeout}s"
