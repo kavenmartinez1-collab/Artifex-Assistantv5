@@ -342,6 +342,43 @@ class TestEnableThinking(unittest.TestCase):
         self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
         self.assertEqual(body["reasoning_format"], "none")
 
+    def test_reasoning_always_thinking_off_drops_reasoning(self):
+        """An entry with reasoning_always (the template ignores enable_thinking)
+        asks for effort "none", keeps the reasoning parser on and returns only
+        the answer when thinking is off; thinking-on is unchanged."""
+        from core.engine_llama_cpp import LlamaCppEngine
+        engine = LlamaCppEngine("test", {"path": "/fake/model.gguf", "reasoning_always": True})
+        engine._loaded = True
+        engine._base_url = "http://localhost:8081"
+        engine._is_server_healthy = lambda: True
+        chunks = [
+            b'data: {"choices":[{"delta":{"reasoning_content":"17*23 = 391."}}]}\n',
+            b'data: {"choices":[{"delta":{"content":"391"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]
+
+        def run(**kwargs):
+            mock_resp = MagicMock()
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_resp.__iter__ = MagicMock(return_value=iter(list(chunks)))
+            with patch("core.engine_llama_cpp.urllib.request.urlopen", return_value=mock_resp) as m:
+                out = engine.generate_streaming([{"role": "user", "content": "hi"}],
+                                                max_tokens=100, temperature=0.7, **kwargs)
+            return out, json.loads(m.call_args[0][0].data.decode())
+
+        toks = []
+        out, body = run(enable_thinking=False, on_token=toks.append)
+        self.assertEqual(body["chat_template_kwargs"],
+                         {"enable_thinking": False, "reasoning_effort": "none"})
+        self.assertNotIn("reasoning_format", body)
+        self.assertEqual(out, "391")
+        self.assertEqual("".join(toks), "391")
+        toks = []
+        out, body = run(enable_thinking=True, reasoning_effort="medium", on_token=toks.append)
+        self.assertEqual(body["chat_template_kwargs"], {"reasoning_effort": "medium"})
+        self.assertEqual("".join(toks), "<think>17*23 = 391.</think>391")
+
     @patch("core.engine_llama_cpp.urllib.request.urlopen")
     def test_reasoning_content_wrapped_in_think_tags(self, mock_urlopen):
         """When llama-server emits reasoning_content, on_token receives <think> tags."""

@@ -284,6 +284,12 @@ class LlamaCppEngine(BaseEngine):
         self._split_gpu_indices = model_config.get("split_gpu_indices")
         # Per-model default reasoning effort; see DEFAULT_REASONING_EFFORT.
         self._configured_reasoning_effort = model_config.get("reasoning_effort")
+        # Entry flag: the template cannot switch reasoning off (Inkling 2
+        # ignores enable_thinking and still writes a short think block at
+        # effort "none").  Thinking-off requests then ask for the lowest
+        # effort, keep the server's reasoning parser on, and drop the
+        # reasoning from the reply instead of letting it leak into content.
+        self._reasoning_always = bool(model_config.get("reasoning_always"))
         # Entry flag: the model calls tools through its trained format, so
         # the chat tool loop sends real tool definitions instead of the
         # @marker prompt (api/web_tools.NATIVE_WEB_TOOLS).
@@ -1398,8 +1404,12 @@ class LlamaCppEngine(BaseEngine):
             # directive. Pass it via chat_template_kwargs so the model
             # actually skips the block instead of thinking anyway and
             # leaking raw <think>...</think> into the response.
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
-            payload["reasoning_format"] = "none"
+            if self._reasoning_always:
+                payload["chat_template_kwargs"] = {"enable_thinking": False,
+                                                   "reasoning_effort": "none"}
+            else:
+                payload["chat_template_kwargs"] = {"enable_thinking": False}
+                payload["reasoning_format"] = "none"
         elif reasoning_effort or self._default_reasoning_effort():
             # Qwen3.8's template defaults reasoning effort to "xhigh", which
             # can deliberate unboundedly on hard structured tasks (measured:
@@ -1491,6 +1501,8 @@ class LlamaCppEngine(BaseEngine):
                         delta = choices[0].get("delta", {})
 
                         reasoning = delta.get("reasoning_content", "")
+                        if reasoning and not enable_thinking and self._reasoning_always:
+                            continue  # thinking was off: the caller wants no think block
                         if reasoning:
                             if not in_thinking:
                                 in_thinking = True
