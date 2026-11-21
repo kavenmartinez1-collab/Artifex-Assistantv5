@@ -212,6 +212,13 @@ def read_gguf_kv_params_uncached(gguf_path: str) -> Optional[dict]:
         return None
 
     hc = found["attention.head_count"]
+    if isinstance(hc, (list, tuple)):
+        # Per-layer head counts (Inkling 2 stores attention.head_count as an
+        # array, like LFM3's head_count_kv): size by the largest layer.
+        hc = max((int(h) for h in hc if h), default=0)
+        if not hc:
+            _log.warning("GGUF %s has no attention heads in head_count", gguf_path)
+            return None
     default_dim = found["embedding_length"] / hc
     key_dim = found.get("attention.key_length", default_dim)
     block_count = found["block_count"]

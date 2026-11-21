@@ -219,6 +219,10 @@ def _read_gguf_kv_params(gguf_path: str) -> dict | None:
         return None
 
     hc = found["attention.head_count"]
+    if isinstance(hc, (list, tuple)):  # per-layer head counts (Inkling 2)
+        hc = max((int(h) for h in hc if h), default=0)
+        if not hc:
+            return None
     default_dim = found["embedding_length"] / hc
     key_dim = found.get("attention.key_length", default_dim)
     block_count = found["block_count"]

@@ -18,7 +18,7 @@ from core.gguf_meta import read_gguf
 LFM3_KV = [0, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0]
 
 
-def _write_gguf(path, arch, head_count_kv):
+def _write_gguf(path, arch, head_count_kv, head_count=16):
     """Minimal GGUF v3: header + metadata, no tensors (all the readers need)."""
     def s(x):
         b = x.encode()
@@ -31,7 +31,9 @@ def _write_gguf(path, arch, head_count_kv):
           u32(f"{arch}.block_count", len(LFM3_KV)),
           u32(f"{arch}.context_length", 262144),
           u32(f"{arch}.embedding_length", 2048),
-          u32(f"{arch}.attention.head_count", 16),
+          (u32(f"{arch}.attention.head_count", head_count) if not isinstance(head_count, list) else
+           s(f"{arch}.attention.head_count") + struct.pack("<IIQ", 9, 5, len(head_count))
+           + b"".join(struct.pack("<i", h) for h in head_count)),
           u32(f"{arch}.attention.key_length", 128),
           u32(f"{arch}.attention.value_length", 128)]
     if isinstance(head_count_kv, list):     # ARRAY (9) of INT32 (5)
@@ -64,6 +66,16 @@ def test_scalar_models_unchanged(tmp_path, reader):
     params = reader(p)
     assert params["head_count_kv"] == 4
     assert params["attn_layer_count"] == 24
+
+
+@pytest.mark.parametrize("reader", [read_gguf_kv_params, _read_gguf_kv_params])
+def test_per_layer_head_count(tmp_path, reader):
+    """Inkling 2 stores attention.head_count per layer too; it used to raise
+    "unsupported operand type(s) for /: 'int' and 'list'" on every chat."""
+    p = _write_gguf(tmp_path / "inkling.gguf", "inkling2_loop", [8] * 24, head_count=[24] * 24)
+    params = reader(p)
+    assert params["head_count"] == 24
+    assert params["head_count_kv"] == 8
 
 
 def test_gguf_meta_kv_bytes(tmp_path):
