@@ -294,6 +294,13 @@ class LlamaCppEngine(BaseEngine):
         # effort, keep the server's reasoning parser on, and drop the
         # reasoning from the reply instead of letting it leak into content.
         self._reasoning_always = bool(model_config.get("reasoning_always"))
+        # Entry key "sampling": the sampler settings the model's release
+        # recommends (e.g. Inkling 2: temp 1.0, top_k 50, top_p 1.0, min_p 0).
+        # They override the caller's preset on every request, chat and agent
+        # alike: a general preset tuned for another model family (balanced
+        # temp 0.7 / top_p 0.9) sends Inkling into repetition loops on long
+        # replies. Keys not named here still come from the caller's preset.
+        self._model_sampling = dict(model_config.get("sampling") or {})
         # Entry flag: the model calls tools through its trained format, so
         # the chat tool loop sends real tool definitions instead of the
         # @marker prompt (api/web_tools.NATIVE_WEB_TOOLS).
@@ -1376,6 +1383,7 @@ class LlamaCppEngine(BaseEngine):
         req_messages = list(messages)
 
         samp = dict(DEFAULT_SAMPLING) if sampling is None else dict(sampling)
+        samp.update(self._model_sampling)
         payload = {
             "model": self.model_name,
             "messages": req_messages,

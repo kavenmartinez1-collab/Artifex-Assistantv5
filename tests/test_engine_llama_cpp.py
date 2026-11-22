@@ -342,6 +342,43 @@ class TestEnableThinking(unittest.TestCase):
         self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
         self.assertEqual(body["reasoning_format"], "none")
 
+    def test_entry_sampling_overrides_caller_preset(self):
+        """An entry's "sampling" (the release's recommended settings) wins over
+        the default and over a caller preset; keys it does not name pass through."""
+        from core.engine_llama_cpp import LlamaCppEngine
+        from core.sampling import get_preset
+
+        def make(cfg):
+            eng = LlamaCppEngine("test", cfg)
+            eng._loaded = True
+            eng._base_url = "http://localhost:8081"
+            eng._is_server_healthy = lambda: True
+            return eng
+
+        def body_for(eng, **kwargs):
+            mock_resp = MagicMock()
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_resp.__iter__ = MagicMock(return_value=iter([
+                b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n',
+                b'data: [DONE]\n']))
+            with patch("core.engine_llama_cpp.urllib.request.urlopen", return_value=mock_resp) as m:
+                eng.generate_streaming([{"role": "user", "content": "hi"}],
+                                       max_tokens=100, temperature=0.7, **kwargs)
+            return json.loads(m.call_args[0][0].data.decode())
+
+        release = {"temperature": 1.0, "top_k": 50, "top_p": 1.0, "min_p": 0.0}
+        eng = make({"path": "/fake/model.gguf", "sampling": release})
+        for kwargs in ({}, {"sampling": get_preset("agent", seed=7)}):
+            body = body_for(eng, **kwargs)
+            for k, v in release.items():
+                self.assertEqual(body[k], v, (k, kwargs))
+        self.assertEqual(body["seed"], 7)  # not named by the entry: the caller's value stays
+
+        # without the key nothing changes: the default preset and the positional temperature apply
+        body = body_for(make({"path": "/fake/model.gguf"}))
+        self.assertEqual((body["temperature"], body["top_k"], body["top_p"]), (0.7, 40, 0.9))
+
     def test_reasoning_always_thinking_off_drops_reasoning(self):
         """An entry with reasoning_always (the template ignores enable_thinking)
         asks for effort "none", keeps the reasoning parser on and returns only
