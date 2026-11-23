@@ -106,6 +106,25 @@ def test_no_actions_means_done(monkeypatch):
     assert calls["actions"] == []
 
 
+def test_server_error_stops_with_reason_not_nudge(monkeypatch):
+    # The engine raises when llama-server reports an error mid-stream; the run
+    # must end on that error (shown to the user) instead of nudging an
+    # "empty" model reply round after round.
+    class FailingEngine(FakeEngine):
+        def generate_streaming(self, messages, max_tokens=0, temperature=0.0, on_token=None):
+            self.i += 1
+            raise RuntimeError("llama-server error (mid-stream): got exception: boom")
+
+    runner, events, calls = build_runner([], monkeypatch)
+    runner.engine = FailingEngine([])
+    res = runner.run("q", [{"role": "system", "content": "x"}])
+    assert res.status.startswith("stopped:error")
+    assert runner.engine.i == 1
+    errors = [e for e in events if e.kind == "error"]
+    assert errors and "boom" in errors[0].reason
+    assert calls["actions"] == []
+
+
 def test_goal_appended_to_history(monkeypatch):
     runner, _, _ = build_runner(['@done("ok")'], monkeypatch)
     hist = [{"role": "system", "content": "x"}]

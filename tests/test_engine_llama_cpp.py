@@ -155,6 +155,58 @@ class TestGrammarPayload(unittest.TestCase):
         self.assertNotIn("response_format", body)
 
 
+class TestMidStreamServerError(unittest.TestCase):
+    """An error sent after the stream started must raise, not read as an empty reply."""
+
+    def _engine_with_stream(self, mock_urlopen, lines):
+        from core.engine_llama_cpp import LlamaCppEngine
+        engine = LlamaCppEngine("test", {"path": "/fake/model.gguf"})
+        engine._loaded = True
+        engine._base_url = "http://localhost:8081"
+        engine._is_server_healthy = lambda: True
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.__iter__ = MagicMock(return_value=iter(lines))
+        mock_urlopen.return_value = mock_resp
+        return engine
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_error_chunk_raises(self, mock_urlopen):
+        # llama-server's shape when a slot throws mid-generation
+        engine = self._engine_with_stream(mock_urlopen, [
+            b'data: {"error":{"code":500,"message":"got exception: Unexpected empty grammar stack '
+            b'after accepting piece: ? (30)","type":"server_error"}}\n',
+        ])
+        with self.assertRaises(RuntimeError) as ctx:
+            engine.generate_streaming([{"role": "user", "content": "hi"}],
+                                      max_tokens=50, temperature=0.7)
+        self.assertIn("empty grammar stack", str(ctx.exception))
+        self.assertEqual(mock_urlopen.call_count, 1)  # not re-sent
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_error_after_tokens_raises(self, mock_urlopen):
+        engine = self._engine_with_stream(mock_urlopen, [
+            b'data: {"choices":[{"delta":{"content":"Let me"}}]}\n',
+            b'data: {"error":"boom"}\n',
+        ])
+        with self.assertRaises(RuntimeError) as ctx:
+            engine.generate_streaming([{"role": "user", "content": "hi"}],
+                                      max_tokens=50, temperature=0.7)
+        self.assertIn("boom", str(ctx.exception))
+
+    @patch("core.engine_llama_cpp.urllib.request.urlopen")
+    def test_normal_stream_unaffected(self, mock_urlopen):
+        engine = self._engine_with_stream(mock_urlopen, [
+            b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n',
+            b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}\n',
+            b'data: [DONE]\n',
+        ])
+        out = engine.generate_streaming([{"role": "user", "content": "hi"}],
+                                        max_tokens=50, temperature=0.7)
+        self.assertEqual(out, "ok")
+
+
 class TestEnableThinking(unittest.TestCase):
     """enable_thinking=False is passed to llama-server via chat_template_kwargs."""
 

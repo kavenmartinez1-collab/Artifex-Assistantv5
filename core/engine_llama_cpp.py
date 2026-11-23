@@ -1492,6 +1492,17 @@ class LlamaCppEngine(BaseEngine):
                         except json.JSONDecodeError:
                             continue
 
+                        # A failure after the stream has started (HTTP 200
+                        # already sent) arrives as an SSE chunk with "error"
+                        # and no choices, then the stream ends. Skipping it
+                        # turned a server crash into an empty reply, and the
+                        # agent loop nudged the model for an answer it never
+                        # got to write. Raise it like an HTTP error instead.
+                        err = chunk.get("error")
+                        if err:
+                            msg = err.get("message") if isinstance(err, dict) else err
+                            raise RuntimeError(f"llama-server error (mid-stream): {msg}")
+
                         # usage/timings arrive in a final chunk whose choices
                         # array is EMPTY — read them before the choices gate
                         # or they are silently skipped.
