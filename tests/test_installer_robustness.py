@@ -508,6 +508,13 @@ def _doc(root, **kw):
     return doctor.check(str(root), **args)
 
 
+def _make_venv_python(root):
+    """The venv's python where recipes looks for it (venv/Scripts on Windows, venv/bin elsewhere)."""
+    py = recipes.venv_python(str(root))
+    os.makedirs(os.path.dirname(py), exist_ok=True)
+    open(py, "wb").close()
+
+
 def test_doctor_flags_a_missing_vc_runtime(tmp_path):
     f = _doc(tmp_path, vc=lambda: False)
     assert any(x["level"] == doctor.FAIL and "Visual C++" in x["title"] for x in f)
@@ -525,8 +532,7 @@ def test_doctor_on_an_old_nvidia_driver_suggests_an_update(tmp_path):
 
 
 def test_doctor_leaves_a_hand_built_folder_alone(tmp_path):
-    (tmp_path / "venv" / "Scripts").mkdir(parents=True)
-    (tmp_path / "venv" / "Scripts" / "python.exe").write_bytes(b"")
+    _make_venv_python(tmp_path)
     (tmp_path / "llama_cpp_config.json").write_text(json.dumps({"models": {"mine": {"path": "x"}}}))
     f = _doc(tmp_path)
     assert any("set up by hand" in x["title"] for x in f)
@@ -534,8 +540,7 @@ def test_doctor_leaves_a_hand_built_folder_alone(tmp_path):
 
 def test_doctor_sees_an_install_that_is_behind(tmp_path):
     pl = _plan(tmp_path)
-    (tmp_path / "venv" / "Scripts").mkdir(parents=True)
-    (tmp_path / "venv" / "Scripts" / "python.exe").write_bytes(b"")
+    _make_venv_python(tmp_path)
     recipes.write_config(pl)
     recipes.save_state(pl)
     f = _doc(tmp_path)
