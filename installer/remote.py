@@ -8,8 +8,9 @@ Funnel (which publishes a port to the public internet). So:
   this PC's tailnet address to it (`tailscale serve --tcp`), reachable from
   your own tailnet devices and nothing else.
 - The only Tailscale commands this module ever runs are fixed, read-only
-  queries (status, serve status, lock status, version) and one fixed serve
-  command with a validated port number. It never runs `tailscale funnel`.
+  queries (status, serve status, lock status, version), one fixed serve
+  command with a validated port number, and its undo (`serve --tcp=<port>
+  off`, for `remote off` and uninstall). It never runs `tailscale funnel`.
 - check_exposure() runs after every setup and on demand
   (`python -m installer remote check`), and fails loudly on anything
   reachable beyond this PC and your tailnet.
@@ -32,7 +33,35 @@ from installer import fetch, hint
 
 WATCHED_PORTS = {8000: "Artifex API", 8080: "web gateway", 8081: "llama.cpp server",
                  8095: "vision helper", 11434: "Ollama", 2222: "Kali SSH",
-                 8082: "Orpheus voice server"}
+                 8082: "Orpheus voice server", 8085: "Strata server",
+                 5173: "Artifex Web / game dev server"}
+
+
+def watched_ports(root: str) -> dict:
+    """WATCHED_PORTS plus every port llama_cpp_config.json gives a model
+    server: entries added by hand or by a pack (Strata, Inkling, a second
+    llama.cpp) listen on ports of their own, and a fixed list missed them."""
+    ports = dict(WATCHED_PORTS)
+    try:
+        with open(os.path.join(root, "llama_cpp_config.json"), encoding="utf-8-sig") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return ports
+    if not isinstance(cfg, dict):
+        return ports
+
+    def add(port, name):
+        if isinstance(port, int) and 0 < port < 65536:
+            ports.setdefault(port, name)
+
+    add(cfg.get("default_port"), "llama.cpp server")
+    for mid, entry in (cfg.get("models") or {}).items():
+        if isinstance(entry, dict):
+            add(entry.get("port"), f"model server '{mid}'")
+    vh = cfg.get("vision_helper")
+    if isinstance(vh, dict):
+        add(vh.get("port"), "vision helper")
+    return ports
 _TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
 _TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
 KEY_FILE = "artifex_api_key.txt"        # the old plaintext key (migrated away)
@@ -43,6 +72,17 @@ OK, WARN, FAIL, INFO = "OK", "WARN", "FAIL", "INFO"
 
 def _finding(level, title, detail="", fix=""):
     return {"level": level, "title": title, "detail": detail, "fix": fix}
+
+
+def system_exe(name: str) -> str:
+    """A Windows tool by its full System32 path, so a same-named program
+    earlier on PATH (or in the current folder) is never run instead."""
+    if os.name != "nt":
+        return name
+    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    sub = {"powershell": os.path.join("WindowsPowerShell", "v1.0", "powershell.exe")}.get(name, name + ".exe")
+    path = os.path.join(root, "System32", sub)
+    return path if os.path.isfile(path) else name
 
 
 def tailscale_exe() -> str:
@@ -90,9 +130,9 @@ def classify_address(addr: str) -> str:
 def listening_sockets(run=subprocess.run) -> list:
     """[(address, port, pid)] for listening TCP sockets, from netstat."""
     try:
-        out = run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True,
+        out = run([system_exe("netstat"), "-ano", "-p", "TCP"], capture_output=True, text=True,
                   timeout=30).stdout
-        out += run(["netstat", "-ano", "-p", "TCPv6"], capture_output=True, text=True,
+        out += run([system_exe("netstat"), "-ano", "-p", "TCPv6"], capture_output=True, text=True,
                    timeout=30).stdout
     except (OSError, subprocess.SubprocessError):
         return []
@@ -112,11 +152,12 @@ def check_exposure(root: str, api_port: int = 8000, min_version: str = "",
     and your tailnet. Read-only."""
     f = []
     # 1. Ports: anything Artifex-related must be loopback (or tailnet) only.
+    watched = watched_ports(root)
     exposed = [(a, p, pid) for a, p, pid in listening_sockets(run)
-               if p in WATCHED_PORTS and classify_address(a) in ("any", "lan")]
+               if p in watched and classify_address(a) in ("any", "lan")]
     if exposed:
         for a, p, pid in exposed:
-            f.append(_finding(FAIL, f"{WATCHED_PORTS[p]} (port {p}) is listening on {a}",
+            f.append(_finding(FAIL, f"{watched[p]} (port {p}) is listening on {a}",
                               f"process {pid}; other machines on your network can reach it, "
                               "and so can the internet if your router forwards that port",
                               "restart it bound to 127.0.0.1 (the installer's launchers do this)"))
@@ -255,7 +296,7 @@ def verify_signature(path: str, run=subprocess.run) -> str:
     ps = ("$s = Get-AuthenticodeSignature -LiteralPath $env:ARTIFEX_SIG_PATH; "
           "\"$($s.Status)|$($s.SignerCertificate.Subject)\"")
     env = dict(os.environ, ARTIFEX_SIG_PATH=os.path.abspath(path))
-    out = run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+    out = run([system_exe("powershell"), "-NoProfile", "-NonInteractive", "-Command", ps],
               capture_output=True, text=True, timeout=60, env=env).stdout.strip()
     status, _, subject = out.partition("|")
     # Exact organisation field, not a substring ("O=Tailscale Inc.Fake").
@@ -274,7 +315,15 @@ def install_tailscale(catalog: dict, download_dir: str, log=print, run=subproces
                    catalog["allowed_hosts"])
     log("  checksum OK; signature: " + verify_signature(dest, run=run))
     log("opening the Tailscale installer: approve the Windows prompt, then sign in")
-    run(["msiexec", "/i", dest], check=True)
+    try:
+        run([system_exe("msiexec"), "/i", dest], check=True)
+    finally:
+        # The verified MSI has done its job; a copy left in the downloads
+        # folder is only something to open again by accident.
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
 
 
 def wait_connected(timeout_s=600, log=print, run=subprocess.run, sleep=time.sleep) -> bool:
@@ -294,9 +343,32 @@ def wait_connected(timeout_s=600, log=print, run=subprocess.run, sleep=time.slee
     return False
 
 
+def forward_is_on(api_port: int, run=subprocess.run) -> bool:
+    """True when `tailscale serve` forwards this tailnet port (read-only)."""
+    ss = _ts(["serve", "status", "--json"], run=run)
+    try:
+        serve = json.loads(ss.stdout) if ss and ss.stdout.strip() else {}
+    except ValueError:
+        return False
+    return bool(((serve.get("TCP") or {}).get(str(api_port)) or {}).get("TCPForward"))
+
+
+def serve_off(api_port: int, run=subprocess.run):
+    """Undo serve_api: stop forwarding the tailnet port. `tailscale serve
+    --bg` persists across reboots, so without this the API stayed reachable
+    from the tailnet after Artifex was removed. Fixed command, validated port."""
+    if not isinstance(api_port, int) or not 1024 <= api_port <= 65535:
+        raise ValueError(f"bad port {api_port!r}")
+    r = _ts(["serve", f"--tcp={api_port}", "off"], timeout=60, run=run)
+    if r is None or r.returncode != 0:
+        raise RuntimeError("tailscale serve off failed: "
+                           + ((r.stderr or r.stdout).strip() if r else "not installed"))
+
+
 def serve_api(api_port: int, run=subprocess.run):
-    """The one write this module makes to Tailscale: forward the tailnet port
-    to the loopback API. Fixed command, validated port."""
+    """The writes this module makes to Tailscale: forward the tailnet port
+    to the loopback API (and serve_off, which undoes it). Fixed commands,
+    validated port."""
     if not isinstance(api_port, int) or not 1024 <= api_port <= 65535:
         raise ValueError(f"bad port {api_port!r}")
     r = _ts(["serve", "--bg", f"--tcp={api_port}", f"tcp://127.0.0.1:{api_port}"],

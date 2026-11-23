@@ -130,8 +130,12 @@ purge_extra.txt
 # Launchers written by python -m installer
 /Artifex *.cmd
 
-# API key written by python -m installer remote setup
+# API keys written by python -m installer remote setup (the old plaintext one, and the hashed key file)
 /artifex_api_key.txt
+/artifex_api_keys.json
+
+# what python -m installer installed here (so "Run the install again" repeats it)
+/installer-state.json
 
 # portable Python fetched by setup.cmd (installer/get-python.ps1)
 /python/

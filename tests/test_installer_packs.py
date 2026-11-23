@@ -4,7 +4,9 @@ to run where it can't work safely, and never exposes anything beyond
 gateway Dockerfile are checked as they are in the repo.
 """
 
+import hashlib
 import json
+import subprocess
 import os
 import re
 import types
@@ -96,7 +98,7 @@ def test_ollama_on_loopback_gets_launchers(monkeypatch, tmp_path):
     def run(cmd, **kw):
         if cmd[0] == "netstat":
             return _ok("  TCP    127.0.0.1:11434  0.0.0.0:0  LISTENING  42\n")
-        return _ok("NAME   ID   SIZE\nlfm3:latest  abc  1.7 GB\n")
+        return _ok("NAME   ID   SIZE\nqwen3.5:2b  abc  2.7 GB\n")
     paths = packs.install_ollama(str(tmp_path), {}, log=lambda *a: None, run=run,
                                  env={"OLLAMA_HOST": "127.0.0.1"})
     text = open(paths[0], encoding="utf-8").read()
@@ -191,7 +193,7 @@ def test_vision_adds_entries_and_never_edits_yours(monkeypatch, tmp_path):
                       "mine": {"path": "keep.gguf"}}}
     (tmp_path / "llama_cpp_config.json").write_text(json.dumps(cfg))
     monkeypatch.setattr(packs, "_hf_file", lambda spec, *a, **k: "models/gguf/" + spec["file"])
-    cpu = tmp_path / "runtime" / "llama.cpp" / "b11945-cpu"
+    cpu = tmp_path / "runtime" / "llama.cpp" / (recipes.load_catalog()["llama_cpp"]["tag"] + "-cpu")
     cpu.mkdir(parents=True)
     (cpu / "llama-server.exe").write_text("")
     run = lambda cmd, **kw: _ok("Red rectangle, blue circle.")
@@ -366,16 +368,17 @@ def test_node_and_game_are_pinned():
     assert "master" not in g["cmudict"]["base_url"]
 
 
-def test_game_ships_lfm3_with_its_licence():
+def test_game_ships_qwen35_with_its_licence():
     g = recipes.load_catalog()["game"]
     dests = {m["dest"] for m in g["models"]}
     gguf = [d for d in dests if d.endswith(".gguf")]
-    assert gguf == ["models/LiquidAI--LFM3-1.7B-GGUF/LFM3-1.7B-Q4_K_M.gguf"]
+    assert gguf == ["models/unsloth--Qwen3.5-2B-GGUF/Qwen3.5-2B-Q4_K_M.gguf"]
     folder = gguf[0].rsplit("/", 1)[0]
-    # The LFM Open License must accompany the weights (§4a), and the
+    # Apache-2.0 asks for the licence beside the weights (4(a)), and the
     # tokenizer must be local or the game would fetch one at runtime.
     for f in ("LICENSE", "tokenizer.json", "tokenizer_config.json"):
         assert f"{folder}/{f}" in dests
+    assert not [d for d in dests if "lfm" in d.lower() or "liquid" in d.lower()]
 
 
 # ── Artifex Web's model (webgpu pack) ───────────────────────────────────────
@@ -442,9 +445,9 @@ def test_artifex_web_ignores_a_core_copy_that_fails_its_hash(monkeypatch, tmp_pa
 def test_artifex_web_launcher_opens_with_the_model_filled_in(tmp_path):
     node = tmp_path / "node" / "node.exe"
     path = packs._web_launcher(str(tmp_path), "Artifex Web.cmd", str(tmp_path / "webgpu"), str(node),
-                               "http://127.0.0.1:5173/?model=local/lfm3-1.7b")
+                               "http://127.0.0.1:5173/?model=local/qwen3.5-2b")
     text = open(path, encoding="utf-8").read()
-    assert 'start "" "http://127.0.0.1:5173/?model=local/lfm3-1.7b"' in text
+    assert 'start "" "http://127.0.0.1:5173/?model=local/qwen3.5-2b"' in text
 
 
 # ── Strata (Qwen3.8-Flash-Next) ─────────────────────────────────────────────
@@ -453,26 +456,38 @@ def test_strata_is_pinned_end_to_end():
     s = recipes.load_catalog()["strata"]
     assert re.fullmatch(r"[0-9a-f]{40}", s["commit"]) and s["repo"].startswith("https://github.com/")
     assert re.fullmatch(r"[0-9a-f]{40}", s["model"]["revision"])
-    pinned = s["model"]["files"] + list(s["engines"].values()) + s["feed"] + [s["llama_cpp_source"]]
-    for f in pinned:
+    assert re.fullmatch(r"[0-9a-f]{40}", s["mtp"]["revision"]) and re.fullmatch(r"[0-9a-f]{16}", s["engine_key_id"])
+    for f in s["model"]["files"] + list(s["engines"].values()):
         assert re.fullmatch(r"[0-9a-f]{64}", f["sha256"]) and f["size"] > 0
-    for f in list(s["engines"].values()) + s["feed"]:
+    for f in s["engines"].values():
         assert f["url"].startswith(f"https://github.com/Niko1221/Strata/releases/download/v{s['version']}/")
-    assert s["llama_cpp_source"]["url"].endswith(".zip") and "/archive/" in s["llama_cpp_source"]["url"]
-    for d in (s["dest"], s["models_dest"], s["data_dest"]):
+        assert fetch.host_allowed(f["url"], recipes.load_catalog()["allowed_hosts"])
+    assert len(s["mtp"]["tensors"]) == 31
+    for t in s["mtp"]["tensors"]:
+        assert re.fullmatch(r"[0-9a-f]{64}", t["sha256"]) and t["end"] - t["start"] + 1 == t["bytes"] > 0
+        assert re.fullmatch(r"model-\d{5}-of-\d{5}\.safetensors", t["shard"])
+        assert re.fullmatch(r"mtp\.[A-Za-z0-9_.]+", t["name"])
+    assert "llama_cpp_source" not in s and "feed" not in s        # Strata's setup.py no longer runs
+    for d in [s["dest"], s["models_dest"], s["data_dest"]] + s.get("older_models_dest", []):
         assert not set(d.split("/")) & {"", ".", ".."}
+
+
+_RX6700 = {"name": "AMD Radeon RX 6700 XT", "vendor": "AMD", "vram_mb": 12242, "device_id": 0x73DF}
 
 
 @pytest.mark.parametrize("probe, variant", [
     ({"ram_mb": 32556, "gpus": [{"name": "NVIDIA GeForce RTX 5060 Ti", "vendor": "NVIDIA", "vram_mb": 8151},
-                                {"name": "AMD Radeon RX 6700 XT", "vendor": "AMD", "vram_mb": 12242}],
-      "nvidia": {"driver": "610.88"}}, "hip-rdna2"),
+                                _RX6700], "nvidia": {"driver": "610.88"}}, "hip-rdna2"),
     ({"ram_mb": 65536, "gpus": [{"name": "AMD Radeon RX 7900 XTX", "vendor": "AMD", "vram_mb": 24560}]}, "hip-rdna3"),
     ({"ram_mb": 65536, "gpus": [{"name": "AMD Radeon RX 9070 XT", "vendor": "AMD", "vram_mb": 16304}]}, "hip-rx9070"),
+    # by PCI device id even when the name says nothing useful
+    ({"ram_mb": 65536, "gpus": [{"name": "AMD Radeon Graphics", "vendor": "AMD", "vram_mb": 16368,
+                                 "device_id": 0x744C}]}, "hip-rdna3"),
+    ({"ram_mb": 32768, "gpus": [{"name": "AMD Radeon RX 6650 XT", "vendor": "AMD", "vram_mb": 12288}]}, "hip-rdna2"),
     ({"ram_mb": 32768, "gpus": [{"name": "NVIDIA GeForce RTX 3060", "vendor": "NVIDIA", "vram_mb": 12288,
                                  "compute_cap": "8.6"}], "nvidia": {"driver": "590.10"}}, "cuda-cuda13"),
     ({"ram_mb": 32768, "gpus": [{"name": "NVIDIA GeForce RTX 3060", "vendor": "NVIDIA", "vram_mb": 12288,
-                                 "compute_cap": "8.6"}], "nvidia": {"driver": "560.00"}}, "cuda-cuda12"),
+                                 "compute_cap": "8.6"}], "nvidia": {"driver": "578.00"}}, "cuda-cuda12"),
 ])
 def test_strata_picks_the_biggest_card_and_its_engine(probe, variant):
     backend, got, g, _ = packs._strata_gpu(lambda: probe)
@@ -483,9 +498,11 @@ def test_strata_picks_the_biggest_card_and_its_engine(probe, variant):
 @pytest.mark.parametrize("probe, why", [
     ({"ram_mb": 32768, "gpus": [{"name": "NVIDIA GeForce RTX 4060", "vendor": "NVIDIA", "vram_mb": 8188}]}, "12 GB"),
     ({"ram_mb": 16384, "gpus": [{"name": "NVIDIA GeForce RTX 3060", "vendor": "NVIDIA", "vram_mb": 12288}]}, "32 GB of RAM"),
-    ({"ram_mb": 32768, "gpus": [{"name": "AMD Radeon RX 6650 XT 12GB", "vendor": "AMD", "vram_mb": 12288}]}, "no ready-made"),
+    ({"ram_mb": 32768, "gpus": [{"name": "AMD Radeon VII", "vendor": "AMD", "vram_mb": 16368}]}, "no ready-made"),
     ({"ram_mb": 32768, "gpus": [{"name": "NVIDIA GeForce GTX 1080 Ti", "vendor": "NVIDIA", "vram_mb": 11264,
                                  "compute_cap": "6.1"}], "nvidia": {"driver": "590.10"}}, "older than RTX 20"),
+    ({"ram_mb": 32768, "gpus": [{"name": "NVIDIA GeForce RTX 3060", "vendor": "NVIDIA", "vram_mb": 12288,
+                                 "compute_cap": "8.6"}], "nvidia": {"driver": "560.00"}}, "575.51"),
     ({"ram_mb": 32768, "gpus": []}, "graphics card"),
 ])
 def test_strata_refuses_hardware_it_cant_run_on(probe, why):
@@ -493,32 +510,79 @@ def test_strata_refuses_hardware_it_cant_run_on(probe, why):
         packs._strata_gpu(lambda: probe)
 
 
-def test_strata_run_config_is_loopback_and_tuned():
+def test_strata_run_config_is_loopback_and_tuned(tmp_path):
     s = recipes.load_catalog()["strata"]
-    setup_cfg = {"exe": "strata.exe", "port": 8080, "args": ["--pack", "p", "--spec", "4", "--mmap-experts",
-                                                             "--max-context", "32768"]}
-    cfg = packs._strata_artifex_config(setup_cfg, s, 31.8, "hip")
+    paths = packs._strata_paths(str(tmp_path), s)
+    engine = tmp_path / "engine"
+    (engine / "rocm" / "bin").mkdir(parents=True)
+    cfg = packs._strata_artifex_config(s, paths, str(engine), "hip", "log.txt")
     a = cfg["args"]
     assert cfg["host"] == "127.0.0.1" and cfg["port"] == s["port"]
-    assert "--mmap-experts" not in a and "--resident-experts" in a
-    assert a[a.index("--resident-budget-gib") + 1] == "12.3"
-    assert a[a.index("--spec") + 1] == "3" and a[a.index("--vram-reserve-mib") + 1] == "700"
-    assert cfg["env"]["STRATA_ROUTE_PRIOR"] == "1.25" and cfg["env"]["STRATA_HIP_PROMPT_F16"] == "1"
-    big = packs._strata_artifex_config(dict(setup_cfg, args=["--pack", "p"]), s, 128, "cuda")
-    assert "--resident-budget-gib" not in big["args"] and "STRATA_HIP_PROMPT_F16" not in big["env"]
+    assert a[a.index("--ram-keep-gib") + 1] == str(s["tuning"]["ram_keep_gib"])
+    assert a[a.index("--spec") + 1] == "3" and "--resident-experts" in a
+    assert a[a.index("--native") + 1].endswith("IQ3_XXS-00001-of-00002.gguf")
+    assert a[a.index("--ple-gguf") + 1].endswith("IQ3_XXS-00002-of-00002.gguf")
+    assert a[a.index("--mtp") + 1].endswith(os.path.join("mtp", "rt"))
+    assert "--vram-reserve-mib" not in a and "--resident-budget-gib" not in a and "--experts-bin" not in a
+    assert cfg["env"]["STRATA_ROUTE_PRIOR"] == "1.25" and cfg["env"]["STRATA_RESIDENT_PIN"] == "0"
+    assert cfg["lib_dirs"] == [str(engine / "rocm" / "bin")]
+    nv = packs._strata_artifex_config(s, paths, str(engine), "cuda", "log.txt")
+    assert "STRATA_RESIDENT_PIN" not in nv["env"] and nv["lib_dirs"] == []
 
 
-def test_strata_stamp_lists_what_strata_setup_would_install(tmp_path):
-    (tmp_path / "requirements.txt").write_text("# c\nnumpy==2.4.6; python_version == \"3.11\"\npillow==12.3.0\n\n")
-    (tmp_path / "requirements-monitor.txt").write_text("# m\ntextual==8.2.8\n")
-    assert packs._strata_runtime_packages(str(tmp_path)) == [
-        'numpy==2.4.6; python_version == "3.11"', "pillow==12.3.0", "textual==8.2.8"]
+def test_strata_mtp_fetches_pinned_ranges_then_packs_offline(tmp_path, monkeypatch):
+    s = recipes.load_catalog()["strata"]
+    paths = packs._strata_paths(str(tmp_path), s)
+    os.makedirs(os.path.join(paths["terminal"], "data"))
+    open(os.path.join(paths["terminal"], "data", "draft_vocab.bin"), "wb").close()
+    got, ran = [], []
+
+    def fake_range(url, dest, start, end, sha, hosts, **k):
+        got.append((url, start, end, sha))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        open(dest, "wb").close()
+    monkeypatch.setattr(packs.fetch, "download_range", fake_range)
+
+    def run(cmd, **kw):
+        ran.append(cmd)
+        if "mtp_rt.py" in cmd[2]:
+            os.makedirs(cmd[cmd.index("--out") + 1], exist_ok=True)
+        assert kw["env"]["STRATA_OFFLINE"] == "1" and kw["cwd"] == paths["terminal"]
+        return subprocess.CompletedProcess(cmd, 0)
+    packs._strata_mtp(s, "py", paths, str(tmp_path), s and recipes.load_catalog()["allowed_hosts"],
+                      lambda *a: None, run)
+    m = s["mtp"]
+    assert len(got) == 31 and all(u.startswith(f"https://huggingface.co/{m['repo']}/resolve/{m['revision']}/")
+                                  for u, *_ in got)
+    assert [c[2] for c in ran] == ["tools/mtp_pack.py", "tools/mtp_rt.py"]
+    man = json.load(open(os.path.join(paths["mtp"], "mtp-manifest.json"), encoding="utf-8"))
+    assert man[0]["file"] == os.path.join("tensors", man[0]["name"] + ".bin")
+    ran.clear()
+    packs._strata_mtp(s, "py", paths, str(tmp_path), [], lambda *a: None, run)     # done: nothing again
+    assert ran == []
+
+
+def test_strata_links_an_older_packs_identical_shard(tmp_path, monkeypatch):
+    s = dict(recipes.load_catalog()["strata"])
+    data = b"shard-two"
+    sha = hashlib.sha256(data).hexdigest()
+    s["model"] = dict(s["model"], files=[dict(s["model"]["files"][1], size=len(data), sha256=sha)])
+    old = tmp_path / "strata" / "models" / "IQ2_XS"
+    old.mkdir(parents=True)
+    (old / "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf").write_bytes(data)
+    monkeypatch.setattr(packs.fetch, "download", lambda url, dest, size, sha256, hosts, **k:
+                        pytest.fail("must link, not download") if not packs.fetch.file_matches(dest, size, sha256)
+                        else dest)
+    paths = packs._strata_paths(str(tmp_path), s)
+    packs._strata_models(s, paths, str(tmp_path), [], lambda *a: None)
+    new = os.path.join(paths["models"], os.path.basename(s["model"]["files"][0]["path"]))
+    assert open(new, "rb").read() == data
 
 
 def test_strata_launcher_binds_loopback_only(tmp_path):
     p = packs._strata_launcher(str(tmp_path), str(tmp_path / "S"), str(tmp_path / "py.exe"),
                                str(tmp_path / "c.json"), 8085, 262144)
-    text = open(p, encoding="ascii").read()
+    text = open(p, encoding="utf-8-sig").read()
     assert "--host 127.0.0.1 --port 8085" in text and "$cfg.host = '127.0.0.1'" in text
     assert "0.0.0.0" not in text
 
@@ -587,3 +651,53 @@ def test_holo_self_test_failure_stops_the_pack(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="holo self-test failed"):
         packs.install_holo(str(tmp_path), recipes.load_catalog(), log=lambda *a: None,
                            run=lambda cmd, **kw: _ok("something else"), probe_fn=lambda: {"gpus": []})
+
+
+def test_vision_replaces_an_old_installer_helper_but_never_yours(monkeypatch, tmp_path):
+    cat = recipes.load_catalog()
+    monkeypatch.setattr(packs, "_hf_file", lambda spec, *a, **k: "models/gguf/" + spec["file"])
+    monkeypatch.setattr(packs.fetch, "download", lambda *a, **k: pytest.fail("no downloads in this test"))
+    cpu = tmp_path / "runtime" / "llama.cpp" / (cat["llama_cpp"]["tag"] + "-cpu")
+    cpu.mkdir(parents=True)
+    (cpu / "llama-server.exe").write_text("")
+    run = lambda cmd, **kw: _ok("Red rectangle, blue circle.")
+    old = {"_comment": "Added by the installer's vision pack. LFM Open License v1.0.",
+           "path": "models/gguf/LFM3-VL-2B-Q4_K_M.gguf"}
+    (tmp_path / "llama_cpp_config.json").write_text(json.dumps({"models": {}, "vision_helper": old}))
+    packs.install_vision(str(tmp_path), cat, log=lambda *a: None, run=run)
+    vh = json.loads((tmp_path / "llama_cpp_config.json").read_text())["vision_helper"]
+    assert vh["path"].endswith(cat["vision_helper"]["model"]["file"])
+    assert vh["sampling"] == cat["vision_helper"]["sampling"]
+    mine = {"_comment": "my own helper", "path": "C:/my/LFM3-VL-2B-Q4_K_M.gguf"}
+    (tmp_path / "llama_cpp_config.json").write_text(json.dumps({"models": {}, "vision_helper": mine}))
+    packs.install_vision(str(tmp_path), cat, log=lambda *a: None, run=run)
+    assert json.loads((tmp_path / "llama_cpp_config.json").read_text())["vision_helper"] == mine
+
+
+def test_no_bundled_model_is_lfm3():
+    cat = recipes.load_catalog()
+    files = [m["file"] for m in cat["chat_models"]] + [cat["vision_helper"]["model"]["file"],
+                                                        cat["vision_helper"]["mmproj"]["file"]]
+    assert not [f for f in files if "lfm" in f.lower()]
+    assert "lfm" not in cat["webgpu"]["model"].lower()
+
+
+def test_vision_helper_reuses_the_chat_models_verified_file(monkeypatch, tmp_path):
+    cat = recipes.load_catalog()
+    vh = cat["vision_helper"]
+    elsewhere = tmp_path / "D" / vh["model"]["file"]
+    elsewhere.parent.mkdir()
+    elsewhere.write_bytes(b"x")
+    monkeypatch.setattr(packs.fetch, "file_matches",
+                        lambda path, size, sha: os.path.abspath(path) == os.path.abspath(str(elsewhere)))
+    fetched = []
+    monkeypatch.setattr(packs, "_hf_file", lambda spec, *a, **k: fetched.append(spec["file"]) or "models/gguf/" + spec["file"])
+    cpu = tmp_path / "runtime" / "llama.cpp" / (cat["llama_cpp"]["tag"] + "-cpu")
+    cpu.mkdir(parents=True)
+    (cpu / "llama-server.exe").write_text("")
+    (tmp_path / "llama_cpp_config.json").write_text(json.dumps(
+        {"models": {"qwen3.5-2b": {"path": str(elsewhere).replace("\\", "/")}}}))
+    packs.install_vision(str(tmp_path), cat, log=lambda *a: None, run=lambda cmd, **kw: _ok("red, blue"))
+    new = json.loads((tmp_path / "llama_cpp_config.json").read_text())
+    assert new["vision_helper"]["path"] == str(elsewhere).replace("\\", "/")
+    assert vh["model"]["file"] not in fetched

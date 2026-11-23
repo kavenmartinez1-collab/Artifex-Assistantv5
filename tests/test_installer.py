@@ -268,13 +268,13 @@ IGPU = {"name": "Intel UHD", "vendor": "Intel", "vram_mb": 128}
 
 
 @pytest.mark.parametrize("probe, variant, model", [
-    (_probe([NV8], "13.3"), "cuda-13.4", "qwen3.5-9b-q4km"),
+    (_probe([NV8], "13.3"), "cuda-13.5", "qwen3.5-9b-q4km"),
     (_probe([NV8], "12.6"), "vulkan", "qwen3.5-9b-q4km"),        # Blackwell needs CUDA 13 build
     (_probe([NV24_OLD], "12.4"), "cuda-12.4", "qwen3.8-27b-q3km"),
     (_probe([NV24_OLD], "11.8"), "vulkan", "qwen3.8-27b-q3km"),
     (_probe([AMD12]), "vulkan", "qwen3.5-9b-q4km"),
-    (_probe([IGPU]), "cpu", "lfm3-1.7b"),
-    (_probe([]), "cpu", "lfm3-1.7b"),
+    (_probe([IGPU]), "cpu", "qwen3.5-2b"),
+    (_probe([]), "cpu", "qwen3.5-2b"),
 ])
 def test_choices(probe, variant, model, tmp_path):
     pl = recipes.plan(probe, recipes.load_catalog(), str(tmp_path))
@@ -318,7 +318,7 @@ def test_find_existing_matches_by_hash_not_name(tmp_path):
 
 def test_installer_never_shells_out_or_evals():
     src = ""
-    for name in ("fetch.py", "recipes.py", "probe.py", "__main__.py"):
+    for name in sorted(n for n in os.listdir(os.path.dirname(recipes.__file__)) if n.endswith(".py")):
         src += open(os.path.join(os.path.dirname(recipes.__file__), name), encoding="utf-8").read()
     assert "shell=True" not in src
     assert not re.search(r"\beval\(|\bexec\(|os\.system\(|os\.popen\(", src)
@@ -396,7 +396,7 @@ def test_an_interrupted_env_is_finished_on_the_next_run(tmp_path):
 
 def test_a_server_that_cannot_start_is_not_registered(tmp_path, monkeypatch):
     pl = {"server_exe": str(tmp_path / "llama-server.exe"), "server_dir": str(tmp_path),
-          "variant": "cuda-13.4", "backend_files": [], "download_dir": str(tmp_path),
+          "variant": "cuda-13.5", "backend_files": [], "download_dir": str(tmp_path), "models": [],
           "model": {"file": "m.gguf", "size": 1, "sha256": "0" * 64, "repo": "r", "id": "m"},
           "model_url": "https://huggingface.co/x", "model_path": str(tmp_path / "m.gguf"),
           "config_path": str(tmp_path / "llama_cpp_config.json")}
@@ -439,7 +439,7 @@ def test_menu_choices_run_the_ordinary_commands(tmp_path, monkeypatch):
     monkeypatch.setattr(recipes, "start_app", lambda root, gui=True: started.append(gui))
     ran = []
     voice = str(list(packs.PACKS).index("voice") + 1)
-    _answers(monkeypatch, "3", voice, "3", "nope", "5", "1", "2", "9", "")
+    _answers(monkeypatch, "3", voice, "3", "nope", "5", "1", "2", "42", "")
     assert cli._menu(str(tmp_path), main_fn=lambda argv: ran.append(argv) or 0) == 0
     root = str(tmp_path)
     assert ran == [["pack", "voice", "--root", root], ["remote", "check", "--root", root]]

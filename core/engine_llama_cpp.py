@@ -857,7 +857,7 @@ class LlamaCppEngine(BaseEngine):
         gate_timeout = (SETTLED_GATE_TIMEOUT if settled is True
                         else DEFAULT_VRAM_WAIT_TIMEOUT)
         reclaimed = False
-        # -ngl 0 puts nothing on a GPU (a CPU-only helper such as LFM3), so
+        # -ngl 0 puts nothing on a GPU (a CPU-only helper model), so
         # there is no VRAM to gate. Charging it the GPU estimate would refuse
         # or step down a model that never touches the card.
         self._device_snapshot = False

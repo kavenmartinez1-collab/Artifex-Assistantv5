@@ -3016,8 +3016,8 @@ function chatSystemPrompt(identity, model) {
   sys += "\n\nTODAY'S DATE: " + new Date().toDateString();
   sys += capabilitiesNote(webOn);
   // A native-tools model gets real tool definitions from the server; the
-  // @search marker instructions would only contradict them (LFM3 copied
-  // the placeholders literally).
+  // @search marker instructions would only contradict them (small models
+  // copy the placeholders literally).
   if (webOn && !modelNativeTools[model || $("model-select").value]) sys += TOOL_PROMPT;
   return sys;
 }

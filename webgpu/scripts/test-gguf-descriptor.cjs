@@ -65,7 +65,6 @@ function coverageCheck(label, file, desc) {
     'moeRouter', 'moeExpertGate', 'moeExpertUp', 'moeExpertDown',
     'moeSharedGateProj', 'moeSharedUpProj', 'moeSharedDownProj', 'moeSharedExpertGate',
     'pleInpGate', 'pleProj', 'plePostNorm',
-    'shortConvInProj', 'shortConvWeight', 'shortConvOutProj', 'attnHeadGate',
   ];
   const located = new Set();
   for (const role of globalRoles) {
@@ -222,54 +221,6 @@ function coverageCheck(label, file, desc) {
     eq(loc9.locate('attnPostNorm', 3), undefined, '9B attnPostNorm absent');
 
     coverageCheck('E4B', f4, d4);
-  });
-  await section('LFM3', async () => {
-    // ── LFM3 1.7B (short conv + SWA + global attention) ──────────────────
-    // The Artifex Web model folder the installer's webgpu pack fills.
-    const pL = path.join(__dirname, '../models/lfm3-1.7b/LFM3-1.7B-Q4_K_M.gguf');
-    const fL = await parseFile(pL);
-    const dL = descriptorFromGGUF(fL);
-    eq(dL.modelType, 'lfm3', 'LFM3 modelType');
-    eq(dL.numLayers, 24, 'LFM3 numLayers');
-    eq(dL.hiddenSize, 2048, 'LFM3 hiddenSize');
-    eq(dL.intermediateSize, 7680, 'LFM3 ffnDim');
-    eq(dL.numAttentionHeads, 16, 'LFM3 heads');
-    eq(dL.numKVHeads, 4, 'LFM3 kvHeads');
-    eq(dL.headDim, 128, 'LFM3 headDim');
-    eq(dL.vocabSize, 128000, 'LFM3 vocabSize (padded)');
-    eq(dL.tieWordEmbeddings, true, 'LFM3 tied');
-    eq(dL.isHybrid, false, 'LFM3 isHybrid (DeltaNet flag)');
-    eq(dL.attnHeadGate, true, 'LFM3 attnHeadGate');
-    eq(dL.shortConvKernel, 7, 'LFM3 shortConvKernel');
-    eq(dL.partialRotaryFactor, undefined, 'LFM3 partialRotary');
-    check(Math.abs(dL.rmsNormEps - 1e-5) < 1e-9, 'LFM3 rmsNormEps 1e-5');
-    const SWA_L = new Set([4, 8, 12, 16, 20]);
-    const GLOBAL_L = new Set([2, 6, 10, 14, 18, 22]);
-    const freqL = new Float32Array(await readTensorBytes(pL, fL, 'rope_freqs.weight'));
-    applyRopeFreqFactors(dL, freqL);
-    for (let l = 0; l < 24; l++) {
-      const layer = dL.layers[l];
-      const kind = SWA_L.has(l) ? 'sliding_attention' : GLOBAL_L.has(l) ? 'full_attention' : 'short_conv';
-      eq(layer.kind, kind, `LFM3 layer ${l} kind`);
-      eq(layer.slidingWindow, kind === 'sliding_attention' ? 256 : undefined, `LFM3 layer ${l} window`);
-      eq(layer.rope?.theta, kind === 'short_conv' ? undefined : kind === 'sliding_attention' ? 10000 : 1000000,
-        `LFM3 layer ${l} rope theta`);
-      // Global layers: rope_freqs keeps pairs 0..31 rotating (partial NEOX)
-      eq(layer.rope?.rotatedPairs, kind === 'full_attention' ? 32 : undefined, `LFM3 layer ${l} rotatedPairs`);
-    }
-    const locL = createGGUFLocator(fL.tensors, ggufArchitecture(fL));
-    eq(locL.locate('postAttnNorm', 2), 'blk.2.ffn_norm.weight', 'LFM3 postAttnNorm (pre-FFN)');
-    eq(locL.locate('attnPostNorm', 2), 'blk.2.post_attention_norm.weight', 'LFM3 attnPostNorm (sandwich)');
-    eq(locL.locate('ffnPostNorm', 0), 'blk.0.post_ffw_norm.weight', 'LFM3 ffnPostNorm');
-    eq(locL.locate('shortConvInProj', 0), 'blk.0.shortconv.in_proj.weight', 'LFM3 shortConvInProj');
-    eq(locL.locate('shortConvWeight', 0), 'blk.0.shortconv.conv.weight', 'LFM3 shortConvWeight');
-    eq(locL.locate('shortConvOutProj', 0), 'blk.0.shortconv.out_proj.weight', 'LFM3 shortConvOutProj');
-    eq(locL.locate('attnHeadGate', 2), 'blk.2.attn_gate.weight', 'LFM3 attnHeadGate');
-    eq(locL.locate('lmHead'), 'token_embd.weight', 'LFM3 lmHead tied');
-    eq(fL.tensors.get('blk.0.shortconv.in_proj.weight').ne, [2048, 6144], 'LFM3 in_proj shape');
-    eq(fL.tensors.get('blk.0.shortconv.conv.weight').ne, [7, 2048], 'LFM3 conv shape');
-    eq(fL.tensors.get('blk.2.attn_gate.weight').ne, [2048, 16], 'LFM3 attn_gate shape');
-    coverageCheck('LFM3', fL, dL);
   });
 
   if (failures > 0) {

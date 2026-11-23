@@ -7,7 +7,8 @@ something else:
   takes the card. It used to wake the 27B chat model (a ~25 s cold load,
   ~13 GB of VRAM) only to rewrite the request BLIND: told "make it winter"
   for a cat photo, it wrote a snowy forest with "no animals" in the
-  negative prompt. LFM3-VL-2B on the CPU sees the photo and answers in ~7 s.
+  negative prompt. A 2B vision model on the CPU sees the photo and answers
+  in ~10-20 s.
 - the agent's @view_image / @describe_images, which only worked when the
   run's own model had been launched with a projector.
 
@@ -19,11 +20,12 @@ spell so its ~1-2 GB of RAM comes back. Configured by a top-level
 that is NOT listed as a chat model:
 
     "vision_helper": {
-      "path": ".../LFM3-VL-2B-Q4_K_M.gguf",
+      "path": ".../Qwen3.5-2B-Q4_K_M.gguf",
       "server_path": ".../llama-server.exe",   (a CPU build is enough)
       "num_gpu_layers": 0, "num_ctx": 8192, "port": 8095,
       "idle_unload_s": 600, "assist_tools": ["edit", "image"],
-      "extra_flags": ["--mmproj", "...", "--no-mmproj-offload", "-t", "10", "--jinja"]
+      "extra_flags": ["--mmproj", "...", "--no-mmproj-offload", "-t", "10", "--jinja"],
+      "sampling": {"presence_penalty": 1.5}    (optional; sent with every request)
     }
 """
 
@@ -104,14 +106,31 @@ def _reap_idle():
 
 
 def chat(messages: list, max_tokens: int = 600, temperature: float = 0.7,
-         timeout: float = 300) -> str:
-    """One non-streamed reply from the helper, thinking off."""
+         timeout: float = 300, schema: dict | None = None) -> str:
+    """One non-streamed reply from the helper, thinking off.
+
+    schema: a JSON schema the reply must follow. llama-server turns it into
+    a grammar, so the reply is always valid JSON of that shape; give string
+    fields a maxLength and a list can't run away either. Small models break
+    JSON on their own (a 2B wrote `"negative": ""no ...` and then repeated
+    "no sunrises, no moonrises" until max_tokens).
+    """
+    from core.sampling import SAMPLING_PAYLOAD_KEYS
     url = ensure_url()
     payload = {
         "messages": messages, "max_tokens": max_tokens,
         "temperature": temperature, "stream": False,
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    # The helper's own sampling from its config block (e.g. the presence
+    # penalty Qwen recommends for its small models); temperature stays the
+    # caller's.
+    for k, v in ((config() or {}).get("sampling") or {}).items():
+        if k in SAMPLING_PAYLOAD_KEYS and k != "temperature":
+            payload[k] = v
+    if schema:
+        payload["response_format"] = {"type": "json_schema",
+                                      "json_schema": {"name": "reply", "schema": schema}}
     req = Request(f"{url}/v1/chat/completions",
                   data=json.dumps(payload).encode("utf-8"),
                   headers={"Content-Type": "application/json"}, method="POST")

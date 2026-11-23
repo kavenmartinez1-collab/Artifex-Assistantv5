@@ -1,6 +1,6 @@
 """Agent runs with structured tool calls (core.native_agent_tools).
 
-LFM3-1.7B could not follow the @marker / ```edit``` text protocol: it needed
+A 1.7B model could not follow the @marker / ```edit``` text protocol: it needed
 five rounds and a shell echo to write one file (2026-10-27). An engine entry
 marked native_tools now gets real tool definitions; each call becomes the
 same AgentAction the text parser produces, so policy and approvals still
@@ -42,7 +42,7 @@ def _call(name, **args):
     (_call("list_files", pattern="*.py"), "glob", "*.py"),
     (_call("list_files", pattern="*.py", directory="src"), "glob", "*.py|src"),
     (_call("search_files", pattern="TODO", path="."), "grep", "TODO|.|"),
-    (_call("web_search", query="lfm3"), "search", "lfm3"),
+    (_call("web_search", query="qwen3.5"), "search", "qwen3.5"),
     (_call("web_read", ref="2"), "web_read", "2"),
 ])
 def test_calls_map_to_the_text_protocols_actions(call, kind, content):
@@ -127,7 +127,7 @@ def _runner(engine, monkeypatch, ran):
 def test_native_run_writes_reads_and_finishes(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     engine = NativeEngine([
-        ("", [_call("write_file", path="hello.txt", content="hi from LFM3")]),
+        ("", [_call("write_file", path="hello.txt", content="hi from a small model")]),
         ("", [_call("read_file", path="hello.txt"), _call("list_files", pattern="*")]),
         ("Done.", [_call("finish", summary="wrote and read hello.txt")]),
     ])

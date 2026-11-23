@@ -126,7 +126,7 @@ def install_ollama(root, catalog, log=print, run=subprocess.run, env=os.environ)
                               "network. Bind it to 127.0.0.1 first.")
     models = _ollama_models(run)
     log("Ollama models: " + (", ".join(models) if models else
-                             "none yet (ollama pull <model>, e.g. ollama pull lfm3)"))
+                             "none yet (ollama pull <model>)"))
     return write_backend_launchers(root, "ollama")
 
 
@@ -194,7 +194,7 @@ def _config(root):
     path = os.path.join(root, "llama_cpp_config.json")
     if not os.path.isfile(path):
         raise PackUnavailable(f"no llama_cpp_config.json yet: run {hint('install')} first")
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         return path, json.load(f)
 
 
@@ -219,8 +219,9 @@ def _hf_file(spec, root, hosts, log=print):
 def vision_plan(root, catalog):
     return ["for each chat model you installed that can see, download its pinned image "
             "projector (~0.9 GB) and add a '<model>-vision' entry (your entries are not changed)",
-            "download LFM3-VL 2B + projector (1.2 GB, pinned) and the CPU llama.cpp build if "
-            "missing, and register the CPU vision helper (port 8095, this PC only)",
+            "download Qwen3.5 2B + its image encoder (about 1.9 GB, pinned; the model file is "
+            "shared with the small chat model) and the CPU llama.cpp build if missing, and "
+            "register the CPU vision helper (port 8095, this PC only)",
             "test it: the helper describes a test picture"]
 
 
@@ -242,15 +243,33 @@ def install_vision(root, catalog, log=print, run=subprocess.run):
     vh = catalog["vision_helper"]
     cpu_plan = recipes.plan({"gpus": []}, catalog, root, variant="cpu",
                             model_id=catalog["chat_models"][0]["id"])
-    if not os.path.isfile(cpu_plan["server_exe"]):
+    if not recipes.backend_complete(cpu_plan):
         for f in cpu_plan["backend_files"]:
             dest = os.path.join(cpu_plan["download_dir"], f["name"])
             log(f"downloading {f['name']} (CPU llama.cpp for the helper)")
             fetch.download(f["url"], dest, f["size"], f["sha256"], hosts)
             fetch.safe_unzip(dest, cpu_plan["server_dir"])
             os.remove(dest)
-    model = _hf_file(vh["model"], root, hosts, log)
+        recipes._write_backend_stamp(cpu_plan)
+    # The helper's model is the small chat model's file: when an entry already
+    # points at a verified copy (installed with --reuse, say), use that one.
+    model = next((str(e["path"]).replace("\\", "/") for e in models.values()
+                  if isinstance(e, dict) and e.get("path")
+                  and os.path.basename(str(e["path"])) == vh["model"]["file"]
+                  and fetch.file_matches(str(e["path"]), vh["model"]["size"], vh["model"]["sha256"])), "")
+    if model:
+        log(f"vision helper: using the verified {vh['model']['file']} the chat model already has")
+    else:
+        model = _hf_file(vh["model"], root, hosts, log)
     mmproj = _hf_file(vh["mmproj"], root, hosts, log)
+    old = cfg.get("vision_helper")
+    if (isinstance(old, dict) and str(old.get("_comment", "")).startswith("Added by the installer's vision pack")
+            and os.path.basename(str(old.get("path", ""))) != vh["model"]["file"]):
+        # A helper this pack set up earlier with a model the catalog no longer
+        # ships (LFM3-VL until 2026-11): replace it. One you wrote yourself
+        # is left alone.
+        log(f"replacing the vision helper's old model {os.path.basename(str(old.get('path')))}")
+        del cfg["vision_helper"]
     if "vision_helper" not in cfg:
         cfg["vision_helper"] = {
             "_comment": f"Added by the installer's vision pack. {vh['license']}.",
@@ -259,6 +278,8 @@ def install_vision(root, catalog, log=print, run=subprocess.run):
             "idle_unload_s": vh["idle_unload_s"], "assist_tools": ["edit", "image"],
             "extra_flags": ["--mmproj", mmproj, "--no-mmproj-offload", "-t",
                             str(max(2, (os.cpu_count() or 4) - 2)), "-np", "1", "--jinja"]}
+        if vh.get("sampling"):
+            cfg["vision_helper"]["sampling"] = dict(vh["sampling"])
         added.append("vision_helper")
     if added:
         _save_config(path, cfg)
@@ -666,21 +687,62 @@ def install_game(root, catalog, log=print, run=subprocess.run, prefer_portable=F
 # ── Strata: Qwen3.8-Flash-Next on one GPU + system RAM ──────────────────────
 #
 # Strata (github.com/Niko1221/Strata, MIT) runs the 125B-total / 6B-active MoE
-# from GPU + RAM + SSD. Its own setup.py does the model preparation (expert
-# pack, MTP draft layer); this pack feeds it only pinned inputs and keeps it
-# offline where it can be:
-#   - the source: git clone over https, checked out at the pinned commit;
-#   - Python: its venv gets OUR hash-locked packages (requirements-strata.txt),
-#     and setup's stamp file is written so setup's own unhashed pip step skips;
-#   - the engine: the pinned v0.2.7 signed feed + the pinned package for this
-#     GPU family in a local folder (--feed DIR); Strata checks the Ed25519
-#     signature and the package's size + SHA-256 on top of ours;
-#   - the model shards and the llama.cpp source: pinned size + SHA-256;
-#   - the MTP draft layer: Strata's tools/mtp_fetch.py, which checks every
-#     tensor against the SHA-256 pinned in that commit; verified again after.
-# The server binds 127.0.0.1 only and Artifex starts/stops it (external_launcher).
+# from GPU + RAM + SSD. Since 0.2.20 nothing of Strata's own installer runs:
+# every input is pinned in catalog.json and fetched by fetch.py (allow-listed
+# hosts, size + SHA-256), and only Strata's offline tools run:
+#   - the source: git (https) sparse checkout of terminal/ at the pinned commit;
+#   - Python: its own venv with OUR hash-locked packages (requirements-strata.txt);
+#   - the engine: the archive for this GPU (sha256 pinned), unpacked with the
+#     tar-slip checks, then its Ed25519-signed manifest verified offline by
+#     Strata's own code against the pinned key id, every file re-hashed;
+#   - the model: two pinned shards (an older pack's identical shard 2 is linked);
+#   - the expert pack: tools/iq_pack.py --experts-bin, offline. A 32 GB PC runs
+#     Strata's low-RAM resident mode, which reads the experts from that ~40 GB
+#     experts.bin (upstream maps the GGUF in place only with ~60 GB of RAM; the
+#     resident mode on a pack without experts.bin crashes the 0.1.66 engine);
+#   - the MTP draft layer: 31 tensors fetched as pinned byte ranges of the base
+#     model's shards (each SHA-256 pinned), packed by tools/mtp_pack.py and
+#     tools/mtp_rt.py, offline.
+# The server binds 127.0.0.1 only, runs --offline (no remote image URLs, no MCP
+# subprocesses), keeps its state under strata\state, and Artifex starts and
+# stops it (external_launcher).
 
-STRATA_SETUP_LOG = os.path.join("logs", "strata-setup.log")
+STRATA_LOG_DIR = "logs"
+
+# Strata's own table at the pinned commit (terminal/strata_control/engine_component.py
+# WIN_AMD_DEVICE_ARCH): the architecture a Windows AMD card runs as, by PCI device id.
+_AMD_DEVICE_ARCH = {0x744C: "gfx1100", 0x7448: "gfx1100", 0x745E: "gfx1100", 0x747E: "gfx1101",
+                    0x7480: "gfx1102", 0x7590: "gfx1200", 0x7550: "gfx1201", 0x7551: "gfx1201",
+                    0x73BF: "gfx1030", 0x73AF: "gfx1030", 0x73A5: "gfx1030", 0x73A1: "gfx1030",
+                    0x73DF: "gfx1031", 0x73FF: "gfx1032", 0x73EF: "gfx1032", 0x73E3: "gfx1032"}
+_GFX_ENGINE = {"gfx1030": "hip-rdna2", "gfx1031": "hip-rdna2", "gfx1032": "hip-rdna2",
+               "gfx1100": "hip-rdna3", "gfx1101": "hip-rdna3", "gfx1102": "hip-rdna3",
+               "gfx1200": "hip-rx9070", "gfx1201": "hip-rx9070"}
+
+
+def _amd_gfx(g) -> str:
+    """The card's gfx arch: by PCI device id, else from its name (Strata's gfx_from_name rules)."""
+    gfx = _AMD_DEVICE_ARCH.get(int(g.get("device_id") or 0), "")
+    if gfx:
+        return gfx
+    name = re.sub(r"\s+", " ", str(g.get("name", ""))).upper()
+    if re.search(r"\bR9700\b|\bR97\d\d\b|\bRX 9070\b", name):
+        return "gfx1201"
+    if re.search(r"\bRX 906\d\b", name):
+        return "gfx1200"
+    m = re.search(r"\b(?:RX |W)(7[5-9]\d\d)\b", name)
+    if m:
+        return {79: "gfx1100", 78: "gfx1101", 77: "gfx1101", 76: "gfx1102", 75: "gfx1102"}[int(m.group(1)) // 100]
+    m = re.search(r"\bRX (6\d{3})\b", name)
+    if m:
+        n = int(m.group(1))
+        if n >= 6800:
+            return "gfx1030"
+        if n in (6700, 6750):
+            return "gfx1031"
+        if 6600 <= n < 6700:
+            return "gfx1032"
+    return ""
 
 
 def _strata_gpu(probe_fn=None):
@@ -690,92 +752,81 @@ def _strata_gpu(probe_fn=None):
     ram_gb = (p.get("ram_mb") or 0) / 1024
     gpus = [g for g in p.get("gpus") or [] if g.get("vendor") in ("NVIDIA", "AMD")]
     if not gpus:
-        raise PackUnavailable("Strata needs an NVIDIA (RTX 20 or newer) or AMD Radeon RX 6800/6700 XT, "
+        raise PackUnavailable("Strata needs an NVIDIA (RTX 20 or newer) or AMD Radeon RX 6000, "
                               "RX 7000 or RX 9000 graphics card.")
     g = max(gpus, key=lambda x: x.get("vram_mb") or 0)
     if (g.get("vram_mb") or 0) < 11000:
         raise PackUnavailable(f"Strata needs a card with 12 GB of video memory or more ({g['name']} has "
                               f"{(g.get('vram_mb') or 0) / 1024:.0f} GB).")
     if ram_gb and ram_gb < 30:
-        raise PackUnavailable(f"Flash-Next IQ2_XS needs 32 GB of RAM or more (this PC has {ram_gb:.0f} GB).")
-    name = g["name"].upper()
+        raise PackUnavailable(f"Flash-Next IQ3_XXS needs 32 GB of RAM or more (this PC has {ram_gb:.0f} GB).")
     if g["vendor"] == "NVIDIA":
         cc = recipes._version(g.get("compute_cap", ""))
         drv = recipes._version((p.get("nvidia") or {}).get("driver", ""))
         if cc and cc < (7, 5):
             raise PackUnavailable(f"{g['name']} is older than RTX 20 (compute capability {g.get('compute_cap')}); "
                                   "Strata's ready-made NVIDIA engines start at sm_75.")
-        if drv >= (580,):
+        # Strata's ENGINE-COMPONENT.md at the pinned commit: CUDA 13 needs 580.65+, CUDA 12 575.51+.
+        if drv >= (580, 65):
             return "cuda", "cuda-cuda13", g, ram_gb
-        if drv >= (528,):
+        if drv >= (575, 51):
             return "cuda", "cuda-cuda12", g, ram_gb
-        raise PackUnavailable("Strata's NVIDIA engine needs driver 528 or newer (580+ for CUDA 13). Update the driver.")
-    if re.search(r"RX 6(7|8|9)\d\d", name):
-        return "hip", "hip-rdna2", g, ram_gb
-    if re.search(r"RX 7\d\d\d", name):
-        return "hip", "hip-rdna3", g, ram_gb
-    if re.search(r"RX 9\d\d\d|R9700", name):
-        return "hip", "hip-rx9070", g, ram_gb
+        raise PackUnavailable("Strata's NVIDIA engine needs driver 575.51 or newer (580.65+ for CUDA 13). "
+                              "Update the driver.")
+    gfx = _amd_gfx(g)
+    if gfx in _GFX_ENGINE:
+        return "hip", _GFX_ENGINE[gfx], g, ram_gb
     raise PackUnavailable(f"{g['name']}: Strata has no ready-made Windows engine for this AMD card "
-                          "(RX 6700 XT/6800/6900, RX 7000 and RX 9000 are supported).")
+                          "(RX 6600-6900, RX 7000 and RX 9000 / AI PRO R9700 are supported).")
 
 
-def _strata_runtime_packages(strata_dir):
-    """The package list Strata's setup.py installs (setup.runtime_packages: requirements.txt +
-    requirements-monitor.txt, comments dropped), so its stamp can say they are installed."""
-    out = []
-    for name in ("requirements.txt", "requirements-monitor.txt"):
-        path = os.path.join(strata_dir, name)
-        if not os.path.isfile(path):
-            continue
-        for raw in open(path, encoding="utf-8").read().splitlines():
-            line = raw.split("#", 1)[0].strip()
-            if line and line not in out:
-                out.append(line)
-    return out
+def _strata_paths(root, s):
+    strata = os.path.join(root, *s["dest"].split("/"))
+    data = os.path.join(root, *s["data_dest"].split("/"))
+    return {"strata": strata, "terminal": os.path.join(strata, "terminal"),
+            "models": os.path.join(root, *s["models_dest"].split("/")),
+            "data": data, "pack": os.path.join(data, "packs", "iq3_xxs"), "mtp": os.path.join(data, "mtp"),
+            "state": os.path.join(root, "strata", "state"), "downloads": os.path.join(root, "strata", "downloads")}
 
 
-def _strata_artifex_config(setup_cfg, s, ram_gb, backend):
-    """Artifex's run config from setup's: loopback only, the tuned settings, and in the
-    low-RAM mapped mode a resident RAM budget that leaves ~19.5 GiB for everything else."""
+def _strata_artifex_config(s, paths, engine_dir, backend, log_path):
+    """Artifex's run config for Strata's server: loopback only, the measured settings."""
     t = s["tuning"]
-    args = list(setup_cfg["args"])
-
-    def put(flag, value=None):
-        if flag in args:
-            i = args.index(flag)
-            if value is not None:
-                args[i + 1] = str(value)
-        else:
-            args.append(flag)
-            if value is not None:
-                args.append(str(value))
-    if "--mmap-experts" in args:
-        args.remove("--mmap-experts")
-        put("--resident-experts")
-        put("--resident-budget-gib", f"{max(t['min_resident_budget_gib'], ram_gb - t['ram_left_for_others_gib']):g}")
-    put("--spec", t["spec"])
-    put("--vram-reserve-mib", t["vram_reserve_mib"])
-    put("--conversation-cache-mib", t["conversation_cache_mib"])
-    put("--max-context", t["default_ctx"])
-    env = dict(setup_cfg.get("env") or {})
-    env["STRATA_ROUTE_PRIOR"] = t["route_prior"]
+    shard = lambda i: os.path.join(paths["models"], os.path.basename(s["model"]["files"][i]["path"]))
+    args = ["--pack", paths["pack"], "--native", shard(0), "--ple-gguf", shard(1),
+            "--expert-profile", os.path.join(paths["terminal"], "data", "expert-profile.bin"),
+            "--expert-cache", "auto", "--prefill", str(t["prefill"]),
+            "--spec", str(t["spec"]), "--spec-min-p", str(t["spec_min_p"]),
+            "--mtp", os.path.join(paths["mtp"], "rt"), "--max-context", str(t["default_ctx"]),
+            "--kv", t["kv"], "--resident-experts", "--conversation-cache-mib", str(t["conversation_cache_mib"]),
+            # Strata pins RAM for experts up to "all but 4 GiB" by default; Artifex and the
+            # rest of the PC need more room than that.
+            "--ram-keep-gib", str(t["ram_keep_gib"])]
+    env = {"STRATA_ROUTE_PRIOR": str(t["route_prior"]), "STRATA_IO_THREADS": str(t["io_threads"])}
+    lib_dirs = []
     if backend == "hip":
-        env["STRATA_HIP_PROMPT_F16"] = "1"          # Strata's own tip for RX 6000 prompt speed
-    cfg = dict(setup_cfg, args=args, env=env, host="127.0.0.1", port=s["port"])
-    return cfg
+        env["STRATA_RESIDENT_PIN"] = "0"          # Strata's own rule for HIP on Windows (setup_config.py)
+        rocm = os.path.join(engine_dir, "rocm", "bin")
+        if os.path.isdir(rocm):
+            lib_dirs.append(rocm)
+    return {"exe": os.path.join(engine_dir, "strata.exe"), "args": args, "cwd": paths["terminal"],
+            "tokenizer": os.path.join(paths["pack"], "tokenizer"), "model_name": s["model_id"],
+            "lib_dirs": lib_dirs, "backend": backend, "env": env, "log": log_path,
+            "host": "127.0.0.1", "port": s["port"], "open_browser": False}
 
 
 def _strata_launcher(root, strata_dir, vpy, cfg_path, port, max_ctx):
     path = os.path.join(os.path.abspath(root), "strata", "start-strata-artifex.ps1")
+    state = os.path.join(os.path.abspath(root), "strata", "state")
     q = lambda p: os.path.abspath(p).replace("'", "''")
     text = f"""# Strata (Qwen3.8-Flash-Next) for Artifex: 127.0.0.1:{port} ONLY. Written by python -m installer
 # (pack strata); Artifex starts it through its external_launcher entry and passes -Context <tier>.
 param([int]$Context = 32768)
 $ErrorActionPreference = 'Stop'
 $strata = '{q(strata_dir)}'
+$term = Join-Path $strata 'terminal'
 $Context = [Math]::Max(4096, [Math]::Min($Context, {max_ctx}))
-$cfg = Get-Content '{q(cfg_path)}' -Raw | ConvertFrom-Json
+$cfg = Get-Content '{q(cfg_path)}' -Raw -Encoding UTF8 | ConvertFrom-Json
 $a = [System.Collections.ArrayList]@($cfg.args)
 $i = $a.IndexOf('--max-context')
 if ($i -ge 0) {{ $a[$i + 1] = "$Context" }} else {{ [void]$a.Add('--max-context'); [void]$a.Add("$Context") }}
@@ -784,12 +835,22 @@ $cfg.host = '127.0.0.1'
 $run = Join-Path $strata 'strata-artifex-run.json'
 $cfg | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 $run
 $env:PYTHONUTF8 = '1'
+$env:PYTHONPATH = $term
+# Strata keeps its state (process records, update cache) under LOCALAPPDATA\\Strata; this
+# install gets its own, so it never shares records with (or ends) another Strata.
+$env:LOCALAPPDATA = '{q(state)}'
+$env:STRATA_KEEP_LEFTOVERS = '1'
+$env:STRATA_OFFLINE = '1'
 foreach ($p in $cfg.env.PSObject.Properties) {{ Set-Item -Path ("env:" + $p.Name) -Value ([string]$p.Value) }}
-Set-Location $strata
-& '{q(vpy)}' -u (Join-Path $strata 'serve\\server.py') --engine strata --config $run --host 127.0.0.1 --port {port}
+Set-Location $term
+& '{q(vpy)}' -u (Join-Path $term 'serve\\server.py') --engine strata --config $run --host 127.0.0.1 --port {port} --offline --no-api-key
 """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="ascii", newline="\r\n") as f:
+    os.makedirs(state, exist_ok=True)
+    # UTF-8 with a BOM: Windows PowerShell 5.1 reads a script without one in
+    # the ANSI code page, so a non-ASCII folder name would break it (the old
+    # ascii-only write crashed outright, after the whole download).
+    with open(path, "w", encoding="utf-8-sig", newline="\r\n") as f:
         f.write(text)
     return path
 
@@ -808,7 +869,7 @@ def _strata_smoke_test(launcher, port, model_id, log=print, run=subprocess.run, 
     if healthy():
         log(f"something already answers on 127.0.0.1:{port} (Artifex running Flash-Next?) - test skipped")
         return "skipped"
-    proc = subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", launcher,
+    proc = subprocess.Popen([remote.system_exe("powershell"), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", launcher,
                              "-Context", "8192"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     try:
@@ -847,15 +908,141 @@ def _strata_smoke_test(launcher, port, model_id, log=print, run=subprocess.run, 
         psutil.wait_procs(procs, timeout=20)
 
 
+def _strata_tool(vpy, paths, args, log_name, root, run, timeout):
+    """Run one of Strata's offline tools from terminal/, output to logs/<log_name>."""
+    log_path = os.path.join(root, STRATA_LOG_DIR, log_name)
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    env = dict(os.environ, PYTHONUTF8="1", PYTHONPATH=paths["terminal"], STRATA_OFFLINE="1",
+               LOCALAPPDATA=paths["state"])
+    with open(log_path, "w", encoding="utf-8") as lf:
+        r = run([vpy, "-u"] + args, cwd=paths["terminal"], env=env, stdout=lf, stderr=subprocess.STDOUT,
+                timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError(f"Strata's {args[0]} failed (exit {r.returncode}); see {log_path}")
+    return log_path
+
+
+_ENGINE_CHECK = """
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from strata_control import engine_component as ec
+c = ec.read_manifest(Path(sys.argv[2]))
+ec.verify(c, full=True)
+status = ec.verify_signature(c, {"STRATA_REQUIRE_SIGNED_COMPONENTS": "1"})
+print(json.dumps({"status": status, "version": c.version, "key_id": (c.signature or {}).get("key_id", "")}))
+"""
+
+
+def _strata_engine(s, variant, vpy, paths, hosts, log, run):
+    """This GPU's engine: pinned archive, slip-checked unpack, signed manifest verified offline."""
+    spec = s["engines"][variant]
+    engine_dir = os.path.join(paths["strata"], "..", f"engine-{s['engine_version']}-{variant}")
+    engine_dir = os.path.abspath(engine_dir)
+    stamp = os.path.join(engine_dir, ".artifex-verified")
+    if not os.path.isfile(stamp):
+        archive = os.path.join(paths["downloads"], spec["url"].rsplit("/", 1)[-1])
+        log(f"downloading the engine {os.path.basename(archive)} ({spec['size'] // (1 << 20)} MB)")
+        fetch.download(spec["url"], archive, spec["size"], spec["sha256"], hosts)
+        if os.path.isdir(engine_dir):
+            shutil.rmtree(engine_dir)
+        fetch.safe_untar(archive, engine_dir)
+        os.remove(archive)
+    r = run([vpy, "-c", _ENGINE_CHECK, paths["terminal"], engine_dir], capture_output=True, text=True,
+            timeout=900, env=dict(os.environ, PYTHONUTF8="1"))
+    try:
+        got = json.loads((r.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise fetch.VerifyError("the Strata engine failed its signature/file check: "
+                                + ((r.stderr or r.stdout) or "")[-400:])
+    if r.returncode != 0 or got.get("status") != "verified" or got.get("key_id") != s["engine_key_id"] \
+            or got.get("version") != s["engine_version"]:
+        raise fetch.VerifyError(f"the Strata engine package is not the pinned, signed build: {got}")
+    with open(stamp, "w", encoding="utf-8") as f:
+        json.dump(got, f)
+    log(f"engine {got['version']} ({variant}): signed by {got['key_id']}, every file re-hashed")
+    return engine_dir
+
+
+def _strata_models(s, paths, root, hosts, log):
+    os.makedirs(paths["models"], exist_ok=True)
+    for f in s["model"]["files"]:
+        name = os.path.basename(f["path"])
+        dest = os.path.join(paths["models"], name)
+        if not fetch.file_matches(dest, f["size"], f["sha256"]):
+            # An older pack's identical file (IQ2_XS shared shard 2): link it, don't fetch 29 GB again.
+            for older in s.get("older_models_dest", []):
+                odir = os.path.join(root, *older.split("/"))
+                for cand in (os.listdir(odir) if os.path.isdir(odir) else []):
+                    src = os.path.join(odir, cand)
+                    if os.path.getsize(src) == f["size"] and fetch.file_matches(src, f["size"], f["sha256"]):
+                        try:
+                            os.link(src, dest)
+                            log(f"{name}: linked the identical file {cand} from {older}")
+                        except OSError:
+                            pass
+                        break
+        if not fetch.file_matches(dest, f["size"], f["sha256"]):
+            log(f"downloading {name} ({f['size'] / 1e9:.1f} GB)")
+        fetch.download(f"https://huggingface.co/{s['model']['repo']}/resolve/{s['model']['revision']}/{f['path']}",
+                       dest, f["size"], f["sha256"], hosts)
+
+
+def _strata_mtp(s, vpy, paths, root, hosts, log, run):
+    """The MTP draft layer: pinned tensor byte ranges, then Strata's offline packers."""
+    mtp, m = paths["mtp"], s["mtp"]
+    rt_done = os.path.join(mtp, "rt", ".artifex-done")
+    if os.path.isfile(rt_done):
+        log("MTP draft layer: already prepared")
+        return
+    manifest = []
+    for t in m["tensors"]:
+        rel = os.path.join("tensors", t["name"] + ".bin")
+        fetch.download_range(f"https://huggingface.co/{m['repo']}/resolve/{m['revision']}/{t['shard']}",
+                             os.path.join(mtp, rel), t["start"], t["end"], t["sha256"], hosts)
+        manifest.append(dict(t, file=rel))
+    log(f"MTP draft layer: {len(manifest)} tensors fetched, each matching its pinned SHA-256")
+    with open(os.path.join(mtp, "mtp-manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=1)
+    gguf = os.path.join(mtp, "mtp-q2_0.gguf")
+    _strata_tool(vpy, paths, ["tools/mtp_pack.py", "--src", mtp, "--experts", "q2_0", "--out", gguf],
+                 "strata-mtp-pack.log", root, run, 3600)
+    _strata_tool(vpy, paths, ["tools/mtp_rt.py", "--gguf", gguf, "--out", os.path.join(mtp, "rt")],
+                 "strata-mtp-rt.log", root, run, 3600)
+    shutil.copy2(os.path.join(paths["terminal"], "data", "draft_vocab.bin"), os.path.join(mtp, "rt", "draft_vocab.bin"))
+    with open(rt_done, "w", encoding="utf-8") as f:
+        f.write(f"{m['repo']}@{m['revision']}\n")
+
+
+def _strata_pack(s, vpy, paths, root, log, run):
+    done = os.path.join(paths["pack"], ".artifex-done")
+    shard1 = s["model"]["files"][0]
+    want = shard1["sha256"] + " experts-bin"
+    if os.path.isfile(done) and open(done, encoding="utf-8").read().strip() == want \
+            and os.path.isfile(os.path.join(paths["pack"], "experts.bin")):
+        log("expert pack: already built")
+        return
+    log("building the expert pack from the model (offline, one time: ~40 GB written; 10-40 min, a lot of "
+        "RAM while it runs, so close big programs first)")
+    _strata_tool(vpy, paths, ["tools/iq_pack.py", "--gguf",
+                              os.path.join(paths["models"], os.path.basename(shard1["path"])), "--out", paths["pack"],
+                              "--experts-bin"],
+                 "strata-pack.log", root, run, 4 * 3600)
+    with open(done, "w", encoding="utf-8") as f:
+        f.write(want + "\n")
+
+
 def strata_plan(root, catalog):
     s = catalog["strata"]
     gb = sum(f["size"] for f in s["model"]["files"]) / 1e9
+    mtp_gb = sum(t["bytes"] for t in s["mtp"]["tensors"]) / 1e9
     return ["pick the GPU with the most video memory (12 GB+) and its Strata engine package; check RAM (32 GB+)",
-            f"git clone {s['repo']} over https and check out commit {s['commit'][:12]} (v{s['version']}, verified)",
+            f"git sparse checkout of Strata's terminal/ folder at commit {s['commit'][:12]} (v{s['version']}, verified)",
             "give it its own Python environment with the hash-locked packages (requirements-strata.txt)",
-            f"download the model ({gb:.0f} GB, 2 files) and the engine package, each pinned and checksum-verified",
-            "let Strata prepare the model offline (expert pack ~35 GB; the MTP draft layer ~5 GB, every tensor "
-            "checked against Strata's pinned SHA-256)",
+            f"download the model ({gb:.0f} GB, 2 files; an older pack's identical shard is linked instead) and the "
+            "engine package, each pinned and checksum-verified; the engine's signed manifest is checked offline",
+            f"download the MTP draft layer ({mtp_gb:.1f} GB: 31 tensors, each pinned) and build it, then build "
+            "the expert pack (offline, Strata's own tools; ~42 GB on disk, a lot of RAM while it builds)",
             f"write a launcher for 127.0.0.1:{s['port']} only and add '{s['model_id']}' to llama_cpp_config.json "
             "(Artifex starts and stops it; it uses the whole GPU while it runs)",
             "test it: start it, ask 17*23, stop it"]
@@ -871,27 +1058,28 @@ def install_strata(root, catalog, log=print, run=subprocess.run, probe_fn=None):
         raise PackUnavailable("The Strata pack is installed with git. Get Git for Windows from "
                               "https://git-scm.com/download/win, then run this pack again.")
     cfg_path, cfg = _config(root)
-    strata = os.path.join(root, *s["dest"].split("/"))
-    models = os.path.join(root, *s["models_dest"].split("/"))
-    data = os.path.join(root, *s["data_dest"].split("/"))
+    paths = _strata_paths(root, s)
     need = sum(f["size"] for f in s["model"]["files"]
-               if not os.path.isfile(os.path.join(models, os.path.basename(f["path"]))))
+               if not os.path.isfile(os.path.join(paths["models"], os.path.basename(f["path"]))))
+    extra = 54 * (1 << 30)              # experts.bin (~40 GiB), draft layer, dense pack, engine, venv
     free = shutil.disk_usage(root).free
-    if free < need + 45 * (1 << 30):
-        raise PackUnavailable(f"not enough disk space: about {(need + 45 * (1 << 30)) / (1 << 30):.0f} GB "
-                              f"needed (model + expert pack + draft layer), {free / (1 << 30):.0f} GB free")
-    # 1. source at the pinned commit
+    if free < need + extra:
+        raise PackUnavailable(f"not enough disk space: about {(need + extra) / (1 << 30):.0f} GB needed, "
+                              f"{free / (1 << 30):.0f} GB free")
+    # 1. source: terminal/ only, at the pinned commit
+    strata = paths["strata"]
     if not os.path.isdir(os.path.join(strata, ".git")):
-        log(f"cloning {s['repo']}")
-        _git(["clone", "--no-checkout", s["repo"], strata], run=run)
+        log(f"cloning {s['repo']} (terminal/ only)")
+        _git(["clone", "--filter=blob:none", "--no-checkout", "--sparse", s["repo"], strata], run=run)
     else:
-        _git(["fetch", "origin"], cwd=strata, run=run)
+        _git(["fetch", "--filter=blob:none", "origin"], cwd=strata, run=run)
+    _git(["sparse-checkout", "set", "--cone"] + list(s["sparse"]), cwd=strata, run=run)
     _git(["checkout", "--detach", s["commit"]], cwd=strata, run=run)
     head = _git(["rev-parse", "HEAD"], cwd=strata, run=run)
     if head != s["commit"]:
         raise fetch.VerifyError(f"checked out {head}, expected {s['commit']}")
     log(f"Strata source at commit {head[:12]} (verified)")
-    # 2. its venv, hash-locked; setup's own pip step is told it is done
+    # 2. its venv, hash-locked
     venv = os.path.join(strata, ".venv")
     vpy = os.path.join(venv, "Scripts", "python.exe") if os.name == "nt" else os.path.join(venv, "bin", "python")
     if not os.path.isfile(vpy):
@@ -902,81 +1090,43 @@ def install_strata(root, catalog, log=print, run=subprocess.run, probe_fn=None):
     log("installing the locked packages (requirements-strata.txt)")
     run([vpy, "-m", "pip", "install", "--isolated", "--require-hashes", "--only-binary=:all:", "--no-input",
          "--disable-pip-version-check", "-r", recipes.LOCKS["strata"]], check=True)
-    with open(os.path.join(venv, ".strata-pip.json"), "w", encoding="utf-8") as f:
-        json.dump(sorted(_strata_runtime_packages(strata)), f, indent=0)
-    with open(os.path.join(venv, ".strata-pip.json.os"), "w", encoding="utf-8") as f:
-        f.write(sys.platform)
-    # 3. pinned downloads: model shards, llama.cpp source, the signed feed + this GPU's engine package
-    for f in s["model"]["files"]:
-        dest = os.path.join(models, os.path.basename(f["path"]))
-        if not fetch.file_matches(dest, f["size"], f["sha256"]):
-            log(f"downloading {os.path.basename(f['path'])} ({f['size'] / 1e9:.1f} GB)")
-        fetch.download(f"https://huggingface.co/{s['model']['repo']}/resolve/{s['model']['revision']}/{f['path']}",
-                       dest, f["size"], f["sha256"], hosts)
-    lc = s["llama_cpp_source"]
-    lz = os.path.join(strata, *lc["dest_in_strata"].split("/"))
-    fetch.download(lc["url"], lz, lc["size"], lc["sha256"], hosts)
-    with open(lz + ".done", "w", encoding="utf-8") as f:     # setup's finish mark: it uses this file, no download
-        f.write("pinned by python -m installer\n")
-    feed_dir = os.path.join(root, "strata", f"feed-v{s['version']}")
-    for f in s["feed"] + [s["engines"][variant]]:
-        fetch.download(f["url"], os.path.join(feed_dir, f["url"].rsplit("/", 1)[-1]), f["size"], f["sha256"], hosts)
-    log(f"engine package {s['engines'][variant]['url'].rsplit('/', 1)[-1]} and the signed feed: verified")
-    # 4. Strata's own preparation (expert pack, MTP draft layer), from the pinned inputs above
-    # STRATA_UPDATE_FEED: the engine comes from the pinned local feed above, never the live one (setup's
-    # `strata update` reads this; --feed alone only covers DeepSeek's engine).
-    env = dict(os.environ, PYTHONUTF8="1", STRATA_UPDATE_FEED=feed_dir)
-    if backend == "hip":            # the AMD card even when an NVIDIA card is present (#3892)
-        env["STRATA_ENGINE_BACKEND"] = "hip"
-        env["STRATA_FEED_BUILD"] = variant
-    cmd = [vpy, "-u", "setup.py", "--backend", backend, "--family", "qwen", "--model", "IQ2_XS",
-           "--gguf-dir", models, "--data-dir", data, "--feed", feed_dir, "--vision", "no", "--images", "no",
-           "--host", "127.0.0.1", "--no-start", "--no-browser", "--yes"]
-    if backend == "cuda":
-        cmd += ["--cuda", "13" if variant == "cuda-cuda13" else "12"]
-    log_path = os.path.join(root, STRATA_SETUP_LOG)
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    log(f"Strata setup: preparing the model (20-60 min; log: {log_path})")
-    with open(log_path, "w", encoding="utf-8") as lf:
-        r = run(cmd, cwd=strata, env=env, stdout=lf, stderr=subprocess.STDOUT, timeout=4 * 3600)
-    if r.returncode != 0:
-        raise RuntimeError(f"Strata setup failed (exit {r.returncode}); see {log_path}")
-    build = json.load(open(os.path.join(strata, "engine", "BUILD.json"), encoding="utf-8-sig"))
-    if build.get("version") != s["engine_version"]:
-        raise fetch.VerifyError(f"Strata installed engine {build.get('version')}, not the pinned "
-                                f"{s['engine_version']}; delete {os.path.join(strata, 'engine')} and run the pack again")
-    log(f"engine {build['version']} ({build.get('backend')}) installed from the pinned feed")
-    r = run([vpy, os.path.join(strata, "tools", "mtp_fetch.py"), "verify", "--out", os.path.join(data, "mtp")],
-            cwd=strata, capture_output=True, text=True, timeout=1800)
-    if r.returncode != 0:
-        raise fetch.VerifyError("the MTP draft layer did not match Strata's pinned SHA-256: "
-                                + (r.stdout or r.stderr)[-400:])
-    log("MTP draft layer: every tensor matches the pinned SHA-256")
+    # 3. pinned downloads, the engine and its signature check
+    _strata_models(s, paths, root, hosts, log)
+    engine_dir = _strata_engine(s, variant, vpy, paths, hosts, log, run)
+    # 4. offline preparation with Strata's own tools
+    _strata_mtp(s, vpy, paths, root, hosts, log, run)
+    _strata_pack(s, vpy, paths, root, log, run)
     # 5. Artifex's run config, launcher and model entry
-    setup_cfg_path = os.path.join(strata, "strata-iq2_xs.json")
-    if not os.path.isfile(setup_cfg_path):
-        raise RuntimeError(f"Strata setup wrote no {setup_cfg_path}")
-    setup_cfg = json.load(open(setup_cfg_path, encoding="utf-8-sig"))
-    art = _strata_artifex_config(setup_cfg, s, ram_gb, backend)
-    art["log"] = os.path.join(os.path.abspath(root), "logs", "strata-flash-next.log")
-    art_path = os.path.join(strata, "strata-iq2_xs-artifex.json")
+    art = _strata_artifex_config(s, paths, engine_dir, backend,
+                                 os.path.join(os.path.abspath(root), STRATA_LOG_DIR, "strata-flash-next.log"))
+    art_path = os.path.join(strata, "strata-artifex.json")
     with open(art_path, "w", encoding="utf-8") as f:
         json.dump(art, f, indent=1)
     launcher = _strata_launcher(root, strata, vpy, art_path, s["port"], s["tuning"]["max_ctx"])
-    entry = {"_comment": (f"Qwen3.8-Flash-Next IQ2_XS on Strata v{s['version']} ({variant}, {g['name']}), "
-                          f"127.0.0.1:{s['port']} only; added by python -m installer (pack strata). "
-                          "Uses the whole GPU while loaded; context follows Artifex's tiers."),
-             "path": os.path.join(models, os.path.basename(s["model"]["files"][0]["path"])).replace("\\", "/"),
-             "port": s["port"], "num_ctx": s["tuning"]["max_ctx"], "health_timeout": 600,
-             "external_launcher": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                                   launcher.replace("\\", "/"), "-Context", "{ctx}"]}
-    cfg.setdefault("models", {})[s["model_id"]] = entry
+    models = cfg.setdefault("models", {})
+    for mid, e in list(models.items()):
+        # the previous pack's entry (IQ2_XS on 0.2.7): its model and launcher are gone
+        if mid != s["model_id"] and isinstance(e, dict) and "(pack strata)" in str(e.get("_comment", "")):
+            log(f"removing the old Strata entry '{mid}'")
+            del models[mid]
+    models[s["model_id"]] = {
+        "_comment": (f"Qwen3.8-Flash-Next IQ3_XXS on Strata v{s['version']} ({variant}, {g['name']}), "
+                     f"127.0.0.1:{s['port']} only; added by python -m installer (pack strata). "
+                     "Uses the whole GPU while loaded; context follows Artifex's tiers."),
+        "path": os.path.join(paths["models"], os.path.basename(s["model"]["files"][0]["path"])).replace("\\", "/"),
+        "port": s["port"], "num_ctx": s["tuning"]["max_ctx"], "health_timeout": 600,
+        "external_launcher": ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                              launcher.replace("\\", "/"), "-Context", "{ctx}"]}
     _save_config(cfg_path, cfg)
     log(f"added '{s['model_id']}' to {cfg_path}")
     # 6. test
     log("testing: start Strata, ask 17*23, stop it (the first start takes a minute)")
     reply = _strata_smoke_test(launcher, s["port"], s["model_id"], log=log, run=run)
     log(f"Strata answered: {reply}")
+    older = [os.path.join(root, *d.split("/")) for d in s.get("older_models_dest", [])]
+    for d in older:
+        if os.path.isdir(d):
+            log(f"note: {d} (an older pack's model) is no longer used; delete it by hand to free the space")
     return launcher
 
 

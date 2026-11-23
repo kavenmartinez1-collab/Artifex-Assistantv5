@@ -60,7 +60,7 @@ class GGUFInfo:
         """Layers that hold a KV cache (hybrid models keep KV on every Nth layer)."""
         if not self.block_count:
             return 0
-        if self.kv_layer_count:          # LFM-style hybrid: conv layers carry no KV
+        if self.kv_layer_count:          # conv/attention hybrid: cache-less layers carry no KV
             return self.kv_layer_count
         # nextn (MTP) layers are counted in block_count but carry their own draft KV.
         base = self.block_count - self.nextn_predict_layers

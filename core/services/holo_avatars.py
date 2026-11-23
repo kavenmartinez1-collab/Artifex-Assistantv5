@@ -8,7 +8,7 @@ keeps its GPU:
   2. depth        Depth-Anything-V2-Small, then grown + blurred so a big
                   parallax shift stretches instead of tearing -> depth.png
   3. face         MediaPipe Face Landmarker (photos / realistic faces), else
-                  the LFM3-VL vision helper's boxes in 0-1000 coordinates
+                  the vision helper's boxes in 0-1000 coordinates
                   (measured on the anime default avatar: mouth and one eye
                   within ~10/1000 of hand-marked truth, the other eye ~35),
                   else a centred guess. The phone shows draggable dots to fix
@@ -398,7 +398,7 @@ def _landmarks_mediapipe(im):
     return (lm, "mediapipe") if lm else (None, None)
 
 
-def _vision_chat(im, prompt, max_tokens=200, temperature=0.0):
+def _vision_chat(im, prompt, max_tokens=200, temperature=0.0, schema=None):
     from core import vision_helper
     if not vision_helper.config():
         return None
@@ -411,7 +411,8 @@ def _vision_chat(im, prompt, max_tokens=200, temperature=0.0):
     # stops every llama-server) gets one fresh try, then the step is skipped.
     for attempt in (1, 2):
         try:
-            return vision_helper.chat(msgs, max_tokens=max_tokens, temperature=temperature)
+            return vision_helper.chat(msgs, max_tokens=max_tokens, temperature=temperature,
+                                      schema=schema)
         except Exception as e:
             _log.warning("vision helper failed (%s, try %d): %s", prompt[:30], attempt, e)
             time.sleep(2)
@@ -428,14 +429,37 @@ def _json_in(text):
         return None
 
 
+def _boxes_in(text):
+    """Named boxes from a vision reply: {"eye_left": [x1,y1,x2,y2], ...}, or
+    Qwen-VL's own trained form [{"bbox_2d": [...], "label": "eye_left"}, ...]
+    (what a Qwen model falls back to)."""
+    if not text:
+        return None
+    m = re.search(r"\[\s*\{.*\}\s*\]", text, re.S)
+    if m and "bbox_2d" in m.group(0):
+        try:
+            return {str(e["label"]): e["bbox_2d"] for e in json.loads(m.group(0))
+                    if isinstance(e, dict) and "label" in e and "bbox_2d" in e}
+        except (ValueError, TypeError):
+            pass
+    return _json_in(text)
+
+
+_BOX = {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 1000},
+        "minItems": 4, "maxItems": 4}
+_FACE_SCHEMA = {"type": "object", "additionalProperties": False,
+                "required": ["eye_left", "eye_right", "mouth"],
+                "properties": {"eye_left": _BOX, "eye_right": _BOX, "mouth": _BOX}}
+
+
 def _landmarks_vision(im):
-    """LFM3-VL boxes. Normalized 0-1000 is what it localizes well (pixel
+    """Vision-helper boxes. Normalized 0-1000 is what it localizes well (pixel
     coordinates came back ~0.8x squashed in y)."""
     out = _vision_chat(im, (
         "Locate the face parts. Reply ONLY with JSON of bounding boxes in normalized 0-1000 "
         'coordinates [x1,y1,x2,y2]: {"eye_left":[...],"eye_right":[...],"mouth":[...]} '
-        "where eye_left is the eye nearer the left edge of the image."))
-    j = _json_in(out)
+        "where eye_left is the eye nearer the left edge of the image."), schema=_FACE_SCHEMA)
+    j = _boxes_in(out)
     try:
         W, H = im.width, im.height
         box = lambda k: [j[k][0] / 1000 * W, j[k][1] / 1000 * H, j[k][2] / 1000 * W, j[k][3] / 1000 * H]

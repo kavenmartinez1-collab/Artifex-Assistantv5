@@ -118,3 +118,58 @@ def test_no_helper_keeps_the_old_message(monkeypatch):
                         lambda url=None: (False, "launched without vision"))
     monkeypatch.setattr(vision_helper, "config", lambda: None)
     assert image_tools.resolve_vision_url() == (None, "launched without vision")
+
+
+# ── schema-enforced JSON and the helper's own sampling (2026-11-23) ────────
+
+def test_chat_sends_the_schema_and_the_helpers_sampling(monkeypatch):
+    import io
+    import json as _json
+    sent = {}
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        sent["body"] = _json.loads(req.data)
+        return Resp(_json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode())
+
+    block = dict(BLOCK, sampling={"presence_penalty": 1.5, "temperature": 9, "bogus": 1})
+    monkeypatch.setattr(vision_helper, "config", lambda: block)
+    monkeypatch.setattr(vision_helper, "ensure_url", lambda: "http://127.0.0.1:8095")
+    monkeypatch.setattr(vision_helper, "urlopen", fake_urlopen)
+    schema = {"type": "object", "properties": {"prompt": {"type": "string"}}}
+    vision_helper.chat([{"role": "user", "content": "hi"}], temperature=0.2, schema=schema)
+    body = sent["body"]
+    assert body["presence_penalty"] == 1.5 and body["temperature"] == 0.2 and "bogus" not in body
+    assert body["response_format"]["json_schema"]["schema"] == schema
+
+
+def test_assist_asks_the_helper_for_schema_shaped_json(monkeypatch):
+    got = {}
+
+    def fake_chat(messages, max_tokens=600, schema=None, **kw):
+        got["schema"] = schema
+        return '{"prompt": "snowy garden", "negative": ""}'
+
+    monkeypatch.setattr(vision_helper, "config", lambda: dict(BLOCK))
+    monkeypatch.setattr(vision_helper, "chat", fake_chat)
+    out = asyncio.run(media_tools.assist_prompt("edit", "make it winter"))
+    assert out[0] == "snowy garden"
+    assert got["schema"]["required"] == ["prompt", "negative"]
+    assert got["schema"]["properties"]["negative"]["maxLength"] <= 500
+
+
+def test_face_boxes_are_read_in_both_formats():
+    from core.services.holo_avatars import _boxes_in
+    plain = '{"eye_left":[1,2,3,4],"eye_right":[5,6,7,8],"mouth":[9,10,11,12]}'
+    qwen = ('```json\n[{"bbox_2d": [1, 2, 3, 4], "label": "eye_left"},\n'
+            ' {"bbox_2d": [5, 6, 7, 8], "label": "eye_right"},\n'
+            ' {"bbox_2d": [9, 10, 11, 12], "label": "mouth"}]\n```')
+    assert _boxes_in(plain) == _boxes_in(qwen) == {
+        "eye_left": [1, 2, 3, 4], "eye_right": [5, 6, 7, 8], "mouth": [9, 10, 11, 12]}
+    assert _boxes_in("no boxes here") is None

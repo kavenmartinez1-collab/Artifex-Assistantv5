@@ -111,6 +111,17 @@ _ASSIST_SYSTEM = {
     ),
 }
 
+# The JSON the assist must return, enforced on the vision helper (a small
+# model writes broken JSON otherwise). maxLength keeps a negative-prompt list
+# from running away; the edit pipeline reads at most 2000 / 500 chars anyway.
+_ASSIST_SCHEMA = {
+    "image": {"type": "object", "additionalProperties": False, "required": ["prompt"],
+              "properties": {"prompt": {"type": "string", "maxLength": 1200}}},
+    "edit": {"type": "object", "additionalProperties": False, "required": ["prompt", "negative"],
+             "properties": {"prompt": {"type": "string", "maxLength": 1200},
+                            "negative": {"type": "string", "maxLength": 400}}},
+}
+
 # async (messages) -> str: one reply from the chat model (api/server.py)
 _prompt_llm = None
 
@@ -172,7 +183,8 @@ async def assist_prompt(tool: str, prompt: str,
                     {"role": "user", "content": user}]
         try:
             reply = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: vision_helper.chat(messages, max_tokens=600))
+                None, lambda: vision_helper.chat(messages, max_tokens=600,
+                                                 schema=_ASSIST_SCHEMA[tool]))
             return parse_assist_reply(reply, prompt)
         except Exception as e:
             if _prompt_llm is None:

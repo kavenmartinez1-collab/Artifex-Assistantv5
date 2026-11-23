@@ -94,6 +94,7 @@ def _gpus():
             found.append({"name": a["description"].strip(),
                           "vendor": _VENDORS.get(a["vendor_id"], f"0x{a['vendor_id']:04X}"),
                           "vram_mb": int(a["dedicated_mb"]),
+                          "device_id": int(a.get("device_id") or 0),
                           "free_mb": int(a.get("free_mb") or 0)})
     except Exception:
         pass

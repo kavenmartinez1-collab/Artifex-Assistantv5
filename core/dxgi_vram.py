@@ -235,6 +235,7 @@ def probe_adapters():
                 entry = {
                     "description": desc.Description,
                     "vendor_id": desc.VendorId,
+                    "device_id": desc.DeviceId,
                     "dedicated_mb": desc.DedicatedVideoMemory / _MB,
                     "budget_mb": 0.0,
                     "usage_mb": 0.0,

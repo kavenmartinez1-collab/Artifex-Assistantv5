@@ -951,8 +951,8 @@ def test_reload_hands_uvicorn_an_import_string(monkeypatch):
 
 def test_model_not_found_warning_lists_the_active_backends_models(monkeypatch):
     import main_api
-    monkeypatch.setattr("core.config.get_model_names", lambda: ["qwen-27b", "lfm3"])
-    assert main_api._available_model_names() == ["qwen-27b", "lfm3"]
+    monkeypatch.setattr("core.config.get_model_names", lambda: ["qwen-27b", "small-helper"])
+    assert main_api._available_model_names() == ["qwen-27b", "small-helper"]
 
 
 def test_ollama_thinking_retry_keeps_the_callers_arguments():

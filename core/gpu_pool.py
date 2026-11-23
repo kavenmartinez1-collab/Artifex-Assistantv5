@@ -214,7 +214,7 @@ def read_gguf_kv_params_uncached(gguf_path: str) -> Optional[dict]:
     hc = found["attention.head_count"]
     if isinstance(hc, (list, tuple)):
         # Per-layer head counts (Inkling 2 stores attention.head_count as an
-        # array, like LFM3's head_count_kv): size by the largest layer.
+        # array, like hybrid models' head_count_kv): size by the largest layer.
         hc = max((int(h) for h in hc if h), default=0)
         if not hc:
             _log.warning("GGUF %s has no attention heads in head_count", gguf_path)
@@ -249,9 +249,9 @@ def read_gguf_kv_params_uncached(gguf_path: str) -> Optional[dict]:
 def per_layer_kv_heads(head_count_kv, attn_layer_count: int) -> tuple:
     """Normalise attention.head_count_kv to (kv_heads, attn_layers).
 
-    Hybrid models like LFM2/LFM3 store it per layer, with 0 on the layers
-    that are convolutions and hold no KV cache (LFM3-1.7B: 11 of 24 layers
-    are attention). The callers multiply attn_layers * kv_heads, which a
+    Hybrid models store it per layer, with 0 on the layers that hold no
+    KV cache (convolution or recurrent layers; e.g. 11 of 24 layers are
+    attention in a 1.7B conv/attention hybrid). The callers multiply attn_layers * kv_heads, which a
     list cannot do, so count only the KV-holding layers.
     """
     if isinstance(head_count_kv, (list, tuple)):

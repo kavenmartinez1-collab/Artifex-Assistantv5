@@ -24,7 +24,11 @@ $tmp = Join-Path $root 'python-unpack.tmp'
 
 function Test-PythonSignature($path) {
     $sig = Get-AuthenticodeSignature -FilePath $path
-    return ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.Subject -match "O=`"?$([regex]::Escape($pin.signer))")
+    if ($sig.Status -ne 'Valid' -or -not $sig.SignerCertificate) { return $false }
+    # The exact organisation field, not a prefix: "O=Python Software Foundation Fake" must fail.
+    if ($sig.SignerCertificate.Subject -notmatch '(?:^|,\s*)O=("([^"]*)"|([^,]*))') { return $false }
+    $org = if ($Matches[2]) { $Matches[2] } else { $Matches[3] }
+    return ($org.Trim() -eq $pin.signer)
 }
 
 if ((Test-Path $exe) -and (Test-PythonSignature $exe)) {

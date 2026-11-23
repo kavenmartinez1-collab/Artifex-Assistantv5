@@ -185,6 +185,119 @@ def download(url: str, dest: str, size: int, sha256: str, allowed_hosts,
         raise
 
 
+def download_range(url: str, dest: str, start: int, end: int, sha256: str, allowed_hosts,
+                   opener=None, sleep=time.sleep) -> str:
+    """Fetch bytes start..end (inclusive) of `url` into `dest`, only if they
+    hash to the pinned SHA-256. For one tensor inside a multi-GB file that
+    isn't worth downloading whole (the MTP draft layer's tensors live inside
+    the base model's safetensors shards).
+
+    The server must answer 206 with a Content-Range for exactly that span: a
+    server (or mirror) that ignores Range and sends the file's start would
+    otherwise be hashed as the tensor. A dropped connection resumes from the
+    .part file, like download().
+    """
+    size = end - start + 1
+    if size <= 0:
+        raise VerifyError(f"bad byte range {start}-{end}")
+    if not host_allowed(url, allowed_hosts):
+        raise VerifyError(f"refused: {url} is not https on an allowed host")
+    if file_matches(dest, size, sha256):
+        return dest
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    part = dest + ".part"
+    opener = opener or urllib.request.build_opener(_AllowListRedirects(allowed_hosts))
+    name = os.path.basename(dest)
+    try:
+        last = None
+        for attempt in range(RETRIES):
+            if attempt:
+                sleep(min(2 ** attempt, 30))
+            h, got = _hash_prefix(part, size)
+            first = start + got
+            req = urllib.request.Request(url, headers={"User-Agent": "Artifex-Installer/1",
+                                                       "Range": f"bytes={first}-{end}"})
+            try:
+                with opener.open(req, timeout=60) as resp:
+                    if not host_allowed(resp.geturl(), allowed_hosts):
+                        raise VerifyError("refused: download ended on a host that is not allowed")
+                    cr = resp.headers.get("Content-Range", "") or ""
+                    if getattr(resp, "status", 200) != 206 or not cr.startswith(f"bytes {first}-{end}/"):
+                        raise VerifyError(f"{name}: the server did not send bytes {first}-{end} "
+                                          f"(status {getattr(resp, 'status', '?')}, Content-Range {cr!r})")
+                    with open(part, "ab" if got else "wb") as out:
+                        while True:
+                            block = resp.read(CHUNK)
+                            if not block:
+                                break
+                            got += len(block)
+                            if got > size:
+                                raise VerifyError(f"{name}: more than the {size} bytes asked for; refused")
+                            h.update(block)
+                            out.write(block)
+            except VerifyError:
+                raise
+            except urllib.error.HTTPError as e:
+                if e.code in _NO_RETRY or e.code == 416:
+                    raise DownloadError(f"{name}: the server answered HTTP {e.code}") from e
+                last = e
+                continue
+            except (OSError, http.client.HTTPException) as e:
+                last = e
+                continue
+            if got < size:
+                last = OSError(f"connection closed after {got} of {size} bytes")
+                continue
+            if h.hexdigest() != sha256.lower():
+                raise VerifyError(f"{name}: SHA-256 does not match the pinned value; deleted")
+            os.replace(part, dest)
+            return dest
+        raise DownloadError(f"{name}: the download kept stopping ({last}). What was fetched so far "
+                            "is kept; run the same command again and it continues from there.")
+    except VerifyError:
+        if os.path.exists(part):
+            os.remove(part)
+        raise
+
+
+def safe_untar(archive: str, dest: str) -> list:
+    """Unpack a .tar / .tar.gz into `dest` after checking every member: only
+    plain files and folders, no absolute paths, drive letters, "..", links or
+    devices, every target inside `dest`. Unpacks into a temporary folder
+    next to `dest` first, like safe_unzip."""
+    import tarfile
+    dest = os.path.abspath(dest)
+    parent = os.path.dirname(dest)
+    os.makedirs(parent, exist_ok=True)
+    with tarfile.open(archive, "r:*") as t:
+        members, names = t.getmembers(), []
+        for m in members:
+            name = m.name.replace("\\", "/")
+            if (not name or name.startswith("/") or ":" in name.split("/")[0]
+                    or ".." in name.split("/")):
+                raise VerifyError(f"refused archive member path: {m.name!r}")
+            if not (m.isfile() or m.isdir()):
+                raise VerifyError(f"refused archive member that is not a plain file: {m.name!r}")
+            target = os.path.abspath(os.path.join(dest, name))
+            if os.path.commonpath([target, dest]) != dest:
+                raise VerifyError(f"refused member outside the folder: {m.name!r}")
+            names.append(name)
+        tmp = tempfile.mkdtemp(prefix=".unpack-", dir=parent)
+        try:
+            kw = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+            t.extractall(tmp, members=members, **kw)
+            os.makedirs(dest, exist_ok=True)
+            for entry in os.listdir(tmp):
+                src, dst = os.path.join(tmp, entry), os.path.join(dest, entry)
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src, dst)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return names
+
+
 def _member_is_link(info: zipfile.ZipInfo) -> bool:
     mode = info.external_attr >> 16
     return stat.S_ISLNK(mode)

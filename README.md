@@ -95,11 +95,14 @@ window, type `cmd`, press **Enter**, then type:
 | Talk and listen (voice) | `setup pack voice` |
 | Show it pictures | `setup pack vision` |
 | Make images, music, 3D | `setup pack create` |
-| Run AI in your web browser (Artifex Web, with LFM3) | `setup pack webgpu` |
+| Run AI in your web browser (Artifex Web, with Qwen3.5 2B) | `setup pack webgpu` |
 | A bigger, smarter model on one 12 GB+ card + 32 GB RAM (Qwen3.8-Flash-Next on Strata) | `setup pack strata` |
 | A talking hologram avatar on your phone (Holo tab, Orpheus + Piper voices, avatars from any photo) | `setup pack holo` |
 | Use it from your phone, safely | `setup remote setup` |
 | Check nothing is exposed to the internet | `setup remote check` |
+| Turn phone access off again | `setup remote off` |
+| See what this PC still needs (changes nothing) | `setup doctor` |
+| Remove what setup installed (lists it first, asks) | `setup uninstall` |
 
 Everything it downloads is pinned and checksum-verified, it needs no admin
 rights, and everything stays on 127.0.0.1 (your phone reaches it only over
@@ -214,7 +217,7 @@ https://github.com/user-attachments/assets/91074fb1-1a53-48df-a627-071f3af519f0
 | WebGPU vision (Qwen3.6 GGUF) | PASS | 27B + mmproj reads fine print off a trading card (set code, serial, 1st-edition stamp) on a consumer GPU |
 | WebGPU multi-turn chat | PASS | Sliding-window context + compression + sessions, 29/29 byte-identical vs the Python reference implementations |
 | WebGPU TurboQuant on 27B | PASS | Greedy exact-f32 vs 3-bit compressed KV: 42/64 tokens identical, first divergence a top-2 near-tie (acceptable lossy KV) |
-| WebGPU LFM3 1.7B (2026-10-28) | PASS | Gated short-conv + sliding-window + global attention hybrid: tokenizer/template exact, 72/72 teacher-forced argmax vs llama.cpp b11945, top-5 probabilities inside llama.cpp's own CPU-vs-CUDA spread (`scripts/test-lfm3-parity.mts`); ~50 tok/s decode, ~220 tok/s prefill on an RDNA2 GPU |
+| WebGPU Qwen3.5 2B (2026-11-23) | PASS | Linear-attention hybrid: tokenizer/template exact, 71/72 teacher-forced argmax vs llama.cpp b12651 (one near-tie), top-5 probabilities within 0.014 of llama.cpp's own CPU..GPU range but for one soft spot, 16- vs 64-token prefill identical (`scripts/test-model-parity.mts`) |
 | Localhost binding | PASS | Confirmed NOT accessible on LAN IP |
 
 ## Supported GPU Tiers
@@ -233,10 +236,10 @@ The transformers engine includes a **dynamic VRAM budget planner** that analyzes
 
 Before setting up Artifex, make sure you have these installed:
 
-1. **Python 3.11+** — [python.org/downloads](https://www.python.org/downloads/)
+1. **Python 3.11–3.13** — [python.org/downloads](https://www.python.org/downloads/)
 2. **NVIDIA GPU drivers** — [nvidia.com/drivers](https://www.nvidia.com/Download/index.aspx) (Game Ready or Studio)
 3. **Git** — [git-scm.com](https://git-scm.com/) (for cloning the repo)
-4. **Node.js 18+** — [nodejs.org](https://nodejs.org/) (only needed for the WebGPU engine)
+4. **Node.js 20+** — [nodejs.org](https://nodejs.org/) (only needed for the WebGPU engine)
 5. **Ollama** *(optional)* — [ollama.com](https://ollama.com/) or `winget install Ollama.Ollama` on Windows
 
 You do **not** need to install CUDA separately — PyTorch bundles the CUDA runtime.
@@ -279,11 +282,17 @@ Then double-click **Artifex CLI.cmd**, **Artifex GUI.cmd**, or
 | NVIDIA, driver with CUDA 13 | llama.cpp CUDA 13 | by video memory, below |
 | NVIDIA RTX 20/30/40, driver with CUDA 12.4+ | llama.cpp CUDA 12 | by video memory |
 | AMD / Intel, or an older NVIDIA driver | llama.cpp Vulkan | by video memory |
-| No GPU with 2 GB+ | llama.cpp CPU | LFM3 1.7B |
-| 16 GB+ / 8 GB+ / less | | Qwen3.8 27B / Qwen3.5 9B / LFM3 1.7B |
+| No GPU with 2 GB+ | llama.cpp CPU | Qwen3.5 2B |
+| 16 GB+ / 8 GB+ / less | | Qwen3.8 27B / Qwen3.5 9B / Qwen3.5 2B |
+
+With an NVIDIA card and another make, the NVIDIA one is used (CUDA) unless the other
+card fits a bigger model. The model must also fit your RAM; on the CPU, the whole
+file plus headroom. Every model listed is Apache-2.0.
 
 Useful options: `--reuse D:\models` (use model files you already have; they
-are recognised by checksum, not name), `--model <id>`, `--variant cpu|vulkan|cuda-12.4|cuda-13.4`,
+are recognised by checksum, not name), `--model <id>`,
+`--variant cpu|vulkan|cuda-12.4|cuda-13.5|rocm-10.0` (ROCm is never picked on its own),
+`--models-dir D:\models` (put the model files on another drive),
 `--no-gui` (skip the desktop GUI, ~100 MB), `--yes` (don't ask).
 
 #### Packs (optional extras)
@@ -296,11 +305,11 @@ python -m installer pack voice         # install one (shows the plan, asks first
 | Pack | What it adds | Size |
 |---|---|---|
 | `voice` | Phone dictation (Whisper small.en) and read-aloud (Piper), on the CPU | ~0.75 GB |
-| `vision` | Image understanding for your chat model, plus a CPU vision helper (LFM3-VL) that lets Create's AI prompt see your photo | ~1.2-2.1 GB |
+| `vision` | Image understanding for your chat model, plus a CPU vision helper (Qwen3.5 2B + its image encoder) that lets Create's AI prompt see your photo | ~1.9-2.6 GB |
 | `create` | Image, photo edit/restore, music, 3D and video (NVIDIA, 8 GB+, CUDA 12.8 driver) | ~3.5 GB packages + 11.5 GB image model (32 GB download, once) |
 | `web-search` | Web search through a hardened gateway + SearXNG in Docker (Docker Desktop must already be installed) | ~0.5 GB |
-| `webgpu` | Artifex Web, the in-browser WebGPU engine in `webgpu/` (uses your Node.js 20+, or downloads a pinned portable Node), with LFM3 1.7B ready to load: its launcher opens with `local/lfm3-1.7b` filled in | ~0.3 GB + 1.1 GB model (reuses the core install's copy when it has one) |
-| `game` | A Tale of Yarn, the WebGPU game: cloned at a pinned commit into `games/`, with its NPC model (LFM3 1.7B, licence included) and voices (Git for Windows required) | ~0.6 GB + 1.3 GB models |
+| `webgpu` | Artifex Web, the in-browser WebGPU engine in `webgpu/` (uses your Node.js 20+, or downloads a pinned portable Node), with Qwen3.5 2B ready to load: its launcher opens with `local/qwen3.5-2b` filled in | ~0.3 GB + 1.3 GB model (reuses the core install's copy when it has one) |
+| `game` | A Tale of Yarn, the WebGPU game: cloned at a pinned commit into `games/`, with its NPC model (Qwen3.5 2B, Apache-2.0 licence included) and voices (Git for Windows required) | ~0.6 GB + 1.3 GB models |
 | `strata` | Qwen3.8-Flash-Next (MoE) on the Strata engine: one 12 GB+ NVIDIA or AMD card and 32 GB of RAM | ~68 GB model + ~35 GB expert pack + ~6 GB |
 | `holo` | The phone app's **Holo** tab: a talking 3D hologram avatar. Four female Piper voices, the streamed Orpheus 3B voices (tara & co.) on their own Vulkan llama.cpp server (127.0.0.1:8082, on demand; the second card when you have two), and avatars from any photo (depth map + face points on the CPU) | ~2.9 GB (+0.2 GB CPU PyTorch if you have none) |
 | `ollama` | Use an Ollama you already have as the backend (checks it isn't open to your network) | nothing |
@@ -315,6 +324,7 @@ speaks a line).
 ```bash
 python -m installer remote setup   # Tailscale + API key + tailnet-only forward
 python -m installer remote check   # any time: is anything reachable that shouldn't be?
+python -m installer remote off     # stop the tailnet forward (it survives reboots otherwise)
 ```
 
 `remote setup` installs Tailscale if needed (pinned version, checksum and
@@ -327,7 +337,8 @@ tailnet devices and nothing else. It never uses Tailscale Funnel, which
 publishes to the internet.
 
 `remote check` changes nothing. It reports FAIL for any Artifex-related port
-(API, llama.cpp, Ollama, web gateway, vision helper) listening on your
+(API, llama.cpp, Ollama, web gateway, vision helper, Strata, the web dev
+server, and every model port in `llama_cpp_config.json`) listening on your
 network, for Funnel being on, and for a tailnet-reachable API without a
 strong key; it warns about an outdated Tailscale and a missing Tailnet Lock.
 

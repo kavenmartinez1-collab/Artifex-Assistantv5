@@ -17,6 +17,11 @@ from installer import recipes, remote
 from installer.fetch import VerifyError
 
 
+def _is_netstat(exe):
+    # remote.py runs it by its full System32 path
+    return os.path.basename(exe).lower() in ("netstat", "netstat.exe")
+
+
 def _netstat(*lines):
     return ("\n  Proto  Local Address  Foreign Address  State  PID\n"
             + "\n".join(lines) + "\n")
@@ -28,7 +33,7 @@ def fake_run(netstat="", version="1.104.4", backend="Running", serve=None, lock=
     def run(cmd, **kw):
         calls.append(cmd)
         out = ""
-        if cmd[0] == "netstat":
+        if _is_netstat(cmd[0]):
             out = netstat if cmd[-1] == "TCP" else ""
         elif cmd[1:] == ["version"]:
             out = version + "\n  tailscale commit: x\n"
@@ -123,7 +128,7 @@ def test_no_tailscale_is_local_only(monkeypatch, root):
 def test_check_never_changes_tailscale(ts_installed, root):
     run = fake_run(serve=SAFE_SERVE)
     remote.check_exposure(root, 8000, run=run)
-    ts_cmds = [c[1:] for c in run.calls if c[0] != "netstat"]
+    ts_cmds = [c[1:] for c in run.calls if not _is_netstat(c[0])]
     assert ts_cmds == [["version"], ["status", "--json"], ["serve", "status", "--json"],
                        ["lock", "status"]]
 

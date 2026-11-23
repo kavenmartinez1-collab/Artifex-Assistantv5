@@ -2,9 +2,9 @@
 
 Agent runs normally teach the model a text protocol — @read_file("path"),
 ```bash``` / ```edit``` blocks, @done(...) — through a long system prompt.
-Large models learn it from the prompt; small ones do not. LFM3-1.7B tried its
-trained XML call format first, then mixed the two, and needed five rounds for
-"write hello.txt and read it back" (2026-10-27). Its chat template already
+Large models learn it from the prompt; small ones do not. A 1.7B model tried
+its trained XML call format first, then mixed the two, and needed five rounds
+for "write hello.txt and read it back" (2026-10-27). Its chat template already
 knows how to call OpenAI-style tools, so a model entry marked
 "native_tools": true gets these definitions instead, and every call is turned
 into the same AgentAction the text parser would have produced. Policy checks,

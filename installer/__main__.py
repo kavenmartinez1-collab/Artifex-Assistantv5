@@ -48,13 +48,19 @@ def _ask(question: str, default: bool = False) -> bool:
 def _describe(pl) -> str:
     g = pl["gpu"]
     lines = [f"Backend: llama.cpp, {pl['variant_label']} ({pl['why']})",
-             f"GPU:     {g['name']}" if g else "GPU:     none (CPU)",
-             f"Model:   {pl['model']['label']}",
-             f"         {pl['model']['repo']} / {pl['model']['file']}",
-             f"License: {pl['model']['license']}",
-             f"Install: {pl['root']}",
-             f"Download at most {pl['download_mb'] / 1024:.1f} GB "
-             "(every file is checked against a SHA-256 pinned in installer/catalog.json)"]
+             f"GPU:     {g['name']}" if g else "GPU:     none (CPU)"]
+    if pl.get("profile"):
+        lines.append(f"Profile: {pl['profile']}")
+    for i, item in enumerate(pl["models"]):
+        m = item["model"]
+        tag = " (default)" if len(pl["models"]) > 1 and i == 0 else ""
+        lines += [f"Model:   {m['label']}{tag}",
+                  f"         {m['repo']} / {m['file']} ({m['size'] / (1 << 30):.1f} GB)",
+                  f"License: {m['license']}"]
+    lines += [f"Install: {pl['root']}",
+              f"Download at most {pl['download_mb'] / 1024:.1f} GB "
+              "(every file is checked against a SHA-256 pinned in installer/catalog.json)"]
+    lines += [f"WARNING: {w}" for w in pl.get("warnings") or []]
     return "\n".join(lines)
 
 
@@ -102,6 +108,21 @@ def _remote(a) -> int:
         except OSError as e:
             print(_NETWORK.format(e=e))
             return 5
+    if a.action == "off":
+        if not remote.tailscale_exe() or not remote.forward_is_on(a.port):
+            print(f"Phone access is already off: no Tailscale forward for port {a.port}.")
+            return 0
+        if not a.yes and not _ask(f"Turn off the Tailscale forward to port {a.port} "
+                                  "(the phone can't reach Artifex until you run setup again)?"):
+            print("Nothing changed.")
+            return 1
+        try:
+            remote.serve_off(a.port)
+        except (RuntimeError, ValueError) as e:
+            print(f"\nSTOPPED: {e}")
+            return 4
+        print("Phone access is off. Your API key file is kept; delete artifex_api_keys.json "
+              "too if you won't turn it back on.")
     findings = remote.check_exposure(root, a.port, min_version=min_v)
     print("\nExposure check:\n" + remote.report(findings))
     return 3 if any(f["level"] == remote.FAIL for f in findings) else 0
@@ -152,8 +173,15 @@ def main(argv=None) -> int:
     for name in ("plan", "install"):
         s = sub.add_parser(name)
         s.add_argument("--root", default=REPO_ROOT, help="install root (default: this Artifex folder)")
-        s.add_argument("--model", help="catalog model id (default: the best that fits)")
-        s.add_argument("--variant", help="llama.cpp build: cuda-13.4, cuda-12.4, vulkan, cpu")
+        s.add_argument("--model", action="append",
+                       help="catalog model id (default: the best that fits); repeat it for "
+                            "several, the first is the default")
+        s.add_argument("--profile", help="a machine profile: several models with flags "
+                                         "measured for that hardware (see: profiles)")
+        s.add_argument("--variant", help="llama.cpp build: cuda-13.5, cuda-12.4, vulkan, rocm-10.0, cpu")
+        s.add_argument("--models-dir", default="",
+                       help="put the model files in this folder (a second drive, say) "
+                            "instead of models/gguf")
         if name == "install":
             s.add_argument("--reuse", action="append", default=[],
                            help="folder to look in for model files you already have")
@@ -165,11 +193,12 @@ def main(argv=None) -> int:
             s.add_argument("--no-gui", action="store_true",
                            help="leave out the desktop GUI (PyQt6, ~100 MB)")
     rm = sub.add_parser("remote", help="phone access over Tailscale, and the exposure check")
-    rm.add_argument("action", choices=["check", "setup"])
+    rm.add_argument("action", choices=["check", "setup", "off"])
     rm.add_argument("--root", default=REPO_ROOT)
     rm.add_argument("--port", type=int, default=8000, help="Artifex API port (default 8000)")
     rm.add_argument("--model", help="model id the phone launcher starts with")
     rm.add_argument("--yes", action="store_true", help="don't ask before changing anything")
+    sub.add_parser("profiles", help="list the machine profiles")
     sub.add_parser("packs", help="list the optional packs")
     pk = sub.add_parser("pack", help="install an optional pack")
     pk.add_argument("id")
@@ -177,10 +206,23 @@ def main(argv=None) -> int:
     pk.add_argument("--yes", action="store_true", help="don't ask first")
     mn = sub.add_parser("menu", help="install if needed, then a numbered menu (what setup.cmd shows)")
     mn.add_argument("--root", default=REPO_ROOT)
+    un = sub.add_parser("uninstall", help="list what the installer put here, then remove it (asks first)")
+    un.add_argument("--root", default=REPO_ROOT)
+    un.add_argument("--port", type=int, default=8000, help="API port whose Tailscale forward to turn off")
+    un.add_argument("--yes", action="store_true", help="don't ask first")
+    dr = sub.add_parser("doctor", help="check what this PC and this folder still need (read-only)")
+    dr.add_argument("--root", default=REPO_ROOT)
     a = ap.parse_args(argv)
 
     if a.cmd == "menu":
         return _menu(a.root)
+    if a.cmd == "doctor":
+        from installer import doctor
+        findings = doctor.check(a.root)
+        print(doctor.report(findings))
+        return 3 if any(f["level"] == doctor.FAIL for f in findings) else 0
+    if a.cmd == "uninstall":
+        return _uninstall(a)
     if a.cmd in ("packs", "pack"):
         return _packs(a)
     if a.cmd == "probe":
@@ -190,6 +232,27 @@ def main(argv=None) -> int:
     if a.cmd == "remote":
         return _remote(a)
     return _install(a)
+
+
+def _uninstall(a) -> int:
+    from installer import remote, uninstall
+    root = os.path.abspath(a.root)
+    fwd = bool(remote.tailscale_exe()) and remote.forward_is_on(a.port)
+    pl = uninstall.plan(root, recipes.load_catalog(), tailscale_forward=fwd)
+    if not pl["items"] and not pl["config_entries"] and not fwd:
+        print("Nothing the installer made is left in " + root)
+        return 0
+    print(f"Uninstall will remove, from {root}:\n" + uninstall.describe(pl))
+    print("Close Artifex first (its files can't be deleted while it runs).")
+    if not a.yes and not _ask("\nRemove all of the above?"):
+        print("Nothing removed.")
+        return 1
+    failed = uninstall.remove(pl, serve_off=lambda: remote.serve_off(a.port))
+    if failed:
+        print("\nNot removed:\n" + "\n".join(f"  {p}: {why}" for p, why in failed))
+        return 4
+    print("\nDone. The Artifex code is still in this folder; delete the folder to remove it too.")
+    return 0
 
 
 def _start(root: str, gui: bool) -> None:
@@ -232,6 +295,9 @@ def _menu(root: str, main_fn=None) -> int:
                 "  4  Use it from my phone (private, over Tailscale)\n"
                 "  5  Check that nothing is reachable from the network\n"
                 "  6  Run the install again (adds anything missing, changes nothing else)\n"
+                "  7  Turn phone access off\n"
+                "  8  Uninstall (lists what it would remove, asks first)\n"
+                "  9  Check this PC: what's missing or out of date (changes nothing)\n"
                 "  Enter  Close")
         try:
             pick = input("> ").strip().lower()
@@ -264,29 +330,86 @@ def _menu(root: str, main_fn=None) -> int:
         elif pick == "5":
             main_fn(["remote", "check", "--root", root])
         elif pick == "6":
-            main_fn(["install", "--root", root])
+            # Repeat THIS folder's install (its profile, or the models it was
+            # given by id, and a backend picked by hand); the generic plan would
+            # add a different model and make it the default.
+            main_fn(["install", "--root", root] + recipes.rerun_args(root, recipes.load_catalog()))
+        elif pick == "7":
+            main_fn(["remote", "off", "--root", root])
+        elif pick == "8":
+            if main_fn(["uninstall", "--root", root]) == 0:
+                return 0
+        elif pick == "9":
+            main_fn(["doctor", "--root", root])
         else:
             print("Type one of the numbers above, or press Enter to close.")
+
+
+def _done(ids: list, starts: str) -> str:
+    """The last line of an install. `starts` is the model Artifex opens with
+    (the first one in the config), which is not the one just installed when
+    the config already had models."""
+    if starts and starts != ids[0]:
+        return (f"Done. Added {', '.join(repr(i) for i in ids)}. Your existing '{starts}' is "
+                "still the one the app opens with; pick the new one in the model list.")
+    return (f"Done. Artifex starts with '{ids[0]}'"
+            + (f"; switch to {', '.join(repr(i) for i in ids[1:])} in the model list."
+               if len(ids) > 1 else "."))
 
 
 _NETWORK = ("\nSTOPPED: {e}\nIf that was the internet connection or a full disk, fix it and run "
             "this again: finished files are kept and a half-fetched one continues where it stopped.")
 
 
+def _free_mb(path: str) -> int:
+    import shutil
+    path = os.path.abspath(path)
+    while not os.path.exists(path) and os.path.dirname(path) != path:
+        path = os.path.dirname(path)
+    try:
+        return shutil.disk_usage(path).free >> 20
+    except OSError:
+        return 0
+
+
 def _install(a) -> int:
     catalog = recipes.load_catalog()
+    if a.cmd == "profiles":
+        for pid, prof in (catalog.get("profiles") or {}).items():
+            print(f"  {pid:12} {prof['label']}")
+            for e in prof["models"]:
+                print(f"  {'':12}   {e['id']}")
+        print("\nInstall one with: " + hint("install --profile <id>"))
+        return 0
     p = probe_mod.probe(a.root)
     try:
-        pl = recipes.plan(p, catalog, a.root, model_id=a.model, variant=a.variant)
+        pl = recipes.plan(p, catalog, a.root, model_id=a.model, variant=a.variant,
+                          profile_id=a.profile, models_dir=a.models_dir)
     except ValueError as e:
         print(f"error: {e}")
         return 2
     print(probe_mod.summary(p) + "\n\n" + _describe(pl))
-    need_mb = pl["download_mb"] * 2 + 1024        # zips unpack next to themselves
-    if p["free_disk_mb"] and p["free_disk_mb"] < need_mb:
+    to_fetch_mb, disk_mb = recipes.missing_mb(pl)
+    print("Everything is already downloaded." if not to_fetch_mb else
+          f"Still to download: {to_fetch_mb / 1024:.1f} GB")
+    need_mb = disk_mb + 1024 if to_fetch_mb else 0
+    if need_mb and p["free_disk_mb"] and p["free_disk_mb"] < need_mb:
         print(f"\nNot enough disk space: about {need_mb / 1024:.1f} GB needed, "
               f"{p['free_disk_mb'] / 1024:.1f} GB free.")
         return 3
+    if a.models_dir:
+        # Models on another drive: that drive needs room for them.
+        models_mb = sum(i["model"]["size"] for i in pl["models"]
+                        if not os.path.isfile(i["model_path"])) >> 20
+        free = _free_mb(pl["models_dir"])
+        if models_mb and free and free < models_mb + 1024:
+            print(f"\nNot enough space for the models in {pl['models_dir']}: about "
+                  f"{(models_mb + 1024) / 1024:.1f} GB needed, {free / 1024:.1f} GB free.")
+            return 3
+    problems = recipes.preflight(pl, env=not getattr(a, "no_env", False))
+    if problems:
+        print("\n" + "\n".join(f"error: {e}" for e in problems))
+        return 2
     if a.cmd == "plan":
         return 0
     if not a.yes and not _ask("\nInstall this?"):
@@ -294,6 +417,7 @@ def _install(a) -> int:
         return 1
     try:
         recipes.install_core(pl, catalog, reuse_dirs=a.reuse, force=a.force, progress=_bar)
+        recipes.save_state(pl, variant_chosen=bool(a.variant))
         if not a.no_env:
             recipes.install_env(pl["root"], gui=not a.no_gui)
             for path in recipes.write_launchers(pl["root"], pl["model"]["id"], gui=not a.no_gui):
@@ -307,10 +431,21 @@ def _install(a) -> int:
     except OSError as e:
         print(_NETWORK.format(e=e))
         return 5
-    print("\nDone. Start Artifex and pick "
-          f"'{pl['model']['id']}' in the model list.")
+    ids = [item["model"]["id"] for item in pl["models"]]
+    print("\n" + _done(ids, recipes.default_model_id(pl["config_path"])))
     return 0
 
 
+def run(argv=None) -> int:
+    """main(), with Ctrl+C or a closed window turned into a plain message
+    instead of a traceback. Downloads keep their .part files either way."""
+    try:
+        return main(argv)
+    except KeyboardInterrupt:
+        print("\n\nStopped (Ctrl+C). Finished downloads are kept, and a half-fetched file "
+              "continues where it stopped: run the same command again.")
+        return 130
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())

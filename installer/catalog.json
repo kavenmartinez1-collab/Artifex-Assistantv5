@@ -2,21 +2,22 @@
   "_comment": "Every file the installer may download. Pinned: a fixed release tag or a Hugging Face commit, the exact size and the SHA-256, all stored HERE in the repo, so a swapped file on the server is refused rather than run. To add or bump an entry, take the digest from the GitHub release API (asset.digest) or the Hugging Face tree API at a commit (lfs.oid), never from the download itself.",
   "schema": 1,
   "llama_cpp": {
-    "tag": "b11945",
-    "base_url": "https://github.com/ggml-org/llama.cpp/releases/download/b11945/",
+    "_comment": "b12651 (commit f5e6915c2, 2026-11-23): the newest Windows build set; first with Inkling 2 Mini (inkling2_loop, merged in b12600) and a Windows ROCm build. The tagged v1.0.0 release has no Windows zips. Sizes and sha256 are GitHub's own asset digests (checked against the CPU zip downloaded 2026-11-23). v1.0 removed --no-mmap: use -lm dio.",
+    "tag": "b12651",
+    "base_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12651/",
     "variants": {
-      "cuda-13.4": {
+      "cuda-13.5": {
         "label": "NVIDIA CUDA 13",
         "files": [
           {
-            "name": "llama-b11945-bin-win-cuda-13.4-x64.zip",
-            "size": 164817929,
-            "sha256": "590b7fd0a85ffea0ca09419a60d31fa5e38126a6a0eba42b12cd76a4f00f8761"
+            "name": "llama-b12651-bin-win-cuda-13.5-x64.zip",
+            "size": 225702093,
+            "sha256": "5ad87e0771f3a129f6461b5fc706d8c2c5e5b71b2bd1f953a4221ca4d7797fef"
           },
           {
-            "name": "cudart-llama-bin-win-cuda-13.4-x64.zip",
-            "size": 423535356,
-            "sha256": "738f8c251ac22b70c3ae6f83a10cf222725df0395246a2cf58f32bdb85fbe668"
+            "name": "cudart-llama-bin-win-cuda-13.5-x64.zip",
+            "size": 426314199,
+            "sha256": "c2bf4cc202bfbaaa7a0b75f5082457c3811326947bb216059b72839d844e9cba"
           }
         ]
       },
@@ -24,9 +25,9 @@
         "label": "NVIDIA CUDA 12",
         "files": [
           {
-            "name": "llama-b11945-bin-win-cuda-12.4-x64.zip",
-            "size": 279503533,
-            "sha256": "1227c700c4f1687d85da15c83eb00df70e9219d30890d27f9543d2af082a12b2"
+            "name": "llama-b12651-bin-win-cuda-12.4-x64.zip",
+            "size": 358031654,
+            "sha256": "1a6c090f76fab41260b5b7597c6fb1add1fad2efaac692ae2673a22366220a29"
           },
           {
             "name": "cudart-llama-bin-win-cuda-12.4-x64.zip",
@@ -39,9 +40,20 @@
         "label": "Vulkan (AMD, Intel, or NVIDIA without a new enough driver)",
         "files": [
           {
-            "name": "llama-b11945-bin-win-vulkan-x64.zip",
-            "size": 37240393,
-            "sha256": "3b9ccbffb6b293860de1dfb9942eae48806166a12266708898021a8d2e34da67"
+            "name": "llama-b12651-bin-win-vulkan-x64.zip",
+            "size": 38939211,
+            "sha256": "e58fa9a137d8046c69334005ad6fb3e904ddc7e56f2a61ad1b844335826ef3f4"
+          }
+        ]
+      },
+      "rocm-10.0": {
+        "label": "AMD ROCm 10 (opt-in: --variant rocm-10.0; never picked automatically)",
+        "auto": false,
+        "files": [
+          {
+            "name": "llama-b12651-bin-win-rocm-10.0-x64.zip",
+            "size": 284457025,
+            "sha256": "2773845442fee43a21031f6d264bc1f41a870be7980892e2cd7a2d46cedc30bd"
           }
         ]
       },
@@ -49,9 +61,9 @@
         "label": "CPU only",
         "files": [
           {
-            "name": "llama-b11945-bin-win-cpu-x64.zip",
-            "size": 24314391,
-            "sha256": "c420f05240e1af28c2194b9a4741ef797142a0cca783c6079be792de88e72d78"
+            "name": "llama-b12651-bin-win-cpu-x64.zip",
+            "size": 25096571,
+            "sha256": "b2d794fa7587aba29f654d717ff9b73e31caeabf50a7766692903008bbe0855d"
           }
         ]
       }
@@ -59,14 +71,14 @@
   },
   "chat_models": [
     {
-      "id": "lfm3-1.7b",
-      "label": "LFM3 1.7B (small and fast; runs on any PC)",
-      "repo": "LiquidAI/LFM3-1.7B-GGUF",
-      "revision": "4b423c332fd97961416f2e8b69467758fd27370d",
-      "file": "LFM3-1.7B-Q4_K_M.gguf",
-      "size": 1099627808,
-      "sha256": "3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4",
-      "license": "LFM Open License v1.0 (LiquidAI; check commercial terms)",
+      "id": "qwen3.5-2b",
+      "label": "Qwen3.5 2B (small and fast; runs on any PC, even without a GPU)",
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae",
+      "file": "Qwen3.5-2B-Q4_K_M.gguf",
+      "size": 1280835840,
+      "sha256": "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
+      "license": "Apache-2.0",
       "min_vram_mb": 0,
       "num_ctx": 32768,
       "native_tools": true,
@@ -76,12 +88,28 @@
         "-np",
         "1",
         "--jinja",
-        "--metrics",
-        "--reasoning-budget",
-        "2048",
-        "--reasoning-budget-message",
-        "Time to answer."
-      ]
+        "--reasoning-format",
+        "deepseek",
+        "--metrics"
+      ],
+      "engine": {
+        "sampling": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "_source": "Qwen3.5 small models, non-thinking recommendation. Measured 2026-11-23 (CPU, b12651): tool bench 27/27 at presence 0 and 1.5; long answers 1.9% -> 0% repeated text at 1.5."
+        }
+      },
+      "mmproj": {
+        "repo": "unsloth/Qwen3.5-2B-GGUF",
+        "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae",
+        "file": "mmproj-F16.gguf",
+        "size": 668227264,
+        "sha256": "7035e9cb8d7c6a9681d07eef9a364783e86ea4cd73faab2eabb4f43a101830c7"
+      },
+      "_comment": "Replaced LFM3 1.7B on 2026-11-23 (LFM Open License has a revenue cap). Artifex tool bench on an i5-14400F: Qwen3.5-2B 27/27 at ~35 tok/s; LFM3 21/27; MiniCPM5-2B 20/27; Qwen3.5-4B 26/27 at ~16 tok/s."
     },
     {
       "id": "qwen3.5-9b-q4km",
@@ -148,6 +176,54 @@
         "size": 927607008,
         "sha256": "cb0a71fe9b84af2552fc6260acf8e9773a29d115c683aba01c72a7ac537b212b"
       }
+    },
+    {
+      "id": "inkling-2-mini-iq4nl",
+      "label": "Inkling 2 Mini (26B MoE, 3.4B active; one 24 GB card)",
+      "repo": "ggml-org/Inkling-2-Mini-GGUF",
+      "revision": "e8a2cecf0e78914f07cc27b9be711a9b2c7561d9",
+      "file": "Inkling-2-Mini-IQ4_NL.gguf",
+      "size": 17627940768,
+      "sha256": "cbdf3fa9dc50a4124977980f37da4f1fa764b0cfe800d275cd43d26ce2a81af4",
+      "license": "Apache-2.0 (Thinking Machines' Inkling 2 Mini; ggml-org quantization)",
+      "min_vram_mb": 22000,
+      "num_ctx": 65536,
+      "auto": false,
+      "native_tools": true,
+      "extra_flags": [
+        "-fa",
+        "on",
+        "-ctk",
+        "q8_0",
+        "-ctv",
+        "q8_0",
+        "-np",
+        "1",
+        "--jinja",
+        "--reasoning-format",
+        "deepseek",
+        "--metrics",
+        "--chat-template-kwargs",
+        "{\"reasoning_effort\":\"none\"}"
+      ],
+      "engine": {
+        "reasoning_always": true,
+        "sampling": {
+          "temperature": 1.0,
+          "top_k": 50,
+          "top_p": 1.0,
+          "min_p": 0.0,
+          "_source": "Inkling 2 release defaults (GGUF general.sampling.*); Artifex's balanced preset made it loop (2026-11-21)"
+        }
+      },
+      "mmproj": {
+        "repo": "ggml-org/Inkling-2-Mini-GGUF",
+        "revision": "e8a2cecf0e78914f07cc27b9be711a9b2c7561d9",
+        "file": "mmproj-Inkling-2-Mini-Q8_0.gguf",
+        "size": 345910944,
+        "sha256": "233287272ec5ac39b4168677aba54a4c024f202410f5629fac1830e1059f8abb"
+      },
+      "_comment": "Opt-in (--model inkling-2-mini-iq4nl): needs llama.cpp b12600+ (inkling2_loop). Stock settings; no drafter (DSpark is an unmerged PR). The template ignores enable_thinking, so the server default is reasoning_effort none and reasoning_always keeps the reasoning parser on. KLD vs Q8_0 0.0125, top-1 95.9% (measured 2026-11-20). On two smaller cards it can be split, but that needs hand-placed layers."
     }
   ],
   "allowed_hosts": [
@@ -219,25 +295,28 @@
     "_comment": "Voice pack model files, pinned to a commit. Large files' SHA-256 come from the Hugging Face LFS pointer; small (non-LFS) files were downloaded at that commit and hashed when pinning, since Hugging Face only gives their git hash."
   },
   "vision_helper": {
-    "_comment": "Vision pack: LFM3-VL-2B on the CPU (core/vision_helper.py) for the Create prompt assist and agent image tools when the chat model can't see.",
+    "_comment": "Vision pack: Qwen3.5-2B (the same file as the small chat model) + its image encoder on the CPU (core/vision_helper.py), for the Create prompt assist and agent image tools when the chat model can't see. Measured 2026-11-23 against LFM3-VL: shape boxes IoU 0.78-0.90 (LFM3-VL: unreadable JSON), describe OK, edit prompts 8/8 valid with the assist's JSON schema, 9-19 s per photo on an i5-14400F.",
     "model": {
-      "repo": "LiquidAI/LFM3-VL-2B-GGUF",
-      "revision": "017b19da2dcffadb41d67745941f3d785f0d162f",
-      "file": "LFM3-VL-2B-Q4_K_M.gguf",
-      "size": 1099627808,
-      "sha256": "56dac2e192ff0d9ab8507f4f1aeb4aed0463449bbbefaac79497f041c95f21eb"
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae",
+      "file": "Qwen3.5-2B-Q4_K_M.gguf",
+      "size": 1280835840,
+      "sha256": "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223"
     },
     "mmproj": {
-      "repo": "LiquidAI/LFM3-VL-2B-GGUF",
-      "revision": "017b19da2dcffadb41d67745941f3d785f0d162f",
-      "file": "mmproj-LFM3-VL-2B-Q8_0.gguf",
-      "size": 203031872,
-      "sha256": "c5c5b58d544a18da919172d2d0368090ea1a4a351b6feb7f8a326a264a5918ab"
+      "repo": "unsloth/Qwen3.5-2B-GGUF",
+      "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae",
+      "file": "mmproj-F16.gguf",
+      "size": 668227264,
+      "sha256": "7035e9cb8d7c6a9681d07eef9a364783e86ea4cd73faab2eabb4f43a101830c7"
     },
-    "license": "LFM Open License v1.0 (LiquidAI; check commercial terms)",
+    "license": "Apache-2.0",
     "num_ctx": 8192,
     "port": 8095,
-    "idle_unload_s": 600
+    "idle_unload_s": 600,
+    "sampling": {
+      "presence_penalty": 1.5
+    }
   },
   "bootstrap_python": {
     "_comment": "Portable Python for setup.cmd when no Python 3.11-3.13 is installed: python.org's NuGet build (a plain zip; no installer, registry or PATH changes), unpacked into <root>/python. sha512 = NuGet's catalog packageHash for this version (base64-decoded), not taken from the download; get-python.ps1 also requires python.exe to be Authenticode-signed by the Python Software Foundation.",
@@ -258,22 +337,22 @@
     "sha256": "d2046d28c2c3dcd211ac5145c0bf30e2047ef9dfb306693c8c6e2eccd8b95fa5"
   },
   "webgpu": {
-    "_comment": "Artifex Web's model: the chat_models entry named by `model` (same pinned GGUF) plus the tokenizer from the base repo, which the GGUF repo doesn't ship. Placed in webgpu/models/<model_dir>, which the app lists as local/<model_dir>. tokenizer.json sha256 = the Hugging Face tree API's lfs.oid at this commit; tokenizer_config.json is not LFS, so its sha256 was taken from the file whose git blob id matched the tree API's oid (562b1ed0...) at this commit.",
-    "model": "lfm3-1.7b",
-    "model_dir": "lfm3-1.7b",
+    "_comment": "Artifex Web's model: the chat_models entry named by `model` (same pinned GGUF) plus the tokenizer from the base repo, which the GGUF repo doesn't ship. Placed in webgpu/models/<model_dir>, which the app lists as local/<model_dir>. tokenizer.json sha256 = the Hugging Face tree API's lfs.oid at this commit; tokenizer_config.json is not LFS, so its sha256 was taken from the file whose git blob id matched the tree API's oid (fae3ce99...) at this commit.",
+    "model": "qwen3.5-2b",
+    "model_dir": "qwen3.5-2b",
     "tokenizer": {
-      "repo": "LiquidAI/LFM3-1.7B",
-      "revision": "ac2586a34f1a1c03329dbdcdefabd8b6478ddaa7",
+      "repo": "Qwen/Qwen3.5-2B",
+      "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
       "files": [
         {
           "file": "tokenizer.json",
-          "size": 17908635,
-          "sha256": "7e226e34bface23ccf6e495d157bf77186c1c30a7659880e1a8994db528c3701"
+          "size": 12807982,
+          "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
         },
         {
           "file": "tokenizer_config.json",
-          "size": 1545,
-          "sha256": "bf028f813efc6137bc07ed045cafe71820df9a5e26a38e39954706ed1e30a457"
+          "size": 16709,
+          "sha256": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
         }
       ]
     }
@@ -282,40 +361,40 @@
     "_comment": "A Tale of Yarn (the WebGPU game), cloned over https and checked out at this exact commit; git verifies the content by hash. Bump deliberately after reviewing the new commits.",
     "name": "A Tale of Yarn",
     "repo": "https://github.com/kavenmartinez1-collab/A_Tale_of_Yarn.git",
-    "commit": "8b9e5e6cc9506ea54f6e2d8eac440f323e7a4923",
+    "commit": "e897c87eed0a464906475a00261f52f302a1a423",
     "dest": "games/a-tale-of-yarn",
     "models": [
       {
-        "dest": "models/LiquidAI--LFM3-1.7B-GGUF/LFM3-1.7B-Q4_K_M.gguf",
-        "repo": "LiquidAI/LFM3-1.7B-GGUF",
-        "revision": "4b423c332fd97961416f2e8b69467758fd27370d",
-        "path": "LFM3-1.7B-Q4_K_M.gguf",
-        "size": 1099627808,
-        "sha256": "3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4"
+        "dest": "models/unsloth--Qwen3.5-2B-GGUF/Qwen3.5-2B-Q4_K_M.gguf",
+        "repo": "unsloth/Qwen3.5-2B-GGUF",
+        "revision": "f6d5376be1edb4d416d56da11e5397a961aca8ae",
+        "path": "Qwen3.5-2B-Q4_K_M.gguf",
+        "size": 1280835840,
+        "sha256": "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223"
       },
       {
-        "dest": "models/LiquidAI--LFM3-1.7B-GGUF/tokenizer.json",
-        "repo": "LiquidAI/LFM3-1.7B",
-        "revision": "ac2586a34f1a1c03329dbdcdefabd8b6478ddaa7",
+        "dest": "models/unsloth--Qwen3.5-2B-GGUF/tokenizer.json",
+        "repo": "Qwen/Qwen3.5-2B",
+        "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
         "path": "tokenizer.json",
-        "size": 17908635,
-        "sha256": "7e226e34bface23ccf6e495d157bf77186c1c30a7659880e1a8994db528c3701"
+        "size": 12807982,
+        "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
       },
       {
-        "dest": "models/LiquidAI--LFM3-1.7B-GGUF/tokenizer_config.json",
-        "repo": "LiquidAI/LFM3-1.7B",
-        "revision": "ac2586a34f1a1c03329dbdcdefabd8b6478ddaa7",
+        "dest": "models/unsloth--Qwen3.5-2B-GGUF/tokenizer_config.json",
+        "repo": "Qwen/Qwen3.5-2B",
+        "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
         "path": "tokenizer_config.json",
-        "size": 1545,
-        "sha256": "bf028f813efc6137bc07ed045cafe71820df9a5e26a38e39954706ed1e30a457"
+        "size": 16709,
+        "sha256": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
       },
       {
-        "dest": "models/LiquidAI--LFM3-1.7B-GGUF/LICENSE",
-        "repo": "LiquidAI/LFM3-1.7B-GGUF",
-        "revision": "4b423c332fd97961416f2e8b69467758fd27370d",
+        "dest": "models/unsloth--Qwen3.5-2B-GGUF/LICENSE",
+        "repo": "Qwen/Qwen3.5-2B",
+        "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
         "path": "LICENSE",
-        "size": 10574,
-        "sha256": "4d28ca14dedc0b3d0fcc2b3339f0e79931faa33874f3d24f522183a8fc70068c"
+        "size": 11544,
+        "sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
       },
       {
         "dest": "models/Xenova--whisper-base.en/onnx/encoder_model_quantized.onnx",
@@ -406,7 +485,7 @@
         "sha256": "141d612cc0a95ed7efc1ca936b845c2364967f2e9217c5dbfcf69fc4d6c65860"
       }
     ],
-    "models_comment": "The game's ship set (scripts/fetch-weights.mts at the pinned commit), each file pinned to a Hugging Face commit. Since 2026-10-28 the NPC + Director model is LiquidAI LFM3-1.7B (the game is free, so the LFM Open License v1.0 revenue cap does not apply; its LICENSE ships beside the weights): GGUF sha256 = the HF tree API lfs.oid; tokenizer_config.json and LICENSE are not LFS, so their sha256 were taken from files whose git blob ids matched the tree API at those commits. The other 11 are unchanged from the previous pin.",
+    "models_comment": "The game's ship set (scripts/fetch-weights.mts at the pinned commit), each file pinned to a Hugging Face commit. Since 2026-11-23 (game e897c87) the NPC + Director model is Qwen3.5-2B (Apache-2.0; it replaced LFM3, whose licence has a revenue cap): the GGUF from unsloth/Qwen3.5-2B-GGUF, the tokenizer, tokenizer_config and LICENSE from the base repo Qwen/Qwen3.5-2B (the GGUF repo ships none), placed in the GGUF repo's folder where the game looks. tokenizer_config.json and LICENSE are not LFS: their sha256 were taken from files whose git blob ids matched the tree API. The other 11 are unchanged from the previous pin.",
     "cmudict": {
       "_comment": "Source for the pronunciation lexicon. Placed in build-lexicon.mts's cache so it never fetches master; the built output is then checked against expected_output.",
       "commit": "74790861f652b15e4ac49015a90074ad62a27690",
@@ -431,90 +510,484 @@
     }
   },
   "strata": {
-    "_comment": "Qwen3.8-Flash-Next (ISTA-DASLab GSQ-RCO IQ2_XS) on the Strata engine, run by Artifex through the llama.cpp engine's external_launcher on 127.0.0.1 only. Everything is pinned: the Strata source by commit (v0.2.7), the engine package per GPU family (release v0.2.7 assets; Strata's setup also checks them against its Ed25519-signed feed), the model shards and the llama.cpp source (size + sha256). The MTP draft layer is fetched by Strata's tools/mtp_fetch.py, which checks every tensor against the SHA-256 pinned in that commit; the pack runs its verify step afterwards. Settings measured 2026-10-29 on an RX 6700 XT + 32 GB: route prior 1.25, VRAM reserve 700, spec 3.",
+    "_comment": "Qwen3.8-Flash-Next (ISTA-DASLab GSQ-RCO IQ3_XXS) on stock Strata 0.2.20, one GPU, run by Artifex through the llama.cpp engine's external_launcher on 127.0.0.1 only. The installer does every step itself from pinned inputs: Strata's terminal/ folder at a pinned commit (sparse checkout, no setup.py), the engine archive for this GPU (sha256 = GitHub's asset digest, and its Ed25519-signed manifest checked offline against key engine_key_id), the two model shards, and the MTP draft layer's 31 tensors as byte ranges of the base model's shards (each tensor's sha256 pinned below, from Strata's own pinned table). The expert pack is built offline by Strata's iq_pack.py with --experts-bin (~40 GB): a 32 GB PC runs Strata's low-RAM resident mode, which reads the experts from it (without it the 0.1.66 engine crashes in that mode, found 2026-11-23). Measured 2026-11-23 on an RX 6700 XT 12 GB + 32 GB RAM: 25.4 tok/s decode at 32K (stock 0.2.20, single card).",
     "repo": "https://github.com/Niko1221/Strata.git",
-    "commit": "5e8a4cca7d690ac60ca37eb09e7d0e010099ad6d",
-    "version": "0.2.7",
-    "engine_version": "0.1.52",
+    "commit": "a34979fc94f3d126b9bb8210f4ad311345688b52",
+    "version": "0.2.20",
+    "engine_version": "0.1.66",
+    "engine_key_id": "5d1bc23abbeffd0d",
+    "sparse": [
+      "terminal"
+    ],
     "dest": "strata/Strata",
-    "models_dest": "strata/models/IQ2_XS",
+    "models_dest": "strata/models/IQ3_XXS",
     "data_dest": "strata/data",
-    "model_id": "qwen3.8-flash-next-iq2xs",
+    "model_id": "qwen3.8-flash-next-iq3xxs",
     "port": 8085,
     "engines": {
-      "hip-rdna2": {
-        "url": "https://github.com/Niko1221/Strata/releases/download/v0.2.7/strata-engine-0.1.52-windows-x86_64-hip-rdna2.tar.gz",
-        "size": 169523898,
-        "sha256": "7b1ce2e5111865990deef04d7b6be65766a35cebfa4760e2bc077fc075f4965a"
-      },
-      "hip-rdna3": {
-        "url": "https://github.com/Niko1221/Strata/releases/download/v0.2.7/strata-engine-0.1.52-windows-x86_64-hip-rdna3.tar.gz",
-        "size": 270617476,
-        "sha256": "6201c5c879791108ee05514c3c322c062a6c40f4da72f664db3a57b8fc024b78"
-      },
-      "hip-rx9070": {
-        "url": "https://github.com/Niko1221/Strata/releases/download/v0.2.7/strata-engine-0.1.52-windows-x86_64-hip-rx9070.tar.gz",
-        "size": 564606929,
-        "sha256": "9ae13a5146c73a2328a3db3b55b190c93b9a138cd56b1df337d942836137f19b"
+      "cuda-cuda12": {
+        "url": "https://github.com/Niko1221/Strata/releases/download/v0.2.20/strata-engine-0.1.66-windows-x86_64-cuda-cuda12.tar.gz",
+        "size": 754388005,
+        "sha256": "dd24509106a5dd200c1f82be116ecc0091f7a5940e5b42dbb707bb78e8705d5b"
       },
       "cuda-cuda13": {
-        "url": "https://github.com/Niko1221/Strata/releases/download/v0.2.7/strata-engine-0.1.52-windows-x86_64-cuda-cuda13.tar.gz",
-        "size": 620430878,
-        "sha256": "bfa68c6b2e92f9c273caaf937d9ae164918e6de4cca2dc1f1d79d32470f0915a"
+        "url": "https://github.com/Niko1221/Strata/releases/download/v0.2.20/strata-engine-0.1.66-windows-x86_64-cuda-cuda13.tar.gz",
+        "size": 494695625,
+        "sha256": "d0fa583e60aaf1d256926b6ea9889ff3ce42a98dbf56f2b556703a76b65e0a64"
       },
-      "cuda-cuda12": {
-        "url": "https://github.com/Niko1221/Strata/releases/download/v0.2.7/strata-engine-0.1.52-windows-x86_64-cuda-cuda12.tar.gz",
-        "size": 902234283,
-        "sha256": "bebe32feee424ecf067d82cdde0d7afd68794784abf45d467b3f60f64ad6e89f"
-      }
-    },
-    "feed": [
-      {
-        "url": "https://github.com/Niko1221/Strata/releases/download/v0.2.7/strata-feed.json",
-        "size": 15490,
-        "sha256": "ebd8e15a378ff3e7a136d6530f174610748c0315927d90eb966e0593d8263ee0"
+      "hip-rdna2": {
+        "url": "https://github.com/Niko1221/Strata/releases/download/v0.2.20/strata-engine-0.1.66-windows-x86_64-hip-rdna2.tar.gz",
+        "size": 167421956,
+        "sha256": "a2de379e9fbb7043465bd4e138b031949651a3cadeb80f3c83a1fe3657f5ce95"
       },
-      {
-        "url": "https://github.com/Niko1221/Strata/releases/download/v0.2.7/strata-feed.json.sig",
-        "size": 151,
-        "sha256": "53057b6da54cf1810ea754cffded580dc504c4180f168dfbb994f70a31162cf0"
+      "hip-rdna3": {
+        "url": "https://github.com/Niko1221/Strata/releases/download/v0.2.20/strata-engine-0.1.66-windows-x86_64-hip-rdna3.tar.gz",
+        "size": 220395581,
+        "sha256": "568b97fd55ac1309c38f2cce00597f5b327c7989fc32fe7b49d9f9772883977b"
+      },
+      "hip-rx9070": {
+        "url": "https://github.com/Niko1221/Strata/releases/download/v0.2.20/strata-engine-0.1.66-windows-x86_64-hip-rx9070.tar.gz",
+        "size": 537054165,
+        "sha256": "1f6c4a969cc41068423b8cee4e4996055f96cccbfb50eb2f113dfa8af626d5a0"
       }
-    ],
-    "llama_cpp_source": {
-      "url": "https://github.com/ggml-org/llama.cpp/archive/3cf03257f219afbe7334045ff7c6a06ac68c627d.zip",
-      "size": 39564399,
-      "sha256": "cbe23c594282ead2937abb3f008e51fcec4609d9256652fff42c7cc1c21ea47b",
-      "dest_in_strata": "third_party/llama.cpp-3cf0325.zip"
     },
     "model": {
       "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
       "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
       "files": [
         {
-          "path": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
-          "size": 39225954592,
-          "sha256": "92cee27ae5bbadcd732416a0f7a7f0acc092399dbbe8f5a5efa707c2ec0a49d7"
+          "path": "IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+          "size": 47039860096,
+          "sha256": "219ea929900dfa9ef091f3aa473fdba6874b65fcb36526d7d851ac9e95856d15"
         },
         {
-          "path": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+          "path": "IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
           "size": 28800138432,
-          "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"
+          "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113",
+          "_comment": "the same file as IQ2_XS's shard 2: an older pack's copy is linked, not downloaded again"
+        }
+      ]
+    },
+    "older_models_dest": [
+      "strata/models/IQ2_XS"
+    ],
+    "mtp": {
+      "repo": "Qwen/Qwen3.8-Flash-Next",
+      "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+      "tensors": [
+        {
+          "name": "mtp.fc_embedding.weight",
+          "shard": "model-00120-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            2560,
+            2560
+          ],
+          "start": 1935412640,
+          "end": 1948519839,
+          "bytes": 13107200,
+          "sha256": "241d6e87ded317a61b1aeb3ca4e28c53f1caba09ad5be66092e91fe5e3e14751"
+        },
+        {
+          "name": "mtp.fc_hidden.weight",
+          "shard": "model-00124-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            2560,
+            2560
+          ],
+          "start": 1716599928,
+          "end": 1729707127,
+          "bytes": 13107200,
+          "sha256": "97c8e427ad0177e2c713ed24a397d815b523eda15ef453f1ae6463f6c70a8f96"
+        },
+        {
+          "name": "mtp.hyper_connection_mixer.hc_norm.weight",
+          "shard": "model-00037-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            10240
+          ],
+          "start": 1742326680,
+          "end": 1742347159,
+          "bytes": 20480,
+          "sha256": "ce948a398e15aeaa403c424cda34e6eed296ab2570d591bb5ff3da642b255d64"
+        },
+        {
+          "name": "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+          "shard": "model-00041-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            320,
+            10240
+          ],
+          "start": 1935412688,
+          "end": 1941966287,
+          "bytes": 6553600,
+          "sha256": "c633d2841fda463e82045e0b93fb8cb8d511ec0c9eda616020f01aca18d71947"
+        },
+        {
+          "name": "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+          "shard": "model-00043-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            10240,
+            320
+          ],
+          "start": 1832518416,
+          "end": 1839072015,
+          "bytes": 6553600,
+          "sha256": "6565285f0ba2923703252763cfc11d8a9bda40ab42e7548e12464b04dbdbec13"
+        },
+        {
+          "name": "mtp.layers.0.attn_hyper_connection.block_inject_weight.weight",
+          "shard": "model-00047-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            4,
+            10240
+          ],
+          "start": 1716599984,
+          "end": 1716681903,
+          "bytes": 81920,
+          "sha256": "c8afff64e7f54412d02120097c4255033c55245e1c1eed84cc630d428ccb864c"
+        },
+        {
+          "name": "mtp.layers.0.attn_hyper_connection.hc_norm.weight",
+          "shard": "model-00049-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            10240
+          ],
+          "start": 1935412672,
+          "end": 1935433151,
+          "bytes": 20480,
+          "sha256": "1fb619aeaaf637ccd70f46f1f8f8116e6a46448cb43026b246de8ee8286ed809"
+        },
+        {
+          "name": "mtp.layers.0.attn_hyper_connection.input_mix_weight_down.weight",
+          "shard": "model-00053-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            320,
+            10240
+          ],
+          "start": 1832518424,
+          "end": 1839072023,
+          "bytes": 6553600,
+          "sha256": "e80ac8bf3e270e9d5a949ec7c913329dc8de017d69851334820fae7b8c86a7f5"
+        },
+        {
+          "name": "mtp.layers.0.attn_hyper_connection.input_mix_weight_up.weight",
+          "shard": "model-00057-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            10240,
+            320
+          ],
+          "start": 1935412680,
+          "end": 1941966279,
+          "bytes": 6553600,
+          "sha256": "f80f1fd44e1183e7764ea496b11ff89ead9dd758f861d4e79a770bf54956b1a5"
+        },
+        {
+          "name": "mtp.layers.0.mlp.experts.down_proj",
+          "shard": "model-00062-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            512,
+            2560,
+            640
+          ],
+          "start": 1832518400,
+          "end": 3510239999,
+          "bytes": 1677721600,
+          "sha256": "539c46234f73bac70450f731f40e715f77ac32faf77def0f3f800e58aaabbbc0"
+        },
+        {
+          "name": "mtp.layers.0.mlp.experts.gate_up_proj",
+          "shard": "model-00060-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            512,
+            1280,
+            2560
+          ],
+          "start": 115918328,
+          "end": 3471361527,
+          "bytes": 3355443200,
+          "sha256": "839e98f9642ebc884b178abd2090b6dc8b0bcd81ed92d7f7a08314c6a68f96d5"
+        },
+        {
+          "name": "mtp.layers.0.mlp.gate.weight",
+          "shard": "model-00066-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            512,
+            2560
+          ],
+          "start": 1716599952,
+          "end": 1719221391,
+          "bytes": 2621440,
+          "sha256": "f0d35fa41b360a08bc0c5b1e5766aa42df960291716ee189208b5d2599462c20"
+        },
+        {
+          "name": "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+          "shard": "model-00076-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            2560,
+            640
+          ],
+          "start": 1935412680,
+          "end": 1938689479,
+          "bytes": 3276800,
+          "sha256": "d2ced8c81367cc494599d1a8cdc279c3dd6579b628ded05acd7495e99cee01d8"
+        },
+        {
+          "name": "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+          "shard": "model-00072-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            640,
+            2560
+          ],
+          "start": 1832518528,
+          "end": 1835795327,
+          "bytes": 3276800,
+          "sha256": "f4a81109165853b3b64f36d809f98094b599763364070f5fa079200e1c386d4c"
+        },
+        {
+          "name": "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+          "shard": "model-00072-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            640,
+            2560
+          ],
+          "start": 1835795328,
+          "end": 1839072127,
+          "bytes": 3276800,
+          "sha256": "172586861eea53efbff10afc43ded5b6e49c83879e9efc01e089c652bbb0a156"
+        },
+        {
+          "name": "mtp.layers.0.mlp.shared_expert_gate.weight",
+          "shard": "model-00070-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            1,
+            2560
+          ],
+          "start": 1832518400,
+          "end": 1832523519,
+          "bytes": 5120,
+          "sha256": "acdd306d9996d356e4667a16ff63af6fef086fc7f570f1bc00bbe882a2a93f6e"
+        },
+        {
+          "name": "mtp.layers.0.mlp_hyper_connection.block_inject_weight.weight",
+          "shard": "model-00078-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            4,
+            10240
+          ],
+          "start": 1832518424,
+          "end": 1832600343,
+          "bytes": 81920,
+          "sha256": "c5782dd92b479a1f8ef43d683fe9c917fd9e8fba81f23c1aae8817bfe4b476a6"
+        },
+        {
+          "name": "mtp.layers.0.mlp_hyper_connection.hc_norm.weight",
+          "shard": "model-00082-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            10240
+          ],
+          "start": 1935412656,
+          "end": 1935433135,
+          "bytes": 20480,
+          "sha256": "21a504876b5e7b788301557c68dfb757999430eba36c66ec8ab96a63604dbfd1"
+        },
+        {
+          "name": "mtp.layers.0.mlp_hyper_connection.input_mix_weight_down.weight",
+          "shard": "model-00086-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            320,
+            10240
+          ],
+          "start": 1935412696,
+          "end": 1941966295,
+          "bytes": 6553600,
+          "sha256": "b71240036dea954e034d5ae04e097bcd7ac51cb28a44e4c93d198af3447278a1"
+        },
+        {
+          "name": "mtp.layers.0.mlp_hyper_connection.input_mix_weight_up.weight",
+          "shard": "model-00088-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            10240,
+            320
+          ],
+          "start": 1832518424,
+          "end": 1839072023,
+          "bytes": 6553600,
+          "sha256": "40756866bf2a5e82c28e407f717b6fa07614d593f78e79c7ceb2cd4ffe6dda94"
+        },
+        {
+          "name": "mtp.layers.0.self_attn.indexer.index_qk_proj.weight",
+          "shard": "model-00090-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            640,
+            2560
+          ],
+          "start": 1832518416,
+          "end": 1835795215,
+          "bytes": 3276800,
+          "sha256": "2befafae6e944c1fc651fd73d4d527eb6f138a6c1679065b003128ee3150e859"
+        },
+        {
+          "name": "mtp.layers.0.self_attn.indexer.k_layernorm.weight",
+          "shard": "model-00094-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            128
+          ],
+          "start": 1935412672,
+          "end": 1935412927,
+          "bytes": 256,
+          "sha256": "2db621f6a08b4085756fc69d60a4a1bd1d7fbf5d406456d2477075842efaae54"
+        },
+        {
+          "name": "mtp.layers.0.self_attn.indexer.q_layernorm.weight",
+          "shard": "model-00100-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            128
+          ],
+          "start": 1716599968,
+          "end": 1716600223,
+          "bytes": 256,
+          "sha256": "afaf59f68e251939970ffdeacad0667dffc657a522bea62cdc44a52816fc49d6"
+        },
+        {
+          "name": "mtp.layers.0.self_attn.k_norm.weight",
+          "shard": "model-00102-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            256
+          ],
+          "start": 1935412648,
+          "end": 1935413159,
+          "bytes": 512,
+          "sha256": "8f924b0357cf936e14fc34518205d000e1423aa60626827df81b0804fae8cdfd"
+        },
+        {
+          "name": "mtp.layers.0.self_attn.k_proj.weight",
+          "shard": "model-00108-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            512,
+            2560
+          ],
+          "start": 1832518624,
+          "end": 1835140063,
+          "bytes": 2621440,
+          "sha256": "1a295dc2d6e633e808aeb19e00c97856a1817bbfcc83f5b610e2bfcacfcb8c38"
+        },
+        {
+          "name": "mtp.layers.0.self_attn.o_proj.weight",
+          "shard": "model-00106-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            2560,
+            6144
+          ],
+          "start": 1832518400,
+          "end": 1863975679,
+          "bytes": 31457280,
+          "sha256": "9d2fcf0ac6ac19de87f638f710cfd1af6ad14141e75b7d3d5d29fbd06f374219"
+        },
+        {
+          "name": "mtp.layers.0.self_attn.q_norm.weight",
+          "shard": "model-00112-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            256
+          ],
+          "start": 1935412664,
+          "end": 1935413175,
+          "bytes": 512,
+          "sha256": "57957aa1e7c5a3ac628bff0ec5522ad55a39b8c0b8bd2d324ae640e3771617ef"
+        },
+        {
+          "name": "mtp.layers.0.self_attn.q_proj.weight",
+          "shard": "model-00108-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            12288,
+            2560
+          ],
+          "start": 1835140064,
+          "end": 1898054623,
+          "bytes": 62914560,
+          "sha256": "5220aef3d288f40759f7356af9ef453e5ac0256a38749a9bb803a4e9db58150d"
+        },
+        {
+          "name": "mtp.layers.0.self_attn.v_proj.weight",
+          "shard": "model-00108-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            512,
+            2560
+          ],
+          "start": 1898054624,
+          "end": 1900676063,
+          "bytes": 2621440,
+          "sha256": "39cb12f5424e965fa71fb81db0ee230c701b7b1e0b72c36641fde7e0e41bff41"
+        },
+        {
+          "name": "mtp.pre_fc_norm_embedding.weight",
+          "shard": "model-00114-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            2560
+          ],
+          "start": 1832518392,
+          "end": 1832523511,
+          "bytes": 5120,
+          "sha256": "04c4a570850e06f2d8913da8220d54d4c7f87db6eb6d45480b938e8ba41d6a86"
+        },
+        {
+          "name": "mtp.pre_fc_norm_hidden.weight",
+          "shard": "model-00118-of-00131.safetensors",
+          "dtype": "BF16",
+          "shape": [
+            10240
+          ],
+          "start": 1716599944,
+          "end": 1716620423,
+          "bytes": 20480,
+          "sha256": "b933b44559879449b1baf2af8385c5c237347307e3fd452394870cb53e6eab6d"
         }
       ]
     },
     "tuning": {
       "route_prior": "1.25",
-      "vram_reserve_mib": 700,
       "spec": 3,
+      "spec_min_p": 0.5,
+      "prefill": 4096,
+      "kv": "int8",
       "conversation_cache_mib": 1024,
-      "ram_left_for_others_gib": 19.5,
-      "min_resident_budget_gib": 8,
+      "ram_keep_gib": 8,
+      "io_threads": 128,
       "default_ctx": 32768,
-      "max_ctx": 262144
+      "max_ctx": 131072
     }
   },
   "holo": {
-    "_comment": "Holo pack (talking hologram avatars on the phone app's Holo tab). Revisions, sizes and SHA-256 from the HF tree API at the commit (LFS oid); the small non-LFS files (.onnx.json, config.json) were downloaded at that commit and hashed. face_landmarker.task: MediaPipe's model bucket, hashed from the download and pinned here (the path carries its version, float16/1). Orpheus Q4_K_M was benchmarked locally (WER 0.000, 1.35x realtime on an RX 6700 XT).",
+    "_comment": "Holo pack (talking hologram avatars on the phone app's Holo tab). Revisions, sizes and SHA-256 from the HF tree API at the commit (LFS oid); the small non-LFS files (.onnx.json, config.json) were downloaded at that commit and hashed. face_landmarker.task: MediaPipe's model bucket, hashed from the download and pinned here (the path carries its version, float16/1). Orpheus is the GGUF the discordai bot benchmarked (WER 0.000, 1.35x realtime on an RX 6700 XT).",
     "piper": {
       "repo": "rhasspy/piper-voices",
       "revision": "e7229f7d33a10e145e109b886d661984201ac3c4",

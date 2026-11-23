@@ -26,10 +26,11 @@ for %%V in (3.13 3.12 3.11) do (
 if not defined PY (
   python -c "import sys; sys.exit(0 if (3, 11) <= sys.version_info[:2] <= (3, 13) else 1)" >nul 2>&1 && set "PY=python"
 )
-if not defined PY if exist "python\tools\python.exe" set "PY=python\tools\python.exe"
+rem The portable Python is re-checked (exact pinned signer) every time before it
+rem is used: get-python.ps1 says "already here" only for a validly signed copy.
 if not defined PY (
-  echo No Python 3.11-3.13 found. Getting the portable one ^(about 15 MB^)...
-  powershell -NoProfile -ExecutionPolicy Bypass -File "installer\get-python.ps1"
+  if not exist "python\tools\python.exe" echo No Python 3.11-3.13 found. Getting the portable one ^(about 15 MB^)...
+  "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "installer\get-python.ps1"
   if errorlevel 1 goto :failed
   set "PY=python\tools\python.exe"
 )

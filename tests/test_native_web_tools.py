@@ -1,6 +1,6 @@
 """Native (structured) tool calls for models that never learn @markers.
 
-LFM3-1.7B, told to write @search("query"), echoed the placeholders and then
+A 1.7B model, told to write @search("query"), echoed the placeholders and then
 fell back to its trained XML call format, so no search ever ran
 (2026-10-27). Entries marked native_tools get real tool definitions and
 their tool_calls are mapped onto the same guarded web tools.

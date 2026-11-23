@@ -119,9 +119,9 @@ def _extract_native_tool_calls(text: str) -> list[dict]:
 # For model entries with "native_tools": true. Instead of teaching the model
 # the @marker syntax in the prompt, the request carries these definitions
 # and llama-server (--jinja) parses whatever call format the model was
-# trained on into OpenAI tool_calls. Small models such as LFM3 never learn
-# the @marker syntax from a prompt: they echo the placeholders or fall back
-# to their own format (2026-10-27, LFM3-1.7B on the phone).
+# trained on into OpenAI tool_calls. Small models never learn the @marker
+# syntax from a prompt: they echo the placeholders or fall back to their
+# own format (seen 2026-10-27 with a 1.7B model on the phone).
 NATIVE_WEB_TOOLS = [
     {"type": "function", "function": {
         "name": "web_search",
